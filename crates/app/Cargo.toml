@@ -1,0 +1,11 @@
+[package]
+name = "signal-gpui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+gpui-kit.workspace = true
+presage.workspace = true
+presage-store-sqlite.workspace = true

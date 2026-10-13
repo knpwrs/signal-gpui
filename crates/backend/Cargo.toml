@@ -1,0 +1,17 @@
+[package]
+name = "signal-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+signal-store.workspace = true
+presage.workspace = true
+presage-store-sqlite.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+url = "2"

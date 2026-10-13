@@ -1,0 +1,45 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+default-members = ["crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[workspace.dependencies]
+signal-emoji = { path = "crates/emoji" }
+signal-store = { path = "crates/store" }
+signal-backend = { path = "crates/backend" }
+
+gpui-kit = "0.7.3"
+
+presage = { git = "https://github.com/whisperfish/presage", rev = "32ffc659fce2f0be7fb01cffdf8c3ebc0c757d80" }
+presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "32ffc659fce2f0be7fb01cffdf8c3ebc0c757d80" }
+
+anyhow = "1"
+thiserror = "2"
+fst = { version = "0.4.7", features = ["levenshtein"] }
+futures = "0.3"
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.9.0", default-features = false, features = ["sqlite", "runtime-tokio", "macros", "migrate"] }
+libsqlite3-sys = { version = "0.36.0" }
+chrono = "0.4"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[patch.crates-io]
+# presage-store-sqlite links SQLCipher through whisperfish's libsqlite3-sys fork.
+libsqlite3-sys = { git = "https://github.com/whisperfish/rusqlite", rev = "2a42b3354c9194700d08aa070f70a131a470e7dc" }
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
