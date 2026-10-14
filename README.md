@@ -36,9 +36,11 @@ Downloaded attachments (`attachments/`) and profile/group photos (`avatars/`) ar
 
 Display names come from the account's Storage Service contact records (nickname, then address-book name, then profile name), falling back to contact sync and fetched profiles (using profile keys from shared groups for people who aren't contacts). Messages that arrived before a sender's name was known are renamed once it is. Pins, archived and muted chats come from there too, and re-sync when your phone reports a storage change. Right-click a chat to pin or unpin it (up to 4). The change is written back to Storage Service, editing only the pinned list and keeping any fields this client doesn't understand, and then your other devices are told to fetch it. Archiving and muting are read-only here for now.
 
-## Sending images
+## Sending images and files
 
-Attach with the paperclip, paste (⌘V, including images macOS puts on the clipboard as TIFF), or drop files on the composer; typed text becomes the caption. Images are optimized losslessly before upload (at the level chosen in Settings → Images), in the outbound queue so messages keep their order:
+Attach with the paperclip, paste (⌘V, including images macOS puts on the clipboard as TIFF), or drop files on the composer; typed text becomes the caption. Files that aren't images (PDFs, documents, audio, archives, up to Signal's 100 MB) are sent as they are, each as a message of its own as in Desktop; the text goes with the images, or with the first file when there are none. Clicking a file you sent or downloaded opens it in its app.
+
+Images are optimized losslessly before upload (at the level chosen in Settings → Images), in the outbound queue so messages keep their order:
 
 - PNG: [oxipng](https://github.com/shssoichiro/oxipng) at its maximum preset (`-o max`), keeping only chunks that affect rendering (colour profile, gamma, physical size).
 - JPEG: mozjpeg's lossless transcode (what `jpegtran -optimize -progressive` does): the DCT coefficients are copied, so pixels are identical; Huffman tables and progressive scans are re-optimized. The ICC profile and EXIF orientation are kept; all other metadata, including GPS, is dropped.

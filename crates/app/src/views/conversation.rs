@@ -2385,8 +2385,13 @@ fn render_attachment(
                     format!("{} · Click to download", crate::views::common::format_size(attachment.size))
                 })),
         )
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.state.read(cx).send(Command::FetchAttachment { message_id, index });
+        .on_click(cx.listener({
+            let local = attachment.local_path.clone().map(std::path::PathBuf::from);
+            move |this, _, _, cx| match &local {
+                // Downloaded (or ours): open it in its app.
+                Some(path) => cx.open_with_system(path),
+                None => this.state.read(cx).send(Command::FetchAttachment { message_id, index }),
+            }
         }))
         .into_any_element()
 }

@@ -14,6 +14,57 @@ use std::panic::AssertUnwindSafe;
 
 use anyhow::{Context as _, anyhow, bail};
 
+/// The MIME type to send a file with, from its extension (what Desktop's
+/// `mime` lookup does for the common kinds); unknown kinds are
+/// `application/octet-stream`.
+pub fn content_type_for_file(name: &str) -> &'static str {
+    let ext = name.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()).unwrap_or_default();
+    match ext.as_str() {
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "gz" | "tgz" => "application/gzip",
+        "txt" | "log" => "text/plain",
+        "md" => "text/markdown",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "rtf" => "application/rtf",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "pages" => "application/vnd.apple.pages",
+        "numbers" => "application/vnd.apple.numbers",
+        "key" => "application/vnd.apple.keynote",
+        "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "wav" => "audio/wav",
+        "ogg" | "oga" => "audio/ogg",
+        "flac" => "audio/flac",
+        "mp4" | "m4v" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "heic" => "image/heic",
+        "heif" => "image/heif",
+        "tif" | "tiff" => "image/tiff",
+        "svg" => "image/svg+xml",
+        _ => "application/octet-stream",
+    }
+}
+
+/// A file name safe to save under: the last path component, without
+/// control characters, at most 100 characters.
+pub fn safe_file_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or_default();
+    let clean: String = base.chars().filter(|c| !c.is_control()).take(100).collect();
+    let clean = clean.trim().trim_start_matches('.').to_owned();
+    if clean.is_empty() { "file".into() } else { clean }
+}
+
 /// An image ready to upload.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedImage {
@@ -400,6 +451,17 @@ fn minimal_exif(orientation: u16) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn file_types_and_names() {
+        assert_eq!(content_type_for_file("Report.PDF"), "application/pdf");
+        assert_eq!(content_type_for_file("notes.txt"), "text/plain");
+        assert_eq!(content_type_for_file("archive"), "application/octet-stream");
+        assert_eq!(safe_file_name("../../etc/passwd"), "passwd");
+        assert_eq!(safe_file_name("a\\b\u{7}.txt"), "b.txt");
+        assert_eq!(safe_file_name(".hidden"), "hidden");
+        assert_eq!(safe_file_name(""), "file");
+    }
+
     use super::*;
 
     #[test]

@@ -99,6 +99,16 @@ pub enum Command {
         /// Who each placeholder in `caption` mentions, in order.
         mentions: Vec<String>,
     },
+    /// Sends any file as it is (not optimized), with `caption` as the
+    /// message text.
+    SendFile {
+        conversation: ConversationId,
+        file: OutgoingFile,
+        caption: String,
+        quote: Option<i64>,
+        /// Who each placeholder in `caption` mentions, in order.
+        mentions: Vec<String>,
+    },
     /// Reacts to message `message_id`; `remove` retracts our reaction.
     React { message_id: i64, emoji: String, remove: bool },
     /// Marks a conversation read locally and sends read receipts / sync.
@@ -240,6 +250,13 @@ pub struct StickerView {
 pub struct OutgoingImage {
     pub bytes: std::sync::Arc<Vec<u8>>,
     pub file_name: Option<String>,
+}
+
+/// A file (not sent as an image) picked, pasted or dropped in the composer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutgoingFile {
+    pub bytes: std::sync::Arc<Vec<u8>>,
+    pub file_name: String,
 }
 
 /// Signal's attachment size limit.

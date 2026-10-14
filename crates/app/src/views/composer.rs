@@ -15,7 +15,7 @@ use gpui_kit::{
     App, ClipboardEntry, Context, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, FontWeight, Image,
     ImageFormat, ObjectFit, PathPromptOptions, SharedString, Subscription, Task, Window, deferred, div, img, px,
 };
-use signal_backend::{Command, LinkPreviewDraft, OutgoingImage};
+use signal_backend::{Command, LinkPreviewDraft, OutgoingFile, OutgoingImage};
 use signal_emoji::{Emoji, SearchOptions};
 use signal_store::{ConversationId, ConversationKind, Message};
 
@@ -57,6 +57,12 @@ impl StagedPreview {
             gpui_kit::ImageSource::Image(image.clone()).remove_asset(cx);
         }
     }
+}
+
+/// A file (not an image) waiting to be sent, as a message of its own.
+struct PendingFile {
+    bytes: Arc<Vec<u8>>,
+    file_name: String,
 }
 
 /// An image waiting to be sent with the next message.
@@ -128,6 +134,7 @@ pub struct Composer {
     /// Mentions picked in this draft: `("@Name", service id)`.
     mentions: Vec<(String, String)>,
     images: Vec<PendingImage>,
+    files: Vec<PendingFile>,
     link_preview: Option<StagedPreview>,
     /// Links whose preview was dismissed in this draft.
     dismissed_previews: std::collections::HashSet<String>,
@@ -217,6 +224,7 @@ impl Composer {
             members: Vec::new(),
             mentions: Vec::new(),
             images: Vec::new(),
+            files: Vec::new(),
             link_preview: None,
             dismissed_previews: Default::default(),
             preview_task: None,
@@ -467,7 +475,7 @@ impl Composer {
             cx.notify();
             return;
         }
-        if text.is_empty() && self.images.is_empty() {
+        if text.is_empty() && self.images.is_empty() && self.files.is_empty() {
             return;
         }
         let quote = self.reply_to.take().map(|m| m.id);
@@ -483,19 +491,39 @@ impl Composer {
         };
         self.dismissed_previews.clear();
         self.preview_task = None;
-        let command = if self.images.is_empty() {
-            Command::SendText { conversation: self.conversation.clone(), body, quote, preview, mentions }
-        } else {
-            let images = std::mem::take(&mut self.images)
-                .into_iter()
-                .map(|i| {
-                    i.release(cx);
-                    OutgoingImage { bytes: i.bytes, file_name: i.file_name }
-                })
-                .collect();
-            Command::SendImages { conversation: self.conversation.clone(), images, caption: body, quote, mentions }
-        };
-        self.state.read(cx).send(command);
+        // The text goes with the images, else with the first file (each file
+        // is a message of its own, as in Desktop).
+        let files = std::mem::take(&mut self.files);
+        let mut commands = Vec::new();
+        let mut caption = Some((body, quote, mentions));
+        if !self.images.is_empty() || files.is_empty() {
+            let (body, quote, mentions) = caption.take().unwrap_or_default();
+            commands.push(if self.images.is_empty() {
+                Command::SendText { conversation: self.conversation.clone(), body, quote, preview, mentions }
+            } else {
+                let images = std::mem::take(&mut self.images)
+                    .into_iter()
+                    .map(|i| {
+                        i.release(cx);
+                        OutgoingImage { bytes: i.bytes, file_name: i.file_name }
+                    })
+                    .collect();
+                Command::SendImages { conversation: self.conversation.clone(), images, caption: body, quote, mentions }
+            });
+        }
+        for file in files {
+            let (caption, quote, mentions) = caption.take().unwrap_or_default();
+            commands.push(Command::SendFile {
+                conversation: self.conversation.clone(),
+                file: OutgoingFile { bytes: file.bytes, file_name: file.file_name },
+                caption,
+                quote,
+                mentions,
+            });
+        }
+        for command in commands {
+            self.state.read(cx).send(command);
+        }
         self.input.update(cx, |input, cx| input.set_value("", window, cx));
         self.typing_sent_at = None; // sending a message implicitly stops typing
         self.save_draft_later(String::new(), cx);
@@ -600,12 +628,24 @@ impl Composer {
         true
     }
 
-    /// Reads files off the UI thread and queues the images among them.
+    /// Queues a file to send as it is; `false` (with a message) when it's
+    /// over Signal's limit.
+    fn add_file(&mut self, bytes: Vec<u8>, file_name: Option<String>, cx: &mut Context<Self>) -> bool {
+        if bytes.len() > signal_backend::MAX_ATTACHMENT_BYTES {
+            return false;
+        }
+        self.files.push(PendingFile { bytes: Arc::new(bytes), file_name: file_name.unwrap_or_else(|| "file".into()) });
+        cx.notify();
+        true
+    }
+
+    /// Reads files off the UI thread and queues them: images to send as
+    /// photos, anything else as a file.
     fn add_paths(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         let read = cx.background_spawn(async move {
             paths
                 .into_iter()
-                .filter_map(|path| {
+                .map(|path| {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
                     std::fs::read(&path).ok().map(|bytes| (bytes, name))
                 })
@@ -614,10 +654,24 @@ impl Composer {
         cx.spawn_in(window, async move |this, cx| {
             let files = read.await;
             let _ = this.update_in(cx, |this, window, cx| {
-                let skipped = files.into_iter().filter(|(bytes, name)| !this.add_image(bytes.clone(), name.clone(), cx)).count();
-                if skipped > 0 {
+                let unreadable = files.iter().filter(|f| f.is_none()).count();
+                let too_big = files
+                    .into_iter()
+                    .flatten()
+                    .filter(|(bytes, name)| {
+                        !this.add_image(bytes.clone(), name.clone(), cx) && !this.add_file(bytes.clone(), name.clone(), cx)
+                    })
+                    .count();
+                let mut problems = Vec::new();
+                if too_big > 0 {
+                    problems.push(format!("{too_big} over Signal's 100 MB limit"));
+                }
+                if unreadable > 0 {
+                    problems.push(format!("{unreadable} that couldn't be read"));
+                }
+                if !problems.is_empty() {
                     this.state.update(cx, |state, cx| {
-                        state.report_error(format!("Skipped {skipped} file(s): only images can be sent"), cx);
+                        state.report_error(format!("Skipped {} file(s): {}", too_big + unreadable, problems.join(", ")), cx);
                     });
                 }
                 this.focus(window, cx);
@@ -626,7 +680,7 @@ impl Composer {
         .detach();
     }
 
-    fn pick_images(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn pick_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let picked = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -659,6 +713,57 @@ impl Composer {
             }
         }
         handled
+    }
+
+    fn render_files(&self, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        div().flex().flex_wrap().gap_2().mx_3().mt_2().children(self.files.iter().enumerate().map(|(ix, file)| {
+            div()
+                .id(("pending-file", ix))
+                .flex()
+                .items_center()
+                .gap_2()
+                .max_w(px(260.))
+                .pl_2()
+                .pr_1()
+                .py_1()
+                .rounded_lg()
+                .bg(palette.input_bg)
+                .border_1()
+                .border_color(palette.panel_border)
+                .child(Icon::new(IconName::File).size_4().text_color(palette.text_secondary))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .min_w_0()
+                        .child(div().text_sm().truncate().child(file.file_name.clone()))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(palette.text_secondary)
+                                .child(crate::views::common::format_size(file.bytes.len() as u64)),
+                        ),
+                )
+                .child(
+                    div()
+                        .id(("remove-file", ix))
+                        .flex_none()
+                        .size(px(20.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .cursor_pointer()
+                        .hover(|d| d.bg(palette.panel_border))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if ix < this.files.len() {
+                                this.files.remove(ix);
+                            }
+                            cx.notify();
+                        }))
+                        .child(Icon::new(IconName::X).size_3().text_color(palette.text)),
+                )
+        }))
     }
 
     fn render_images(&self, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
@@ -881,7 +986,8 @@ impl Render for Composer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::get(cx);
         let typeahead_open = self.typeahead.is_some();
-        let can_send = !self.input.read(cx).value().trim().is_empty() || !self.images.is_empty();
+        let can_send =
+            !self.input.read(cx).value().trim().is_empty() || !self.images.is_empty() || !self.files.is_empty();
 
         div()
             .relative()
@@ -949,7 +1055,11 @@ impl Render for Composer {
             // ↑ in an empty composer edits your last message; Esc cancels an edit.
             .when(!typeahead_open, |d| {
                 d.capture_action(cx.listener(|this, _: &MoveUp, _, cx| {
-                    if this.editing.is_none() && this.images.is_empty() && this.input.read(cx).value().is_empty() {
+                    if this.editing.is_none()
+                        && this.images.is_empty()
+                        && this.files.is_empty()
+                        && this.input.read(cx).value().is_empty()
+                    {
                         cx.stop_propagation();
                         cx.emit(ComposerEvent::EditLast);
                     }
@@ -963,6 +1073,7 @@ impl Render for Composer {
             })
             .when_some(self.render_link_preview(palette, cx), |d, card| d.child(card))
             .when(!self.images.is_empty(), |d| d.child(self.render_images(palette, cx)))
+            .when(!self.files.is_empty(), |d| d.child(self.render_files(palette, cx)))
             .child(
                 div()
                     .flex()
@@ -995,7 +1106,7 @@ impl Render for Composer {
                             .rounded_full()
                             .cursor_pointer()
                             .hover(|d| d.bg(palette.row_hover))
-                            .on_click(cx.listener(|this, _, window, cx| this.pick_images(window, cx)))
+                            .on_click(cx.listener(|this, _, window, cx| this.pick_files(window, cx)))
                             .child(Icon::new(IconName::Paperclip).size_5().text_color(palette.text_secondary)),
                     )
                     .child(
@@ -1196,6 +1307,52 @@ mod tests {
         .unwrap();
         assert_eq!(cx.update(|cx| f.composer.read(cx).images.len()), 0);
         assert_eq!(text(&f, cx), "");
+    }
+
+    /// The demo's messages in the composer's chat, once `filter` matches one.
+    fn sent(f: &Fixture, filter: impl Fn(&signal_store::Message) -> bool) -> Vec<signal_store::Message> {
+        for _ in 0..300 {
+            let db = f.backend.db().clone();
+            let messages: Vec<_> = futures::executor::block_on(
+                f.backend.spawn(async move { db.messages(&ConversationId("d:test".into()), None, 50).await }),
+            )
+            .unwrap_or_default();
+            if messages.iter().any(&filter) {
+                return messages;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("nothing was sent");
+    }
+
+    #[gpui_kit::test]
+    fn files_send_as_their_own_messages_with_the_caption(cx: &mut TestAppContext) {
+        let f = mount(cx);
+        let target = input_id(&f, cx);
+        cx.update_window(f.window, |_, window, cx| {
+            window.click(target, cx);
+            window.input("the notes", cx);
+        })
+        .unwrap();
+        f.composer.update(cx, |c, cx| {
+            assert!(c.add_file(b"%PDF-1.7".to_vec(), Some("notes.pdf".into()), cx));
+            assert!(c.add_file(b"a,b".to_vec(), Some("data.csv".into()), cx));
+            // Over Signal's limit: refused.
+            assert!(!c.add_file(vec![0; signal_backend::MAX_ATTACHMENT_BYTES + 1], Some("big.bin".into()), cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.update(|cx| f.composer.read(cx).files.len()), 2);
+        cx.update_window(f.window, |_, window, cx| f.composer.update(cx, |c, cx| c.submit(window, cx))).unwrap();
+        assert_eq!(cx.update(|cx| f.composer.read(cx).files.len()), 0);
+
+        let messages = sent(&f, |m| m.attachments.iter().any(|a| a.file_name.as_deref() == Some("data.csv")));
+        let file = |name: &str| messages.iter().find(|m| m.attachments[0].file_name.as_deref() == Some(name)).unwrap().clone();
+        let (pdf, csv) = (file("notes.pdf"), file("data.csv"));
+        // The text goes with the first file; each file is its own message.
+        assert_eq!((pdf.body.as_str(), pdf.attachments[0].content_type.as_str()), ("the notes", "application/pdf"));
+        assert_eq!((csv.body.as_str(), csv.attachments[0].content_type.as_str()), ("", "text/csv"));
+        let saved = std::fs::read(pdf.attachments[0].local_path.as_ref().unwrap()).unwrap();
+        assert_eq!(saved, b"%PDF-1.7");
     }
 
     #[gpui_kit::test]

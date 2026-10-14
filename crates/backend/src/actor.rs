@@ -59,6 +59,15 @@ fn now_millis() -> i64 {
         .unwrap_or_default()
 }
 
+/// An attachment to upload from its local copy.
+struct Upload {
+    path: std::path::PathBuf,
+    file_name: Option<String>,
+    /// A file to send unchanged, with this MIME type; `None` for an image,
+    /// which is optimized first.
+    file_type: Option<String>,
+}
+
 /// Outbound work, processed one at a time so sessions are never ratcheted concurrently.
 enum Outbound {
     Send {
@@ -76,7 +85,7 @@ enum Outbound {
         timestamp: u64,
         message: i64,
         /// Local copies (in `attachments/`), in attachment order.
-        images: Vec<(std::path::PathBuf, Option<String>)>,
+        images: Vec<Upload>,
         /// The link preview's image (already optimized), for `body.preview`.
         preview_image: Option<std::path::PathBuf>,
     },
@@ -396,6 +405,9 @@ impl Actor {
                 }
                 Command::SendImages { conversation, images, caption, quote, mentions } => {
                     self.send_images(conversation, images, caption, quote, mentions).await
+                }
+                Command::SendFile { conversation, file, caption, quote, mentions } => {
+                    self.send_file(conversation, file, caption, quote, mentions).await
                 }
                 Command::React { message_id, emoji, remove } => {
                     self.react(message_id, emoji, remove).await
@@ -2189,7 +2201,19 @@ impl Actor {
             let size = (gif.width.unwrap_or(0), gif.height.unwrap_or(0));
             return self.enqueue(Outbound::SendGif { conversation, body: data, timestamp, message: message_id, path, size });
         }
-        let images: Vec<_> = attachments.iter().filter_map(|a| Some((local(a)?, a.file_name.clone()))).collect();
+        let images: Vec<_> = attachments
+            .iter()
+            .filter_map(|a| {
+                Some(Upload {
+                    path: local(a)?,
+                    file_name: a.file_name.clone(),
+                    // Only the kinds we optimize go through it (a HEIC or TIFF
+                    // sent as a file stays as it is).
+                    file_type: (!matches!(a.content_type.as_str(), "image/png" | "image/jpeg" | "image/webp" | "image/gif"))
+                        .then(|| a.content_type.clone()),
+                })
+            })
+            .collect();
         let preview_image = preview.and_then(|p| p.image.as_ref()).and_then(local);
         if let Some(preview) = preview {
             data.preview = vec![presage::proto::Preview {
@@ -2421,7 +2445,7 @@ impl Actor {
                 gif: false,
                 remote: None,
             });
-            files.push((path, image.file_name));
+            files.push(Upload { path, file_name: image.file_name, file_type: None });
         }
         if files.is_empty() {
             return;
@@ -2438,6 +2462,57 @@ impl Actor {
             timestamp,
             message: id,
             images: files,
+            preview_image: None,
+        });
+    }
+
+    /// Sends a file as it is. A copy is kept next to downloaded attachments,
+    /// under its own name, so it opens from the message.
+    async fn send_file(
+        self: Rc<Self>,
+        conversation: ConversationId,
+        file: crate::OutgoingFile,
+        caption: String,
+        quote: Option<i64>,
+        mentions: Vec<String>,
+    ) {
+        if file.bytes.len() > crate::MAX_ATTACHMENT_BYTES {
+            return self.error("can't send file", "larger than Signal's 100 MB limit");
+        }
+        let name = media::safe_file_name(&file.file_name);
+        let dir = self.config.data_dir.join("attachments").join(format!("sent-{}", now_millis()));
+        let path = dir.join(&name);
+        let written = async {
+            tokio::fs::create_dir_all(&dir).await?;
+            tokio::fs::write(&path, file.bytes.as_slice()).await
+        };
+        if let Err(error) = written.await {
+            return self.error("failed to save file", error);
+        }
+        let meta_type = media::content_type_for_file(&name).to_owned();
+        let meta = AttachmentMeta {
+            content_type: meta_type.clone(),
+            file_name: Some(name.clone()),
+            size: file.bytes.len() as u64,
+            width: None,
+            height: None,
+            local_path: Some(path.to_string_lossy().into_owned()),
+            sticker: false,
+            gif: false,
+            remote: None,
+        };
+        let wire_caption = caption.trim_end().to_owned();
+        let (caption, spans) = self.render_mentions(&wire_caption, &mentions).await;
+        let Some((id, mut data, timestamp)) = self.store_outgoing(&conversation, caption, quote, vec![meta], None).await else {
+            return;
+        };
+        self.add_mentions(id, &mut data, wire_caption, &mentions, &spans).await;
+        self.enqueue(Outbound::SendImages {
+            conversation,
+            body: data,
+            timestamp,
+            message: id,
+            images: vec![Upload { path, file_name: Some(name), file_type: Some(meta_type) }],
             preview_image: None,
         });
     }
@@ -2841,15 +2916,31 @@ impl Actor {
     }
 
     /// Optimizes each image losslessly (replacing the local copy, which looks
-    /// identical), then uploads them all.
+    /// identical), then uploads them all. Other files go up as they are.
     async fn upload_images(
         &self,
         manager: &SignalManager,
-        images: Vec<(std::path::PathBuf, Option<String>)>,
+        images: Vec<Upload>,
     ) -> anyhow::Result<Vec<AttachmentPointer>> {
         let mut uploads = Vec::with_capacity(images.len());
-        for (path, file_name) in images {
+        for Upload { path, file_name, file_type } in images {
             let original = tokio::fs::read(&path).await.with_context(|| format!("reading {}", path.display()))?;
+            if let Some(content_type) = file_type {
+                let spec = AttachmentSpec {
+                    content_type,
+                    length: original.len(),
+                    file_name,
+                    preview: None,
+                    voice_note: None,
+                    borderless: None,
+                    width: None,
+                    height: None,
+                    caption: None,
+                    blur_hash: None,
+                };
+                uploads.push((spec, original));
+                continue;
+            }
             let before = original.len();
             let level = self.image_optimization().await;
             let prepared = tokio::task::spawn_blocking(move || media::prepare(&original, level)).await??;

@@ -836,6 +836,44 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     emit(Event::MessageChanged { conversation, message_id: id });
                 }
             }
+            Command::SendFile { conversation, file, caption, quote, mentions } => {
+                let name = crate::media::safe_file_name(&file.file_name);
+                let dir = data_dir.join("attachments").join(format!("sent-{}", now()));
+                let path = dir.join(&name);
+                if std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, file.bytes.as_slice())).is_err() {
+                    continue;
+                }
+                let sent_at = next_sent_at();
+                let (body, spans) = demo_mentions(&db, caption.trim_end(), &mentions).await;
+                let msg = NewMessage {
+                    conversation_id: conversation.clone(),
+                    sent_at,
+                    received_at: sent_at,
+                    direction: Direction::Outgoing,
+                    author: None,
+                    author_name: None,
+                    body,
+                    status: DeliveryStatus::Sent,
+                    quote: demo_quote(&db, quote).await,
+                    attachments: vec![AttachmentMeta {
+                        content_type: crate::media::content_type_for_file(&name).into(),
+                        file_name: Some(name),
+                        size: file.bytes.len() as u64,
+                        width: None,
+                        height: None,
+                        local_path: path.to_str().map(Into::into),
+                        sticker: false,
+                        gif: false,
+                        remote: None,
+                    }],
+                    link_preview: None,
+                    expires_in: 0,
+                };
+                if let Ok(id) = db.insert_message(&msg).await {
+                    let _ = db.set_mentions(id, &spans).await;
+                    emit(Event::MessageChanged { conversation, message_id: id });
+                }
+            }
             Command::Link | Command::Typing { .. } | Command::FetchAttachment { .. } | Command::Unlink | Command::SkipHistory => {}
         }
     }
