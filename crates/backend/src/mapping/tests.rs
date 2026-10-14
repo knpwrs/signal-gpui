@@ -232,6 +232,7 @@ fn incoming_edit() {
             conversation: ConversationId::direct(ALICE),
             target_author: Some(ALICE.into()),
             target_sent_at: 100,
+            sent_at: 300,
             body: "fixed".into(),
             mentions: vec![],
         }]
@@ -284,6 +285,7 @@ fn sync_sent_edit_to_group() {
             conversation: ConversationId::group(&group_key()),
             target_author: None,
             target_sent_at: 700,
+            sent_at: 800,
             body: "edited".into(),
             mentions: vec![],
         }]

@@ -577,7 +577,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
             }
             Command::EditMessage { message_id, body, mentions } => {
                 let (body, spans) = demo_mentions(&db, body.trim_end(), &mentions).await;
-                if db.edit_message(message_id, &body).await.is_ok()
+                if db.edit_message(message_id, &body, next_sent_at()).await.is_ok()
                     && db.set_mentions(message_id, &spans).await.is_ok()
                     && let Ok(Some(m)) = db.message(message_id).await
                 {

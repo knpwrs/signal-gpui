@@ -220,7 +220,7 @@ async fn delete_edit_attachments_and_search() {
     assert!(db.search_messages("\"fox OR NEAR(", 10).await.is_ok());
     assert!(db.search_messages("  ", 10).await.unwrap().is_empty());
 
-    db.edit_message(id, "slow green turtle").await.unwrap();
+    db.edit_message(id, "slow green turtle", 50).await.unwrap();
     let got = db.message(id).await.unwrap().unwrap();
     assert!(got.edited);
     assert_eq!(db.search_messages("fox", 10).await.unwrap().len(), 1);
@@ -239,8 +239,11 @@ async fn delete_edit_attachments_and_search() {
         Some("This message was deleted")
     );
     // Edits after delete are ignored.
-    db.edit_message(id, "resurrected").await.unwrap();
+    db.edit_message(id, "resurrected", 60).await.unwrap();
     assert!(db.message(id).await.unwrap().unwrap().body.is_empty());
+    let recorded: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM message_edits WHERE sent_at = 60").fetch_one(&db.pool).await.unwrap();
+    assert_eq!(recorded, 0, "an edit that didn't apply doesn't name the message");
 }
 
 #[tokio::test]
@@ -747,6 +750,8 @@ async fn fake_pre_squash_history(db: &AppDb, applied: usize) {
         20261025000000, 20261026000000, 20261027000000, 20261028000000,
     ];
     sqlx::query("DELETE FROM _sqlx_migrations").execute(&db.pool).await.unwrap();
+    // Nor had it anything from migrations after the squash.
+    sqlx::query("DROP TABLE message_edits").execute(&db.pool).await.unwrap();
     for version in &VERSIONS[..applied] {
         sqlx::query(
             "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
@@ -772,8 +777,11 @@ async fn adopts_fully_migrated_pre_squash_database() {
     }
     let db = AppDb::open(&path, &key).await.unwrap();
     assert_eq!(db.conversations().await.unwrap().len(), 1);
-    let versions: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations").fetch_all(&db.pool).await.unwrap();
-    assert_eq!(versions, vec![20261013000000]);
+    // The init stands in for the old history; later migrations then apply.
+    let versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version").fetch_all(&db.pool).await.unwrap();
+    let ours: Vec<i64> = sqlx::migrate!("./migrations").iter().map(|m| m.version).collect();
+    assert_eq!(versions, ours);
     db.close().await;
     // And opens again cleanly.
     AppDb::open(&path, &key).await.unwrap().close().await;
@@ -809,4 +817,57 @@ async fn refuses_partly_migrated_database_with_chats() {
         db.close().await;
     }
     assert!(matches!(AppDb::open(&path, &key).await, Err(Error::Schema(_))));
+}
+
+#[tokio::test]
+async fn an_edited_message_answers_to_its_edits_timestamps() {
+    let db = AppDb::open_in_memory().await.unwrap();
+    let theirs = db.insert_message(&incoming("d:a", "a", 100, "hi")).await.unwrap();
+    db.edit_message(theirs, "hi there", 200).await.unwrap();
+    // A reaction (or reply) to the edited message names the edit.
+    let found = db.find_message(&conv("d:a"), Some("a"), 200).await.unwrap().unwrap();
+    assert_eq!(found.id, theirs);
+    assert_eq!(db.find_message_any(Some("a"), 200).await.unwrap().map(|m| m.id), Some(theirs));
+    assert_eq!(db.find_message(&conv("d:a"), Some("a"), 100).await.unwrap().map(|m| m.id), Some(theirs));
+    assert!(db.find_message(&conv("d:a"), Some("b"), 200).await.unwrap().is_none(), "another author's message");
+    // A read sync for the edit reads it.
+    assert_eq!(db.mark_message_read("a", 200).await.unwrap(), Some(conv("d:a")));
+
+    // Our own: receipts for the edit's timestamp move its status.
+    let mut ours = incoming("d:a", "a", 300, "typo");
+    ours.direction = Direction::Outgoing;
+    ours.author = None;
+    ours.status = DeliveryStatus::Sent;
+    let ours = db.insert_message(&ours).await.unwrap();
+    db.edit_message(ours, "fixed", 400).await.unwrap();
+    let changed = db.update_status_by_sent_at(400, DeliveryStatus::Delivered).await.unwrap();
+    assert_eq!(changed, [(conv("d:a"), ours)]);
+
+    // A message's own timestamp wins over another's edit at the same time.
+    let later = db.insert_message(&incoming("d:a", "a", 200, "another")).await.unwrap();
+    assert_eq!(db.find_message(&conv("d:a"), Some("a"), 200).await.unwrap().map(|m| m.id), Some(later));
+
+    // Removing a message drops its edits.
+    db.remove_message(theirs).await.unwrap();
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM message_edits WHERE message_id = ?")
+        .bind(theirs)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+}
+
+#[tokio::test]
+async fn opens_a_database_with_migrations_after_the_init() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.db");
+    let key = [7u8; 32];
+    {
+        let db = AppDb::open(&path, &key).await.unwrap();
+        db.upsert_conversation(&conv("d:a"), ConversationUpdate { title: Some("A".into()), ..Default::default() }).await.unwrap();
+        db.close().await;
+    }
+    // Reopening (every migration applied, the newest after the init) keeps the chats.
+    let db = AppDb::open(&path, &key).await.unwrap();
+    assert_eq!(db.conversations().await.unwrap().len(), 1);
 }

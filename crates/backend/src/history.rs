@@ -451,7 +451,18 @@ async fn import_item(
         .collect();
     let (body, spans) = crate::mapping::render_mention_spans(&message.body, &mentions, &names);
     message.body = body;
+    // An edited message is the latest version, dated by the latest edit; it
+    // goes by its original (oldest) date, and its edits' dates name it too.
+    let mut edits: Vec<i64> = item.revisions.iter().map(|r| r.dateSent as i64).collect();
+    if !edits.is_empty() {
+        edits.push(message.sent_at);
+        edits.sort_unstable();
+        message.sent_at = edits.remove(0);
+    }
     let id = db.insert_message(&message).await?;
+    for at in &edits {
+        db.edit_message(id, &message.body, *at).await?;
+    }
     if !spans.is_empty() {
         db.set_mentions(id, &spans).await?;
     }
@@ -630,7 +641,12 @@ mod tests {
         mention.bodyRanges.push(range);
         let mut standard = proto::StandardMessage::new();
         standard.text = Some(mention).into();
-        push(proto::Frame { item: Some(proto::frame::Item::ChatItem(item(30, 2, 1_000, true, Item::StandardMessage(standard)))), ..Default::default() });
+        // Edited: the item is the latest version; its first version was sent at 800.
+        let mut first = proto::StandardMessage::new();
+        first.text = Some(text("hi")).into();
+        let mut edited = item(30, 2, 1_000, true, Item::StandardMessage(standard));
+        edited.revisions.push(item(30, 2, 800, true, Item::StandardMessage(first)));
+        push(proto::Frame { item: Some(proto::frame::Item::ChatItem(edited)), ..Default::default() });
         // Our reply to Alice, quoting her, with her reaction.
         let mut standard = proto::StandardMessage::new();
         standard.text = Some(text("on my way")).into();
@@ -687,6 +703,10 @@ mod tests {
         assert_eq!(in_group[0].mentions[0].aci, me);
         assert_eq!(in_group[0].author.as_deref(), Some(alice_sid.as_str()));
         assert_eq!(group.unread_count, 0, "read on the phone");
+        // Dated by its first version; the edit's date names it too.
+        assert_eq!((in_group[0].sent_at, in_group[0].edited), (800, true));
+        let by_edit = db.find_message(&group.id, Some(&alice_sid), 1_000).await.unwrap().map(|m| m.id);
+        assert_eq!(by_edit, Some(in_group[0].id));
 
         let with_alice = db.messages(&alice.id, None, 10).await.unwrap();
         let reply = &with_alice[0];

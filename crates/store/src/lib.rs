@@ -470,6 +470,12 @@ const CONVERSATION_COLUMNS: &str = "id, kind, title, phone, color, members, last
 const MESSAGE_COLUMNS: &str = "id, conversation_id, sent_at, received_at, direction, author, \
      author_name, body, status, reactions, quote, attachments, link_preview, deleted, edited, expires_in, expire_start, edit_count, notice, mentions";
 
+/// SQL matching a message whose own timestamp, or one of its edits', is
+/// the bound parameter `{param}`.
+fn sent_at_matches(param: &str) -> String {
+    format!("(sent_at = {param} OR id IN (SELECT message_id FROM message_edits WHERE sent_at = {param}))")
+}
+
 const INIT_VERSION: i64 = 20261013000000;
 /// The last migration before the 16 development migrations were squashed
 /// into one init.
@@ -495,7 +501,9 @@ async fn adopt_squashed_history(pool: &SqlitePool, migrator: &sqlx::migrate::Mig
             .fetch_one(pool)
             .await?;
     let Some(max) = max else { return Ok(()) };
-    if max <= INIT_VERSION {
+    // Every applied version is one of ours: nothing to adopt.
+    let applied: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success").fetch_all(pool).await?;
+    if applied.iter().all(|v| migrator.iter().any(|m| m.version == *v)) {
         return Ok(());
     }
     let init = migrator
@@ -1012,11 +1020,12 @@ impl AppDb {
     /// conversation if the message was previously unread.
     pub async fn mark_message_read(&self, author: &str, sent_at: i64) -> Result<Option<ConversationId>> {
         let mut tx = self.pool.begin().await?;
-        let conversation: Option<String> = sqlx::query_scalar(
+        let conversation: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
             "UPDATE messages SET is_read = 1, \
                 expire_start = CASE WHEN expires_in > 0 THEN CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) END \
-             WHERE author_key = ? AND sent_at = ? AND is_read = 0 RETURNING conversation_id",
-        )
+             WHERE author_key = ?1 AND {} AND is_read = 0 RETURNING conversation_id",
+            sent_at_matches("?2")
+        )))
         .bind(author)
         .bind(sent_at)
         .fetch_optional(&mut *tx)
@@ -1118,9 +1127,12 @@ impl AppDb {
         author: Option<&str>,
         sent_at: i64,
     ) -> Result<Option<Message>> {
+        // Its own timestamp wins over another message's edit.
         let row = sqlx::query(AssertSqlSafe(format!(
             "SELECT {MESSAGE_COLUMNS} FROM messages \
-             WHERE conversation_id = ? AND author_key = ? AND sent_at = ?"
+             WHERE conversation_id = ?1 AND author_key = ?2 AND {} \
+             ORDER BY sent_at = ?3 DESC LIMIT 1",
+            sent_at_matches("?3")
         )))
         .bind(&conversation.0)
         .bind(author.unwrap_or(""))
@@ -1134,7 +1146,8 @@ impl AppDb {
     /// content that doesn't name its conversation (e.g. receipts, sync reads).
     pub async fn find_message_any(&self, author: Option<&str>, sent_at: i64) -> Result<Option<Message>> {
         let row = sqlx::query(AssertSqlSafe(format!(
-            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE author_key = ? AND sent_at = ? LIMIT 1"
+            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE author_key = ?1 AND {} ORDER BY sent_at = ?2 DESC LIMIT 1",
+            sent_at_matches("?2")
         )))
         .bind(author.unwrap_or(""))
         .bind(sent_at)
@@ -1253,11 +1266,12 @@ impl AppDb {
         sent_at: i64,
         status: DeliveryStatus,
     ) -> Result<()> {
-        sqlx::query(
+        sqlx::query(AssertSqlSafe(format!(
             "UPDATE messages SET status = ?1 \
-             WHERE conversation_id = ?2 AND author_key = '' AND sent_at = ?3 \
+             WHERE conversation_id = ?2 AND author_key = '' AND {} \
                AND ((?1 != 4 AND status != 4 AND status < ?1) OR (?1 = 4 AND status = 0))",
-        )
+            sent_at_matches("?3")
+        )))
         .bind(status_to_i64(status))
         .bind(&conversation.0)
         .bind(sent_at)
@@ -1274,12 +1288,13 @@ impl AppDb {
         sent_at: i64,
         status: DeliveryStatus,
     ) -> Result<Vec<(ConversationId, i64)>> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(AssertSqlSafe(format!(
             "UPDATE messages SET status = ?1 \
-             WHERE author_key = '' AND sent_at = ?2 AND direction = 1 \
+             WHERE author_key = '' AND {} AND direction = 1 \
                AND ((?1 != 4 AND status != 4 AND status < ?1) OR (?1 = 4 AND status = 0)) \
              RETURNING conversation_id, id",
-        )
+            sent_at_matches("?2")
+        )))
         .bind(status_to_i64(status))
         .bind(sent_at)
         .fetch_all(&self.pool)
@@ -1339,14 +1354,29 @@ impl AppDb {
         .await
     }
 
-    pub async fn edit_message(&self, message_id: i64, body: &str) -> Result<()> {
-        self.update_and_refresh(
-            message_id,
+    /// Applies an edit sent at `edit_sent_at`, which then names the message
+    /// too (reactions to the edited message use it).
+    /// A deleted message ignores it.
+    pub async fn edit_message(&self, message_id: i64, body: &str, edit_sent_at: i64) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let conversation: Option<String> = sqlx::query_scalar(
             "UPDATE messages SET body = ?2, edited = 1, edit_count = edit_count + 1 WHERE id = ?1 AND deleted = 0 \
              RETURNING conversation_id",
-            Some(body),
         )
-        .await
+        .bind(message_id)
+        .bind(body)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(conversation) = conversation {
+            sqlx::query("INSERT OR IGNORE INTO message_edits (message_id, sent_at) VALUES (?, ?)")
+                .bind(message_id)
+                .bind(edit_sent_at)
+                .execute(&mut *tx)
+                .await?;
+            refresh_preview(&mut tx, &ConversationId(conversation)).await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Removes a message entirely ("delete for me"), keeping the
@@ -1796,6 +1826,7 @@ impl AppDb {
     /// Deletes everything about the account (used when unlinking).
     pub async fn clear(&self) -> Result<()> {
         let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM message_edits").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM messages").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM conversations").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM settings").execute(&mut *tx).await?;

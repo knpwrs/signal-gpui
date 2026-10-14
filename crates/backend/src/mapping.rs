@@ -52,6 +52,9 @@ pub enum Action {
         conversation: ConversationId,
         target_author: Option<String>,
         target_sent_at: i64,
+        /// The edit's own timestamp: replies and reactions to the edited
+        /// message name it by this.
+        sent_at: i64,
         body: String,
         mentions: Vec<String>,
     },
@@ -283,7 +286,7 @@ pub fn map_content(content: &Content, ctx: &MapContext) -> Vec<Action> {
             map_data_message(dm, Origin::Incoming { sender }, ts, ctx)
         }
         ContentBody::EditMessage(edit) => {
-            map_edit(edit, Origin::Incoming { sender }, ctx).into_iter().collect()
+            map_edit(edit, Origin::Incoming { sender }, envelope_ts, ctx).into_iter().collect()
         }
         ContentBody::SynchronizeMessage(sync) => map_sync(sync, envelope_ts, ctx),
         ContentBody::ReceiptMessage(receipt) => map_receipt(receipt).into_iter().collect(),
@@ -502,7 +505,8 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
     }]
 }
 
-fn map_edit(edit: &EditMessage, origin: Origin, ctx: &MapContext) -> Option<Action> {
+/// `envelope_ts` dates the edit when its message carries no timestamp.
+fn map_edit(edit: &EditMessage, origin: Origin, envelope_ts: i64, ctx: &MapContext) -> Option<Action> {
     let target = edit.target_sent_timestamp? as i64;
     let dm = edit.data_message.as_ref()?;
     let conversation = conversation_for(dm, &origin)?;
@@ -510,6 +514,7 @@ fn map_edit(edit: &EditMessage, origin: Origin, ctx: &MapContext) -> Option<Acti
         conversation,
         target_author: author_of(&origin, ctx),
         target_sent_at: target,
+        sent_at: dm.timestamp.map_or(envelope_ts, |t| t as i64),
         body: dm.body.clone().unwrap_or_default(),
         mentions: mentions(&dm.body_ranges),
     })
@@ -529,7 +534,7 @@ fn map_sync(sync: &SyncMessage, envelope_ts: i64, ctx: &MapContext) -> Vec<Actio
             ));
         }
         if let Some(edit) = &sent.edit_message {
-            out.extend(map_edit(edit, Origin::Outgoing { destination }, ctx));
+            out.extend(map_edit(edit, Origin::Outgoing { destination }, ts, ctx));
         }
     }
     let reads: Vec<(String, i64)> = sync

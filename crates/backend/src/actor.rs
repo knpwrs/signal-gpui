@@ -740,12 +740,12 @@ impl Actor {
                     Err(error) => self.error("failed to delete message", error),
                 }
             }
-            Action::Edit { conversation, target_author, target_sent_at, body, mentions } => {
+            Action::Edit { conversation, target_author, target_sent_at, sent_at, body, mentions } => {
                 let Some(target) = self.find(&conversation, target_author.as_deref(), target_sent_at).await else {
                     return;
                 };
                 let (body, spans) = self.render_mentions(&body, &mentions).await;
-                match self.db.edit_message(target, &body).await {
+                match self.db.edit_message(target, &body, sent_at).await {
                     Ok(()) => {
                         let _ = self.db.set_mentions(target, &spans).await;
                         self.emit(Event::MessageChanged { conversation, message_id: target });
@@ -2095,13 +2095,13 @@ impl Actor {
         if !crate::edits::can_edit(&message, self.is_note_to_self(&conversation), now_millis()) {
             return self.error("can't edit", "messages can be edited for 24 hours, up to 10 times");
         }
-        if let Err(error) = self.db.edit_message(message_id, &body).await {
+        let timestamp = self.next_timestamp() as u64;
+        if let Err(error) = self.db.edit_message(message_id, &body, timestamp as i64).await {
             return self.error("failed to edit message", error);
         }
         let _ = self.db.set_mentions(message_id, &spans).await;
         self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id });
         self.emit(Event::ConversationsChanged);
-        let timestamp = self.next_timestamp() as u64;
         let self_aci = self.self_aci();
         let data = DataMessage {
             body_ranges: mapping::mention_ranges(&wire_body, &mentions),
