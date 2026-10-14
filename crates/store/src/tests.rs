@@ -900,3 +900,30 @@ async fn adopts_a_database_from_the_first_init() {
         AppDb::open(&path, &key).await.unwrap().close().await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_writers_wait_for_each_other() {
+    // As during a history import, with messages arriving at the same time:
+    // transactions that read before writing used to fail with "database is
+    // locked" when another connection committed in between.
+    let dir = tempfile::tempdir().unwrap();
+    let db = AppDb::open(&dir.path().join("app.db"), &[7u8; 32]).await.unwrap();
+    let tasks: Vec<_> = (0..8)
+        .map(|writer| {
+            let db = db.clone();
+            tokio::spawn(async move {
+                for n in 0..40 {
+                    let chat = format!("d:{writer}");
+                    let id = db.insert_message(&incoming(&chat, "a", n, "hi")).await?;
+                    // Reads the reactions, then writes them.
+                    db.set_reaction(id, Reaction { emoji: "👍".into(), author: None, sent_at: n }).await?;
+                }
+                Ok::<_, Error>(())
+            })
+        })
+        .collect();
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
+    assert_eq!(db.conversations().await.unwrap().len(), 8);
+}

@@ -476,6 +476,9 @@ fn sent_at_matches(param: &str) -> String {
     format!("(sent_at = {param} OR id IN (SELECT message_id FROM message_edits WHERE sent_at = {param}))")
 }
 
+/// How every transaction here starts (they all write); see `AppDb::write`.
+const BEGIN_WRITE: &str = "BEGIN IMMEDIATE";
+
 const INIT_VERSION: i64 = 20261013000000;
 /// The last migration before the 16 development migrations were squashed
 /// into one init.
@@ -535,7 +538,7 @@ async fn adopt_squashed_history(pool: &SqlitePool, migrator: &sqlx::migrate::Mig
     let first_init = applied.iter().any(|(v, _)| *v == INIT_VERSION)
         && applied.iter().all(|(v, _)| *v == INIT_VERSION || *v == MESSAGE_EDITS_VERSION);
     if first_init_schema && (pre_squash || first_init) {
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with(BEGIN_WRITE).await?;
         sqlx::raw_sql(SINCE_FIRST_INIT).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM _sqlx_migrations").execute(&mut *tx).await?;
         sqlx::query(
@@ -694,7 +697,7 @@ impl AppDb {
 
     /// Replaces all Storage Service contact names.
     pub async fn replace_contact_names(&self, names: &[(String, String)]) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write().await?;
         sqlx::query("DELETE FROM contact_names").execute(&mut *tx).await?;
         for (service_id, name) in names {
             sqlx::query("INSERT OR REPLACE INTO contact_names (service_id, name) VALUES (?, ?)")
@@ -733,7 +736,7 @@ impl AppDb {
         if self.setting("color_format").await?.as_deref() == Some("signal") {
             return Ok(());
         }
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write().await?;
         let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM conversations").fetch_all(&mut *tx).await?;
         for id in ids {
             sqlx::query("UPDATE conversations SET color = ? WHERE id = ?")
@@ -758,7 +761,7 @@ impl AppDb {
     /// Recomputes every conversation's preview (after a change to how they're
     /// written, or to the names in them).
     pub async fn refresh_all_previews(&self) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write().await?;
         let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM conversations").fetch_all(&mut *tx).await?;
         for id in ids {
             refresh_preview(&mut tx, &ConversationId(id)).await?;
@@ -770,7 +773,7 @@ impl AppDb {
     /// Rewrites the stored author names (on messages and their quotes) for
     /// each `(service_id, name)`. Returns how many rows changed.
     pub async fn rename_authors(&self, names: &[(String, String)]) -> Result<u64> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write().await?;
         let mut changed = 0;
         for (service_id, name) in names {
             changed += sqlx::query(
@@ -868,7 +871,7 @@ impl AppDb {
         id: &ConversationId,
         update: ConversationUpdate,
     ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write().await?;
         ensure_conversation(&mut tx, id).await?;
         sqlx::query(
             "UPDATE conversations SET \
@@ -929,7 +932,7 @@ impl AppDb {
     /// Pinned conversations are listed even before they have messages, so
     /// missing ones are created. Returns whether anything changed.
     pub async fn replace_pinned(&self, ids: &[ConversationId]) -> Result<bool> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write().await?;
         let before: Vec<String> =
             sqlx::query_scalar("SELECT id FROM conversations WHERE pinned = 1 ORDER BY pin_order")
                 .fetch_all(&mut *tx)
@@ -971,7 +974,7 @@ impl AppDb {
     /// conversations that already exist are touched. Returns whether any
     /// changed.
     pub async fn apply_chat_states(&self, states: &[ChatState]) -> Result<bool> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write().await?;
         let mut changed = 0;
         for state in states {
             changed += sqlx::query(
@@ -1016,7 +1019,7 @@ impl AppDb {
     /// Zeroes the unread count; returns `(author, sent_at)` of incoming messages
     /// that were unread, so read receipts can be sent.
     pub async fn mark_read(&self, id: &ConversationId) -> Result<Vec<(String, i64)>> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write().await?;
         let rows = sqlx::query(
             "UPDATE messages SET is_read = 1, \
                 expire_start = CASE WHEN expires_in > 0 THEN CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) END \
@@ -1044,7 +1047,7 @@ impl AppDb {
     /// Marks one incoming message read (e.g. read on another device). Returns its
     /// conversation if the message was previously unread.
     pub async fn mark_message_read(&self, author: &str, sent_at: i64) -> Result<Option<ConversationId>> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write().await?;
         let conversation: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
             "UPDATE messages SET is_read = 1, \
                 expire_start = CASE WHEN expires_in > 0 THEN CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) END \
@@ -1073,7 +1076,7 @@ impl AppDb {
     /// Updates the conversation's preview/last_message_at and, for incoming
     /// messages, its unread count. Returns the row id (existing row on dedupe).
     pub async fn insert_message(&self, msg: &NewMessage) -> Result<i64> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write().await?;
         ensure_conversation(&mut tx, &msg.conversation_id).await?;
         let incoming = msg.direction == Direction::Incoming;
         let author_key = msg.author.as_deref().unwrap_or("");
@@ -1350,7 +1353,7 @@ impl AppDb {
         message_id: i64,
         f: impl FnOnce(&mut Vec<Reaction>),
     ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write().await?;
         let Some(json) = sqlx::query_scalar::<_, String>("SELECT reactions FROM messages WHERE id = ?")
             .bind(message_id)
             .fetch_optional(&mut *tx)
@@ -1383,7 +1386,7 @@ impl AppDb {
     /// too (reactions to the edited message use it).
     /// A deleted message ignores it.
     pub async fn edit_message(&self, message_id: i64, body: &str, edit_sent_at: i64) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write().await?;
         let conversation: Option<String> = sqlx::query_scalar(
             "UPDATE messages SET body = ?2, edited = 1, edit_count = edit_count + 1 WHERE id = ?1 AND deleted = 0 \
              RETURNING conversation_id",
@@ -1407,7 +1410,7 @@ impl AppDb {
     /// Removes a message entirely ("delete for me"), keeping the
     /// conversation's preview and unread count right.
     pub async fn remove_message(&self, message_id: i64) -> Result<Option<ConversationId>> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write().await?;
         let conversation: Option<String> =
             sqlx::query_scalar("DELETE FROM messages WHERE id = ? RETURNING conversation_id")
                 .bind(message_id)
@@ -1433,7 +1436,7 @@ impl AppDb {
     /// (a chat deleted on another device, up to what that device had).
     /// Returns how many messages are left.
     pub async fn remove_messages_through(&self, conversation: &ConversationId, through: i64) -> Result<i64> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write().await?;
         sqlx::query(
             "DELETE FROM messages WHERE conversation_id = ?1 \
                AND (received_at, id) <= (SELECT received_at, id FROM messages WHERE id = ?2 AND conversation_id = ?1)",
@@ -1491,7 +1494,7 @@ impl AppDb {
 
     /// Sets a chat's disappearing timer and its version.
     pub async fn set_expire_timer(&self, id: &ConversationId, seconds: u32, version: u32) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write().await?;
         ensure_conversation(&mut tx, id).await?;
         sqlx::query("UPDATE conversations SET expire_timer = ?, expire_timer_version = ? WHERE id = ?")
             .bind(i64::from(seconds))
@@ -1537,7 +1540,7 @@ impl AppDb {
     /// doesn't become the chat's preview. Repeats of the same event are
     /// ignored. Returns its row id when new.
     pub async fn insert_notice(&self, conversation: &ConversationId, at: i64, notice: &Notice) -> Result<Option<i64>> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write().await?;
         ensure_conversation(&mut tx, conversation).await?;
         let id = sqlx::query_scalar(
             "INSERT INTO messages (conversation_id, sent_at, received_at, direction, author_key, body, status, \
@@ -1573,7 +1576,7 @@ impl AppDb {
         expires_at: Option<i64>,
         limit: usize,
     ) -> Result<bool> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write().await?;
         let changed = sqlx::query(
             "INSERT INTO pinned_messages (conversation_id, message_id, pinned_at, expires_at) VALUES (?, ?, ?, ?) \
              ON CONFLICT (conversation_id, message_id) DO UPDATE SET pinned_at = excluded.pinned_at, expires_at = excluded.expires_at",
@@ -1626,7 +1629,7 @@ impl AppDb {
 
     /// Removes a conversation and all its messages ("delete chat").
     pub async fn remove_conversation(&self, id: &ConversationId) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write().await?;
         sqlx::query("DELETE FROM messages WHERE conversation_id = ?").bind(&id.0).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM pinned_messages WHERE conversation_id = ?").bind(&id.0).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM conversations WHERE id = ?").bind(&id.0).execute(&mut *tx).await?;
@@ -1635,7 +1638,7 @@ impl AppDb {
     }
 
     async fn update_and_refresh(&self, message_id: i64, sql: &'static str, body: Option<&str>) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write().await?;
         let mut q = sqlx::query_scalar::<_, String>(sql).bind(message_id);
         if let Some(body) = body {
             q = q.bind(body);
@@ -1648,7 +1651,7 @@ impl AppDb {
     }
 
     pub async fn set_attachment_path(&self, message_id: i64, index: usize, path: &str) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write().await?;
         let Some(json) =
             sqlx::query_scalar::<_, String>("SELECT attachments FROM messages WHERE id = ?")
                 .bind(message_id)
@@ -1672,7 +1675,7 @@ impl AppDb {
 
     /// Replaces the directory with `entries`.
     pub async fn replace_directory(&self, entries: &[DirectoryEntry]) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write().await?;
         sqlx::query("DELETE FROM directory").execute(&mut *tx).await?;
         for entry in entries {
             sqlx::query("INSERT OR REPLACE INTO directory (id, kind, title, phone) VALUES (?, ?, ?, ?)")
@@ -1745,7 +1748,7 @@ impl AppDb {
 
     /// Records where a message's link preview image was saved.
     pub async fn set_preview_image_path(&self, message_id: i64, path: &str) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write().await?;
         let json: Option<String> = sqlx::query_scalar("SELECT link_preview FROM messages WHERE id = ?")
             .bind(message_id)
             .fetch_optional(&mut *tx)
@@ -1850,7 +1853,7 @@ impl AppDb {
 
     /// Deletes everything about the account (used when unlinking).
     pub async fn clear(&self) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.write().await?;
         sqlx::query("DELETE FROM message_edits").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM messages").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM conversations").execute(&mut *tx).await?;
@@ -1862,6 +1865,14 @@ impl AppDb {
         sqlx::query("DELETE FROM emoji_usage").execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// A transaction that holds the write lock from the start. A deferred
+    /// one reads first and then upgrades to write, and when another
+    /// connection has committed in between, SQLite fails it with "database
+    /// is locked" at once instead of waiting out the busy timeout.
+    async fn write(&self) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
+        Ok(self.pool.begin_with(BEGIN_WRITE).await?)
     }
 
     /// Closes the pool, waiting for connections to finish.
