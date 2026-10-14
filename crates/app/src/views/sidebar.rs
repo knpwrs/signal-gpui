@@ -89,9 +89,7 @@ impl Sidebar {
         let subscriptions = vec![
             cx.subscribe_in(&search, window, |this, input, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
-                    this.query = input.read(cx).value().trim().to_owned();
-                    this.run_search(cx);
-                    cx.notify();
+                    this.set_query(input.read(cx).value().trim().to_owned(), cx);
                 }
             }),
             cx.subscribe_in(&state, window, |this, _, event: &AppEvent, window, cx| match event {
@@ -145,6 +143,17 @@ impl Sidebar {
 
     pub fn search_input(&self) -> Entity<InputState> {
         self.search.clone()
+    }
+
+    /// A new query: search again, from the top of the list (a long list
+    /// otherwise keeps a short one's scroll position, or the reverse).
+    fn set_query(&mut self, query: String, cx: &mut Context<Self>) {
+        if query != self.query {
+            self.list.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(0.) });
+        }
+        self.query = query;
+        self.run_search(cx);
+        cx.notify();
     }
 
     fn scroll_to_selected(&self, cx: &App) {
@@ -902,6 +911,34 @@ mod tests {
         }
         assert_eq!(state.read_with(&cx, |s, _| s.selected.clone()), Some(dana));
         assert!(sidebar.read_with(&cx, |s, _| s.query.is_empty()));
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn a_new_query_starts_at_the_top(cx: &mut TestAppContext) {
+        use gpui_kit::VisualTestContext;
+        cx.update(gpui_kit::init);
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config { data_dir: dir.path().to_owned(), db_key: [7; 32], device_name: "test".into(), demo: true };
+        let (backend, _events) = Backend::start(config).unwrap();
+        let state = cx.update(|cx| crate::state::new_state(backend.clone(), cx));
+        let (window, sidebar) = cx.update(|cx| {
+            let state = state.clone();
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| cx.new(|cx| Sidebar::new(state, window, cx)))
+                .unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window, cx);
+        sidebar.update_in(&mut cx, |sidebar, _, _| {
+            sidebar.list.splice(0..0, 20);
+            sidebar.list.scroll_to(ListOffset { item_ix: 15, offset_in_item: px(0.) });
+        });
+        // Select all, delete: back to the whole list, from the top.
+        sidebar.update_in(&mut cx, |sidebar, _, cx| {
+            sidebar.query = "maya".into();
+            sidebar.set_query(String::new(), cx);
+        });
+        assert_eq!(sidebar.read_with(&cx, |s, _| s.list.logical_scroll_top().item_ix), 0);
         backend.shutdown();
     }
 
