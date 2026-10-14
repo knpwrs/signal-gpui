@@ -5,10 +5,45 @@
 
 use std::{future::Future, path::PathBuf};
 
+use anyhow::Context as _;
 use futures::channel::mpsc;
 use signal_store::{AppDb, ConversationId};
 
 pub use url::Url;
+
+mod actor;
+mod demo;
+pub mod mapping;
+mod storage;
+mod groups;
+mod history;
+pub mod media;
+pub mod link_preview;
+pub mod debug_log;
+pub mod recipients;
+pub mod giphy;
+pub mod deletes;
+pub mod edits;
+
+/// Most conversations an account can pin (Signal's limit).
+pub use storage::MAX_PINNED;
+
+/// Settings key: when `"false"`, read receipts are not sent.
+pub const SETTING_READ_RECEIPTS: &str = "read_receipts";
+/// Settings key: when `"false"`, typing indicators are not sent.
+pub const SETTING_TYPING_INDICATORS: &str = "typing_indicators";
+/// Settings key: when `"false"`, link previews aren't generated (synced from
+/// the account's Storage Service record).
+pub const SETTING_LINK_PREVIEWS: &str = "link_previews";
+/// Settings key: your Giphy API key for GIF search (`GIPHY_API_KEY` also
+/// works). Not a Signal setting.
+pub const SETTING_GIPHY_API_KEY: &str = "giphy_api_key";
+
+/// Settings key: lossless optimization of images we send (`max`, `fast` or
+/// `off`; see [`media::Optimization`]). Not a Signal setting.
+pub const SETTING_IMAGE_OPTIMIZATION: &str = "image_optimization";
+
+pub use link_preview::{LinkPreviewDraft, PreviewImage};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -18,6 +53,8 @@ pub struct Config {
     pub db_key: [u8; 32],
     /// Device name shown in the phone's "Linked devices" list.
     pub device_name: String,
+    /// Demo mode: sample data, never connects to Signal (see `demo.rs`).
+    pub demo: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -26,9 +63,41 @@ pub enum Command {
     Link,
     SendText {
         conversation: ConversationId,
+        /// With a [`mapping::MENTION_PLACEHOLDER`] per @mention.
         body: String,
         /// Message id (in `AppDb`) being replied to.
         quote: Option<i64>,
+        /// A preview fetched with [`Command::FetchLinkPreview`], to send along.
+        preview: Option<LinkPreviewDraft>,
+        /// Who each placeholder in `body` mentions, in order.
+        mentions: Vec<String>,
+    },
+    /// GIF search (trending when `query` is empty); answered with `Event::Gifs`.
+    SearchGifs { query: String, offset: u32 },
+    /// Sends a GIF from search results.
+    SendGif { conversation: ConversationId, gif: giphy::Gif },
+    /// Lists installed sticker packs; answered with `Event::Stickers`.
+    LoadStickers,
+    /// Sends a sticker from an installed pack.
+    SendSticker {
+        conversation: ConversationId,
+        pack: std::sync::Arc<StickerPackView>,
+        sticker: StickerView,
+    },
+    /// Looks up a username or phone number on Signal; answered with
+    /// `Event::RecipientFound`.
+    FindRecipient { query: String },
+    /// Builds a link preview for `url`; answered with `Event::LinkPreview`.
+    FetchLinkPreview { url: String },
+    /// Sends images (optimized losslessly first), with `caption` as the
+    /// message text.
+    SendImages {
+        conversation: ConversationId,
+        images: Vec<OutgoingImage>,
+        caption: String,
+        quote: Option<i64>,
+        /// Who each placeholder in `caption` mentions, in order.
+        mentions: Vec<String>,
     },
     /// Reacts to message `message_id`; `remove` retracts our reaction.
     React { message_id: i64, emoji: String, remove: bool },
@@ -36,13 +105,145 @@ pub enum Command {
     MarkRead { conversation: ConversationId },
     /// Sends a typing indicator.
     Typing { conversation: ConversationId, started: bool },
+    /// Deletes messages on this device and your other devices.
+    DeleteForMe { message_ids: Vec<i64> },
+    /// Pins a message for everyone in the chat; `duration` in seconds,
+    /// `None` for forever.
+    PinMessage { message_id: i64, duration: Option<u32> },
+    UnpinMessage { message_id: i64 },
+    /// Changes the text of one of our sent messages (Signal's edit).
+    EditMessage { message_id: i64, body: String, mentions: Vec<String> },
+    /// Sends a failed message again, with its original timestamp.
+    RetrySend { message_id: i64 },
+    /// Sends copies of messages (text, photos, GIFs, link previews) to
+    /// other chats, as Desktop's "Forward".
+    Forward { message_ids: Vec<i64>, conversations: Vec<ConversationId> },
+    /// Deletes a whole chat on this device and your other devices.
+    DeleteConversation { conversation: ConversationId },
     /// Deletes our own message for everyone.
     DeleteForEveryone { message_id: i64 },
     /// Downloads attachment `index` of `message_id`.
     FetchAttachment { message_id: i64, index: usize },
+    /// Pins or unpins a conversation for the whole account (Storage Service).
+    SetPinned { conversation: ConversationId, pinned: bool },
+    /// Archives, mutes, marks unread or blocks a chat for the whole account
+    /// (Storage Service).
+    SetChat { conversation: ConversationId, change: ChatChange },
+    /// Sets a chat's disappearing-message timer (seconds; 0 turns it off)
+    /// for everyone in it.
+    SetExpireTimer { conversation: ConversationId, seconds: u32 },
+    /// Renames a group or changes its description (`None`: unchanged).
+    UpdateGroup { conversation: ConversationId, title: Option<String>, description: Option<String> },
+    /// Leaves a group.
+    LeaveGroup { conversation: ConversationId },
+    /// Creates a group with us as its admin; answered with `Event::GroupCreated`.
+    CreateGroup { title: String, members: Vec<String> },
+    /// Sets (or with an empty `text`, clears) our label in a group.
+    SetMemberLabel { conversation: ConversationId, emoji: Option<String>, text: String },
     /// Unlinks this device and wipes local state.
     Unlink,
+    /// Stops waiting for the history transfer and continues without it.
+    /// Ignored once the import has started.
+    SkipHistory,
 }
+
+/// A per-chat setting kept in the Storage Service.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ChatChange {
+    Archived(bool),
+    /// Unix millis; [`MUTED_ALWAYS`] for always, 0 unmutes.
+    MutedUntil(i64),
+    MarkedUnread(bool),
+    Blocked(bool),
+}
+
+/// Pinned messages per chat (Desktop's `global.pinnedMessageLimit` default).
+pub const MAX_PINNED_MESSAGES: usize = 3;
+
+/// The history transfer after linking, as shown while it runs.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HistoryProgress {
+    /// Waiting for the phone to upload it.
+    Waiting,
+    /// Bytes downloaded, of `total` when the CDN says.
+    Downloading { done: u64, total: Option<u64> },
+    /// Bytes of the decrypted backup imported so far.
+    Importing { done: u64, total: u64 },
+    Done { chats: usize, messages: usize },
+    /// The phone skipped it.
+    Skipped,
+    Failed(String),
+}
+
+/// "Muted always", as Signal's apps store it (Android's `Long.MAX_VALUE`).
+pub const MUTED_ALWAYS: i64 = i64::MAX;
+
+/// A page of GIF search results.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GifResults {
+    /// Each GIF with its downloaded preview.
+    pub gifs: Vec<(giphy::Gif, std::path::PathBuf)>,
+    pub next: Option<u32>,
+}
+
+/// Your Giphy key: Settings, then `GIPHY_API_KEY`.
+pub(crate) async fn giphy_key(db: &AppDb) -> Option<String> {
+    let clean = |key: String| Some(key.trim().to_owned()).filter(|k| !k.is_empty());
+    // A cleared setting falls back to the environment.
+    db.setting(SETTING_GIPHY_API_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(clean)
+        .or_else(|| std::env::var("GIPHY_API_KEY").ok().and_then(clean))
+}
+
+/// Searches Giphy and downloads the result previews into `cache`.
+pub(crate) async fn search_gifs(db: &AppDb, cache: &std::path::Path, query: &str, offset: u32) -> Result<GifResults, String> {
+    let key = giphy_key(db).await.ok_or("Add a Giphy API key to search GIFs")?;
+    let page = giphy::search(&key, query, offset).await.map_err(|e| format!("{e:#}"))?;
+    std::fs::create_dir_all(cache).map_err(|e| e.to_string())?;
+    let downloads = page.gifs.into_iter().map(|gif| async move {
+        let path = cache.join(format!("{}.mp4", gif.id.replace(['/', '.'], "")));
+        if !path.exists() {
+            let bytes = giphy::download(&gif.preview.url).await.ok()?;
+            // Whole files only: an interrupted write mustn't be reused.
+            let partial = path.with_extension(format!("{}.part", rand::Rng::random::<u32>(&mut rand::rng())));
+            tokio::fs::write(&partial, bytes).await.ok()?;
+            tokio::fs::rename(&partial, &path).await.ok()?;
+        }
+        Some((gif, path))
+    });
+    let gifs = futures::future::join_all(downloads).await.into_iter().flatten().collect();
+    Ok(GifResults { gifs, next: page.next })
+}
+
+/// An installed sticker pack, with its stickers saved to disk for display.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StickerPackView {
+    pub id: Vec<u8>,
+    pub key: Vec<u8>,
+    pub title: String,
+    pub author: String,
+    pub stickers: Vec<StickerView>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StickerView {
+    pub id: u32,
+    pub emoji: Option<String>,
+    pub path: std::path::PathBuf,
+}
+
+/// An image picked, pasted or dropped in the composer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutgoingImage {
+    pub bytes: std::sync::Arc<Vec<u8>>,
+    pub file_name: Option<String>,
+}
+
+/// Signal's attachment size limit.
+pub const MAX_ATTACHMENT_BYTES: usize = 100 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -68,6 +269,36 @@ pub enum Event {
     /// A message was inserted or updated (status, reaction, edit, delete, attachment).
     MessageChanged { conversation: ConversationId, message_id: i64 },
     Typing { conversation: ConversationId, author: String, started: bool },
+    /// A message is gone (deleted for me, here or on another device).
+    MessageRemoved { conversation: ConversationId, message_id: i64 },
+    /// A whole chat is gone.
+    ConversationRemoved(ConversationId),
+    /// Some of a chat's messages are gone (deleted on another device); reload it.
+    ConversationCleared(ConversationId),
+    /// A chat's pinned messages changed.
+    PinsChanged(ConversationId),
+    /// A group we created is ready to open.
+    GroupCreated(ConversationId),
+    /// Progress of the message history transfer after linking.
+    /// Draining the server queue after starting: the server timestamps
+    /// (unix millis) of the first queued message and the latest one
+    /// processed. Sent a few times a second at most, and only until the first
+    /// `Connection(Online)`.
+    CatchingUp { first: i64, latest: i64 },
+    History(HistoryProgress),
+    /// A new message from someone else arrived (for notifications).
+    Incoming { conversation: ConversationId, message_id: i64, mentions_me: bool },
+    /// GIF search results with their previews downloaded (`Err`: why not).
+    Gifs { query: String, offset: u32, result: Result<GifResults, String> },
+    /// Installed sticker packs (answer to `Command::LoadStickers`).
+    Stickers(Vec<StickerPackView>),
+    /// Answer to `Command::FindRecipient`: who it is, or why not.
+    RecipientFound { query: String, result: Result<signal_store::DirectoryEntry, String> },
+    /// Answer to `Command::FetchLinkPreview` (`None`: no preview for it).
+    LinkPreview { url: String, preview: Option<LinkPreviewDraft> },
+    /// Stored author names changed: `(service id, name)` pairs. Loaded
+    /// messages and quotes by these authors should take the new names.
+    AuthorNamesChanged(Vec<(String, String)>),
     Error(String),
     Unlinked,
 }
@@ -78,14 +309,80 @@ pub struct Backend {
     db: AppDb,
     commands: mpsc::UnboundedSender<Command>,
     runtime: tokio::runtime::Handle,
+    data_dir: std::path::PathBuf,
 }
 
 impl Backend {
+    /// Where the databases, attachments and logs live.
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
+    }
+
     /// Opens the databases, starts the runtime thread, and begins connecting
     /// (or emits `NeedsLinking`). Events arrive on the returned receiver, which
     /// may be polled from any executor.
     pub fn start(config: Config) -> anyhow::Result<(Backend, mpsc::UnboundedReceiver<Event>)> {
-        todo!()
+        std::fs::create_dir_all(config.data_dir.join("attachments"))
+            .with_context(|| format!("creating {}", config.data_dir.display()))?;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("signal-worker")
+            .enable_all()
+            .build()
+            .context("starting tokio runtime")?;
+
+        let db = runtime
+            .block_on(AppDb::open(&config.data_dir.join("app.db"), &config.db_key))
+            .context("opening app database")?;
+        if let Err(error) = runtime.block_on(db.upgrade_colors()) {
+            tracing::warn!(%error, "failed to recompute avatar colors");
+        }
+        if let Err(error) = runtime.block_on(db.upgrade_previews()) {
+            tracing::warn!(%error, "failed to refresh conversation previews");
+        }
+
+        // Never let the pool drop implicitly: see `actor::run` on SQLCipher's
+        // exit-time shutdown. `Backend::shutdown` closes it explicitly.
+        std::mem::forget(db.clone());
+
+        let (commands, command_rx) = mpsc::unbounded();
+        let (event_tx, events) = mpsc::unbounded();
+        let backend = Backend {
+            db: db.clone(),
+            commands,
+            runtime: runtime.handle().clone(),
+            data_dir: config.data_dir.clone(),
+        };
+
+        std::thread::Builder::new()
+            .name("signal-backend".into())
+            .spawn(move || {
+                // presage's futures are !Send, so the actor lives on a LocalSet
+                // pinned to this thread; `Backend::spawn` work goes to the workers.
+                let local = tokio::task::LocalSet::new();
+                if config.demo {
+                    runtime.block_on(local.run_until(demo::run(db, config.data_dir.clone(), command_rx, event_tx)));
+                } else {
+                    runtime.block_on(local.run_until(actor::run(config, db, command_rx, event_tx)));
+                }
+                // `Backend::spawn` and `shutdown` use this runtime's handle
+                // even if the actor stopped early (signal.db failed to open,
+                // say): never shut it down.
+                std::mem::forget(runtime);
+            })
+            .context("spawning backend thread")?;
+
+        Ok((backend, events))
+    }
+
+    /// Closes the app database (checkpointing its WAL) before the process
+    /// exits. Blocks for at most two seconds; call from a non-runtime thread.
+    pub fn shutdown(&self) {
+        let db = self.db.clone();
+        let _ = self
+            .runtime
+            .block_on(async move { tokio::time::timeout(std::time::Duration::from_secs(2), db.close()).await });
     }
 
     pub fn db(&self) -> &AppDb {

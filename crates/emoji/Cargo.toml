@@ -3,6 +3,21 @@ name = "signal-emoji"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 publish.workspace = true
+description = "Static emoji table and FST-backed emoji search / type-ahead"
 
 [dependencies]
+fst.workspace = true
+unicode-segmentation = "1.12"
+
+[build-dependencies]
+fst.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false }
+
+[[bench]]
+name = "search"
+harness = false

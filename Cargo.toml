@@ -7,6 +7,7 @@ default-members = ["crates/app"]
 version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-only"
+repository = "https://github.com/knpwrs/signal-gpui"
 publish = false
 
 [workspace.dependencies]
@@ -16,7 +17,7 @@ signal-backend = { path = "crates/backend" }
 
 gpui-kit = "0.7.3"
 
-presage = { git = "https://github.com/whisperfish/presage", rev = "32ffc659fce2f0be7fb01cffdf8c3ebc0c757d80" }
+presage = { git = "https://github.com/whisperfish/presage", rev = "32ffc659fce2f0be7fb01cffdf8c3ebc0c757d80", features = ["cdsi"] }
 presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "32ffc659fce2f0be7fb01cffdf8c3ebc0c757d80" }
 
 anyhow = "1"
@@ -37,8 +38,14 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # presage-store-sqlite links SQLCipher through whisperfish's libsqlite3-sys fork.
 libsqlite3-sys = { git = "https://github.com/whisperfish/rusqlite", rev = "2a42b3354c9194700d08aa070f70a131a470e7dc" }
 
+# On macOS debug info stays in per-build .o files that cargo never removes;
+# line tables keep backtraces useful at a fraction of the size.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.dev.package."*"]
 opt-level = 2
+debug = false
 
 [profile.release]
 lto = "thin"

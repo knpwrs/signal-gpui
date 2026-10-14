@@ -1,0 +1,4 @@
+# Sign the app before running it so Keychain access survives rebuilds
+# (scripts/setup-dev-signing.sh explains why).
+[target.'cfg(target_os = "macos")']
+runner = "scripts/cargo-runner.sh"

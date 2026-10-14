@@ -3,6 +3,7 @@ name = "signal-backend"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 publish.workspace = true
 
 [dependencies]
@@ -11,7 +12,52 @@ presage.workspace = true
 presage-store-sqlite.workspace = true
 anyhow.workspace = true
 futures.workspace = true
-tokio.workspace = true
+# `net`: DNS lookups for link previews, which only connect to public addresses.
+tokio = { workspace = true, features = ["net"] }
 tracing.workspace = true
 serde_json.workspace = true
 url = "2"
+rand = "0.9"
+# Storage Service writes: item crypto and wire-level record edits (versions
+# match libsignal-service's).
+aes-gcm = "0.11"
+base64 = "0.22"
+# Group requests: the group's public params are bincode-encoded, then hex.
+bincode = "1.3"
+hex = "0.4"
+# Message history at link time ("link and sync"): the backup format's
+# frames and keys, from the same libsignal as presage.
+# (`test-util` only makes its generated protobuf types public.)
+libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", features = ["test-util"] }
+libsignal-account-keys = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
+protobuf = "3"
+hkdf = "0.13"
+hmac = "0.13"
+reqwest = { version = "0.13", default-features = false, features = ["json", "multipart"] }
+prost = "0.14"
+sha2 = "0.11"
+# Draws the demo photo.
+png = "0.18"
+# Link previews: finding links, parsing pages, fetching over TLS checked
+# against the system's trust store.
+linkify = "0.10"
+chrono.workspace = true
+idna = "1"
+scraper = "0.27"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-platform-verifier = "0.7"
+# Debug logs: redaction and gzip for upload.
+regex = "1"
+flate2 = "1"
+# Lossless optimization of images we send.
+oxipng = { version = "10", default-features = false, features = ["parallel"] }
+# `unwinding` turns libjpeg errors into catchable panics instead of aborts.
+mozjpeg-sys = { version = "2", default-features = false, features = ["unwinding"] }
+imagesize = "0.15"
+# TIFF/BMP (what macOS often puts on the clipboard) become PNG before sending.
+image = { version = "0.25", default-features = false, features = ["png", "tiff", "bmp", "ico"] }
+
+[dev-dependencies]
+jpeg-encoder = "0.6"
+jpeg-decoder = "0.3"
+tempfile = "3"
