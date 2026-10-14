@@ -930,3 +930,24 @@ async fn concurrent_writers_wait_for_each_other() {
     }
     assert_eq!(db.conversations().await.unwrap().len(), 8);
 }
+
+#[tokio::test]
+async fn a_read_sync_reads_everything_older_in_its_chat() {
+    let db = AppDb::open_in_memory().await.unwrap();
+    for (author, at) in [("a", 1), ("b", 2), ("a", 3), ("a", 4)] {
+        db.insert_message(&incoming("g:00ff", author, at, "hi")).await.unwrap();
+    }
+    db.insert_message(&incoming("d:other", "a", 2, "elsewhere")).await.unwrap();
+    // The phone sent one read sync, for the third message.
+    assert_eq!(db.apply_read_sync("a", 3).await.unwrap(), ReadSync::Read(conv("g:00ff")));
+    let unread: Vec<i64> = sqlx::query_scalar("SELECT sent_at FROM messages WHERE conversation_id = 'g:00ff' AND is_read = 0")
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(unread, [4]);
+    assert_eq!(db.conversation(&conv("g:00ff")).await.unwrap().unwrap().unread_count, 1);
+    assert_eq!(db.conversation(&conv("d:other")).await.unwrap().unwrap().unread_count, 1, "other chats untouched");
+    assert_eq!(db.apply_read_sync("a", 3).await.unwrap(), ReadSync::AlreadyRead);
+    // Before its message arrives.
+    assert_eq!(db.apply_read_sync("a", 99).await.unwrap(), ReadSync::NotFound);
+}

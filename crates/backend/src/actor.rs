@@ -50,6 +50,8 @@ pub(crate) type SignalManager = Manager<SqliteStore, Registered>;
 /// Images up to this size are downloaded as soon as they arrive.
 /// "1" while the history transfer after linking hasn't finished.
 const SETTING_HISTORY_PENDING: &str = "history.pending";
+/// Read syncs kept for messages not here yet.
+const MAX_EARLY_READS: usize = 1000;
 /// `verified.<ACI>`: the identity key (hex) we marked verified for them;
 /// empty when cleared. Verification lapses when their key changes.
 const SETTING_VERIFIED: &str = "verified.";
@@ -128,6 +130,9 @@ struct Actor {
     group_ids: RefCell<HashMap<Vec<u8>, [u8; 32]>>,
     profile_fetches: RefCell<HashSet<String>>,
     receiver: RefCell<Option<tokio::task::JoinHandle<()>>>,
+    /// Read syncs that arrived before their message, `(author, sent_at)`,
+    /// applied when it does (as Desktop keeps them). Newest last.
+    early_reads: RefCell<std::collections::VecDeque<(String, i64)>>,
     /// The history transfer after linking, while it can still be skipped
     /// (taken once the import starts).
     history: RefCell<Option<tokio::task::JoinHandle<()>>>,
@@ -176,6 +181,7 @@ pub(crate) async fn run(
         group_ids: RefCell::default(),
         profile_fetches: RefCell::default(),
         receiver: RefCell::new(None),
+        early_reads: RefCell::default(),
         history: RefCell::new(None),
         outbound,
         linking: RefCell::new(false),
@@ -689,7 +695,14 @@ impl Actor {
                         if !spans.is_empty() {
                             let _ = self.db.set_mentions(id, &spans).await;
                         }
-                        if !repeat && message.direction == Direction::Incoming {
+                        // Already read on another device, before it got here.
+                        let read_early = !repeat
+                            && message.direction == Direction::Incoming
+                            && match &message.author {
+                                Some(author) => self.apply_early_read(author, message.sent_at).await,
+                                None => false,
+                            };
+                        if !repeat && !read_early && message.direction == Direction::Incoming {
                             let me = self.self_aci();
                             self.emit(Event::Incoming {
                                 conversation: conversation.clone(),
@@ -773,6 +786,10 @@ impl Actor {
                 match self.db.edit_message(target, &body, sent_at).await {
                     Ok(()) => {
                         let _ = self.db.set_mentions(target, &spans).await;
+                        // A read sync can name the edit, and come before it.
+                        if let Some(author) = &target_author {
+                            self.apply_early_read(author, sent_at).await;
+                        }
                         self.emit(Event::MessageChanged { conversation, message_id: target });
                         self.emit(Event::ConversationsChanged);
                     }
@@ -814,9 +831,16 @@ impl Actor {
             Action::ReadSync(entries) => {
                 let mut changed = false;
                 for (author, sent_at) in entries {
-                    match self.db.mark_message_read(&author, sent_at).await {
-                        Ok(Some(_)) => changed = true,
-                        Ok(None) => {}
+                    match self.db.apply_read_sync(&author, sent_at).await {
+                        Ok(signal_store::ReadSync::Read(_)) => changed = true,
+                        Ok(signal_store::ReadSync::AlreadyRead) => {}
+                        Ok(signal_store::ReadSync::NotFound) => {
+                            let mut early = self.early_reads.borrow_mut();
+                            if early.len() >= MAX_EARLY_READS {
+                                early.pop_front();
+                            }
+                            early.push_back((author, sent_at));
+                        }
                         Err(error) => self.error("failed to apply read sync", error),
                     }
                 }
@@ -3012,6 +3036,31 @@ impl Actor {
             self.error("failed to update message status", error);
         }
         self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id: id });
+    }
+
+    /// Applies a read sync that came before this message (or edit), if one
+    /// did; `true` when it's now read. Kept for later if applying fails.
+    async fn apply_early_read(&self, author: &str, sent_at: i64) -> bool {
+        let position = |early: &std::collections::VecDeque<(String, i64)>| {
+            early.iter().position(|(a, at)| a == author && *at == sent_at)
+        };
+        if position(&self.early_reads.borrow()).is_none() {
+            return false;
+        }
+        match self.db.apply_read_sync(author, sent_at).await {
+            Ok(_) => {
+                let mut early = self.early_reads.borrow_mut();
+                if let Some(ix) = position(&early) {
+                    early.remove(ix);
+                }
+                self.expiry.notify_one();
+                true
+            }
+            Err(error) => {
+                self.error("failed to apply read sync", error);
+                false
+            }
+        }
     }
 
     // --------------------------------------------------------- safety numbers

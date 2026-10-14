@@ -153,6 +153,17 @@ pub struct AttachmentMeta {
     pub remote: Option<RemoteAttachment>,
 }
 
+/// What a read sync did (`AppDb::apply_read_sync`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadSync {
+    /// Messages in this chat were marked read.
+    Read(ConversationId),
+    /// The message was already read.
+    AlreadyRead,
+    /// No such message (yet: read syncs can arrive before their message).
+    NotFound,
+}
+
 /// An attachment on Signal's transit CDN: enough to download and check it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RemoteAttachment {
@@ -1089,6 +1100,50 @@ impl AppDb {
         }
         tx.commit().await?;
         Ok(conversation.map(ConversationId))
+    }
+
+    /// A read sync from another device: marks that incoming message read and,
+    /// as Desktop does, every older incoming message in its chat (a phone
+    /// doesn't send one for each message, and some get lost).
+    pub async fn apply_read_sync(&self, author: &str, sent_at: i64) -> Result<ReadSync> {
+        let mut tx = self.write().await?;
+        let target: Option<(String, i64, i64)> = sqlx::query_as(AssertSqlSafe(format!(
+            "SELECT conversation_id, sent_at, id FROM messages \
+             WHERE author_key = ?1 AND direction = 0 AND {} ORDER BY sent_at = ?2 DESC LIMIT 1",
+            sent_at_matches("?2")
+        )))
+        .bind(author)
+        .bind(sent_at)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((conversation, target_sent_at, target_id)) = target else {
+            return Ok(ReadSync::NotFound);
+        };
+        let read = sqlx::query(
+            "UPDATE messages SET is_read = 1, \
+                expire_start = CASE WHEN expires_in > 0 THEN CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) END \
+             WHERE conversation_id = ?1 AND direction = 0 AND is_read = 0 \
+               AND (sent_at < ?2 OR (sent_at = ?2 AND id <= ?3))",
+        )
+        .bind(&conversation)
+        .bind(target_sent_at)
+        .bind(target_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if read == 0 {
+            return Ok(ReadSync::AlreadyRead);
+        }
+        sqlx::query(
+            "UPDATE conversations SET unread_count = \
+                (SELECT COUNT(*) FROM messages WHERE conversation_id = ?1 AND is_read = 0) \
+             WHERE id = ?1",
+        )
+        .bind(&conversation)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(ReadSync::Read(ConversationId(conversation)))
     }
 
     /// Inserts a message, deduplicating on `(conversation_id, author, sent_at)`.
