@@ -338,6 +338,11 @@ impl Actor {
         self.refresh_titles().await;
         self.emit(Event::ConversationsChanged);
         self.emit(Event::History(progress));
+        // The transfer usually adds chats after this session's first photo
+        // sync ran.
+        if let Some(manager) = self.manager() {
+            self.sync_avatars(manager).await;
+        }
     }
 
     async fn skip_history(self: &Rc<Self>) {
@@ -1152,6 +1157,18 @@ impl Actor {
             // Added back.
             let _ = self.db.set_left(&conversation, false).await;
         }
+        let new_photo = summary
+            .notices
+            .iter()
+            .any(|n| matches!(n, signal_store::Notice::Group { change: signal_store::GroupNotice::Avatar, .. }));
+        if new_photo && let Some(manager) = self.manager() {
+            let this = self.clone();
+            tokio::task::spawn_local(async move {
+                if this.refresh_group_avatar(&manager, key, true).await {
+                    this.emit(Event::ConversationsChanged);
+                }
+            });
+        }
         // One notice per change, a millisecond apart (notices dedupe by time).
         for (ix, notice) in summary.notices.into_iter().enumerate() {
             self.notice(&conversation, at + ix as i64, notice).await;
@@ -1670,22 +1687,18 @@ impl Actor {
         let conversations = self.db.conversations().await.unwrap_or_default();
         let mut changed = false;
         for conversation in conversations {
+            // Groups are checked every time: their photo can change.
+            if conversation.kind == ConversationKind::Group {
+                if let Some(key) = conversation.id.as_group().and_then(|k| <[u8; 32]>::try_from(k).ok()) {
+                    changed |= self.refresh_group_avatar(&manager, key, false).await;
+                }
+                continue;
+            }
             if conversation.avatar_path.as_ref().is_some_and(|p| std::path::Path::new(p).exists()) {
                 continue;
             }
             let bytes = match conversation.kind {
-                ConversationKind::Group => {
-                    let Some(key) = conversation.id.as_group().and_then(|k| <[u8; 32]>::try_from(k).ok()) else {
-                        continue;
-                    };
-                    let revision = self.store.group(key).await.ok().flatten().map(|g| g.revision);
-                    let context = GroupContextV2 {
-                        master_key: Some(key.to_vec()),
-                        revision,
-                        group_change: None,
-                    };
-                    manager.retrieve_group_avatar(context).await
-                }
+                ConversationKind::Group => continue,
                 ConversationKind::Direct => {
                     let Some(aci) = conversation.id.as_direct().and_then(Aci::parse_from_service_id_string) else {
                         continue;
@@ -1717,6 +1730,64 @@ impl Actor {
         if changed {
             self.emit(Event::ConversationsChanged);
         }
+    }
+
+    /// Brings a group's photo up to date: downloaded when the group's avatar
+    /// (a CDN path, new for each upload) differs from the one we saved,
+    /// removed when the group has none. `fetch` asks the group server rather
+    /// than presage's copy of the group, for right after a change.
+    async fn refresh_group_avatar(&self, manager: &SignalManager, key: [u8; 32], fetch: bool) -> bool {
+        let conversation = ConversationId::group(&key);
+        let stored = if fetch { None } else { self.store.group(key).await.ok().flatten().map(|g| g.avatar) };
+        let path = match stored {
+            Some(path) => path,
+            None => {
+                let fetched = async {
+                    let group = crate::groups::GroupSession::new(manager, key).await?.fetch().await?;
+                    let path = group.avatar.clone();
+                    self.store.save_group(key, group).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+                    anyhow::Ok(path)
+                }
+                .await;
+                match fetched {
+                    Ok(path) => path,
+                    Err(error) => {
+                        warn!(error = %format!("{error:#}"), "couldn't fetch a group for its photo");
+                        return false;
+                    }
+                }
+            }
+        };
+        let saved = self.db.conversation(&conversation).await.ok().flatten().and_then(|c| c.avatar_path);
+        if path.is_empty() {
+            let Some(saved) = saved else { return false };
+            let _ = std::fs::remove_file(&saved);
+            return self.db.set_avatar(&conversation, None).await.is_ok();
+        }
+        // The file is named after the avatar it holds, so a new one shows.
+        let name = format!("{}-{}", conversation.0.replace(':', "-"), &hex::encode(<sha2::Sha256 as sha2::Digest>::digest(path.as_bytes()))[..16]);
+        let current = saved.as_deref().map(std::path::Path::new);
+        if current.is_some_and(|p| p.exists() && p.file_stem().is_some_and(|stem| stem == name.as_str())) {
+            return false;
+        }
+        let bytes = match crate::groups::download_avatar(manager, key, &path).await {
+            Ok(Some(bytes)) if !bytes.is_empty() => bytes,
+            Ok(_) => return false,
+            Err(error) => {
+                warn!(error = %format!("{error:#}"), "group photo download failed");
+                return false;
+            }
+        };
+        let ext = if bytes.starts_with(b"\x89PNG") { "png" } else { "jpg" };
+        let file = self.config.data_dir.join("avatars").join(format!("{name}.{ext}"));
+        if let Err(error) = std::fs::write(&file, &bytes) {
+            warn!(%error, "failed to save avatar");
+            return false;
+        }
+        if let Some(old) = current.filter(|old| *old != file) {
+            let _ = std::fs::remove_file(old);
+        }
+        self.db.set_avatar(&conversation, file.to_str()).await.is_ok()
     }
 
     /// Profile photos of everyone shown in a chat: 1:1 contacts (copied from

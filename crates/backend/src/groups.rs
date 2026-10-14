@@ -193,6 +193,20 @@ impl GroupSession {
     }
 }
 
+/// Downloads and decrypts a group's photo; `path` is the group's `avatar`
+/// (empty when it has none). The CDN needs no credential.
+pub(crate) async fn download_avatar(manager: &SignalManager, master_key: [u8; 32], path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    let service = crate::storage::push_service(manager)?;
+    let response = service
+        .request(reqwest::Method::GET, Endpoint::cdn(0, path), HttpAuthOverride::Unidentified)?
+        .send()
+        .await?
+        .error_for_status()?;
+    let encrypted = response.bytes().await?;
+    let operations = GroupOperations::new(GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key)));
+    Ok(operations.decrypt_avatar(&encrypted))
+}
+
 fn uuid_of(aci: Aci) -> presage::libsignal_service::prelude::Uuid {
     aci.into()
 }
