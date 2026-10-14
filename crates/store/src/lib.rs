@@ -481,13 +481,28 @@ const INIT_VERSION: i64 = 20261013000000;
 /// into one init.
 const LAST_PRE_SQUASH: i64 = 20261028000000;
 const PRE_SQUASH_COUNT: i64 = 16;
+/// `message_edits`, a migration of its own until it was squashed into the
+/// init too.
+const MESSAGE_EDITS_VERSION: i64 = 20261029000000;
 
-/// Lets a database migrated before the squash open under the squashed init.
+/// What the init gained after the first squash, for a database whose
+/// schema matches that first init: added if missing.
+const SINCE_FIRST_INIT: &str = "\
+    CREATE TABLE IF NOT EXISTS message_edits ( \
+        message_id INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE, \
+        sent_at    INTEGER NOT NULL, \
+        PRIMARY KEY (message_id, sent_at) \
+    ) STRICT; \
+    CREATE INDEX IF NOT EXISTS message_edits_sent_at ON message_edits (sent_at);";
+
+/// Lets a database migrated before a squash open under the squashed init.
 ///
-/// With every pre-squash migration applied, the schema already matches the
-/// init (plus a leftover `muted` column nothing reads), so the history is
-/// rewritten to the init alone and the data kept. A partly migrated database
-/// is rebuilt if it holds no chats, and refused otherwise.
+/// Two histories have a schema matching the first init: every pre-squash
+/// migration applied (plus a leftover `muted` column nothing reads), or the
+/// first init itself, with or without the `message_edits` migration. Those
+/// get what the init has gained since, and their history is rewritten to
+/// the init alone; the data is kept. A partly migrated database is rebuilt
+/// if it holds no chats, and refused otherwise.
 async fn adopt_squashed_history(pool: &SqlitePool, migrator: &sqlx::migrate::Migrator) -> Result<()> {
     let has_history: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations')")
@@ -501,17 +516,27 @@ async fn adopt_squashed_history(pool: &SqlitePool, migrator: &sqlx::migrate::Mig
             .fetch_one(pool)
             .await?;
     let Some(max) = max else { return Ok(()) };
-    // Every applied version is one of ours: nothing to adopt.
-    let applied: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success").fetch_all(pool).await?;
-    if applied.iter().all(|v| migrator.iter().any(|m| m.version == *v)) {
+    // Every applied migration is one of ours, unchanged: nothing to adopt.
+    let applied: Vec<(i64, Vec<u8>)> =
+        sqlx::query_as("SELECT version, checksum FROM _sqlx_migrations WHERE success").fetch_all(pool).await?;
+    if applied.iter().all(|(v, c)| migrator.iter().any(|m| m.version == *v && *m.checksum == **c)) {
         return Ok(());
     }
     let init = migrator
         .iter()
         .find(|m| m.version == INIT_VERSION)
         .expect("init migration is embedded");
-    if count == PRE_SQUASH_COUNT && max == LAST_PRE_SQUASH {
+    // The first init's last column, so its schema is all there.
+    let first_init_schema: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pragma_table_info('conversations') WHERE name = 'can_label')")
+            .fetch_one(pool)
+            .await?;
+    let pre_squash = count == PRE_SQUASH_COUNT && max == LAST_PRE_SQUASH;
+    let first_init = applied.iter().any(|(v, _)| *v == INIT_VERSION)
+        && applied.iter().all(|(v, _)| *v == INIT_VERSION || *v == MESSAGE_EDITS_VERSION);
+    if first_init_schema && (pre_squash || first_init) {
         let mut tx = pool.begin().await?;
+        sqlx::raw_sql(SINCE_FIRST_INIT).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM _sqlx_migrations").execute(&mut *tx).await?;
         sqlx::query(
             "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \

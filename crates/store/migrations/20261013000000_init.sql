@@ -82,6 +82,17 @@ CREATE INDEX messages_unread ON messages (conversation_id, is_read) WHERE is_rea
 CREATE INDEX messages_outgoing_sent_at ON messages (sent_at) WHERE author_key = '';
 CREATE INDEX messages_expiry ON messages (expire_start + expires_in * 1000) WHERE expire_start IS NOT NULL;
 
+-- Each edit's own timestamp. Reactions, replies and receipts can name an
+-- edited message by any of them (Desktop's `editHistory` timestamps), not
+-- only by the original's `sent_at`.
+CREATE TABLE message_edits (
+    message_id INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE,
+    sent_at    INTEGER NOT NULL,
+    PRIMARY KEY (message_id, sent_at)
+) STRICT;
+
+CREATE INDEX message_edits_sent_at ON message_edits (sent_at);
+
 CREATE VIRTUAL TABLE messages_fts USING fts5 (
     body,
     content = 'messages',

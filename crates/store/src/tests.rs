@@ -782,6 +782,9 @@ async fn adopts_fully_migrated_pre_squash_database() {
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version").fetch_all(&db.pool).await.unwrap();
     let ours: Vec<i64> = sqlx::migrate!("./migrations").iter().map(|m| m.version).collect();
     assert_eq!(versions, ours);
+    // What the init gained since the old migrations is there too.
+    db.edit_message(1, "edited", 2).await.unwrap();
+    assert_eq!(db.find_message(&conv("d:a"), Some("a"), 2).await.unwrap().map(|m| m.body), Some("edited".into()));
     db.close().await;
     // And opens again cleanly.
     AppDb::open(&path, &key).await.unwrap().close().await;
@@ -857,17 +860,43 @@ async fn an_edited_message_answers_to_its_edits_timestamps() {
     assert_eq!(left, 0);
 }
 
-#[tokio::test]
-async fn opens_a_database_with_migrations_after_the_init() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("app.db");
-    let key = [7u8; 32];
-    {
-        let db = AppDb::open(&path, &key).await.unwrap();
-        db.upsert_conversation(&conv("d:a"), ConversationUpdate { title: Some("A".into()), ..Default::default() }).await.unwrap();
-        db.close().await;
+/// A database made by the first init (`message_edits` came later), with
+/// or without the `message_edits` migration applied.
+async fn fake_first_init(db: &AppDb, with_edits_migration: bool) {
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = x'00'").execute(&db.pool).await.unwrap();
+    if with_edits_migration {
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+             VALUES (20261029000000, 'message edits', TRUE, x'00', 0)",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    } else {
+        sqlx::query("DROP TABLE message_edits").execute(&db.pool).await.unwrap();
     }
-    // Reopening (every migration applied, the newest after the init) keeps the chats.
-    let db = AppDb::open(&path, &key).await.unwrap();
-    assert_eq!(db.conversations().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn adopts_a_database_from_the_first_init() {
+    for with_edits_migration in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.db");
+        let key = [7u8; 32];
+        {
+            let db = AppDb::open(&path, &key).await.unwrap();
+            db.insert_message(&incoming("d:a", "a", 1, "kept")).await.unwrap();
+            fake_first_init(&db, with_edits_migration).await;
+            db.close().await;
+        }
+        let db = AppDb::open(&path, &key).await.unwrap();
+        assert_eq!(db.conversations().await.unwrap().len(), 1, "with_edits_migration: {with_edits_migration}");
+        let id = db.find_message(&conv("d:a"), Some("a"), 1).await.unwrap().unwrap().id;
+        db.edit_message(id, "edited", 2).await.unwrap();
+        assert_eq!(db.find_message(&conv("d:a"), Some("a"), 2).await.unwrap().map(|m| m.id), Some(id));
+        let versions: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations").fetch_all(&db.pool).await.unwrap();
+        assert_eq!(versions, vec![20261013000000]);
+        db.close().await;
+        AppDb::open(&path, &key).await.unwrap().close().await;
+    }
 }
