@@ -7,29 +7,31 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::prelude::*;
 use gpui_kit::{App, Entity, FontWeight, Window, div, px, white};
 use signal_backend::Command;
-use signal_store::Conversation;
+use signal_store::ConversationId;
 
 use crate::state::AppState;
 use crate::theme::Palette;
 
 const QR_SIZE: f32 = 180.;
 
-pub fn open(state: Entity<AppState>, conversation: Conversation, window: &mut Window, cx: &mut App) {
+/// `conversation` is their 1:1 chat's id (whether or not the chat exists);
+/// `name` is theirs.
+pub fn open(state: Entity<AppState>, conversation: ConversationId, name: String, window: &mut Window, cx: &mut App) {
     state.update(cx, |state, _| state.safety_number = None);
-    state.read(cx).send(Command::LoadSafetyNumber { conversation: conversation.id.clone() });
+    state.read(cx).send(Command::LoadSafetyNumber { conversation: conversation.clone() });
     window.open_dialog(cx, move |dialog, _, cx| {
         let palette = Palette::get(cx);
         let loaded = state
             .read(cx)
             .safety_number
             .as_ref()
-            .filter(|(id, _)| *id == conversation.id)
+            .filter(|(id, _)| *id == conversation)
             .map(|(_, result)| result.clone());
         let body = match loaded {
             None => div().flex().justify_center().py_6().child(Spinner::new()).into_any_element(),
             Some(Err(error)) => div().text_sm().text_color(palette.text_secondary).child(error).into_any_element(),
             Some(Ok(number)) => {
-                let (state, id, verified) = (state.clone(), conversation.id.clone(), number.verified);
+                let (state, id, verified) = (state.clone(), conversation.clone(), number.verified);
                 div()
                     .flex()
                     .flex_col()
@@ -54,11 +56,11 @@ pub fn open(state: Entity<AppState>, conversation: Conversation, window: &mut Wi
                         div().text_sm().text_color(palette.text_secondary).text_center().child(format!(
                             "To verify end-to-end encryption with {}, compare the numbers above with their device. \
                              They can also scan your code with their device.",
-                            conversation.title
+                            name
                         )),
                     )
                     .when(verified, |d| {
-                        d.child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(format!("✓ {} is verified", conversation.title)))
+                        d.child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(format!("✓ {} is verified", name)))
                     })
                     .child(
                         Button::new("toggle-verified")
@@ -130,7 +132,7 @@ mod tests {
                 found
             })
             .expect("the demo has Maya");
-        cx.update_window(window, |_, window, cx| super::open(state.clone(), conversation, window, cx)).unwrap();
+        cx.update_window(window, |_, window, cx| super::open(state.clone(), conversation.id, conversation.title, window, cx)).unwrap();
         let loaded = |cx: &mut TestAppContext| {
             for _ in 0..300 {
                 cx.run_until_parked();

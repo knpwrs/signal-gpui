@@ -264,6 +264,11 @@ impl ConversationView {
             Notice::Pinned { author, sent_at, .. } => Some((author.clone(), *sent_at)),
             _ => None,
         };
+        // Their safety number (they may have no 1:1 chat, only a group).
+        let safety_with = match notice {
+            Notice::SafetyNumberChanged { who } => Some((ConversationId::direct(who), self.reactor_name(Some(who), cx))),
+            _ => None,
+        };
         div()
             .flex()
             .flex_col()
@@ -298,6 +303,17 @@ impl ConversationView {
                                 .label("Go to message")
                                 .ghost()
                                 .on_click(cx.listener(move |this, _, _, cx| this.go_to(author.clone(), at, cx))),
+                        )
+                    })
+                    .when_some(safety_with, |d, (chat, name)| {
+                        let state = self.state.clone();
+                        d.child(
+                            Button::new(SharedString::from(format!("notice-safety-{sent_at}")))
+                                .label("View safety number")
+                                .ghost()
+                                .on_click(move |_, window, cx| {
+                                    crate::views::safety_number::open(state.clone(), chat.clone(), name.clone(), window, cx);
+                                }),
                         )
                     }),
             )
@@ -3289,7 +3305,8 @@ mod tests {
             state.update(cx, |state, cx| state.handle(signal_backend::Event::PinsChanged(ConversationId(MAYA.into())), cx));
         };
         backend.send(Command::PinMessage { message_id: target.id, duration: None });
-        let notice = wait_for_messages(&backend, MAYA, 1, |m| m.notice.is_some()).remove(0);
+        let notice =
+            wait_for_messages(&backend, MAYA, 1, |m| matches!(m.notice, Some(signal_store::Notice::Pinned { .. }))).remove(0);
         pins_changed(&mut cx);
         bounds(&mut cx, "pinned-bar".into());
         assert!(matches!(notice.notice, Some(signal_store::Notice::Pinned { by: None, .. })));

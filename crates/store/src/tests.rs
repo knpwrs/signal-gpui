@@ -951,3 +951,11 @@ async fn a_read_sync_reads_everything_older_in_its_chat() {
     // Before its message arrives.
     assert_eq!(db.apply_read_sync("a", 99).await.unwrap(), ReadSync::NotFound);
 }
+
+#[tokio::test]
+async fn safety_number_notices_round_trip() {
+    let db = AppDb::open_in_memory().await.unwrap();
+    let notice = Notice::SafetyNumberChanged { who: "a".into() };
+    let id = db.insert_notice(&conv("d:a"), 5, &notice).await.unwrap().unwrap();
+    assert_eq!(db.message(id).await.unwrap().unwrap().notice, Some(notice));
+}

@@ -78,7 +78,7 @@ pub fn open(state: Entity<AppState>, conversation: Conversation, window: &mut Wi
             let (state, chat) = (state.clone(), conversation.clone());
             let safety = Button::new("view-safety-number").label("View safety number").outline().on_click(move |_, window, cx| {
                 window.close_all_dialogs(cx);
-                crate::views::safety_number::open(state.clone(), chat.clone(), window, cx);
+                crate::views::safety_number::open(state.clone(), chat.id.clone(), chat.title.clone(), window, cx);
             });
             let body = body.when(direct, |d| d.child(div().child(safety)));
             return dialog.title("Chat settings").w(px(420.)).child(body);

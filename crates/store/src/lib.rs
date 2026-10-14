@@ -243,6 +243,9 @@ pub enum Notice {
     Pinned { by: Option<String>, author: Option<String>, sent_at: i64 },
     /// A group changed.
     Group { by: Option<String>, change: GroupNotice },
+    /// Their identity key changed (Desktop's "Your safety number with …
+    /// has changed"): `who` is their service id.
+    SafetyNumberChanged { who: String },
 }
 
 /// One change to a group, as a notice shows it. Service ids are `None`

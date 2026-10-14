@@ -61,6 +61,9 @@ const MAX_EARLY_READS: usize = 1000;
 /// `verified.<ACI>`: the identity key (hex) we marked verified for them;
 /// empty when cleared. Verification lapses when their key changes.
 const SETTING_VERIFIED: &str = "verified.";
+/// `identity.<ACI>`: their identity key (hex) as last seen, to notice a
+/// change.
+const SETTING_IDENTITY: &str = "identity.";
 pub(crate) const AUTO_DOWNLOAD_MAX: u64 = 25 * 1024 * 1024;
 
 fn now_millis() -> i64 {
@@ -139,6 +142,8 @@ struct Actor {
     /// Read syncs that arrived before their message, `(author, sent_at)`,
     /// applied when it does (as Desktop keeps them). Newest last.
     early_reads: RefCell<std::collections::VecDeque<(String, i64)>>,
+    /// Identity keys (hex) seen this session, ahead of `SETTING_IDENTITY`.
+    identities_seen: RefCell<HashMap<String, String>>,
     /// A later batch of profile photo checks is scheduled.
     avatar_batch_pending: std::cell::Cell<bool>,
     /// The history transfer after linking, while it can still be skipped
@@ -190,6 +195,7 @@ pub(crate) async fn run(
         profile_fetches: RefCell::default(),
         receiver: RefCell::new(None),
         early_reads: RefCell::default(),
+        identities_seen: RefCell::default(),
         avatar_batch_pending: std::cell::Cell::new(false),
         history: RefCell::new(None),
         outbound,
@@ -494,7 +500,8 @@ impl Actor {
             Ok(manager) => {
                 info!("linked as secondary device");
                 // A fresh link may be a different account: start from a clean slate.
-                if let Err(error) = self.db.clear().await {
+                self.identities_seen.borrow_mut().clear();
+        if let Err(error) = self.db.clear().await {
                     self.error("failed to reset app database", error);
                 }
                 self.titled.borrow_mut().clear();
@@ -536,6 +543,7 @@ impl Actor {
         if let Err(error) = store.clear_registration().await {
             warn!(%error, "failed to clear presage registration");
         }
+        self.identities_seen.borrow_mut().clear();
         if let Err(error) = self.db.clear().await {
             warn!(%error, "failed to clear app database");
         }
@@ -624,6 +632,9 @@ impl Actor {
             Received::Content(content) => {
                 let self_aci = self.self_aci();
                 let sender = content.metadata.sender.service_id_string();
+                if sender != self_aci {
+                    self.check_identity(&sender).await;
+                }
                 if let Some((key, change, at)) = mapping::group_change_of(&content) {
                     self.apply_group_change(key, &change, at).await;
                 }
@@ -3137,6 +3148,71 @@ impl Actor {
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .context("there's no safety number until you've exchanged a message with them on this device")?;
         Ok((ours, our_key, theirs, their_key))
+    }
+
+    /// Desktop's "Your safety number with … has changed": when someone's
+    /// identity key differs from the one last seen, a notice goes in their
+    /// 1:1 chat and every group we share. The first key seen is just noted.
+    async fn check_identity(&self, sid: &str) {
+        let Some(aci) = Aci::parse_from_service_id_string(sid) else { return };
+        let store = presage::store::Store::aci_protocol_store(&self.store);
+        let Ok(device) = DeviceId::new(1) else { return };
+        let Ok(Some(key)) = store.get_identity(&ProtocolAddress::new(aci.service_id_string(), device)).await else { return };
+        let key = hex::encode(key.serialize());
+        if self.identities_seen.borrow().get(sid) == Some(&key) {
+            return;
+        }
+        let setting = format!("{SETTING_IDENTITY}{sid}");
+        // A read that failed isn't "no key": compare again next message.
+        let Ok(previous) = self.db.setting(&setting).await else { return };
+        if previous.as_deref() == Some(key.as_str()) {
+            self.identities_seen.borrow_mut().insert(sid.to_owned(), key);
+            return;
+        }
+        if previous.as_deref().is_some_and(|p| !p.is_empty()) && !self.add_safety_notices(sid).await {
+            // Not recorded: the next message tries again.
+            return;
+        }
+        if let Err(error) = self.db.set_setting(&setting, &key).await {
+            return self.error("failed to record an identity key", error);
+        }
+        self.identities_seen.borrow_mut().insert(sid.to_owned(), key);
+    }
+
+    /// The safety-number-changed notice in their 1:1 chat and the groups we
+    /// share; `false` if one couldn't be saved.
+    async fn add_safety_notices(&self, sid: &str) -> bool {
+        let notice = signal_store::Notice::SafetyNumberChanged { who: sid.to_owned() };
+        let at = now_millis();
+        let direct = ConversationId::direct(sid);
+        let mut chats = Vec::new();
+        if self.db.conversation(&direct).await.ok().flatten().is_some() {
+            chats.push(direct);
+        }
+        let mut all = self.db.conversations().await.unwrap_or_default();
+        all.extend(self.db.archived_conversations().await.unwrap_or_default());
+        chats.extend(all.into_iter().filter(|c| c.kind == ConversationKind::Group && c.members.iter().any(|m| m == sid)).map(|c| c.id));
+        let mut saved = true;
+        for chat in chats {
+            // Notices dedupe by time: another one in this millisecond (a
+            // timer change in the same message, say) would swallow this one.
+            for offset in 0..10 {
+                match self.db.insert_notice(&chat, at + offset, &notice).await {
+                    Ok(Some(id)) => {
+                        self.emit(Event::MessageChanged { conversation: chat.clone(), message_id: id });
+                        break;
+                    }
+                    Ok(None) => continue,
+                    Err(error) => {
+                        self.error("failed to add notice", error);
+                        saved = false;
+                        break;
+                    }
+                }
+            }
+        }
+        self.emit(Event::ConversationsChanged);
+        saved
     }
 
     async fn safety_number(&self, conversation: &ConversationId) -> anyhow::Result<crate::SafetyNumber> {

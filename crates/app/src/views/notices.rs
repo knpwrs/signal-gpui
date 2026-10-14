@@ -18,6 +18,7 @@ pub fn notice_text(notice: &Notice, name: impl Fn(&str) -> String) -> String {
         Notice::Pinned { by: None, .. } => "You pinned a message".into(),
         Notice::Pinned { by: Some(by), .. } => format!("{} pinned a message", name(by)),
         Notice::Group { by, change } => group_text(by.as_deref(), change, name),
+        Notice::SafetyNumberChanged { who } => format!("Your safety number with {} has changed.", name(who)),
     }
 }
 
@@ -76,6 +77,10 @@ mod tests {
         let by = |s: &str| Some(s.to_owned());
         assert_eq!(text(Notice::Timer { by: None, seconds: 86_400 }), "You set the disappearing message time to 1 day.");
         assert_eq!(text(Notice::Timer { by: by("a"), seconds: 0 }), "Alice disabled disappearing messages.");
+        assert_eq!(
+            text(Notice::SafetyNumberChanged { who: "a".into() }),
+            "Your safety number with Alice has changed."
+        );
         let group = |by: Option<String>, change| Notice::Group { by, change };
         assert_eq!(
             text(group(by("a"), GroupNotice::Title { title: "Hikers".into() })),

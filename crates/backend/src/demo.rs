@@ -242,6 +242,9 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
     let mut reply = outgoing(MAYA, now - 45 * MINUTE, "Reading it now", DeliveryStatus::Read);
     reply.quote = Some(quote_of(&article, article_image.and_then(|i| i.local_path)));
     db.insert_message(&reply).await?;
+    // She set up a new phone.
+    let changed = signal_store::Notice::SafetyNumberChanged { who: aci(MAYA).into() };
+    db.insert_notice(&ConversationId(MAYA.into()), now - 30 * MINUTE, &changed).await?;
     db.mark_read(&ConversationId(MAYA.into())).await?;
     db.insert_message(&incoming(MAYA, MAYA, now - 12 * MINUTE, "Let me know what you think!")).await?;
 
