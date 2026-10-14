@@ -101,7 +101,8 @@ The ⋯ menu in a chat's header (and right-clicking a chat in the list) works li
 - **All media:** a chat's photos, documents and links.
 - **Select messages**, then forward (up to 30 messages, to up to 5 chats) or delete them.
 - **Safety number** (Chat settings in a 1:1 chat): the 60 digits and QR code, computed as Signal does (libsignal's fingerprint over both ACIs and identity keys), to compare with the other person's device. **Mark as verified** is tied to their current identity key, so it lapses when their key changes, and it's synced with your other devices both ways (Signal's Verified sync message).
-- **Search in chat** (⌘⇧F, or the magnifying glass) lists matches; picking one jumps to it. Results from the main search jump too.
+- **Search in chat** (⌘⇧F, or the magnifying glass in the header) works as in Desktop: the sidebar's search box shows the chat's avatar and searches only that chat, listing each match under its sender; picking one jumps to it. The ✕ beside the avatar, Escape, or Backspace in the empty box goes back to searching everything. Results from the main search jump too.
+- **Chat details:** click the avatar or name in a chat's header.
 
 ## Messages
 
@@ -156,7 +157,7 @@ cargo bench -p signal-emoji
 
 ## Not yet implemented
 
-Voice/video calls, stories, adding and removing group members, and most settings. New identity keys are trusted automatically (a verified contact's key change clears the verification, but there's no notice or confirmation step yet). Attachments in transferred history that are only in the backup (media) tier, which needs a backup subscription, aren't downloaded. See `todo.md` for more.
+Voice/video calls, stories, adding and removing group members, and most settings. New identity keys are trusted automatically: a key change shows Desktop's "Your safety number with … has changed" notice (in the 1:1 chat and shared groups) and clears a verification, but sending isn't held for confirmation. Attachments in transferred history that are only in the backup (media) tier, which needs a backup subscription, aren't downloaded. See `todo.md` for more.
 
 ## License
 
