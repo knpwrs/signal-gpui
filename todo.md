@@ -29,7 +29,7 @@ flag as on whenever it's set.
 | `binaryServiceId` | Sending service ids in the binary proto fields (`*Binary`) instead of strings. | We accept both and send strings, which is still valid. |
 | `retireAccessKeyGroupSend` | Group sends with group send endorsements instead of access keys. | Up to libsignal-service-rs / presage. |
 | `sendMessageViaLibsignal` | Sending through libsignal's network stack. | Not applicable. |
-| `keyTransparency` | Key transparency checks in safety numbers. | Not applicable yet: safety-number verification isn't implemented. |
+| `keyTransparency` | Key transparency checks in safety numbers. | Not done: safety numbers are shown and can be verified, without key transparency. |
 | `localBackups` | Local (on-disk) backups. | Not applicable. |
 | `disappearingCalls`, `remoteMute.send` | Calls. | Not applicable: no calls. |
 

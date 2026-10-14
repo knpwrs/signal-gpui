@@ -531,3 +531,24 @@ fn group_changes_become_notices() {
     assert_eq!(summary.timer, Some(3600));
     assert!(summary.left, "we were removed");
 }
+
+#[test]
+fn sync_verified() {
+    let sync = |state: presage::proto::verified::State| SyncMessage {
+        content: Some(sync_message::Content::Verified(presage::proto::Verified {
+            destination_aci: Some(ALICE.into()),
+            identity_key: Some(vec![5; 33]),
+            state: Some(state.into()),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    assert_eq!(
+        map_content(&content(ME, sync(presage::proto::verified::State::Verified)), &ctx()),
+        vec![Action::Verified { aci: ALICE.into(), identity_key: vec![5; 33], verified: true }]
+    );
+    assert_eq!(
+        map_content(&content(ME, sync(presage::proto::verified::State::Default)), &ctx()),
+        vec![Action::Verified { aci: ALICE.into(), identity_key: vec![5; 33], verified: false }]
+    );
+}

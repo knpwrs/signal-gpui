@@ -3,7 +3,7 @@
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::prelude::*;
-use gpui_kit::{App, Bounds, Entity, FontWeight, Hsla, IntoElement, Window, canvas, div, fill, point, px, size, white};
+use gpui_kit::{App, Bounds, Entity, FontWeight, IntoElement, Window, canvas, div, fill, point, px, size, white};
 use qrcode::QrCode;
 use signal_backend::Command;
 
@@ -38,7 +38,7 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> im
                 }
             }))
             .into_any_element(),
-        (Some(url), None) => qr_code(&with_history(url.as_str()), palette.text).into_any_element(),
+        (Some(url), None) => qr_code(with_history(url.as_str()).as_bytes(), QR_SIZE).into_any_element(),
         (None, None) => div()
             .size(px(QR_SIZE))
             .flex()
@@ -98,9 +98,9 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> im
         )
 }
 
-/// Paints `data` as a QR code with one quad per dark module.
-fn qr_code(data: &str, _fg: Hsla) -> impl IntoElement {
-    let modules: Option<(usize, Vec<bool>)> = QrCode::new(data.as_bytes()).ok().map(|code| {
+/// Paints `data` as a `size`-point QR code, one quad per dark module.
+pub(crate) fn qr_code(data: &[u8], side: f32) -> impl IntoElement {
+    let modules: Option<(usize, Vec<bool>)> = QrCode::new(data).ok().map(|code| {
         let width = code.width();
         let dark = code
             .to_colors()
@@ -126,7 +126,7 @@ fn qr_code(data: &str, _fg: Hsla) -> impl IntoElement {
             }
         },
     )
-    .size(px(QR_SIZE))
+    .size(px(side))
 }
 /// Asks the phone to send message history, as Desktop's link QR does
 /// (`capabilities=backup5`, "link and sync").

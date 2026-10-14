@@ -14,6 +14,7 @@ pub mod message_info;
 pub mod new_group;
 pub mod notices;
 pub mod root;
+pub mod safety_number;
 pub mod settings;
 pub mod sidebar;
 pub mod syncing;

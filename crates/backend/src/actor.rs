@@ -20,7 +20,7 @@ use presage::{
         sender::AttachmentSpec,
         content::ContentBody,
         prelude::{GroupMasterKey, GroupSecretParams, ProfileKey, ServiceError},
-        protocol::{Aci, ServiceId},
+        protocol::{Aci, DeviceId, IdentityKey, IdentityKeyStore as _, ProtocolAddress, ServiceId},
     },
     manager::Registered,
     model::messages::Received,
@@ -50,6 +50,9 @@ pub(crate) type SignalManager = Manager<SqliteStore, Registered>;
 /// Images up to this size are downloaded as soon as they arrive.
 /// "1" while the history transfer after linking hasn't finished.
 const SETTING_HISTORY_PENDING: &str = "history.pending";
+/// `verified.<ACI>`: the identity key (hex) we marked verified for them;
+/// empty when cleared. Verification lapses when their key changes.
+const SETTING_VERIFIED: &str = "verified.";
 pub(crate) const AUTO_DOWNLOAD_MAX: u64 = 25 * 1024 * 1024;
 
 fn now_millis() -> i64 {
@@ -434,6 +437,8 @@ impl Actor {
                 Command::LeaveGroup { conversation } => self.leave_group(conversation).await,
                 Command::CreateGroup { title, members } => self.create_group(title, members).await,
                 Command::SetMemberLabel { conversation, emoji, text } => self.set_member_label(conversation, emoji, text).await,
+                Command::LoadSafetyNumber { conversation } => self.emit_safety_number(conversation).await,
+                Command::SetVerified { conversation, verified } => self.set_verified(conversation, verified).await,
                 Command::Unlink => self.unlink().await,
                 Command::SkipHistory => self.skip_history().await,
             }
@@ -795,6 +800,16 @@ impl Actor {
                     },
                 };
                 self.emit(Event::Typing { conversation, author: sender, started });
+            }
+            Action::Verified { aci, identity_key, verified } => {
+                let conversation = ConversationId::direct(&aci);
+                let current = self.identities(&conversation).await.ok().map(|(_, _, _, theirs)| theirs.serialize());
+                // Only for the key we have; an older key's verification is moot.
+                if current.as_deref() == Some(identity_key.as_slice()) {
+                    let value = if verified { hex::encode(&identity_key) } else { String::new() };
+                    let _ = self.db.set_setting(&format!("{SETTING_VERIFIED}{aci}"), &value).await;
+                    self.emit_safety_number(conversation).await;
+                }
             }
             Action::ReadSync(entries) => {
                 let mut changed = false;
@@ -2997,6 +3012,72 @@ impl Actor {
             self.error("failed to update message status", error);
         }
         self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id: id });
+    }
+
+    // --------------------------------------------------------- safety numbers
+
+    /// Our ACI and identity key, and theirs, for a 1:1 chat.
+    async fn identities(&self, conversation: &ConversationId) -> anyhow::Result<(Aci, IdentityKey, Aci, IdentityKey)> {
+        let theirs = conversation
+            .as_direct()
+            .and_then(Aci::parse_from_service_id_string)
+            .context("safety numbers are for chats with one person")?;
+        let ours = Aci::parse_from_service_id_string(&self.self_aci()).context("not linked")?;
+        let store = presage::store::Store::aci_protocol_store(&self.store);
+        let our_key = *store.get_identity_key_pair().await.map_err(|e| anyhow::anyhow!("{e}"))?.identity_key();
+        let address = ProtocolAddress::new(theirs.service_id_string(), DeviceId::new(1).map_err(|e| anyhow::anyhow!("{e}"))?);
+        let their_key = store
+            .get_identity(&address)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .context("there's no safety number until you've exchanged a message with them on this device")?;
+        Ok((ours, our_key, theirs, their_key))
+    }
+
+    async fn safety_number(&self, conversation: &ConversationId) -> anyhow::Result<crate::SafetyNumber> {
+        let (ours, our_key, theirs, their_key) = self.identities(conversation).await?;
+        let (digits, qr) = crate::safety::compute((ours, &our_key), (theirs, &their_key))?;
+        let verified = self
+            .db
+            .setting(&format!("{SETTING_VERIFIED}{}", theirs.service_id_string()))
+            .await?
+            .is_some_and(|key| key == hex::encode(their_key.serialize()));
+        Ok(crate::SafetyNumber { digits, qr, verified })
+    }
+
+    async fn emit_safety_number(&self, conversation: ConversationId) {
+        let result = self.safety_number(&conversation).await.map_err(|e| format!("{e:#}"));
+        self.emit(Event::SafetyNumber { conversation, result });
+    }
+
+    /// Marks their current identity key verified (or clears it) and tells
+    /// our other devices, as Desktop's "Mark as verified" does.
+    async fn set_verified(&self, conversation: ConversationId, verified: bool) {
+        let (theirs, their_key) = match self.identities(&conversation).await {
+            Ok((_, _, theirs, key)) => (theirs, key),
+            Err(error) => return self.error("can't verify", format!("{error:#}")),
+        };
+        let key = their_key.serialize();
+        let value = if verified { hex::encode(&key) } else { String::new() };
+        if let Err(error) = self.db.set_setting(&format!("{SETTING_VERIFIED}{}", theirs.service_id_string()), &value).await {
+            return self.error("can't verify", error);
+        }
+        let state = if verified { presage::proto::verified::State::Verified } else { presage::proto::verified::State::Default };
+        // Padding, as Desktop sends, so the message's size says nothing.
+        let null_message: Vec<u8> = (0..rand::Rng::random_range(&mut rand::rng(), 1..=512)).map(|_| rand::random()).collect();
+        self.enqueue(Outbound::Sync {
+            body: SyncMessage {
+                content: Some(sync_message::Content::Verified(presage::proto::Verified {
+                    destination_aci: Some(theirs.service_id_string()),
+                    destination_aci_binary: Some(theirs.service_id_binary()),
+                    identity_key: Some(key.to_vec()),
+                    state: Some(state.into()),
+                    null_message: Some(null_message),
+                })),
+                ..SyncMessage::with_padding(&mut rand::rng())
+            },
+        });
+        self.emit_safety_number(conversation).await;
     }
 
     // ------------------------------------------------------------ attachments

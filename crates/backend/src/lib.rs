@@ -17,6 +17,7 @@ pub mod mapping;
 mod storage;
 mod groups;
 mod history;
+mod safety;
 pub mod media;
 pub mod link_preview;
 pub mod debug_log;
@@ -150,6 +151,11 @@ pub enum Command {
     CreateGroup { title: String, members: Vec<String> },
     /// Sets (or with an empty `text`, clears) our label in a group.
     SetMemberLabel { conversation: ConversationId, emoji: Option<String>, text: String },
+    /// Computes a 1:1 chat's safety number; answered with `Event::SafetyNumber`.
+    LoadSafetyNumber { conversation: ConversationId },
+    /// Marks a 1:1 contact's current identity verified (or clears it), here
+    /// and on our other devices; answered with `Event::SafetyNumber`.
+    SetVerified { conversation: ConversationId, verified: bool },
     /// Unlinks this device and wipes local state.
     Unlink,
     /// Stops waiting for the history transfer and continues without it.
@@ -252,6 +258,17 @@ pub struct OutgoingImage {
     pub file_name: Option<String>,
 }
 
+/// A 1:1 contact's safety number, as Signal shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafetyNumber {
+    /// 60 digits, shown in 12 groups of five.
+    pub digits: String,
+    /// The scannable fingerprint, for the QR code.
+    pub qr: Vec<u8>,
+    /// We marked their current identity key verified.
+    pub verified: bool,
+}
+
 /// A file (not sent as an image) picked, pasted or dropped in the composer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutgoingFile {
@@ -294,6 +311,8 @@ pub enum Event {
     ConversationCleared(ConversationId),
     /// A chat's pinned messages changed.
     PinsChanged(ConversationId),
+    /// A 1:1 chat's safety number, or why there isn't one.
+    SafetyNumber { conversation: ConversationId, result: Result<SafetyNumber, String> },
     /// A group we created is ready to open.
     GroupCreated(ConversationId),
     /// Progress of the message history transfer after linking.

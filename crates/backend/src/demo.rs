@@ -874,9 +874,25 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     emit(Event::MessageChanged { conversation, message_id: id });
                 }
             }
+            // Made-up digits (there are no keys here), stable per chat.
+            Command::LoadSafetyNumber { conversation } => {
+                let verified = db.setting(&format!("demo.verified.{}", conversation.0)).await.ok().flatten().is_some_and(|v| v == "1");
+                emit(Event::SafetyNumber { conversation: conversation.clone(), result: Ok(demo_safety_number(&conversation, verified)) });
+            }
+            Command::SetVerified { conversation, verified } => {
+                let _ = db.set_setting(&format!("demo.verified.{}", conversation.0), if verified { "1" } else { "" }).await;
+                emit(Event::SafetyNumber { conversation: conversation.clone(), result: Ok(demo_safety_number(&conversation, verified)) });
+            }
             Command::Link | Command::Typing { .. } | Command::FetchAttachment { .. } | Command::Unlink | Command::SkipHistory => {}
         }
     }
+}
+
+fn demo_safety_number(conversation: &ConversationId, verified: bool) -> crate::SafetyNumber {
+    use sha2::Digest as _;
+    let hash = sha2::Sha256::digest(conversation.0.as_bytes());
+    let digits: String = hash.iter().cycle().take(60).map(|b| char::from(b'0' + b % 10)).collect();
+    crate::SafetyNumber { qr: digits.clone().into_bytes(), digits, verified }
 }
 
 /// "@Name" for each mention placeholder, names from the demo's chats.

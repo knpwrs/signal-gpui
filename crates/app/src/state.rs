@@ -116,6 +116,8 @@ pub struct AppState {
     pub window_active: bool,
     /// The message history transfer after linking, while it runs.
     pub history: Option<signal_backend::HistoryProgress>,
+    /// The safety number last loaded (`Command::LoadSafetyNumber`).
+    pub safety_number: Option<(ConversationId, Result<signal_backend::SafetyNumber, String>)>,
     pub catching_up: Option<CatchUp>,
     /// Like Desktop, notifications wait until the catch-up is done, and then
     /// only the latest is shown.
@@ -155,6 +157,7 @@ impl AppState {
             notification_setting: Default::default(),
             window_active: true,
             history: None,
+            safety_number: None,
             catching_up: None,
             held_notification: None,
         };
@@ -398,6 +401,7 @@ impl AppState {
                 self.reload_conversations(cx);
             }
             Event::PinsChanged(conversation) => cx.emit(AppEvent::PinsChanged(conversation)),
+            Event::SafetyNumber { conversation, result } => self.safety_number = Some((conversation, result)),
             Event::History(progress) => self.on_history(progress, cx),
             Event::GroupCreated(conversation) => {
                 self.reload_conversations(cx);

@@ -69,6 +69,8 @@ pub enum Action {
     },
     /// Our other device read these incoming messages: `(author, sent_at)`.
     ReadSync(Vec<(String, i64)>),
+    /// Our other device marked a contact's identity key verified (or not).
+    Verified { aci: String, identity_key: Vec<u8>, verified: bool },
     /// Our primary device changed the Storage Service (pins, names, ...).
     StorageChanged,
     /// "Delete for me" on another of our devices: these messages
@@ -548,6 +550,16 @@ fn map_sync(sync: &SyncMessage, envelope_ts: i64, ctx: &MapContext) -> Vec<Actio
         .collect();
     if !reads.is_empty() {
         out.push(Action::ReadSync(reads));
+    }
+    if let Some(sync_message::Content::Verified(v)) = &sync.content
+        && let Some(aci) = parse_aci_with_fallback(v.destination_aci_binary.as_deref(), v.destination_aci.as_deref())
+        && let Some(identity_key) = v.identity_key.clone()
+    {
+        out.push(Action::Verified {
+            aci: aci.service_id_string(),
+            identity_key,
+            verified: v.state() == presage::proto::verified::State::Verified,
+        });
     }
     if let Some(sync_message::Content::DeleteForMe(delete)) = &sync.content {
         let messages: Vec<_> = delete
