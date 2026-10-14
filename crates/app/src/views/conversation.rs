@@ -674,11 +674,8 @@ impl ConversationView {
             Some(c) => c.title.clone(),
             None => String::new(),
         };
-        let subtitle = conversation.and_then(|c| match c.kind {
-            ConversationKind::Direct => c.phone.clone(),
-            ConversationKind::Group => Some("Group".into()),
-            ConversationKind::NoteToSelf => None,
-        });
+        // As Desktop: no phone number; the name opens their details.
+        let subtitle = conversation.and_then(|c| (c.kind == ConversationKind::Group).then(|| "Group".to_owned()));
         let timer = conversation.map(|c| c.expire_timer).unwrap_or(0);
         let color = conversation.map(|c| c.color).unwrap_or(0);
 
@@ -691,19 +688,33 @@ impl ConversationView {
             .px_4()
             .border_b_1()
             .border_color(palette.panel_border)
-            .child(match conversation {
-                Some(c) => conversation_avatar(c, px(32.)),
-                None => avatar(&title, color, px(32.)).into_any_element(),
-            })
             .child(
                 div()
+                    .id("chat-details")
                     .flex()
-                    .flex_col()
+                    .items_center()
+                    .gap_3()
                     .min_w_0()
-                    .child(div().font_weight(FontWeight::SEMIBOLD).truncate().child(title))
-                    .when_some(subtitle, |d, s| {
-                        d.child(div().text_xs().text_color(palette.text_secondary).child(s))
-                    }),
+                    .when_some(conversation.cloned().filter(|c| c.kind != ConversationKind::NoteToSelf), |d, chat| {
+                        let state = self.state.clone();
+                        d.cursor_pointer().on_click(move |_, window, cx| {
+                            crate::views::chat_settings::open(state.clone(), chat.clone(), window, cx);
+                        })
+                    })
+                    .child(match conversation {
+                        Some(c) => conversation_avatar(c, px(32.)),
+                        None => avatar(&title, color, px(32.)).into_any_element(),
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .min_w_0()
+                            .child(div().font_weight(FontWeight::SEMIBOLD).truncate().child(title))
+                            .when_some(subtitle, |d, s| {
+                                d.child(div().text_xs().text_color(palette.text_secondary).child(s))
+                            }),
+                    ),
             )
             .child(div().flex_1())
             .when(timer > 0, |d| {
