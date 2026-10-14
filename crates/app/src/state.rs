@@ -71,6 +71,9 @@ pub enum AppEvent {
     RecipientFound { query: String, result: Result<signal_store::DirectoryEntry, String> },
     /// GIF search results (`Err`: why not).
     Gifs { query: String, offset: u32, result: Result<signal_backend::GifResults, String> },
+    /// Desktop's "Search in chat": the sidebar's search box searches this
+    /// chat.
+    SearchInChat(ConversationId),
     /// Show an image full-window.
     ViewImage(crate::views::image_viewer::ViewedImage),
     /// A link preview the composer asked for (`None`: nothing to show).
@@ -719,6 +722,10 @@ impl AppState {
     }
 
     /// Opens `conversation` scrolled to `message_id`.
+    pub fn search_in_chat(&mut self, conversation: ConversationId, cx: &mut Context<Self>) {
+        cx.emit(AppEvent::SearchInChat(conversation));
+    }
+
     pub fn jump_to(&mut self, conversation: ConversationId, message_id: i64, cx: &mut Context<Self>) {
         self.jump = Some((conversation.clone(), message_id));
         self.select(Some(conversation.clone()), cx);

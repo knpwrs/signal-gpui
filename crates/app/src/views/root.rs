@@ -143,10 +143,12 @@ impl Render for RootView {
                 let search = this.sidebar.read(cx).search_input();
                 search.update(cx, |search, cx| search.focus(window, cx));
             }))
-            .on_action(cx.listener(|this, _: &SearchInChat, window, cx| {
-                if let Some(view) = &this.conversation {
-                    view.update(cx, |view, cx| view.open_search(window, cx));
-                }
+            .on_action(cx.listener(|this, _: &SearchInChat, _, cx| {
+                this.state.update(cx, |state, cx| {
+                    if let Some(chat) = state.selected.clone() {
+                        state.search_in_chat(chat, cx);
+                    }
+                });
             }))
             .on_action(|_: &About, window, cx| crate::views::about::open(window, cx))
             // Available before linking too, where problems are hardest to see.

@@ -57,8 +57,6 @@ pub struct ConversationView {
     loading_newer: bool,
     /// A message just jumped to, highlighted briefly.
     highlight: Option<i64>,
-    /// Desktop's "Search in chat".
-    search: Option<ChatSearch>,
     /// The message whose "⋯" menu is open (its hover buttons stay up).
     menu_open_for: Option<i64>,
     /// Select mode: the chosen messages.
@@ -67,15 +65,6 @@ pub struct ConversationView {
     pins: Vec<Message>,
     pin_index: usize,
     _subscriptions: Vec<Subscription>,
-}
-
-struct ChatSearch {
-    input: Entity<gpui_kit::component::input::InputState>,
-    hits: Vec<signal_store::SearchHit>,
-    /// Hidden after picking a result, shown again on typing.
-    show_results: bool,
-    task: Option<gpui_kit::Task<()>>,
-    _subscription: Subscription,
 }
 
 /// How long a jumped-to message stays highlighted.
@@ -205,7 +194,6 @@ impl ConversationView {
             generation: 0,
             loading_newer: false,
             highlight: None,
-            search: None,
             menu_open_for: None,
             selecting: None,
             pins: Vec::new(),
@@ -538,123 +526,6 @@ impl ConversationView {
         .detach();
     }
 
-    /// Opens (or focuses) "Search in chat".
-    pub fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        use gpui_kit::component::input::{InputEvent, InputState};
-        if self.search.is_none() {
-            let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search in chat"));
-            let subscription = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| {
-                if matches!(event, InputEvent::Change) {
-                    this.run_search(cx);
-                }
-            });
-            self.search = Some(ChatSearch { input, hits: Vec::new(), show_results: true, task: None, _subscription: subscription });
-        }
-        if let Some(search) = &self.search {
-            search.input.update(cx, |input, cx| input.focus(window, cx));
-        }
-        cx.notify();
-    }
-
-    fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.search = None;
-        let handle = self.composer.read(cx).focus_handle(cx);
-        window.focus(&handle, cx);
-        cx.notify();
-    }
-
-    fn run_search(&mut self, cx: &mut Context<Self>) {
-        let Some(search) = &mut self.search else { return };
-        let query = search.input.read(cx).value().to_string();
-        search.show_results = true;
-        if query.trim().chars().count() < 2 {
-            search.hits.clear();
-            search.task = None;
-            cx.notify();
-            return;
-        }
-        let backend = self.state.read(cx).backend.clone();
-        let id = self.id.clone();
-        search.task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(std::time::Duration::from_millis(150)).await;
-            let db = backend.db().clone();
-            let hits = backend.spawn(async move { db.search_conversation(&id, &query, 100).await }).await;
-            let _ = this.update(cx, |this, cx| {
-                if let Some(search) = &mut this.search {
-                    search.hits = hits.unwrap_or_default();
-                }
-                cx.notify();
-            });
-        }));
-    }
-
-    fn render_search(&self, search: &ChatSearch, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        use gpui_kit::component::input::Input;
-        let query_len = search.input.read(cx).value().trim().chars().count();
-        let results = (search.show_results && query_len >= 2).then(|| {
-            // Over the messages below.
-            deferred(div()
-                .id("chat-search-results")
-                .absolute()
-                .top_full()
-                .left_0()
-                .right_0()
-                .max_h(px(360.))
-                .overflow_y_scroll()
-                .bg(palette.popover)
-                .border_b_1()
-                .border_color(palette.panel_border)
-                .shadow_md()
-                .when(search.hits.is_empty(), |d| {
-                    d.child(div().px_4().py_3().text_sm().text_color(palette.text_secondary).child("No results"))
-                })
-                .children(search.hits.iter().map(|hit| {
-                    let message_id = hit.message_id;
-                    div()
-                        .id(SharedString::from(format!("chat-hit-{message_id}")))
-                        .px_4()
-                        .py_2()
-                        .cursor_pointer()
-                        .hover(|d| d.bg(palette.row_hover))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(search) = &mut this.search {
-                                search.show_results = false;
-                            }
-                            this.load_around(message_id, cx);
-                        }))
-                        .child(div().text_xs().text_color(palette.text_secondary).child(crate::views::common::short_timestamp(hit.sent_at)))
-                        .child(crate::views::sidebar::snippet(&hit.snippet, palette))
-                })))
-            .with_priority(1)
-        });
-        div()
-            .relative()
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_4()
-            .py_2()
-            .border_b_1()
-            .border_color(palette.panel_border)
-            .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
-                if event.keystroke.key == "escape" {
-                    this.close_search(window, cx);
-                    cx.stop_propagation();
-                }
-            }))
-            .child(Icon::new(IconName::Search).size_4().text_color(palette.text_secondary))
-            .child(div().flex_1().child(Input::new(&search.input).appearance(false)))
-            .child(
-                div()
-                    .id("chat-search-close")
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _, window, cx| this.close_search(window, cx)))
-                    .child(Icon::new(IconName::X).size_4().text_color(palette.text_secondary)),
-            )
-            .children(results)
-    }
-
     fn load_older(&mut self, cx: &mut Context<Self>) {
         if self.loading_older || !self.has_more || self.messages.is_empty() {
             return;
@@ -854,7 +725,10 @@ impl ConversationView {
                         .ghost()
                         .icon(IconName::Search)
                         .tooltip("Search in chat")
-                        .on_click(cx.listener(|this, _, window, cx| this.open_search(window, cx))),
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let chat = this.id.clone();
+                            this.state.update(cx, |state, cx| state.search_in_chat(chat, cx));
+                        })),
                 )
                 .child(self.render_menu_button(cx))
             })
@@ -2444,10 +2318,6 @@ impl Render for ConversationView {
             .text_color(palette.text)
             .child(self.render_header(palette, cx))
             .children(self.render_pins(palette, cx))
-            .map(|d| match &self.search {
-                Some(search) => d.child(self.render_search(search, palette, cx)),
-                None => d,
-            })
             .child(
                 div()
                     .relative()

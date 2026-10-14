@@ -346,6 +346,9 @@ pub struct SearchHit {
     pub sent_at: i64,
     /// Body with matches wrapped in `\u{2}` … `\u{3}` markers.
     pub snippet: String,
+    /// Who sent it: `None` for us.
+    pub author: Option<String>,
+    pub author_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1866,7 +1869,7 @@ impl AppDb {
             return Ok(Vec::new());
         };
         let rows = sqlx::query(
-            "SELECT m.id, m.conversation_id, m.sent_at, \
+            "SELECT m.id, m.conversation_id, m.sent_at, m.author, m.author_name, \
                 snippet(messages_fts, 0, char(2), char(3), '…', 12) AS snippet \
              FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid \
              WHERE messages_fts MATCH ?1 AND m.deleted = 0 AND (?2 IS NULL OR m.conversation_id = ?2) \
@@ -1884,6 +1887,8 @@ impl AppDb {
                     conversation_id: ConversationId(r.try_get("conversation_id")?),
                     sent_at: r.try_get("sent_at")?,
                     snippet: r.try_get("snippet")?,
+                    author: r.try_get("author")?,
+                    author_name: r.try_get("author_name")?,
                 })
             })
             .collect()

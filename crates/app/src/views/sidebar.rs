@@ -80,7 +80,17 @@ pub struct Sidebar {
     archive_open: bool,
     /// The kind of item at each position when the list was last laid out.
     layout_key: Vec<u8>,
+    /// Desktop's "Search in chat": the search box searches this chat only.
+    chat_search: Option<ChatSearch>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// The search box while it's searching one chat. It has its own input, for
+/// its "Search chat" placeholder.
+struct ChatSearch {
+    conversation: ConversationId,
+    input: Entity<InputState>,
+    _subscription: Subscription,
 }
 
 impl Sidebar {
@@ -107,8 +117,14 @@ impl Sidebar {
                         }
                     }
                 }
+                AppEvent::SearchInChat(conversation) => this.search_in_chat(conversation.clone(), window, cx),
                 AppEvent::ConversationsChanged | AppEvent::SelectionChanged | AppEvent::TypingChanged { .. } => {
                     if let AppEvent::SelectionChanged = event {
+                        // Searching another chat ends when you leave it.
+                        let selected = this.state.read(cx).selected.clone();
+                        if this.chat_search.as_ref().is_some_and(|s| Some(&s.conversation) != selected.as_ref()) {
+                            this.end_chat_search(window, cx);
+                        }
                         this.scroll_to_selected(cx);
                     }
                     cx.notify()
@@ -137,12 +153,17 @@ impl Sidebar {
             items: Rc::default(),
             archive_open: false,
             layout_key: Vec::new(),
+            chat_search: None,
             _subscriptions: subscriptions,
         }
     }
 
+    /// The search box in use: the chat search's while there is one.
     pub fn search_input(&self) -> Entity<InputState> {
-        self.search.clone()
+        match &self.chat_search {
+            Some(search) => search.input.clone(),
+            None => self.search.clone(),
+        }
     }
 
     /// A new query: search again, from the top of the list (a long list
@@ -154,6 +175,34 @@ impl Sidebar {
         self.query = query;
         self.run_search(cx);
         cx.notify();
+    }
+
+    /// Desktop's "Search in chat": the search box searches `conversation`.
+    pub fn search_in_chat(&mut self, conversation: ConversationId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.chat_search.as_ref().is_none_or(|s| s.conversation != conversation) {
+            let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search chat"));
+            let subscription = cx.subscribe_in(&input, window, |this, input, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.set_query(input.read(cx).value().trim().to_owned(), cx);
+                }
+            });
+            self.chat_search = Some(ChatSearch { conversation, input, _subscription: subscription });
+            self.set_query(String::new(), cx);
+        }
+        if let Some(search) = &self.chat_search {
+            search.input.update(cx, |input, cx| input.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Back to searching everything (with whatever the main box holds).
+    fn end_chat_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.chat_search.take().is_none() {
+            return;
+        }
+        let query = self.search.read(cx).value().trim().to_owned();
+        self.set_query(query, cx);
+        self.search.update(cx, |input, cx| input.focus(window, cx));
     }
 
     fn scroll_to_selected(&self, cx: &App) {
@@ -180,9 +229,15 @@ impl Sidebar {
         if self.archive_open && state.archived.is_empty() {
             self.archive_open = false;
         }
-        let conversations = self.visible_conversations(cx);
+        let conversations = if self.chat_search.is_some() && !self.query.is_empty() {
+            Vec::new()
+        } else {
+            self.visible_conversations(cx)
+        };
         let pinned = conversations.iter().take_while(|c| c.pinned).count();
         let inbox = self.query.is_empty() && !self.archive_open;
+        // Searching one chat lists only its messages (the hits, below).
+        let chat_search = self.chat_search.is_some() && !self.query.is_empty();
         let sections = inbox && pinned > 0;
         let archived = if inbox { state.archived.len() } else { 0 };
         let mut items = Vec::with_capacity(conversations.len() + 2);
@@ -201,7 +256,7 @@ impl Sidebar {
         }
         // Searching also finds contacts and groups without a chat, and offers
         // to look up a username or phone number, as Desktop does.
-        if !self.query.is_empty() && !self.archive_open {
+        if !self.query.is_empty() && !self.archive_open && !chat_search {
             let (groups, contacts): (Vec<_>, Vec<_>) =
                 self.directory_hits.iter().cloned().partition(|e| e.kind == ConversationKind::Group);
             if !items.is_empty() && (!contacts.is_empty() || !groups.is_empty()) {
@@ -303,11 +358,18 @@ impl Sidebar {
         }
         let backend = self.state.read(cx).backend.clone();
         let query = self.query.clone();
+        let scope = self.chat_search.as_ref().map(|s| s.conversation.clone());
         self.search_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SEARCH_DEBOUNCE).await;
             let db = backend.db().clone();
             let found = backend
-                .spawn(async move { Ok::<_, signal_store::Error>((db.search_messages(&query, 50).await?, db.search_directory(&query, 20).await?)) })
+                .spawn(async move {
+                    Ok::<_, signal_store::Error>(match scope {
+                        // One chat: its messages only.
+                        Some(chat) => (db.search_conversation(&chat, &query, 100).await?, Vec::new()),
+                        None => (db.search_messages(&query, 50).await?, db.search_directory(&query, 20).await?),
+                    })
+                })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 let (hits, directory) = found.unwrap_or_default();
@@ -548,11 +610,16 @@ impl Sidebar {
                     .text_color(palette.text_secondary)
                     .child("MESSAGES"),
             )
-            .children(self.hits.iter().take(20).map(|hit| {
-                let title = state
-                    .conversation(&hit.conversation_id)
-                    .map(|c| c.title.clone())
-                    .unwrap_or_default();
+            .children(self.hits.iter().take(if self.chat_search.is_some() { 100 } else { 20 }).map(|hit| {
+                // In one chat, who said it; across chats, which chat.
+                let title = if self.chat_search.is_some() {
+                    match &hit.author {
+                        None => "You".to_owned(),
+                        Some(_) => hit.author_name.clone().unwrap_or_else(|| "Unknown".into()),
+                    }
+                } else {
+                    state.conversation(&hit.conversation_id).map(|c| c.title.clone()).unwrap_or_default()
+                };
                 let id = hit.conversation_id.clone();
                 let message_id = hit.message_id;
                 div()
@@ -709,10 +776,46 @@ impl Render for Sidebar {
                     .px_3()
                     .pb_2()
                     .child(
-                        Input::new(&self.search)
-                            .cleanable(true)
-                            .prefix(Icon::new(IconName::Search).size_4().text_color(palette.text_secondary)),
-                    ),
+                        match &self.chat_search {
+                            // Desktop's look: the chat's avatar and an ✕ that
+                            // goes back to searching everything.
+                            Some(search) => {
+                                let chat = state.conversation(&search.conversation).cloned();
+                                Input::new(&search.input)
+                                    .cleanable(true)
+                                    .prefix(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .children(chat.map(|c| conversation_avatar(&c, px(20.))))
+                                            .child(
+                                                div()
+                                                    .id("end-chat-search")
+                                                    .cursor_pointer()
+                                                    .on_click(cx.listener(|this, _, window, cx| this.end_chat_search(window, cx)))
+                                                    .child(Icon::new(IconName::X).size_4().text_color(palette.text_secondary)),
+                                            ),
+                                    )
+                                    .into_any_element()
+                            }
+                            None => Input::new(&self.search)
+                                .cleanable(true)
+                                .prefix(Icon::new(IconName::Search).size_4().text_color(palette.text_secondary))
+                                .into_any_element(),
+                        },
+                    )
+                    // Backspace in an empty "Search chat", or Escape, searches
+                    // everything again.
+                    .capture_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
+                        let Some(search) = &this.chat_search else { return };
+                        let empty = search.input.read(cx).value().is_empty();
+                        let key = event.keystroke.key.as_str();
+                        if key == "escape" || (key == "backspace" && empty) {
+                            cx.stop_propagation();
+                            this.end_chat_search(window, cx);
+                        }
+                    })),
             )
             .when_some(banner, |d, (text, icon)| {
                 d.child(
@@ -750,7 +853,10 @@ impl Render for Sidebar {
                         .p_4()
                         .text_sm()
                         .text_color(palette.text_secondary)
-                        .child(format!("No results for \"{}\"", self.query)),
+                        .child(match self.chat_search.as_ref().and_then(|s| state.conversation(&s.conversation)) {
+                            Some(chat) => format!("No results for \"{}\" in {}", self.query, chat.title),
+                            None => format!("No results for \"{}\"", self.query),
+                        }),
                 )
             })
             .when(searching && !self.hits.is_empty(), |d| {
@@ -911,6 +1017,63 @@ mod tests {
         }
         assert_eq!(state.read_with(&cx, |s, _| s.selected.clone()), Some(dana));
         assert!(sidebar.read_with(&cx, |s, _| s.query.is_empty()));
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn searching_one_chat_lists_its_messages_by_sender(cx: &mut TestAppContext) {
+        use gpui_kit::VisualTestContext;
+        cx.update(gpui_kit::init);
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config { data_dir: dir.path().to_owned(), db_key: [7; 32], device_name: "test".into(), demo: true };
+        let (backend, _events) = Backend::start(config).unwrap();
+        let state = cx.update(|cx| crate::state::new_state(backend.clone(), cx));
+        let (window, sidebar) = cx.update(|cx| {
+            let state = state.clone();
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| cx.new(|cx| Sidebar::new(state, window, cx)))
+                .unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window, cx);
+        let hikes = ConversationId("g:0000000000000000000000000000000000000000000000000000000000000001".into());
+        sidebar.update_in(&mut cx, |sidebar, window, cx| sidebar.search_in_chat(hikes.clone(), window, cx));
+        // "ridge" is in the hiking group (twice) and nowhere else.
+        let mut hits = Vec::new();
+        for attempt in 0..300 {
+            // Again now and then: the demo seeds in the background.
+            if attempt % 50 == 0 {
+                sidebar.update_in(&mut cx, |sidebar, window, cx| {
+                    let input = sidebar.search_input();
+                    input.update(cx, |input, cx| input.set_value("ridge", window, cx));
+                    sidebar.set_query("ridge".into(), cx);
+                });
+            }
+            cx.executor().advance_clock(SEARCH_DEBOUNCE * 2);
+            cx.run_until_parked();
+            hits = sidebar.read_with(&cx, |s, _| s.hits.clone());
+            if hits.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(hits.len() >= 2, "{hits:?}");
+        assert!(hits.iter().all(|h| h.conversation_id == hikes));
+        assert!(hits.iter().any(|h| h.author.is_none()), "ours: shown as You");
+        assert!(hits.iter().any(|h| h.author_name.as_deref() == Some("Maya Chen")));
+        // No chats or contacts while searching one chat.
+        assert!(sidebar.read_with(&cx, |s, _| s.items.is_empty()));
+
+        // Backspace in the empty box searches everything again.
+        sidebar.update_in(&mut cx, |sidebar, window, cx| {
+            let input = sidebar.search_input();
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+            sidebar.set_query(String::new(), cx);
+        });
+        let input = sidebar.read_with(&cx, |s, _| s.search_input());
+        cx.update(|window, cx| window.focus(&input.focus_handle(cx), cx));
+        cx.simulate_keystrokes("backspace");
+        cx.run_until_parked();
+        assert!(sidebar.read_with(&cx, |s, _| s.chat_search.is_none()));
         backend.shutdown();
     }
 
