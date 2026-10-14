@@ -17,6 +17,7 @@ A native Signal Desktop client built on [GPUI](https://gpui-kit.com) (via `gpui-
 
 Things this client does that Signal Desktop doesn't:
 
+- **Less memory.** In one Activity Monitor spot check (Memory column, same account, both apps open), Signal GPUI used 121 MB. Signal Desktop's six processes (main, renderer and four helpers) used 1,038 MB, so that's about 12%. Adding the 11 MB AutoFill process macOS starts for our text fields makes it 132 MB, about 13%. Signal Desktop runs on Electron; this is one native process.
 - **Lossless image optimization.** Images you send are shrunk without changing a pixel: PNG with [oxipng](https://github.com/shssoichiro/oxipng) at its maximum preset, JPEG with mozjpeg's lossless transcode (optimized Huffman tables, searched progressive scans). Signal Desktop re-encodes images lossily instead. Settings → Images picks Maximum (default), Fast or Off. Every level removes metadata such as location while keeping the colour profile and rotation.
 - **Reply from a notification.** New-message notifications have a reply field and Mark as Read; Signal Desktop's notifications only open the chat. They follow Desktop otherwise: grouped per chat, none for the chat you're looking at, none for muted chats unless you're mentioned, and taken down once the chat is read (here or on another device). Settings → Notifications picks name and message, name only, no name or content, or off. The Dock shows your unread count.
 - **Any pasted image.** TIFF and BMP (which macOS often puts on the clipboard) are converted to PNG losslessly before sending.
