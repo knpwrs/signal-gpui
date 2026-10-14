@@ -859,6 +859,12 @@ impl AppDb {
     }
 
     /// `(service id, photo path)` for everyone with a downloaded photo.
+    /// They have no profile photo (anymore).
+    pub async fn remove_person_avatar(&self, service_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM person_avatars WHERE service_id = ?").bind(service_id).execute(&self.pool).await?;
+        Ok(())
+    }
+
     pub async fn person_avatars(&self) -> Result<Vec<(String, String)>> {
         Ok(sqlx::query_as("SELECT service_id, path FROM person_avatars").fetch_all(&self.pool).await?)
     }

@@ -18,6 +18,7 @@ mod storage;
 mod groups;
 mod history;
 mod safety;
+mod profiles;
 pub mod media;
 pub mod link_preview;
 pub mod debug_log;

@@ -50,6 +50,12 @@ pub(crate) type SignalManager = Manager<SqliteStore, Registered>;
 /// Images up to this size are downloaded as soon as they arrive.
 /// "1" while the history transfer after linking hasn't finished.
 const SETTING_HISTORY_PENDING: &str = "history.pending";
+/// `avatar.checked.<service id>`: when we last fetched their profile for
+/// its photo (unix millis).
+const SETTING_AVATAR_CHECKED: &str = "avatar.checked.";
+const AVATAR_CHECK_INTERVAL_MS: i64 = 24 * 60 * 60 * 1000;
+const AVATAR_CHECKS_PER_SYNC: usize = 100;
+const AVATAR_BATCH_DELAY: Duration = Duration::from_secs(5 * 60);
 /// Read syncs kept for messages not here yet.
 const MAX_EARLY_READS: usize = 1000;
 /// `verified.<ACI>`: the identity key (hex) we marked verified for them;
@@ -133,6 +139,8 @@ struct Actor {
     /// Read syncs that arrived before their message, `(author, sent_at)`,
     /// applied when it does (as Desktop keeps them). Newest last.
     early_reads: RefCell<std::collections::VecDeque<(String, i64)>>,
+    /// A later batch of profile photo checks is scheduled.
+    avatar_batch_pending: std::cell::Cell<bool>,
     /// The history transfer after linking, while it can still be skipped
     /// (taken once the import starts).
     history: RefCell<Option<tokio::task::JoinHandle<()>>>,
@@ -182,6 +190,7 @@ pub(crate) async fn run(
         profile_fetches: RefCell::default(),
         receiver: RefCell::new(None),
         early_reads: RefCell::default(),
+        avatar_batch_pending: std::cell::Cell::new(false),
         history: RefCell::new(None),
         outbound,
         linking: RefCell::new(false),
@@ -1737,60 +1746,149 @@ impl Actor {
         }
     }
 
-    /// Downloads profile and group photos for conversations that lack one.
-    /// They are decrypted into `avatars/`, like attachments.
-    async fn sync_avatars(self: &Rc<Self>, mut manager: SignalManager) {
+    /// Brings group and profile photos up to date. They are decrypted into
+    /// `avatars/`, like attachments.
+    async fn sync_avatars(self: &Rc<Self>, manager: SignalManager) {
         let dir = self.config.data_dir.join("avatars");
         if let Err(error) = std::fs::create_dir_all(&dir) {
             warn!(%error, "failed to create avatars directory");
             return;
         }
-        let conversations = self.db.conversations().await.unwrap_or_default();
+        let mut conversations = self.db.conversations().await.unwrap_or_default();
+        conversations.extend(self.db.archived_conversations().await.unwrap_or_default());
         let mut changed = false;
-        for conversation in conversations {
-            // Groups are checked every time: their photo can change.
-            if conversation.kind == ConversationKind::Group {
-                if let Some(key) = conversation.id.as_group().and_then(|k| <[u8; 32]>::try_from(k).ok()) {
-                    changed |= self.refresh_group_avatar(&manager, key, false).await;
-                }
-                continue;
-            }
-            if conversation.avatar_path.as_ref().is_some_and(|p| std::path::Path::new(p).exists()) {
-                continue;
-            }
-            let bytes = match conversation.kind {
-                ConversationKind::Group => continue,
-                ConversationKind::Direct => {
-                    let Some(aci) = conversation.id.as_direct().and_then(Aci::parse_from_service_id_string) else {
-                        continue;
-                    };
-                    let Ok(Some(key)) = self.store.profile_key(&ServiceId::from(aci)).await else { continue };
-                    manager.retrieve_profile_avatar_by_uuid(aci.into(), key).await
-                }
-                ConversationKind::NoteToSelf => continue,
-            };
-            let bytes = match bytes {
-                Ok(Some(bytes)) if !bytes.is_empty() => bytes,
-                Ok(_) => continue,
-                Err(error) => {
-                    debug!(%error, conversation = %conversation.id.0, "avatar download failed");
-                    continue;
-                }
-            };
-            let ext = if bytes.starts_with(b"\x89PNG") { "png" } else { "jpg" };
-            let path = dir.join(format!("{}.{ext}", conversation.id.0.replace(':', "-")));
-            if let Err(error) = std::fs::write(&path, &bytes) {
-                warn!(%error, "failed to save avatar");
-                continue;
-            }
-            if self.db.set_avatar(&conversation.id, path.to_str()).await.is_ok() {
-                changed = true;
+        // Groups are checked every time: a group's copy is local, so it's cheap.
+        for conversation in &conversations {
+            if let Some(key) = conversation.id.as_group().and_then(|k| <[u8; 32]>::try_from(k).ok()) {
+                changed |= self.refresh_group_avatar(&manager, key, false).await;
             }
         }
-        changed |= self.sync_member_avatars(&mut manager, &dir).await;
-        if changed {
+        let (people_changed, more) = self.sync_person_avatars(&manager, &conversations, &dir).await;
+        if changed || people_changed {
             self.emit(Event::ConversationsChanged);
         }
+        // The next batch of profile photos, a little later (after linking,
+        // most everyone's is missing).
+        if more && !self.avatar_batch_pending.replace(true) {
+            let this = self.clone();
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(AVATAR_BATCH_DELAY).await;
+                this.avatar_batch_pending.set(false);
+                if let Some(manager) = this.manager() {
+                    Box::pin(this.sync_avatars(manager)).await;
+                }
+            });
+        }
+    }
+
+    /// Profile photos of everyone shown with one: 1:1 contacts and group
+    /// members. Each check is a profile fetch, so, like Desktop's routine
+    /// profile refresh, a person is checked at most daily and a sync makes
+    /// at most `AVATAR_CHECKS_PER_SYNC` checks: missing photos first, then
+    /// the longest unchecked. Returns whether anything changed and whether
+    /// more are due (for another sync soon).
+    async fn sync_person_avatars(
+        &self,
+        manager: &SignalManager,
+        conversations: &[signal_store::Conversation],
+        dir: &std::path::Path,
+    ) -> (bool, bool) {
+        let saved: HashMap<String, String> = self.db.person_avatars().await.unwrap_or_default().into_iter().collect();
+        let me = self.self_aci();
+        let mut people = std::collections::BTreeSet::new();
+        for conversation in conversations {
+            match conversation.kind {
+                ConversationKind::Direct => people.extend(conversation.id.as_direct().map(str::to_owned)),
+                ConversationKind::Group => people.extend(conversation.members.iter().cloned()),
+                ConversationKind::NoteToSelf => {}
+            }
+        }
+        people.remove(&me);
+        let now = now_millis();
+        let mut due = Vec::new();
+        for sid in people {
+            let has = saved.get(&sid).is_some_and(|p| std::path::Path::new(p).exists());
+            let checked: i64 = self
+                .db
+                .setting(&format!("{SETTING_AVATAR_CHECKED}{sid}"))
+                .await
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            if now - checked >= AVATAR_CHECK_INTERVAL_MS {
+                due.push((has, checked, sid));
+            }
+        }
+        due.sort();
+        let more = due.len() > AVATAR_CHECKS_PER_SYNC;
+        let mut changed = false;
+        for (_, _, sid) in due.into_iter().take(AVATAR_CHECKS_PER_SYNC) {
+            changed |= self.refresh_person_avatar(manager, &sid, saved.get(&sid).map(String::as_str), dir).await;
+        }
+        (changed, more)
+    }
+
+    /// Fetches their profile and brings their photo up to date: downloaded
+    /// when its avatar path differs from the one saved, removed when they
+    /// have none. Kept for their 1:1 chat and wherever they appear.
+    async fn refresh_person_avatar(&self, manager: &SignalManager, sid: &str, saved: Option<&str>, dir: &std::path::Path) -> bool {
+        let Some(aci) = Aci::parse_from_service_id_string(sid) else { return false };
+        // Someone known only from a group has their key in the group.
+        let Some(key) = self.profile_key_of(&ServiceId::from(aci)).await else { return false };
+        // Failures count as a check too, so a profile we can't read (or a
+        // rate limit) isn't asked for again until tomorrow.
+        let _ = self.db.set_setting(&format!("{SETTING_AVATAR_CHECKED}{sid}"), &now_millis().to_string()).await;
+        let path = match crate::profiles::avatar_path(manager, aci, key).await {
+            Ok(path) => path,
+            Err(error) => {
+                debug!(error = %format!("{error:#}"), member = %sid, "profile fetch failed");
+                return false;
+            }
+        };
+        let chat = ConversationId::direct(sid);
+        let Some(path) = path else {
+            // No photo: drop ours, and their chat's (which can predate ours).
+            let chat_had = self.db.conversation(&chat).await.ok().flatten().and_then(|c| c.avatar_path);
+            if saved.is_none() && chat_had.is_none() {
+                return false;
+            }
+            for old in saved.into_iter().chain(chat_had.as_deref()) {
+                let _ = std::fs::remove_file(old);
+            }
+            let _ = self.db.remove_person_avatar(sid).await;
+            let _ = self.db.set_avatar(&chat, None).await;
+            return true;
+        };
+        let stem = crate::profiles::file_stem(sid, &path);
+        let current = saved.map(std::path::Path::new).filter(|p| p.exists());
+        if let Some(current) = current.filter(|p| p.file_stem().is_some_and(|s| s == stem.as_str())) {
+            // Saved while they were only in a group: their 1:1 chat gets it too.
+            let chat_has = self.db.conversation(&chat).await.ok().flatten().map(|c| c.avatar_path);
+            if let Some(None) = chat_has {
+                return self.db.set_avatar(&chat, current.to_str()).await.is_ok();
+            }
+            return false;
+        }
+        let bytes = match crate::profiles::download_avatar(manager, &path, key).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                debug!(error = %format!("{error:#}"), member = %sid, "profile photo download failed");
+                return false;
+            }
+        };
+        let ext = if bytes.starts_with(b"\x89PNG") { "png" } else { "jpg" };
+        let file = dir.join(format!("{stem}.{ext}"));
+        if let Err(error) = std::fs::write(&file, &bytes) {
+            warn!(%error, "failed to save avatar");
+            return false;
+        }
+        let Some(file) = file.to_str() else { return false };
+        if let Some(old) = current.filter(|old| *old != std::path::Path::new(file)) {
+            let _ = std::fs::remove_file(old);
+        }
+        let _ = self.db.set_avatar(&chat, Some(file)).await;
+        self.db.set_person_avatar(sid, file).await.is_ok()
     }
 
     /// Brings a group's photo up to date: downloaded when the group's avatar
@@ -1849,48 +1947,6 @@ impl Actor {
             let _ = std::fs::remove_file(old);
         }
         self.db.set_avatar(&conversation, file.to_str()).await.is_ok()
-    }
-
-    /// Profile photos of everyone shown in a chat: 1:1 contacts (copied from
-    /// their chats) and group members, who may have no 1:1 chat.
-    async fn sync_member_avatars(&self, manager: &mut SignalManager, dir: &std::path::Path) -> bool {
-        let known: std::collections::HashMap<String, String> =
-            self.db.person_avatars().await.unwrap_or_default().into_iter().collect();
-        let have = |sid: &str| known.get(sid).is_some_and(|p| std::path::Path::new(p).exists());
-        let conversations = self.db.conversations().await.unwrap_or_default();
-        let mut changed = false;
-        let mut members = std::collections::BTreeSet::new();
-        for conversation in &conversations {
-            match (conversation.id.as_direct(), &conversation.avatar_path) {
-                (Some(sid), Some(path)) if !have(sid) => {
-                    changed |= self.db.set_person_avatar(sid, path).await.is_ok();
-                }
-                _ => members.extend(conversation.members.iter().cloned()),
-            }
-        }
-        let me = self.self_aci();
-        for sid in members.into_iter().filter(|sid| *sid != me && !have(sid)) {
-            let Some(aci) = Aci::parse_from_service_id_string(&sid) else { continue };
-            let Ok(Some(key)) = self.store.profile_key(&ServiceId::from(aci)).await else { continue };
-            let bytes = match manager.retrieve_profile_avatar_by_uuid(aci.into(), key).await {
-                Ok(Some(bytes)) if !bytes.is_empty() => bytes,
-                Ok(_) => continue,
-                Err(error) => {
-                    debug!(%error, member = %sid, "member avatar download failed");
-                    continue;
-                }
-            };
-            let ext = if bytes.starts_with(b"\x89PNG") { "png" } else { "jpg" };
-            let path = dir.join(format!("d-{sid}.{ext}"));
-            if let Err(error) = std::fs::write(&path, &bytes) {
-                warn!(%error, "failed to save avatar");
-                continue;
-            }
-            if let Some(path) = path.to_str() {
-                changed |= self.db.set_person_avatar(&sid, path).await.is_ok();
-            }
-        }
-        changed
     }
 
     async fn title_for(self: &Rc<Self>, conversation: &ConversationId) -> Option<ConversationUpdate> {
