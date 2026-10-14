@@ -121,7 +121,7 @@ Deleting works as in Signal Desktop:
 
 ## Message history when linking
 
-Like Signal Desktop's "link and sync", the link QR code asks your phone to send your message history (`capabilities=backup5`). After linking, the app waits for the phone to upload it (up to an hour), downloads it, checks and decrypts it with the one-time key from linking, and imports your chats: names, archived, muted, pinned and unread state, timers, and messages with their quotes, reactions, mentions, pins and read state. Messages that have already disappeared are skipped. Attachments come over as their details only; downloading their files isn't done yet. The chat list shows how it's going, and if the app quits partway it carries on next time.
+Like Signal Desktop's "link and sync", the link QR code asks your phone to send your message history (`capabilities=backup5`). After linking, the app waits for the phone to upload it (up to an hour), downloads it, checks and decrypts it with the one-time key from linking, and imports your chats: names, archived, muted, pinned and unread state, timers, and messages with their quotes, reactions, mentions, pins and read state. Messages that have already disappeared are skipped, and an edited message keeps its edit history's timestamps. Attachments still on Signal's transit tier (where the phone puts them for the transfer, for a limited time) download from there: photos and GIFs right after the import, other files when you open them. Sticker packs installed on the phone are installed here too. The chat list shows how it's going, and if the app quits partway it carries on next time.
 
 ## Finding people
 

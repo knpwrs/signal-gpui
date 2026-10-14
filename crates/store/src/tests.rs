@@ -198,6 +198,7 @@ async fn delete_edit_attachments_and_search() {
         local_path: None,
         sticker: false,
         gif: false,
+        remote: None,
     }];
     m.quote = Some(Quote { author: None, author_name: "You".into(), sent_at: 0, text: "q".into(), thumbnail: None });
     let id = db.insert_message(&m).await.unwrap();
@@ -259,6 +260,7 @@ async fn attachment_only_preview() {
         local_path: None,
         sticker: false,
         gif: false,
+        remote: None,
     }];
     db.insert_message(&m).await.unwrap();
     assert_eq!(
@@ -688,6 +690,7 @@ async fn media_messages_are_those_with_attachments_or_previews() {
         local_path: Some("/tmp/x.png".into()),
         sticker: false,
         gif: false,
+        remote: None,
     }];
     let photo = db.insert_message(&photo).await.unwrap();
     let media: Vec<i64> = db.media_messages(&conv("d:a"), 10).await.unwrap().iter().map(|m| m.id).collect();

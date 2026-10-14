@@ -172,6 +172,7 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
             local_path: path.to_str().map(Into::into),
             sticker: false,
             gif: false,
+            remote: None,
         })
     };
     let photo = image("demo-photo.png", PHOTO_WIDTH, PHOTO_HEIGHT);
@@ -280,6 +281,7 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
             local_path: clip.to_str().map(Into::into),
             sticker: false,
             gif: true,
+            remote: None,
         }];
         db.insert_message(&gif).await?;
     }
@@ -493,6 +495,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                             local_path: path.to_str().map(Into::into),
                             sticker: false,
                             gif: false,
+                            remote: None,
                         })
                     });
                     LinkPreview { url: draft.url, title: Some(draft.title), description: draft.description, date: draft.date, image }
@@ -728,6 +731,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                         local_path: path.to_str().map(Into::into),
                         sticker: false,
                         gif: true,
+                        remote: None,
                     }],
                     link_preview: None,
                     expires_in: 0,
@@ -758,6 +762,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                         local_path: sticker.path.to_str().map(Into::into),
                         sticker: true,
                         gif: false,
+                        remote: None,
                     }],
                     link_preview: None,
                     expires_in: 0,
@@ -803,6 +808,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                         local_path: path.to_str().map(Into::into),
                         sticker: false,
                         gif: false,
+                        remote: None,
                     });
                 }
                 if attachments.is_empty() {

@@ -147,6 +147,25 @@ pub struct AttachmentMeta {
     /// A looping, silent video sent as a GIF (Signal's GIF flag).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub gif: bool,
+    /// Where to download it when no stored message holds its pointer (an
+    /// attachment from transferred history).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteAttachment>,
+}
+
+/// An attachment on Signal's transit CDN: enough to download and check it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RemoteAttachment {
+    pub cdn: u32,
+    pub cdn_key: String,
+    /// The 64-byte AES and HMAC key, hex.
+    pub key: String,
+    /// SHA-256 of the encrypted file, hex, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    /// SHA-256 of the decrypted file, hex, when that's what's known instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plaintext_hash: Option<String>,
 }
 
 /// A message as rendered in the timeline.

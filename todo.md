@@ -52,11 +52,10 @@ flag as on whenever it's set.
 
 ## Attachments in transferred history
 
-Link and sync imports messages, but each attachment arrives as its details
-only (type, name, size). Desktop then downloads them from the transit tier
-(`FilePointer.locatorInfo`: CDN number, key, digest) in the background. That
-needs the locator stored with each imported attachment and a download path
-that doesn't go through a received message.
+Done for the transit tier (`FilePointer.locatorInfo`: CDN number, key, and
+digest or plaintext hash), which is what the phone fills for link and sync.
+Attachments only in the backup (media) tier need backup-tier credentials
+and aren't downloaded.
 
 ## Admin delete
 

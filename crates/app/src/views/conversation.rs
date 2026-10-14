@@ -2976,6 +2976,7 @@ mod tests {
                 local_path: Some("/tmp/x.png".into()),
                 sticker: false,
                 gif: false,
+                remote: None,
             }),
         };
         assert_eq!(full_size_preview_image(&preview(1200, 630)).map(|f| f.1), Some((300., 157.5)));

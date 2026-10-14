@@ -19,7 +19,7 @@ use presage::libsignal_service::protocol::Aci;
 use protobuf::Message as _;
 use signal_store::{
     AppDb, AttachmentMeta, ChatState, ConversationId, ConversationKind, ConversationUpdate, DeliveryStatus, Direction,
-    LinkPreview, NewMessage, Quote, Reaction,
+    LinkPreview, NewMessage, Quote, Reaction, RemoteAttachment,
 };
 
 /// What the phone did with the history transfer.
@@ -98,6 +98,46 @@ pub(crate) async fn download(
     Ok(data)
 }
 
+/// Downloads a transferred attachment from the transit tier, checks it
+/// against its digest or plaintext hash, and decrypts it. `size` (when
+/// known) trims the padding.
+pub(crate) async fn download_attachment(
+    manager: &crate::actor::SignalManager,
+    remote: &RemoteAttachment,
+    size: u64,
+) -> anyhow::Result<Vec<u8>> {
+    use presage::libsignal_service::configuration::Endpoint;
+    use presage::libsignal_service::push_service::HttpAuthOverride;
+    use sha2::Digest as _;
+    let key: [u8; 64] = hex::decode(&remote.key)?.try_into().map_err(|_| anyhow!("bad attachment key"))?;
+    let service = crate::storage::push_service(manager)?;
+    let path = format!("attachments/{}", remote.cdn_key);
+    let response = service.request(reqwest::Method::GET, Endpoint::cdn(remote.cdn, path), HttpAuthOverride::Unidentified)?.send().await?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        bail!("it's no longer on Signal's servers");
+    }
+    let mut data = response.error_for_status()?.bytes().await?.to_vec();
+    if let Some(digest) = &remote.digest
+        && sha2::Sha256::digest(&data).as_slice() != hex::decode(digest)?.as_slice()
+    {
+        bail!("the download doesn't match its digest");
+    }
+    let mut data = tokio::task::spawn_blocking(move || {
+        presage::libsignal_service::attachment_cipher::decrypt_in_place(key, &mut data).map(|()| data)
+    })
+    .await?
+    .map_err(|e| anyhow!("can't decrypt the attachment: {e:?}"))?;
+    if size > 0 && (size as usize) < data.len() {
+        data.truncate(size as usize);
+    }
+    if let Some(hash) = &remote.plaintext_hash
+        && sha2::Sha256::digest(&data).as_slice() != hex::decode(hash)?.as_slice()
+    {
+        bail!("the download doesn't match its hash");
+    }
+    Ok(data)
+}
+
 /// Verifies, decrypts and decompresses a transferred backup.
 pub(crate) fn decrypt(mut data: Vec<u8>, ephemeral_key: [u8; 32], aci: Aci) -> anyhow::Result<Vec<u8>> {
     use libsignal_account_keys::BackupKey;
@@ -151,6 +191,11 @@ fn delimited(mut bytes: &[u8]) -> impl Iterator<Item = anyhow::Result<&[u8]>> {
 pub(crate) struct Imported {
     pub chats: usize,
     pub messages: usize,
+    /// Photos and GIFs to download now, as `(message id, attachment index)`;
+    /// other files wait to be opened.
+    pub downloads: Vec<(i64, usize)>,
+    /// Installed sticker packs: `(pack id, pack key)`.
+    pub sticker_packs: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 enum Who {
@@ -288,8 +333,12 @@ pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: imp
                 chats.insert(chat.id, id);
                 imported.chats += 1;
             }
+            Some(proto::frame::Item::StickerPack(pack)) => {
+                imported.sticker_packs.push((pack.packId.clone(), pack.packKey.clone()));
+            }
             Some(proto::frame::Item::ChatItem(item)) => {
-                imported.messages += usize::from(import_item(db, &item, &people, &chats, me, now).await?);
+                imported.messages +=
+                    usize::from(import_item(db, &item, &people, &chats, me, now, &mut imported.downloads).await?);
             }
             _ => {}
         }
@@ -311,6 +360,7 @@ async fn import_item(
     chats: &HashMap<u64, ConversationId>,
     me: &str,
     now: i64,
+    downloads: &mut Vec<(i64, usize)>,
 ) -> anyhow::Result<bool> {
     use proto::chat_item::{DirectionalDetails, Item};
     let Some(conversation) = chats.get(&item.chatId) else { return Ok(false) };
@@ -460,6 +510,12 @@ async fn import_item(
         message.sent_at = edits.remove(0);
     }
     let id = db.insert_message(&message).await?;
+    for (index, attachment) in message.attachments.iter().enumerate() {
+        let photo = attachment.gif || attachment.content_type.starts_with("image/");
+        if attachment.remote.is_some() && photo && attachment.size <= crate::actor::AUTO_DOWNLOAD_MAX {
+            downloads.push((id, index));
+        }
+    }
     for at in &edits {
         db.edit_message(id, &message.body, *at).await?;
     }
@@ -510,16 +566,35 @@ fn outgoing_status(statuses: &[proto::SendStatus]) -> DeliveryStatus {
 
 /// An attachment's details (its file isn't transferred yet).
 fn attachment(pointer: &proto::FilePointer) -> AttachmentMeta {
+    let locator = pointer.locatorInfo.as_ref();
     AttachmentMeta {
         content_type: pointer.contentType.clone().unwrap_or_else(|| "application/octet-stream".into()),
         file_name: pointer.fileName.clone(),
-        size: 0,
+        size: locator.map_or(0, |l| u64::from(l.size)),
         width: pointer.width,
         height: pointer.height,
         local_path: None,
         sticker: false,
         gif: false,
+        remote: locator.and_then(remote),
     }
+}
+
+/// Where a transferred attachment can be downloaded: the transit tier,
+/// which the phone fills for link and sync (and which expires). The backup
+/// (media) tier needs a backup subscription's credentials, so it isn't used.
+fn remote(locator: &proto::file_pointer::LocatorInfo) -> Option<RemoteAttachment> {
+    use proto::file_pointer::locator_info::IntegrityCheck;
+    let cdn_key = locator.transitCdnKey.clone().filter(|k| !k.is_empty())?;
+    if locator.key.len() != 64 {
+        return None;
+    }
+    let (digest, plaintext_hash) = match &locator.integrityCheck {
+        Some(IntegrityCheck::EncryptedDigest(d)) => (Some(hex::encode(d)), None),
+        Some(IntegrityCheck::PlaintextHash(h)) => (None, Some(hex::encode(h))),
+        _ => return None,
+    };
+    Some(RemoteAttachment { cdn: locator.transitCdnNumber.unwrap_or(0), cdn_key, key: hex::encode(&locator.key), digest, plaintext_hash })
 }
 
 #[cfg(test)]
@@ -647,9 +722,27 @@ mod tests {
         let mut edited = item(30, 2, 1_000, true, Item::StandardMessage(standard));
         edited.revisions.push(item(30, 2, 800, true, Item::StandardMessage(first)));
         push(proto::Frame { item: Some(proto::frame::Item::ChatItem(edited)), ..Default::default() });
-        // Our reply to Alice, quoting her, with her reaction.
+        // A sticker pack installed on the phone.
+        let mut pack = proto::StickerPack::new();
+        pack.packId = vec![0xab; 16];
+        pack.packKey = vec![0xcd; 32];
+        push(proto::Frame { item: Some(proto::frame::Item::StickerPack(pack)), ..Default::default() });
+        // Our reply to Alice, quoting her, with her reaction and a photo
+        // still on the transit tier.
         let mut standard = proto::StandardMessage::new();
         standard.text = Some(text("on my way")).into();
+        let mut locator = proto::file_pointer::LocatorInfo::new();
+        locator.key = vec![1; 64];
+        locator.size = 1234;
+        locator.transitCdnKey = Some("abc".into());
+        locator.transitCdnNumber = Some(3);
+        locator.integrityCheck = Some(proto::file_pointer::locator_info::IntegrityCheck::EncryptedDigest(vec![2; 32]));
+        let mut photo = proto::FilePointer::new();
+        photo.contentType = Some("image/jpeg".into());
+        photo.locatorInfo = Some(locator).into();
+        let mut photo_attachment = proto::MessageAttachment::new();
+        photo_attachment.pointer = Some(photo).into();
+        standard.attachments.push(photo_attachment);
         let mut quote = proto::Quote::new();
         quote.targetSentTimestamp = Some(900);
         quote.authorId = 2;
@@ -687,7 +780,8 @@ mod tests {
         // Progress only moves forward and ends at the whole backup.
         assert!(seen.windows(2).all(|w| w[0] < w[1]));
         assert_eq!(seen.last(), Some(&(plain.len() as u64)));
-        assert_eq!(imported, Imported { chats: 3, messages: 3 });
+        assert_eq!((imported.chats, imported.messages), (3, 3));
+        assert_eq!(imported.sticker_packs, vec![(vec![0xab; 16], vec![0xcd; 32])]);
 
         let alice_sid = Aci::from_uuid_bytes([0xa1; 16]).service_id_string();
         let alice = db.conversation(&ConversationId::direct(&alice_sid)).await.unwrap().unwrap();
@@ -713,6 +807,13 @@ mod tests {
         assert_eq!((reply.direction, reply.status, reply.body.as_str()), (Direction::Outgoing, DeliveryStatus::Read, "on my way"));
         assert_eq!(reply.quote.as_ref().map(|q| (q.sent_at, q.author_name.as_str())), Some((900, "Alice Liddell")));
         assert_eq!(reply.reactions[0].emoji, "👍");
+        // The photo keeps where to download it, and downloads now.
+        let photo = &reply.attachments[0];
+        assert_eq!(photo.size, 1234);
+        let remote = photo.remote.as_ref().unwrap();
+        assert_eq!((remote.cdn, remote.cdn_key.as_str(), remote.key.len()), (3, "abc", 128));
+        assert_eq!(remote.digest.as_deref(), Some(hex::encode([2; 32]).as_str()));
+        assert_eq!(imported.downloads, vec![(reply.id, 0)]);
         assert!(with_alice[1].deleted);
     }
 }

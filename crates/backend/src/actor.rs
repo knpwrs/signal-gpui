@@ -50,7 +50,7 @@ pub(crate) type SignalManager = Manager<SqliteStore, Registered>;
 /// Images up to this size are downloaded as soon as they arrive.
 /// "1" while the history transfer after linking hasn't finished.
 const SETTING_HISTORY_PENDING: &str = "history.pending";
-const AUTO_DOWNLOAD_MAX: u64 = 25 * 1024 * 1024;
+pub(crate) const AUTO_DOWNLOAD_MAX: u64 = 25 * 1024 * 1024;
 
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
@@ -310,12 +310,20 @@ impl Actor {
             let total = plain.len() as u64;
             self.emit(Event::History(HistoryProgress::Importing { done: 0, total }));
             let mut every = Every::new(PROGRESS_INTERVAL);
-            let imported = crate::history::import(&self.db, &plain, &aci.service_id_string(), |done| {
+            let mut imported = crate::history::import(&self.db, &plain, &aci.service_id_string(), |done| {
                 if every.ready() {
                     self.emit(Event::History(HistoryProgress::Importing { done, total }));
                 }
             })
             .await?;
+            let packs = std::mem::take(&mut imported.sticker_packs);
+            if !packs.is_empty() {
+                tokio::task::spawn_local(self.clone().install_sticker_packs(manager.clone(), packs));
+            }
+            let downloads = std::mem::take(&mut imported.downloads);
+            if !downloads.is_empty() {
+                tokio::task::spawn_local(self.clone().download_transferred(manager.clone(), downloads));
+            }
             anyhow::Ok(Some(imported))
         }
         .await;
@@ -1531,6 +1539,7 @@ impl Actor {
             local_path: Some(path.to_string_lossy().into_owned()),
             sticker: false,
             gif: true,
+            remote: None,
         };
         let Some((id, data, timestamp)) = self.store_outgoing(&conversation, String::new(), None, vec![meta], None).await
         else {
@@ -1583,6 +1592,7 @@ impl Actor {
             local_path: Some(sticker.path.to_string_lossy().into_owned()),
             sticker: true,
             gif: false,
+            remote: None,
         };
         let Some((id, mut data, timestamp)) = self.store_outgoing(&conversation, String::new(), None, vec![meta], None).await
         else {
@@ -2325,6 +2335,7 @@ impl Actor {
                                 local_path: Some(path.to_string_lossy().into_owned()),
                                 sticker: false,
                                 gif: false,
+                                remote: None,
                             })
                         }
                     }
@@ -2408,6 +2419,7 @@ impl Actor {
                 local_path: Some(path.to_string_lossy().into_owned()),
                 sticker: false,
                 gif: false,
+                remote: None,
             });
             files.push((path, image.file_name));
         }
@@ -2901,6 +2913,13 @@ impl Actor {
     async fn fetch_attachment(self: Rc<Self>, message_id: i64, index: usize) {
         let Some(manager) = self.manager() else { return };
         let Some(message) = self.db.message(message_id).await.ok().flatten() else { return };
+        // From transferred history: no stored message, but its locator.
+        if let Some(meta) = message.attachments.get(index).filter(|a| a.remote.is_some()) {
+            if let Err(error) = self.download_remote(&manager, &message.conversation_id, message_id, index, meta).await {
+                self.error("couldn't download the attachment", format!("{error:#}"));
+            }
+            return;
+        }
         let thread = match message.conversation_id.as_group() {
             Some(key) => match key.try_into() {
                 Ok(key) => Thread::Group(key),
@@ -2953,6 +2972,70 @@ impl Actor {
 }
 
 impl Actor {
+    /// Downloads an attachment from its saved transit-tier locator.
+    async fn download_remote(
+        &self,
+        manager: &SignalManager,
+        conversation: &ConversationId,
+        message_id: i64,
+        index: usize,
+        meta: &AttachmentMeta,
+    ) -> anyhow::Result<()> {
+        let remote = meta.remote.as_ref().context("no locator")?;
+        let bytes = crate::history::download_attachment(manager, remote, meta.size).await?;
+        let pointer = AttachmentPointer {
+            content_type: Some(meta.content_type.clone()),
+            file_name: meta.file_name.clone(),
+            ..Default::default()
+        };
+        let path = self
+            .config
+            .data_dir
+            .join("attachments")
+            .join(format!("{message_id}-{index}.{}", extension_for(&pointer)));
+        tokio::fs::write(&path, &bytes).await?;
+        self.db.set_attachment_path(message_id, index, &path.to_string_lossy()).await?;
+        self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id });
+        Ok(())
+    }
+
+    /// The sticker packs installed on the phone, from the transfer: each
+    /// downloaded unless it's already here.
+    async fn install_sticker_packs(self: Rc<Self>, mut manager: SignalManager, packs: Vec<(Vec<u8>, Vec<u8>)>) {
+        let installed: Vec<Vec<u8>> = match self.store.sticker_packs().await {
+            Ok(packs) => packs.flatten().map(|p| p.id).collect(),
+            Err(_) => Vec::new(),
+        };
+        let mut added = 0;
+        for (id, key) in packs {
+            if installed.contains(&id) {
+                continue;
+            }
+            match manager.install_sticker_pack(&id, &key).await {
+                Ok(()) => added += 1,
+                Err(error) => warn!(%error, "couldn't install a transferred sticker pack"),
+            }
+        }
+        info!(added, "installed transferred sticker packs");
+    }
+
+    /// Photos and GIFs from transferred history, one at a time. Ones that
+    /// fail (expired from the transit tier, usually) stay downloadable by
+    /// hand, which says why.
+    async fn download_transferred(self: Rc<Self>, manager: SignalManager, downloads: Vec<(i64, usize)>) {
+        let total = downloads.len();
+        let mut failed = 0;
+        for (message_id, index) in downloads {
+            let Some(message) = self.db.message(message_id).await.ok().flatten() else { continue };
+            let Some(meta) = message.attachments.get(index).filter(|a| a.local_path.is_none()) else { continue };
+            if let Err(error) = self.download_remote(&manager, &message.conversation_id, message_id, index, meta).await {
+                debug!(error = %format!("{error:#}"), "transferred attachment download failed");
+                failed += 1;
+            }
+        }
+        info!(total, failed, "downloaded transferred photos");
+    }
+
     async fn download_preview_image(
         &self,
         manager: &SignalManager,
