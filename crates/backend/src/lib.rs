@@ -28,6 +28,7 @@ pub mod giphy;
 pub mod sticker_upload;
 pub mod deletes;
 pub mod edits;
+pub mod long_text;
 pub mod release_notes;
 pub mod megaphones;
 
@@ -176,6 +177,9 @@ pub enum Command {
     DeleteForEveryone { message_id: i64 },
     /// Downloads attachment `index` of `message_id`.
     FetchAttachment { message_id: i64, index: usize },
+    /// Downloads the whole text of a long message whose download failed
+    /// (Desktop's "Download Full Message").
+    FetchLongText { message_id: i64 },
     /// Pins or unpins a conversation for the whole account (Storage Service).
     SetPinned { conversation: ConversationId, pinned: bool },
     /// Archives, mutes, marks unread or blocks a chat for the whole account

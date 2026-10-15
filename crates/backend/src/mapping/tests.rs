@@ -236,6 +236,7 @@ fn incoming_edit() {
             body: "fixed".into(),
             mentions: vec![],
             styles: vec![],
+            long_text: None,
         }]
     );
 }
@@ -290,6 +291,7 @@ fn sync_sent_edit_to_group() {
             body: "edited".into(),
             mentions: vec![],
             styles: vec![],
+            long_text: None,
         }]
     );
 }
@@ -765,6 +767,80 @@ fn viewed_receipts_count_story_views() {
     };
     let actions = map_content(&content(ME, sync), &ctx());
     assert!(actions.iter().any(|a| matches!(a, Action::ViewedSync(v) if v == &[(Some(ALICE.into()), 400)])));
+}
+
+fn long_text_pointer() -> AttachmentPointer {
+    AttachmentPointer {
+        content_type: Some(LONG_TEXT_TYPE.into()),
+        attachment_identifier: Some(attachment_pointer::AttachmentIdentifier::CdnKey("text-key".into())),
+        cdn_number: Some(3),
+        key: Some(vec![9; 64]),
+        digest: Some(vec![8; 32]),
+        size: Some(3000),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_long_text_is_kept_apart_from_the_attachments() {
+    // As Desktop sends one: the whole text first, the body only its start.
+    let photo = AttachmentPointer { content_type: Some("image/png".into()), ..Default::default() };
+    let mut dm = text("the start", 100);
+    dm.attachments = vec![long_text_pointer(), photo.clone()];
+    dm.body_ranges = vec![BodyRange {
+        start: Some(0),
+        length: Some(2500),
+        associated_value: Some(body_range::AssociatedValue::Style(body_range::Style::Bold.into())),
+    }];
+    let actions = map_content(&content(ALICE, dm), &ctx());
+    let [Action::Insert { message, pointers, long_text, styles, .. }] = actions.as_slice() else {
+        panic!("{actions:?}")
+    };
+    assert_eq!(message.body, "the start");
+    assert_eq!(pointers, &[photo]);
+    assert_eq!(message.attachments.len(), 1);
+    assert_eq!(message.attachments[0].content_type, "image/png");
+    assert_eq!(long_text.as_ref(), Some(&long_text_pointer()));
+    // Its ranges are over the whole text, kept as sent.
+    assert_eq!(styles, &[WireStyle { start: 0, len: 2500, style: TextStyle::Bold }]);
+
+    // An edit can bring one too.
+    let mut edited = text("the new start", 300);
+    edited.attachments = vec![long_text_pointer()];
+    let edit = EditMessage { target_sent_timestamp: Some(100), data_message: Some(edited) };
+    let actions = map_content(&content(ALICE, edit), &ctx());
+    let [Action::Edit { long_text, body, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+    assert_eq!((body.as_str(), long_text.as_ref()), ("the new start", Some(&long_text_pointer())));
+
+    // Only the stored message's own attachments are counted for downloads.
+    let mut dm = text("x", 1);
+    dm.attachments = vec![long_text_pointer(), AttachmentPointer { size: Some(5), ..Default::default() }];
+    assert_eq!(normal_attachments(&dm).map(|p| p.size).collect::<Vec<_>>(), [Some(5)]);
+}
+
+#[test]
+fn where_a_long_text_downloads_from() {
+    let remote = remote_of(&long_text_pointer()).unwrap();
+    assert_eq!((remote.cdn, remote.cdn_key.as_str()), (3, "text-key"));
+    assert_eq!((remote.key, remote.digest), ("09".repeat(64), Some("08".repeat(32))));
+    // Older pointers name the file by number, on CDN 0.
+    let old = AttachmentPointer {
+        attachment_identifier: Some(attachment_pointer::AttachmentIdentifier::CdnId(42)),
+        cdn_number: None,
+        ..long_text_pointer()
+    };
+    let remote = remote_of(&old).unwrap();
+    assert_eq!((remote.cdn, remote.cdn_key.as_str()), (0, "42"));
+    // Without its digest it can't be checked, so it isn't fetched.
+    assert_eq!(remote_of(&AttachmentPointer { digest: None, ..long_text_pointer() }), None);
+}
+
+#[test]
+fn formatting_past_the_end_of_the_text_is_cut_at_the_end() {
+    // The start of a long text, shown until the rest comes.
+    let styles = [WireStyle { start: 4, len: 100, style: TextStyle::Bold }];
+    let (body, _, spans) = render_body("the start", &[], &[], &styles);
+    assert_eq!(&body[spans[0].start..spans[0].start + spans[0].len], "start");
 }
 
 #[test]

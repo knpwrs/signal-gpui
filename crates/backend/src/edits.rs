@@ -46,6 +46,7 @@ mod tests {
             styles: Vec::new(),
             cta: None,
             deleted_by_admin: None,
+            long_text: None,
         }
     }
 

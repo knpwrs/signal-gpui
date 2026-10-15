@@ -194,6 +194,8 @@ pub(crate) struct Imported {
     /// Photos and GIFs to download now, as `(message id, attachment index)`;
     /// other files wait to be opened.
     pub downloads: Vec<(i64, usize)>,
+    /// Messages whose whole text is still to download.
+    pub long_texts: Vec<i64>,
     /// Installed sticker packs: `(pack id, pack key)`.
     pub sticker_packs: Vec<(Vec<u8>, Vec<u8>)>,
 }
@@ -345,7 +347,7 @@ pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: imp
             }
             Some(proto::frame::Item::ChatItem(item)) => {
                 imported.messages +=
-                    usize::from(import_item(db, &item, &people, &chats, me, now, &mut imported.downloads).await?);
+                    usize::from(import_item(db, &item, &people, &chats, me, now, &mut imported).await?);
             }
             _ => {}
         }
@@ -367,7 +369,7 @@ async fn import_item(
     chats: &HashMap<u64, ConversationId>,
     me: &str,
     now: i64,
-    downloads: &mut Vec<(i64, usize)>,
+    imported: &mut Imported,
 ) -> anyhow::Result<bool> {
     use proto::chat_item::{DirectionalDetails, Item};
     let Some(conversation) = chats.get(&item.chatId) else { return Ok(false) };
@@ -530,6 +532,21 @@ async fn import_item(
                 .unwrap_or_else(|| "Unknown".into())
         })
         .collect();
+    // The whole text, when it's an attachment to download; Desktop keeps
+    // the body and its ranges for it (`ts/services/backups/import.preload.ts`).
+    let long_text = match &item.item {
+        Some(Item::StandardMessage(standard)) => standard.longText.as_ref().and_then(|pointer| {
+            let locator = pointer.locatorInfo.as_ref()?;
+            Some(signal_store::LongText {
+                remote: remote(locator)?,
+                size: u64::from(locator.size),
+                mentions: mentions.clone(),
+                styles: styles.clone(),
+                state: signal_store::LongTextState::Downloading,
+            })
+        }),
+        _ => None,
+    };
     let (body, spans, style_spans) = crate::mapping::render_body(&message.body, &mentions, &names, &styles);
     message.body = body;
     // An edited message is the latest version, dated by the latest edit; it
@@ -544,7 +561,7 @@ async fn import_item(
     for (index, attachment) in message.attachments.iter().enumerate() {
         let photo = attachment.gif || attachment.voice || attachment.content_type.starts_with("image/");
         if attachment.remote.is_some() && photo && attachment.size <= crate::actor::AUTO_DOWNLOAD_MAX {
-            downloads.push((id, index));
+            imported.downloads.push((id, index));
         }
     }
     for at in &edits {
@@ -558,6 +575,9 @@ async fn import_item(
     }
     if deleted {
         db.mark_deleted(id).await?;
+    } else if let Some(long_text) = &long_text {
+        db.set_long_text(id, Some(long_text)).await?;
+        imported.long_texts.push(id);
     }
     for reaction in reactions {
         let (author, _) = person(reaction.authorId);
@@ -775,6 +795,17 @@ mod tests {
         mention.bodyRanges.push(range);
         let mut standard = proto::StandardMessage::new();
         standard.text = Some(mention).into();
+        // Its whole text is an attachment still to download.
+        let mut locator = proto::file_pointer::LocatorInfo::new();
+        locator.key = vec![4; 64];
+        locator.size = 3_000;
+        locator.transitCdnKey = Some("text".into());
+        locator.transitCdnNumber = Some(3);
+        locator.integrityCheck = Some(proto::file_pointer::locator_info::IntegrityCheck::EncryptedDigest(vec![5; 32]));
+        let mut long_text = proto::FilePointer::new();
+        long_text.contentType = Some("text/x-signal-plain".into());
+        long_text.locatorInfo = Some(locator).into();
+        standard.longText = Some(long_text).into();
         // Edited: the item is the latest version; its first version was sent at 800.
         let mut first = proto::StandardMessage::new();
         first.text = Some(text("hi")).into();
@@ -864,6 +895,11 @@ mod tests {
         assert_eq!((in_group[0].sent_at, in_group[0].edited), (800, true));
         let by_edit = db.find_message(&group.id, Some(&alice_sid), 1_000).await.unwrap().map(|m| m.id);
         assert_eq!(by_edit, Some(in_group[0].id));
+        // Its whole text downloads next, its mention kept for it.
+        let long_text = in_group[0].long_text.as_ref().unwrap();
+        assert_eq!((long_text.size, long_text.remote.cdn_key.as_str()), (3_000, "text"));
+        assert_eq!(long_text.mentions, vec![me.clone()]);
+        assert_eq!(imported.long_texts, [in_group[0].id]);
 
         let with_alice = db.messages(&alice.id, None, 10).await.unwrap();
         let reply = &with_alice[0];

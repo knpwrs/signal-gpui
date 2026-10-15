@@ -2462,6 +2462,8 @@ enum TextClick {
     Open(String),
     /// Shows the message's spoilers.
     Reveal,
+    /// Tries the long message's whole text again.
+    DownloadText,
 }
 
 /// Text, its runs, and what clicking where does.
@@ -2546,26 +2548,57 @@ fn text_runs(
     }
     let mut content = body.to_owned();
     if let Some((spacer, bg)) = spacer {
-        let mut font = gpui_kit::font(".SystemUIFont");
-        font.weight = FontWeight::NORMAL;
-        runs.push(gpui_kit::TextRun {
-            len: spacer.len(),
-            font,
-            color: bg,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        });
-        content.push_str(spacer);
+        push_run(&mut content, &mut runs, spacer, bg, FontWeight::NORMAL, false);
     }
     (content, runs, clicks)
+}
+
+/// `text` added to laid-out text in the system font.
+fn push_run(content: &mut String, runs: &mut Vec<gpui_kit::TextRun>, text: &str, color: Hsla, weight: FontWeight, underline: bool) {
+    let mut font = gpui_kit::font(".SystemUIFont");
+    font.weight = weight;
+    runs.push(gpui_kit::TextRun {
+        len: text.len(),
+        font,
+        color,
+        background_color: None,
+        underline: underline.then_some(gpui_kit::UnderlineStyle { thickness: px(1.), ..Default::default() }),
+        strikethrough: None,
+    });
+    content.push_str(text);
+}
+
+/// How a long message ends while only its start is here, in Desktop's words
+/// (`ts/components/conversation/MessageBody.dom.tsx`): "..." and then what's
+/// happening to the rest, which can be clicked to try again after a failed
+/// download.
+fn long_text_tail(state: signal_store::LongTextState) -> (&'static str, Option<TextClick>) {
+    use signal_store::LongTextState;
+    match state {
+        LongTextState::Downloading => ("Downloading", None),
+        LongTextState::Failed => ("Download Full Message", Some(TextClick::DownloadText)),
+        LongTextState::TooBig => ("Message too long to display more", None),
+    }
 }
 
 /// A message's text: see [`text_runs`]. Clicking a hidden spoiler shows the
 /// message's spoilers.
 fn message_text(message: &Message, fg: Hsla, revealed: bool, spacer: Option<(&str, Hsla)>, cx: &mut Context<ConversationView>) -> AnyElement {
     let text = div().text_size(px(BODY_SIZE)).line_height(px(BODY_LINE));
-    let (content, runs, clicks) = text_runs(&message.body, &message.mentions, &message.styles, revealed, fg, spacer);
+    let (mut content, mut runs, mut clicks) =
+        text_runs(&message.body, &message.mentions, &message.styles, revealed, fg, None);
+    if let Some(long_text) = &message.long_text {
+        let (label, click) = long_text_tail(long_text.state);
+        push_run(&mut content, &mut runs, "... ", fg, FontWeight::NORMAL, false);
+        let start = content.len();
+        push_run(&mut content, &mut runs, label, fg, FontWeight::SEMIBOLD, click.is_some());
+        if let Some(click) = click {
+            clicks.push((start..content.len(), click));
+        }
+    }
+    if let Some((spacer, bg)) = spacer {
+        push_run(&mut content, &mut runs, spacer, bg, FontWeight::NORMAL, false);
+    }
     let styled = gpui_kit::StyledText::new(content).with_runs(runs);
     if clicks.is_empty() {
         return text.child(styled).into_any_element();
@@ -2582,6 +2615,9 @@ fn message_text(message: &Message, fg: Hsla, revealed: bool, spacer: Option<(&st
                     this.revealed_spoilers.insert(message_id);
                     cx.notify();
                 });
+            }
+            TextClick::DownloadText => {
+                let _ = view.update(cx, |this, cx| this.state.read(cx).send(Command::FetchLongText { message_id }));
             }
         },
     ))
@@ -3574,6 +3610,7 @@ mod tests {
             styles: Vec::new(),
             cta: None,
             deleted_by_admin: None,
+            long_text: None,
         }
     }
 
@@ -3742,35 +3779,57 @@ mod tests {
         panic!("{selector} never rendered");
     }
 
-    #[gpui_kit::test]
-    fn photo_bubbles_are_as_wide_as_the_photo(cx: &mut TestAppContext) {
-        let (backend, _dir) = demo_backend(cx);
-        let photos = wait_for_messages(&backend, NOTE_TO_SELF, 3, |m| !m.attachments.is_empty());
-        let mut cx = open(cx, &backend, NOTE_TO_SELF);
-
-        // Photo only, short caption, long caption: all as wide as the photo
-        // (the window would allow ~600pt), and a bare photo has no padding.
-        let bare = bounds(&mut cx, format!("bubble-{}", photos[0].id));
-        assert_eq!((bare.size.width, bare.size.height), (px(300.), px(400.)));
-        assert_eq!(bounds(&mut cx, format!("bubble-{}", photos[1].id)).size.width, px(300.));
-        let long = bounds(&mut cx, format!("bubble-{}", photos[2].id));
-        assert_eq!(long.size.width, px(300.));
-        assert!(long.size.height > px(500.), "caption should wrap to the photo's width: {long:?}");
-        backend.shutdown();
+    #[test]
+    fn a_long_message_ends_as_desktops_does_until_its_text_comes() {
+        use signal_store::LongTextState;
+        assert_eq!(long_text_tail(LongTextState::Downloading), ("Downloading", None));
+        assert_eq!(long_text_tail(LongTextState::Failed), ("Download Full Message", Some(TextClick::DownloadText)));
+        assert_eq!(long_text_tail(LongTextState::TooBig), ("Message too long to display more", None));
     }
 
-    const MAYA: &str = "d:00000000-0000-4000-8000-00000000a11c";
-
-    #[test]
-    fn grouped_bubbles_tighten_the_senders_side() {
-        let alone = Corners::for_bubble(false, true, true);
-        assert_eq!(alone, Corners { top_left: 18., top_right: 18., bottom_left: 18., bottom_right: 18. });
-        // Incoming, middle of a run: left (sender's) side tight.
-        let middle = Corners::for_bubble(false, false, false);
-        assert_eq!(middle, Corners { top_left: 6., top_right: 18., bottom_left: 6., bottom_right: 18. });
-        // Outgoing, first of a run: only the bottom right meets the next one.
-        let first = Corners::for_bubble(true, true, false);
-        assert_eq!(first, Corners { top_left: 18., top_right: 18., bottom_left: 18., bottom_right: 6. });
+    #[gpui_kit::test]
+    fn a_long_message_shows_its_start_until_its_text_comes(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        wait_for_messages(&backend, NOTE_TO_SELF, 1, |_| true);
+        let db = backend.db().clone();
+        let sent_at = chrono::Utc::now().timestamp_millis();
+        let id = futures::executor::block_on(backend.spawn(async move {
+            let id = db
+                .insert_message(&signal_store::NewMessage {
+                    conversation_id: ConversationId(NOTE_TO_SELF.into()),
+                    sent_at,
+                    received_at: sent_at,
+                    direction: Direction::Outgoing,
+                    author: None,
+                    author_name: None,
+                    body: "The start of a long story".into(),
+                    status: DeliveryStatus::Sent,
+                    quote: None,
+                    attachments: vec![],
+                    link_preview: None,
+                    expires_in: 0,
+                })
+                .await?;
+            let long_text = signal_store::LongText {
+                remote: signal_store::RemoteAttachment {
+                    cdn: 3,
+                    cdn_key: "made-up".into(),
+                    key: "00".repeat(64),
+                    digest: Some("00".repeat(32)),
+                    plaintext_hash: None,
+                },
+                size: 4000,
+                mentions: vec![],
+                styles: vec![],
+                state: signal_store::LongTextState::Failed,
+            };
+            db.set_long_text(id, Some(&long_text)).await?;
+            Ok::<_, signal_store::Error>(id)
+        }))
+        .unwrap();
+        let mut cx = open(cx, &backend, NOTE_TO_SELF);
+        let bubble = bounds(&mut cx, format!("bubble-{id}"));
+        assert!(bubble.size.width > px(0.));
     }
 
     #[gpui_kit::test]
@@ -3824,6 +3883,37 @@ mod tests {
         bounds(&mut cx, format!("too-big-{alone}"));
         bounds(&mut cx, format!("too-big-{mixed}"));
         assert!(cx.debug_bounds(Box::leak(format!("too-big-{fits}").into_boxed_str())).is_none());
+    }
+
+    #[gpui_kit::test]
+    fn photo_bubbles_are_as_wide_as_the_photo(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        let photos = wait_for_messages(&backend, NOTE_TO_SELF, 3, |m| !m.attachments.is_empty());
+        let mut cx = open(cx, &backend, NOTE_TO_SELF);
+
+        // Photo only, short caption, long caption: all as wide as the photo
+        // (the window would allow ~600pt), and a bare photo has no padding.
+        let bare = bounds(&mut cx, format!("bubble-{}", photos[0].id));
+        assert_eq!((bare.size.width, bare.size.height), (px(300.), px(400.)));
+        assert_eq!(bounds(&mut cx, format!("bubble-{}", photos[1].id)).size.width, px(300.));
+        let long = bounds(&mut cx, format!("bubble-{}", photos[2].id));
+        assert_eq!(long.size.width, px(300.));
+        assert!(long.size.height > px(500.), "caption should wrap to the photo's width: {long:?}");
+        backend.shutdown();
+    }
+
+    const MAYA: &str = "d:00000000-0000-4000-8000-00000000a11c";
+
+    #[test]
+    fn grouped_bubbles_tighten_the_senders_side() {
+        let alone = Corners::for_bubble(false, true, true);
+        assert_eq!(alone, Corners { top_left: 18., top_right: 18., bottom_left: 18., bottom_right: 18. });
+        // Incoming, middle of a run: left (sender's) side tight.
+        let middle = Corners::for_bubble(false, false, false);
+        assert_eq!(middle, Corners { top_left: 6., top_right: 18., bottom_left: 6., bottom_right: 18. });
+        // Outgoing, first of a run: only the bottom right meets the next one.
+        let first = Corners::for_bubble(true, true, false);
+        assert_eq!(first, Corners { top_left: 18., top_right: 18., bottom_left: 18., bottom_right: 6. });
     }
 
     #[gpui_kit::test]

@@ -1239,7 +1239,12 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 let _ = db.set_setting(&format!("demo.verified.{}", conversation.0), if verified { "1" } else { "" }).await;
                 emit(Event::SafetyNumber { conversation: conversation.clone(), result: Ok(demo_safety_number(&conversation, verified)) });
             }
-            Command::Link | Command::Typing { .. } | Command::FetchAttachment { .. } | Command::Unlink | Command::SkipHistory => {}
+            Command::Link
+            | Command::Typing { .. }
+            | Command::FetchAttachment { .. }
+            | Command::FetchLongText { .. }
+            | Command::Unlink
+            | Command::SkipHistory => {}
         }
     }
 }

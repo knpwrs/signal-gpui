@@ -749,6 +749,15 @@ impl Composer {
             return;
         }
         let text = self.input.read(cx).value().trim().to_string();
+        // Desktop's composer stops at 64 KiB with this toast
+        // (`ts/components/CompositionInput.dom.tsx`); here the text stays to
+        // be shortened.
+        if text.len() > signal_backend::long_text::MAX_TEXT_BYTES {
+            use gpui_kit::component::WindowExt as _;
+            use gpui_kit::component::notification::Notification;
+            window.push_notification(Notification::new().message("Message body is too long."), cx);
+            return;
+        }
         let (plain, styles) = crate::formatting::parse(&text);
         let (body, mentions, styles) = encode_mentions(&plain, &std::mem::take(&mut self.mentions), &styles);
         if let Some(original) = self.editing.take() {
@@ -1935,6 +1944,21 @@ mod tests {
         assert_eq!((csv.body.as_str(), csv.attachments[0].content_type.as_str()), ("", "text/csv"));
         let saved = std::fs::read(pdf.attachments[0].local_path.as_ref().unwrap()).unwrap();
         assert_eq!(saved, b"%PDF-1.7");
+    }
+
+    #[gpui_kit::test]
+    fn text_over_64_kib_isnt_sent(cx: &mut TestAppContext) {
+        let f = mount(cx);
+        let long = "a".repeat(signal_backend::long_text::MAX_TEXT_BYTES + 1);
+        cx.update_window(f.window, |_, window, cx| {
+            f.composer.update(cx, |c, cx| {
+                c.input.update(cx, |input, cx| input.set_value(long.clone(), window, cx));
+                c.submit(window, cx);
+            });
+        })
+        .unwrap();
+        // Kept, to be shortened, as Desktop's composer refuses it.
+        assert_eq!(text(&f, cx).len(), long.len());
     }
 
     #[gpui_kit::test]

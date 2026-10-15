@@ -29,6 +29,9 @@ pub enum Action {
         styles: Vec<WireStyle>,
         /// Pointers matching `message.attachments`, for downloading.
         pointers: Vec<AttachmentPointer>,
+        /// The whole text, when it came as an attachment and `message.body`
+        /// is only its start.
+        long_text: Option<AttachmentPointer>,
         /// The link preview's image, for downloading.
         preview_image: Option<AttachmentPointer>,
         /// The sender's disappearing-timer version (1:1 chats), with
@@ -73,6 +76,8 @@ pub enum Action {
         body: String,
         mentions: Vec<String>,
         styles: Vec<WireStyle>,
+        /// The edit's whole text, when it came as an attachment.
+        long_text: Option<AttachmentPointer>,
     },
     Receipt {
         sent_at: Vec<i64>,
@@ -391,12 +396,7 @@ fn mentions(ranges: &[presage::proto::BodyRange]) -> Vec<String> {
 
 /// A style as Signal sends it: UTF-16 positions in the body as sent, where
 /// each mention is one placeholder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WireStyle {
-    pub start: u32,
-    pub len: u32,
-    pub style: TextStyle,
-}
+pub use signal_store::WireStyle;
 
 pub(crate) fn styles(ranges: &[presage::proto::BodyRange]) -> Vec<WireStyle> {
     use presage::proto::body_range::{AssociatedValue, Style};
@@ -437,6 +437,8 @@ fn byte_spans(text: &str, styles: &[WireStyle]) -> Vec<StyleSpan> {
 fn place_styles(at: &[(u32, usize)], styles: &[WireStyle]) -> Vec<StyleSpan> {
     let byte = |pos: u32, up: bool| match at.binary_search_by_key(&pos, |(u, _)| *u) {
         Ok(ix) => Some(at[ix].1),
+        // Past the end (the start of a long text, say): cut at the end.
+        Err(ix) if up && ix == at.len() => at.last().map(|(_, b)| *b),
         Err(ix) => at.get(if up { ix } else { ix.checked_sub(1)? }).map(|(_, b)| *b),
     };
     styles
@@ -502,6 +504,45 @@ pub fn attachment_meta(p: &AttachmentPointer) -> AttachmentMeta {
         voice: p.flags.unwrap_or(0) & attachment_pointer::Flags::VoiceMessage as u32 != 0,
         remote: None,
     }
+}
+
+/// What a message's whole text is sent as when it's too long for the body
+/// (Desktop's `LONG_MESSAGE`, `ts/types/MIME.std.ts`).
+pub const LONG_TEXT_TYPE: &str = "text/x-signal-plain";
+
+fn is_long_text(pointer: &AttachmentPointer) -> bool {
+    pointer.content_type.as_deref() == Some(LONG_TEXT_TYPE)
+}
+
+/// A message's attachments, without its long text (Desktop's
+/// `partitionBodyAndNormalAttachments`, `ts/util/Attachment.std.ts`).
+pub fn normal_attachments(dm: &DataMessage) -> impl Iterator<Item = &AttachmentPointer> {
+    dm.attachments.iter().filter(|p| !is_long_text(p))
+}
+
+/// A message's whole text, when it came as an attachment: the first such
+/// attachment, as in Desktop (`partitionBodyAndNormalAttachments`).
+pub fn long_text_of(dm: &DataMessage) -> Option<AttachmentPointer> {
+    dm.attachments.iter().find(|p| is_long_text(p)).cloned()
+}
+
+/// Where to download an attachment from Signal's transit CDN.
+pub fn remote_of(pointer: &AttachmentPointer) -> Option<signal_store::RemoteAttachment> {
+    use attachment_pointer::AttachmentIdentifier;
+    let cdn_key = match pointer.attachment_identifier.as_ref()? {
+        AttachmentIdentifier::CdnId(id) => id.to_string(),
+        AttachmentIdentifier::CdnKey(key) if !key.is_empty() => key.clone(),
+        AttachmentIdentifier::CdnKey(_) => return None,
+    };
+    let key = pointer.key.as_deref().filter(|k| k.len() == 64)?;
+    let digest = pointer.digest.as_deref().filter(|d| !d.is_empty())?;
+    Some(signal_store::RemoteAttachment {
+        cdn: pointer.cdn_number.unwrap_or(0),
+        cdn_key,
+        key: hex::encode(key),
+        digest: Some(hex::encode(digest)),
+        plaintext_hash: None,
+    })
 }
 
 /// Body text for a data message, including fallbacks for content types the
@@ -631,8 +672,9 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
     let body = body_text(dm);
     let sticker = dm.sticker.as_ref().and_then(|s| s.data.clone()).filter(|_| dm.body.is_none());
     let is_sticker = sticker.is_some();
-    let pointers: Vec<AttachmentPointer> = dm.attachments.iter().cloned().chain(sticker).collect();
-    if body.is_empty() && pointers.is_empty() {
+    let pointers: Vec<AttachmentPointer> = normal_attachments(dm).cloned().chain(sticker).collect();
+    let long_text = long_text_of(dm);
+    if body.is_empty() && pointers.is_empty() && long_text.is_none() {
         // Profile key updates, group changes, call updates, etc.
         return Vec::new();
     }
@@ -697,6 +739,7 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
         mentions: mentions(&dm.body_ranges),
         styles: styles(&dm.body_ranges),
         pointers,
+        long_text,
         preview_image,
         timer_version: dm.expire_timer_version,
     }]
@@ -861,6 +904,7 @@ fn map_story_reply(
         mentions: if emoji.is_some() { Vec::new() } else { mentions(&dm.body_ranges) },
         styles: if emoji.is_some() { Vec::new() } else { styles(&dm.body_ranges) },
         pointers: Vec::new(),
+        long_text: if emoji.is_some() { None } else { long_text_of(dm) },
         preview_image: None,
         timer_version: dm.expire_timer_version,
     }]
@@ -879,6 +923,7 @@ fn map_edit(edit: &EditMessage, origin: Origin, envelope_ts: i64, ctx: &MapConte
         body: dm.body.clone().unwrap_or_default(),
         mentions: mentions(&dm.body_ranges),
         styles: styles(&dm.body_ranges),
+        long_text: long_text_of(dm),
     })
 }
 

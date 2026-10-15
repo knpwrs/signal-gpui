@@ -222,6 +222,8 @@ struct Actor {
     linking: RefCell<bool>,
     /// Storage Service contacts have been read this session.
     storage_synced: RefCell<bool>,
+    /// Long texts cut off last time have been tried again this session.
+    long_texts_resumed: RefCell<bool>,
     /// Wakes the disappearing-message sweeper when a countdown starts.
     expiry: tokio::sync::Notify,
     /// The last timestamp we sent with: each send gets a later one, since
@@ -290,6 +292,7 @@ pub(crate) async fn run(
         outbound,
         linking: RefCell::new(false),
         storage_synced: RefCell::new(false),
+        long_texts_resumed: RefCell::new(false),
         expiry: tokio::sync::Notify::new(),
         last_sent_at: std::cell::Cell::new(0),
     });
@@ -465,6 +468,16 @@ impl Actor {
             if !downloads.is_empty() {
                 tokio::task::spawn_local(self.clone().download_transferred(manager.clone(), downloads));
             }
+            let long_texts = std::mem::take(&mut imported.long_texts);
+            if !long_texts.is_empty() {
+                let (this, manager) = (self.clone(), manager.clone());
+                tokio::task::spawn_local(async move {
+                    // One at a time: they're small, and there can be many.
+                    for id in long_texts {
+                        this.download_long_text(&manager, id).await;
+                    }
+                });
+            }
             anyhow::Ok(Some(imported))
         }
         .await;
@@ -561,6 +574,11 @@ impl Actor {
                 Command::DeleteForEveryone { message_id } => self.delete_for_everyone(message_id).await,
                 Command::FetchAttachment { message_id, index } => {
                     self.fetch_attachment(message_id, index).await
+                }
+                Command::FetchLongText { message_id } => {
+                    if let Some(manager) = self.manager() {
+                        self.download_long_text(&manager, message_id).await;
+                    }
                 }
                 Command::SetPinned { conversation, pinned } => self.set_pinned(conversation, pinned).await,
                 Command::SetChat { conversation, change } => self.set_chat(conversation, change).await,
@@ -755,6 +773,9 @@ impl Actor {
             Received::QueueEmpty => {
                 self.emit(Event::Connection(ConnectionState::Online));
                 self.refresh_titles().await;
+                if !self.long_texts_resumed.replace(true) {
+                    tokio::task::spawn_local(self.clone().resume_long_texts(manager.clone()));
+                }
                 if !self.storage_synced.replace(true) {
                     self.spawn_storage_sync(manager);
                 }
@@ -821,7 +842,7 @@ impl Actor {
 
     async fn apply(self: &Rc<Self>, manager: &SignalManager, action: Action) {
         match action {
-            Action::Insert { mut message, mentions, styles, pointers, preview_image, timer_version } => {
+            Action::Insert { mut message, mentions, styles, pointers, long_text, preview_image, timer_version } => {
                 let mut spans = Vec::new();
                 let mut style_spans = Vec::new();
                 // Every 1:1 message carries the sender's timer (groups take
@@ -898,6 +919,11 @@ impl Actor {
                         }
                         if !style_spans.is_empty() {
                             let _ = self.db.set_styles(id, &style_spans).await;
+                        }
+                        // Only its start came in the body; the rest follows
+                        // (a re-delivery is already on its way).
+                        if !repeat && let Some(pointer) = &long_text {
+                            self.expect_long_text(manager, id, pointer, mentions.clone(), styles.clone()).await;
                         }
                         // Already read on another device, before it got here.
                         let read_early = !repeat
@@ -1006,7 +1032,7 @@ impl Actor {
                     Err(error) => self.error("failed to delete message", error),
                 }
             }
-            Action::Edit { conversation, target_author, target_sent_at, sent_at, body, mentions, styles } => {
+            Action::Edit { conversation, target_author, target_sent_at, sent_at, body, mentions, styles, long_text } => {
                 let Some(target) = self.find(&conversation, target_author.as_deref(), target_sent_at).await else {
                     return;
                 };
@@ -1015,6 +1041,9 @@ impl Actor {
                     Ok(()) => {
                         let _ = self.db.set_mentions(target, &spans).await;
                         let _ = self.db.set_styles(target, &style_spans).await;
+                        if let Some(pointer) = &long_text {
+                            self.expect_long_text(manager, target, pointer, mentions, styles).await;
+                        }
                         // A read sync can name the edit, and come before it.
                         if let Some(author) = &target_author {
                             self.apply_early_read(author, sent_at).await;
@@ -3399,6 +3428,10 @@ impl Actor {
             return DeliveryStatus::Failed;
         }
         let mut body = self.stamp_timer(conversation, body).await;
+        if let Err(error) = self.attach_long_text(manager, &mut body).await {
+            self.error("failed to send", format!("{error:#}"));
+            return DeliveryStatus::Failed;
+        }
         self.attach_quote_thumbnail(manager, &mut body).await;
         let result = match (conversation.as_group(), mapping::service_id_of(conversation)) {
             (Some(key), _) => manager.send_message_to_group(&key, body, timestamp).await,
@@ -3415,6 +3448,49 @@ impl Actor {
                 DeliveryStatus::Failed
             }
         }
+    }
+
+    /// A body over 2 KiB goes as Desktop sends it (`sendNormalMessage`,
+    /// `ts/jobs/helpers/sendNormalMessage.preload.ts`): the whole text as a
+    /// `text/x-signal-plain` attachment, first among the attachments, and
+    /// only its first 2 KiB in the body. Mentions and formatting stay as
+    /// they are, over the whole text. Edits go the same way.
+    async fn attach_long_text(&self, manager: &SignalManager, body: &mut ContentBody) -> anyhow::Result<()> {
+        use crate::long_text;
+        let data = match body {
+            ContentBody::DataMessage(data) => data,
+            ContentBody::EditMessage(edit) => match edit.data_message.as_mut() {
+                Some(data) => data,
+                None => return Ok(()),
+            },
+            _ => return Ok(()),
+        };
+        let Some(text) = data.body.as_deref().filter(|b| long_text::is_too_long(b)) else { return Ok(()) };
+        if text.len() > long_text::MAX_TEXT_BYTES {
+            anyhow::bail!("the message is over Signal's 64 KiB limit");
+        }
+        let bytes = text.as_bytes().to_vec();
+        let trimmed = long_text::trim_body(text);
+        let spec = AttachmentSpec {
+            content_type: mapping::LONG_TEXT_TYPE.into(),
+            length: bytes.len(),
+            file_name: None,
+            preview: None,
+            voice_note: None,
+            borderless: None,
+            width: None,
+            height: None,
+            caption: None,
+            blur_hash: None,
+        };
+        let pointer = manager
+            .upload_attachment(spec, bytes)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .map_err(|e| anyhow::anyhow!("uploading the message's text: {e}"))?;
+        data.attachments.insert(0, pointer);
+        data.body = Some(trimmed);
+        Ok(())
     }
 
     /// A quote of a photo goes with a thumbnail of it, as Desktop's do
@@ -3750,11 +3826,99 @@ impl Actor {
             Ok(None) => return self.error("attachment unavailable", "original message not found"),
             Err(error) => return self.error("attachment unavailable", error),
         };
-        let pointer = data_message_of(&content.body).and_then(|dm| dm.attachments.get(index).cloned());
+        let pointer = data_message_of(&content.body).and_then(|dm| mapping::normal_attachments(dm).nth(index).cloned());
         let Some(pointer) = pointer else {
             return self.error("attachment unavailable", "no such attachment");
         };
         self.download(&manager, message.conversation_id, message_id, index, &pointer).await;
+    }
+
+    /// Notes that a message's whole text came as an attachment, and
+    /// downloads it.
+    async fn expect_long_text(
+        self: &Rc<Self>,
+        manager: &SignalManager,
+        message_id: i64,
+        pointer: &AttachmentPointer,
+        mentions: Vec<String>,
+        styles: Vec<mapping::WireStyle>,
+    ) {
+        let Some(remote) = mapping::remote_of(pointer) else {
+            return warn!("a long text came without where to download it");
+        };
+        let long_text = signal_store::LongText {
+            remote,
+            size: pointer.size.map_or(0, u64::from),
+            mentions,
+            styles,
+            state: signal_store::LongTextState::Downloading,
+        };
+        if let Err(error) = self.db.set_long_text(message_id, Some(&long_text)).await {
+            return self.error("failed to store message", error);
+        }
+        let this = self.clone();
+        let manager = manager.clone();
+        tokio::task::spawn_local(async move { this.download_long_text(&manager, message_id).await });
+    }
+
+    /// Downloads a message's whole text and puts it in place of the body's
+    /// start, with its mentions and formatting (Desktop's
+    /// `addAttachmentToMessage` for a `long-message`,
+    /// `ts/messageModifiers/AttachmentDownloads.preload.ts`). One over
+    /// Desktop's size limit isn't downloaded.
+    async fn download_long_text(self: &Rc<Self>, manager: &SignalManager, message_id: i64) {
+        use signal_store::LongTextState;
+        let Ok(Some(message)) = self.db.message(message_id).await else { return };
+        let Some(long_text) = message.long_text else { return };
+        let conversation = message.conversation_id;
+        let set_state = async |state: LongTextState| {
+            match self.db.set_long_text_state(message_id, &long_text, state).await {
+                Ok(true) => self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id }),
+                Ok(false) => {}
+                Err(error) => self.error("failed to store message", error),
+            }
+        };
+        if long_text.size > crate::long_text::max_receive_bytes() {
+            info!(size = long_text.size, "not downloading a long text over the limit");
+            return set_state(LongTextState::TooBig).await;
+        }
+        if long_text.state != LongTextState::Downloading {
+            set_state(LongTextState::Downloading).await;
+        }
+        let bytes = match crate::history::download_attachment(manager, &long_text.remote, long_text.size).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!(error = %format!("{error:#}"), "couldn't download a long text");
+                return set_state(LongTextState::Failed).await;
+            }
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let (body, spans, style_spans) = self.render_body(&text, &long_text.mentions, &long_text.styles).await;
+        match self.db.apply_long_text(message_id, &long_text, &body, &spans, &style_spans).await {
+            Ok(true) => {
+                self.emit(Event::MessageChanged { conversation, message_id });
+                self.emit(Event::ConversationsChanged);
+            }
+            // Deleted or edited since.
+            Ok(false) => {}
+            Err(error) => self.error("failed to store message", error),
+        }
+    }
+
+    /// Long texts whose download was cut off (the app quit, say): tried
+    /// again, a few at a time, once connected.
+    async fn resume_long_texts(self: Rc<Self>, manager: SignalManager) {
+        const PER_RUN: usize = 50;
+        let ids = match self.db.downloading_long_texts(PER_RUN).await {
+            Ok(ids) => ids,
+            Err(error) => return self.error("failed to read messages", error),
+        };
+        if !ids.is_empty() {
+            info!(count = ids.len(), "downloading long texts again");
+        }
+        for id in ids {
+            self.download_long_text(&manager, id).await;
+        }
     }
 
     async fn download(
@@ -3765,6 +3929,11 @@ impl Actor {
         index: usize,
         pointer: &AttachmentPointer,
     ) {
+        // Too big to receive: left undownloaded, as Desktop leaves it.
+        let size = pointer.size.map_or(0, u64::from);
+        if size > crate::MAX_RECEIVE_ATTACHMENT_BYTES {
+            return info!(size, "not downloading an attachment over the receive limit");
+        }
         let bytes = match manager.get_attachment(pointer).await {
             Ok(bytes) => bytes,
             Err(error) => return self.error("failed to download attachment", error),
@@ -3883,11 +4052,6 @@ impl Actor {
         message_id: i64,
         pointer: &AttachmentPointer,
     ) {
-        // Too big to receive: left undownloaded, as Desktop leaves it.
-        let size = pointer.size.map_or(0, u64::from);
-        if size > crate::MAX_RECEIVE_ATTACHMENT_BYTES {
-            return info!(size, "not downloading an attachment over the receive limit");
-        }
         let bytes = match manager.get_attachment(pointer).await {
             Ok(bytes) => bytes,
             Err(error) => return debug!(%error, "failed to download link preview image"),

@@ -42,6 +42,7 @@ hmac = "0.13"
 reqwest = { version = "0.13", default-features = false, features = ["json", "multipart"] }
 prost = "0.14"
 sha2 = "0.11"
+unicode-segmentation = "1.12"
 # Draws the demo photo.
 png = "0.18"
 # Link previews: finding links, parsing pages, fetching over TLS checked

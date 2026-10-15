@@ -291,6 +291,9 @@ pub struct Message {
     pub cta: Option<CallToAction>,
     /// Deleted for everyone by a group admin rather than its author.
     pub deleted_by_admin: Option<DeletedByAdmin>,
+    /// Its whole text, when that came as an attachment that hasn't
+    /// replaced `body` (only its start) yet.
+    pub long_text: Option<LongText>,
 }
 
 /// The group admin who deleted a message for everyone (Desktop's
@@ -374,6 +377,47 @@ pub struct StyleSpan {
     pub start: usize,
     pub len: usize,
     pub style: TextStyle,
+}
+
+/// A style as Signal sends it: UTF-16 positions in the body as sent, where
+/// each mention is one placeholder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WireStyle {
+    pub start: u32,
+    pub len: u32,
+    pub style: TextStyle,
+}
+
+/// A message whose text is too long to send inline: Signal sends the whole
+/// text as a `text/x-signal-plain` attachment, and the body holds only its
+/// first 2 KiB (Desktop's `bodyAttachment`, `ts/util/longAttachment.std.ts`).
+/// Kept until the whole text replaces the body.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LongText {
+    /// Where to download the text.
+    pub remote: RemoteAttachment,
+    /// Its size in bytes, as sent.
+    pub size: u64,
+    /// Who each mention placeholder in the whole text names, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<String>,
+    /// Its formatting over the whole text as sent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub styles: Vec<WireStyle>,
+    pub state: LongTextState,
+}
+
+/// Where the whole text of a [`LongText`] message stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LongTextState {
+    /// Being downloaded (Desktop's "Downloading").
+    Downloading,
+    /// The download failed; it can be tried again ("Download Full Message").
+    Failed,
+    /// Over the size limit, so not downloaded ("Message too long to display
+    /// more").
+    TooBig,
 }
 
 /// What stands in for spoiler text where it can't be revealed (previews,
@@ -703,7 +747,7 @@ const CONVERSATION_COLUMNS: &str = "id, kind, title, phone, color, members, last
       AS last_outgoing_status";
 
 const MESSAGE_COLUMNS: &str = "id, conversation_id, sent_at, received_at, direction, author, \
-     author_name, body, status, reactions, quote, attachments, link_preview, deleted, edited, expires_in, expire_start, edit_count, notice, mentions, styles, cta, deleted_by_admin";
+     author_name, body, status, reactions, quote, attachments, link_preview, deleted, edited, expires_in, expire_start, edit_count, notice, mentions, styles, cta, deleted_by_admin, long_text";
 
 /// SQL matching a message whose own timestamp, or one of its edits', is
 /// the bound parameter `{param}`.
@@ -897,6 +941,7 @@ fn message_from_row(row: &SqliteRow) -> Result<Message> {
             .try_get::<Option<String>, _>("deleted_by_admin")?
             .map(|d| serde_json::from_str(&d))
             .transpose()?,
+        long_text: row.try_get::<Option<String>, _>("long_text")?.map(|l| serde_json::from_str(&l)).transpose()?,
     })
 }
 
@@ -1701,7 +1746,8 @@ impl AppDb {
         self.update_and_refresh(
             message_id,
             "UPDATE messages SET deleted = 1, body = '', attachments = '[]', reactions = '[]', \
-             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL WHERE id = ? RETURNING conversation_id",
+             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL \
+             WHERE id = ? RETURNING conversation_id",
             None,
         )
         .await
@@ -1714,7 +1760,7 @@ impl AppDb {
         let mut tx = self.write().await?;
         let conversation: Option<String> = sqlx::query_scalar(
             "UPDATE messages SET deleted = 1, deleted_by_admin = ?2, body = '', attachments = '[]', reactions = '[]', \
-             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL WHERE id = ?1 AND deleted = 0 \
+             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL WHERE id = ?1 AND deleted = 0 \
              RETURNING conversation_id",
         )
         .bind(message_id)
@@ -1734,8 +1780,9 @@ impl AppDb {
     pub async fn edit_message(&self, message_id: i64, body: &str, edit_sent_at: i64) -> Result<()> {
         let mut tx = self.write().await?;
         let conversation: Option<String> = sqlx::query_scalar(
-            // The old formatting doesn't fit the new text; callers set the edit's.
-            "UPDATE messages SET body = ?2, styles = NULL, edited = 1, edit_count = edit_count + 1 WHERE id = ?1 AND deleted = 0 \
+            // The old formatting doesn't fit the new text, nor does a long
+            // text still to come; callers set the edit's.
+            "UPDATE messages SET body = ?2, styles = NULL, long_text = NULL, edited = 1, edit_count = edit_count + 1 WHERE id = ?1 AND deleted = 0 \
              RETURNING conversation_id",
         )
         .bind(message_id)
@@ -1752,6 +1799,82 @@ impl AppDb {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Keeps (or with `None`, forgets) a message's long text still to come.
+    pub async fn set_long_text(&self, message_id: i64, long_text: Option<&LongText>) -> Result<()> {
+        let json = long_text.map(serde_json::to_string).transpose()?;
+        sqlx::query("UPDATE messages SET long_text = ? WHERE id = ? AND deleted = 0")
+            .bind(json)
+            .bind(message_id)
+            .execute(&self.writer)
+            .await?;
+        Ok(())
+    }
+
+    /// Moves the message's long text to `state`, if it's still waiting for
+    /// the same text (an edit since may have replaced it). Returns whether it
+    /// did.
+    pub async fn set_long_text_state(&self, message_id: i64, expected: &LongText, state: LongTextState) -> Result<bool> {
+        let mut tx = self.write().await?;
+        let Some(current) = current_long_text(&mut tx, message_id).await? else { return Ok(false) };
+        if current.remote != expected.remote {
+            return Ok(false);
+        }
+        let json = serde_json::to_string(&LongText { state, ..current })?;
+        sqlx::query("UPDATE messages SET long_text = ? WHERE id = ?").bind(json).bind(message_id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Puts the whole text in place of the body's start, with its mentions
+    /// and formatting, if the message is still waiting for this text: not
+    /// deleted, nor edited to something else since. Returns whether it did.
+    pub async fn apply_long_text(
+        &self,
+        message_id: i64,
+        expected: &LongText,
+        body: &str,
+        mentions: &[MentionSpan],
+        styles: &[StyleSpan],
+    ) -> Result<bool> {
+        let mut tx = self.write().await?;
+        let Some(current) = current_long_text(&mut tx, message_id).await? else { return Ok(false) };
+        if current.remote != expected.remote {
+            return Ok(false);
+        }
+        let mentions = (!mentions.is_empty()).then(|| serde_json::to_string(mentions)).transpose()?;
+        let styles = (!styles.is_empty()).then(|| serde_json::to_string(styles)).transpose()?;
+        let conversation: String = sqlx::query_scalar(
+            "UPDATE messages SET body = ?, mentions = ?, styles = ?, long_text = NULL WHERE id = ? RETURNING conversation_id",
+        )
+        .bind(body)
+        .bind(mentions)
+        .bind(styles)
+        .bind(message_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        refresh_preview(&mut tx, &ConversationId(conversation)).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Messages whose long text was being downloaded (when the app last
+    /// quit, say), newest first, at most `limit`.
+    pub async fn downloading_long_texts(&self, limit: usize) -> Result<Vec<i64>> {
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT id, long_text FROM messages WHERE long_text IS NOT NULL AND deleted = 0 ORDER BY id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|(_, json)| {
+                serde_json::from_str::<LongText>(json).is_ok_and(|l| l.state == LongTextState::Downloading)
+            })
+            .map(|(id, _)| id)
+            .take(limit)
+            .collect())
     }
 
     /// Removes a message entirely ("delete for me"), keeping the
@@ -2377,6 +2500,15 @@ async fn ensure_conversation(
 }
 
 /// Recomputes the conversation's preview from its newest message.
+/// A live message's long text still to come, if any.
+async fn current_long_text(conn: &mut sqlx::SqliteConnection, message_id: i64) -> Result<Option<LongText>> {
+    let json: Option<Option<String>> = sqlx::query_scalar("SELECT long_text FROM messages WHERE id = ? AND deleted = 0")
+        .bind(message_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    Ok(json.flatten().map(|j| serde_json::from_str(&j)).transpose()?)
+}
+
 async fn refresh_preview(conn: &mut sqlx::SqliteConnection, id: &ConversationId) -> Result<()> {
     let row = sqlx::query(
         "SELECT m.sent_at, m.body, m.styles, m.deleted, m.attachments, m.direction, m.author_name, c.kind \

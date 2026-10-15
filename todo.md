@@ -44,7 +44,7 @@ flag as on whenever it's set.
 | `attachments.maxBytes` | 100 MiB | Same (`MAX_ATTACHMENT_BYTES`). |
 | `attachments.maxReceiveBytes` | 1.25 × the send limit | Same, hard-coded (`MAX_RECEIVE_ATTACHMENT_BYTES`). Desktop marks an attachment too big when a download is tried; here it's judged from the size the sender gave, so the bubble says so from the start. |
 | `attachments.maxAutoDownloadSizeBytes` | 200 MiB | We auto-download up to 25 MiB (`AUTO_DOWNLOAD_MAX`). Raise it, or make it a setting? |
-| `textAttachmentLimitBytes` | Size of a long-text attachment | Long text isn't handled. Desktop sends bodies over 2 KiB as a `text/x-signal-plain` attachment and shows received ones in full. We send the whole body inline, and we show a received long message cut off. Worth fixing on its own. |
+| `textAttachmentLimitBytes` | Size of a long-text attachment | Desktop's built-in limits, hard-coded (`crates/backend/src/long_text.rs`): bodies over 2 KiB go as a `text/x-signal-plain` attachment, received ones download and replace the body, and the composer stops at 64 KiB. Not done: Desktop's "Read more" past 800 characters, its automatic retries of a failed download (here: a "Download Full Message" button), long text in group story replies we send, and dropping received messages whose inline body is over 2 KiB (Desktop's `MessageReceiver` drops them). |
 | `groupsv2.maxGroupSize` / `groupSizeHardLimit` | From config | New groups don't enforce a size limit yet; the server rejects one that's too big. |
 | `nicknames.min` / `.max` | From config | Not used: nicknames aren't editable. |
 | `messageQueueTimeInSeconds` | 30 days (never less) | How long the server keeps undelivered messages. Not used. |
