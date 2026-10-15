@@ -30,8 +30,8 @@ pub struct RootView {
     call: Option<Entity<crate::views::call::CallView>>,
     /// The chat list's width as dragged (see `crate::sidebar_width`).
     sidebar_preferred: f32,
-    /// Whether an account was ready when last seen.
-    had_account: bool,
+    /// The account (its ACI) when last seen.
+    account: Option<String>,
     /// Counts account changes, so a width read for an earlier account
     /// isn't applied to the next.
     account_generation: u64,
@@ -96,18 +96,7 @@ impl RootView {
                 }
             }),
             cx.observe(&state, |this, state, cx| {
-                // The width is the account's setting: an unlink wipes it, so
-                // start over, and read the next account's once it's ready.
-                let has_account = state.read(cx).account.is_some();
-                if this.had_account != has_account {
-                    this.account_generation += 1;
-                }
-                if this.had_account && !has_account {
-                    this.sidebar_preferred = crate::sidebar_width::DEFAULT_WIDTH;
-                } else if !this.had_account && has_account {
-                    this.load_sidebar_width(cx);
-                }
-                this.had_account = has_account;
+                this.follow_account(cx);
                 let active = {
                     let s = state.read(cx);
                     s.call.is_some() || s.lobby.is_some()
@@ -120,7 +109,7 @@ impl RootView {
                 cx.notify()
             }),
         ];
-        let this = Self {
+        let mut this = Self {
             state,
             sidebar,
             picker,
@@ -129,12 +118,27 @@ impl RootView {
             video_viewer: None,
             call: None,
             sidebar_preferred: crate::sidebar_width::DEFAULT_WIDTH,
-            had_account: false,
+            account: None,
             account_generation: 0,
             _subscriptions: subscriptions,
         };
-        // (The width loads once the account is ready: see the observer.)
+        this.follow_account(cx);
         this
+    }
+
+    /// The width is the account's setting (an unlink wipes it): with each
+    /// account, start over and read its own.
+    fn follow_account(&mut self, cx: &mut Context<Self>) {
+        let account = self.state.read(cx).account.as_ref().map(|a| a.aci.clone());
+        if account == self.account {
+            return;
+        }
+        self.account = account;
+        self.account_generation += 1;
+        self.sidebar_preferred = crate::sidebar_width::DEFAULT_WIDTH;
+        if self.account.is_some() {
+            self.load_sidebar_width(cx);
+        }
     }
 
     /// The width last dragged to, from the settings.
