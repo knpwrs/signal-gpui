@@ -1345,9 +1345,10 @@ impl ConversationView {
                             .px_3()
                             .pt_1p5()
                             .pb_2()
-                            .children(rest.iter().enumerate().map(|(ix, a)| {
+                            .children(rest.iter().enumerate().filter(|(_, a)| !too_big(a)).map(|(ix, a)| {
                                 render_attachment(message.id, ix + 1, a, &title, fg, palette, &self.state, cx)
                             }))
+                            .children(too_big_label(message))
                             .when(caption, |d| d.child(message_text(message, fg, self.revealed_spoilers.contains(&message.id), spacer.as_deref().map(|s| (s, bg)), cx)))
                             .when_some(meta, |d, m| d.child(place_meta(m, inline_meta))),
                     )
@@ -1419,7 +1420,15 @@ impl ConversationView {
                 d.child(author_line(author_name, author_color, author_label))
             })
             .when_some(message.quote.clone(), |d, quote| d.child(self.render_quote(message.id, quote, fg, palette, cx)))
-            .children(message.attachments.iter().enumerate().map(|(ix, a)| render_attachment(message.id, ix, a, &title, fg, palette, &self.state, cx)))
+            .children(
+                message
+                    .attachments
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| !too_big(a))
+                    .map(|(ix, a)| render_attachment(message.id, ix, a, &title, fg, palette, &self.state, cx)),
+            )
+            .children((!message.deleted).then(|| too_big_label(message)).flatten())
             .map(|d| {
                 if message.deleted {
                     d.child(div().italic().child(self.deleted_text(message, cx)))
@@ -3344,6 +3353,30 @@ fn open_pin_dialog(state: Entity<AppState>, message_id: i64, pinned: usize, disa
     });
 }
 
+/// An attachment over Signal's receive limit, which isn't downloaded or
+/// shown (Desktop's `wasTooBig`, `ts/jobs/AttachmentDownloadManager.preload.ts`).
+fn too_big(attachment: &AttachmentMeta) -> bool {
+    attachment.local_path.is_none() && attachment.size > signal_backend::MAX_RECEIVE_ATTACHMENT_BYTES
+}
+
+/// What stands in for attachments too big to receive, in Desktop's words
+/// (`renderAttachmentTooBig` in `ts/components/conversation/Message.dom.tsx`).
+fn too_big_text(message: &Message) -> Option<&'static str> {
+    if !message.attachments.iter().any(too_big) {
+        None
+    } else if message.attachments.iter().all(too_big) {
+        Some("Attachment too large to display.")
+    } else {
+        Some("Some attachments are too large to display.")
+    }
+}
+
+fn too_big_label(message: &Message) -> Option<AnyElement> {
+    let label = too_big_text(message)?;
+    let id = message.id;
+    Some(div().debug_selector(move || format!("too-big-{id}")).italic().child(label).into_any_element())
+}
+
 /// Saves downloaded attachments: one through a save dialog, several into a
 /// chosen folder.
 fn download_attachments(attachments: Vec<AttachmentMeta>, cx: &mut App) {
@@ -3738,6 +3771,59 @@ mod tests {
         // Outgoing, first of a run: only the bottom right meets the next one.
         let first = Corners::for_bubble(true, true, false);
         assert_eq!(first, Corners { top_left: 18., top_right: 18., bottom_left: 18., bottom_right: 6. });
+    }
+
+    #[gpui_kit::test]
+    fn attachments_over_the_receive_limit_are_left_out(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        wait_for_messages(&backend, NOTE_TO_SELF, 1, |_| true);
+        let file = |name: &str, size: u64| AttachmentMeta {
+            content_type: "application/zip".into(),
+            file_name: Some(name.into()),
+            size,
+            width: None,
+            height: None,
+            local_path: None,
+            sticker: false,
+            gif: false,
+            voice: false,
+            remote: None,
+        };
+        let limit = signal_backend::MAX_RECEIVE_ATTACHMENT_BYTES;
+        let insert = |sent_at: i64, attachments: Vec<AttachmentMeta>| {
+            let db = backend.db().clone();
+            let message = signal_store::NewMessage {
+                conversation_id: ConversationId(NOTE_TO_SELF.into()),
+                sent_at,
+                received_at: sent_at,
+                direction: Direction::Outgoing,
+                author: None,
+                author_name: None,
+                body: String::new(),
+                status: DeliveryStatus::Sent,
+                quote: None,
+                attachments,
+                link_preview: None,
+                expires_in: 0,
+            };
+            futures::executor::block_on(backend.spawn(async move { db.insert_message(&message).await })).unwrap()
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        let alone = insert(now, vec![file("huge.zip", limit + 1)]);
+        let mixed = insert(now + 1, vec![file("small.zip", 10), file("huge.zip", limit + 1)]);
+        let fits = insert(now + 2, vec![file("edge.zip", limit)]);
+        let message = |id: i64| {
+            let db = backend.db().clone();
+            futures::executor::block_on(backend.spawn(async move { db.message(id).await })).unwrap().unwrap()
+        };
+        assert_eq!(too_big_text(&message(alone)), Some("Attachment too large to display."));
+        assert_eq!(too_big_text(&message(mixed)), Some("Some attachments are too large to display."));
+        assert_eq!(too_big_text(&message(fits)), None, "the limit itself is allowed");
+
+        let mut cx = open(cx, &backend, NOTE_TO_SELF);
+        bounds(&mut cx, format!("too-big-{alone}"));
+        bounds(&mut cx, format!("too-big-{mixed}"));
+        assert!(cx.debug_bounds(Box::leak(format!("too-big-{fits}").into_boxed_str())).is_none());
     }
 
     #[gpui_kit::test]

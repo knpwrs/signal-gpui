@@ -3797,6 +3797,9 @@ impl Actor {
         meta: &AttachmentMeta,
     ) -> anyhow::Result<()> {
         let remote = meta.remote.as_ref().context("no locator")?;
+        if meta.size > crate::MAX_RECEIVE_ATTACHMENT_BYTES {
+            anyhow::bail!("it's over Signal's receive limit");
+        }
         let bytes = crate::history::download_attachment(manager, remote, meta.size).await?;
         let pointer = AttachmentPointer {
             content_type: Some(meta.content_type.clone()),
@@ -3880,6 +3883,11 @@ impl Actor {
         message_id: i64,
         pointer: &AttachmentPointer,
     ) {
+        // Too big to receive: left undownloaded, as Desktop leaves it.
+        let size = pointer.size.map_or(0, u64::from);
+        if size > crate::MAX_RECEIVE_ATTACHMENT_BYTES {
+            return info!(size, "not downloading an attachment over the receive limit");
+        }
         let bytes = match manager.get_attachment(pointer).await {
             Ok(bytes) => bytes,
             Err(error) => return debug!(%error, "failed to download link preview image"),

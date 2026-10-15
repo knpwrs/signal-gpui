@@ -488,6 +488,11 @@ pub const VOICE_CONTENT_TYPE: &str = "audio/aac";
 /// Signal's attachment size limit.
 pub const MAX_ATTACHMENT_BYTES: usize = 100 * 1024 * 1024;
 
+/// Attachments bigger than this aren't downloaded: 1.25 times the send
+/// limit, Desktop's default for `global.attachments.maxReceiveBytes`
+/// (`getMaximumIncomingAttachmentSize` in `ts/types/AttachmentSize.std.ts`).
+pub const MAX_RECEIVE_ATTACHMENT_BYTES: u64 = MAX_ATTACHMENT_BYTES as u64 * 5 / 4;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionState {
     Offline,

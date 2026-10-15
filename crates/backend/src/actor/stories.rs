@@ -96,6 +96,10 @@ impl Actor {
 
     async fn download_story(&self, manager: &SignalManager, id: i64, pointer: &AttachmentPointer) {
         let saved = async {
+            let size = pointer.size.map_or(0, u64::from);
+            if size > crate::MAX_RECEIVE_ATTACHMENT_BYTES {
+                anyhow::bail!("{size} bytes is over Signal's receive limit");
+            }
             let bytes = manager.get_attachment(pointer).await.map_err(|e| anyhow::anyhow!("{e}"))?;
             let path = self.config.data_dir.join("attachments").join(format!("story-{id}.{}", extension_for(pointer)));
             tokio::fs::write(&path, &bytes).await?;
