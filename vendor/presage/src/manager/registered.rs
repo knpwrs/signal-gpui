@@ -1072,6 +1072,40 @@ impl<S: Store> Manager<S, Registered> {
         Ok(resolved_username)
     }
 
+    /// signal-gpui: sends a story (a `StoryMessage`), or a reply to a group
+    /// story (a `DataMessage` with its `story_context`), to one recipient's
+    /// devices: sealed, flagged as a story, without an access key. Our
+    /// profile key goes in a story, as Desktop puts it there. Nothing is
+    /// saved, and no sync message is sent (the caller sends one for every
+    /// recipient).
+    pub async fn send_story(
+        &mut self,
+        recipient: impl Into<ServiceId>,
+        message: impl Into<ContentBody>,
+        timestamp: u64,
+    ) -> Result<(), Error<S::Error>> {
+        let mut sender = self.new_message_sender().await?;
+        let recipient = recipient.into();
+        let mut content_body: ContentBody = message.into();
+        let profile_key = self.state.data.profile_key().get_bytes().to_vec();
+        match &mut content_body {
+            ContentBody::StoryMessage(story) => {
+                story.profile_key.get_or_insert(profile_key);
+            }
+            ContentBody::DataMessage(message) => {
+                message.profile_key.get_or_insert(profile_key);
+                message.required_protocol_version = Some(0);
+            }
+            _ => {}
+        }
+        ensure_data_message_timestamp(&mut content_body, timestamp);
+        let sender_certificate = self.sender_certificate().await?;
+        sender
+            .send_story(&recipient, &sender_certificate, content_body, timestamp)
+            .await?;
+        Ok(())
+    }
+
     /// Sends a messages to the provided [ServiceId].
     /// The timestamp should be set to now and is used by Signal mobile apps
     /// to order messages later, and apply reactions.

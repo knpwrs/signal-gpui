@@ -12,6 +12,9 @@ upstream workspace). Changes:
 - `src/manager/registered.rs`: the receiving websocket sends
   `X-Signal-Receive-Stories: true`, so the server delivers stories (upstream
   hard-codes `false`).
+- `src/manager/registered.rs`: `Manager::send_story` sends a story (or a
+  reply to a group story) to one recipient through libsignal-service's
+  `MessageSender::send_story`, with our profile key in it.
 
 ## libsignal-service
 
