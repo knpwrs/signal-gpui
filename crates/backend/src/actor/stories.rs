@@ -299,4 +299,47 @@ impl Actor {
         };
         self.enqueue(Outbound::Send { conversation, body: data.into(), timestamp: timestamp as u64, message: Some(id) });
     }
+
+    /// Hides (or shows again) a person's or group's stories, here.
+    pub(super) async fn set_story_hidden(&self, chat: &ConversationId, hidden: bool) -> signal_store::Result<()> {
+        self.db.set_story_hidden(chat, hidden).await?;
+        self.emit(Event::StorySettingsChanged);
+        Ok(())
+    }
+
+    /// Stories' settings from Storage Service: the story lists, hidden
+    /// stories, stories off, and view receipts (Desktop syncs all four).
+    pub(super) async fn save_story_settings(
+        &self,
+        lists: Vec<crate::StoryList>,
+        hidden: Vec<ConversationId>,
+        disabled: Option<bool>,
+        view_receipts: Option<bool>,
+    ) {
+        let saved = async {
+            self.db.set_setting(crate::SETTING_STORY_LISTS, &serde_json::to_string(&lists)?).await?;
+            let mut hidden: Vec<String> = hidden.into_iter().map(|c| c.0).collect();
+            hidden.sort();
+            self.db.set_setting(crate::SETTING_HIDDEN_STORIES, &serde_json::to_string(&hidden)?).await?;
+            if let Some(disabled) = disabled {
+                self.db.set_setting(SETTING_STORIES_DISABLED, if disabled { "true" } else { "false" }).await?;
+                if disabled {
+                    for file in self.db.remove_all_stories().await? {
+                        let _ = tokio::fs::remove_file(file).await;
+                    }
+                }
+            }
+            if let Some(on) = view_receipts {
+                self.db.set_setting(SETTING_STORY_VIEW_RECEIPTS, if on { "true" } else { "false" }).await?;
+            }
+            anyhow::Ok(())
+        };
+        match saved.await {
+            Ok(()) => {
+                self.emit(Event::StorySettingsChanged);
+                self.emit(Event::StoriesChanged);
+            }
+            Err(error) => warn!(error = %format!("{error:#}"), "couldn't save story settings"),
+        }
+    }
 }

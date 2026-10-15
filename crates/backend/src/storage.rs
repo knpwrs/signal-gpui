@@ -66,6 +66,14 @@ pub(crate) struct StorageSnapshot {
     pub chats: Vec<ChatState>,
     /// The account's "Generate link previews" setting.
     pub link_previews: Option<bool>,
+    /// Story lists, My Story among them (not deleted ones).
+    pub story_lists: Vec<crate::StoryList>,
+    /// Chats whose stories are hidden (`hideStory`).
+    pub hidden_stories: Vec<ConversationId>,
+    /// The account's `storiesDisabled`.
+    pub stories_disabled: Option<bool>,
+    /// The account's `storyViewReceiptsEnabled`, when set.
+    pub story_view_receipts: Option<bool>,
 }
 
 /// Reads the account record and every contact record from the Storage Service.
@@ -85,7 +93,13 @@ pub(crate) async fn fetch(manager: &SignalManager) -> anyhow::Result<StorageSnap
         .identifiers
         .iter()
         .filter(|id| {
-            matches!(id.r#type(), IdentifierType::Contact | IdentifierType::Groupv2 | IdentifierType::Account)
+            matches!(
+                id.r#type(),
+                IdentifierType::Contact
+                    | IdentifierType::Groupv2
+                    | IdentifierType::Account
+                    | IdentifierType::StoryDistributionList
+            )
         })
         .map(|id| id.raw.clone())
         .collect();
@@ -97,13 +111,30 @@ pub(crate) async fn fetch(manager: &SignalManager) -> anyhow::Result<StorageSnap
             match record.record {
                 Some(Record::Contact(contact)) => {
                     snapshot.chats.extend(contact_chat(&contact));
+                    if contact.hide_story
+                        && let Some(aci) = record_aci(&contact)
+                    {
+                        snapshot.hidden_stories.push(ConversationId::direct(&Aci::from(aci).service_id_string()));
+                    }
                     snapshot.contacts.extend(from_record(&contact));
                 }
-                Some(Record::GroupV2(group)) => snapshot.chats.extend(group_chat(&group)),
+                Some(Record::GroupV2(group)) => {
+                    if group.hide_story && group.master_key.len() == 32 {
+                        snapshot.hidden_stories.push(ConversationId::group(&group.master_key));
+                    }
+                    snapshot.chats.extend(group_chat(&group));
+                }
                 Some(Record::Account(account)) => {
                     snapshot.pinned = Some(pinned(&account));
                     snapshot.link_previews = Some(account.link_previews);
+                    snapshot.stories_disabled = Some(account.stories_disabled);
+                    snapshot.story_view_receipts = match account.story_view_receipts_enabled() {
+                        presage::proto::OptionalBool::Enabled => Some(true),
+                        presage::proto::OptionalBool::Disabled => Some(false),
+                        presage::proto::OptionalBool::Unset => None,
+                    };
                 }
+                Some(Record::StoryDistributionList(list)) => snapshot.story_lists.extend(story_list(&list)),
                 _ => {}
             }
         }
@@ -246,6 +277,8 @@ pub(crate) enum ChatEdit {
     MutedUntil(u64),
     MarkedUnread(bool),
     Blocked(bool),
+    /// Their stories hidden (`hideStory`).
+    HideStory(bool),
 }
 
 impl ChatEdit {
@@ -256,6 +289,7 @@ impl ChatEdit {
             ChatEdit::Archived(on) => (11, 4, u64::from(on)),
             ChatEdit::MarkedUnread(on) => (12, 5, u64::from(on)),
             ChatEdit::MutedUntil(until) => (13, 6, until),
+            ChatEdit::HideStory(on) => (14, 8, u64::from(on)),
         };
         (if group { group_field } else { contact }, value)
     }
@@ -540,6 +574,27 @@ pub(crate) fn push_service(manager: &SignalManager) -> anyhow::Result<PushServic
     Ok(PushService::new(data.signal_servers, Some(credentials), "signal-gpui"))
 }
 
+/// A story list (Desktop's `StoryDistributionListRecord`): its members as
+/// service ids (the binary form preferred), unless it's been deleted.
+fn story_list(record: &presage::proto::StoryDistributionListRecord) -> Option<crate::StoryList> {
+    if record.deleted_at_timestamp != 0 {
+        return None;
+    }
+    let id = Uuid::from_slice(&record.identifier).ok()?;
+    let members = if record.recipient_service_ids_binary.is_empty() {
+        record.recipient_service_ids.iter().filter_map(|s| ServiceId::parse_from_service_id_string(s)).collect::<Vec<_>>()
+    } else {
+        record.recipient_service_ids_binary.iter().filter_map(|b| ServiceId::parse_from_service_id_binary(b)).collect()
+    };
+    Some(crate::StoryList {
+        id: id.to_string(),
+        name: record.name.clone(),
+        members: members.iter().map(ServiceId::service_id_string).collect(),
+        block_list: record.is_block_list,
+        allows_replies: record.allows_replies,
+    })
+}
+
 fn contact_chat(record: &ContactRecord) -> Option<ChatState> {
     let aci = record_aci(record)?;
     Some(ChatState {
@@ -762,6 +817,43 @@ mod tests {
         let Some(Record::Contact(c)) = StorageRecord::decode(unarchived.as_slice()).unwrap().record else { panic!() };
         assert!(!c.archived);
         assert_eq!(edit_chat_record(&unarchived, ChatEdit::Archived(false)).unwrap(), None);
+    }
+
+    #[test]
+    fn hiding_stories_writes_hide_story() {
+        for (record, group) in [
+            (StorageRecord { record: Some(Record::Contact(ContactRecord { aci: ACI.into(), ..Default::default() })) }, false),
+            (StorageRecord { record: Some(Record::GroupV2(GroupV2Record { master_key: vec![1; 32], ..Default::default() })) }, true),
+        ] {
+            let hidden = edit_chat_record(&record.encode_to_vec(), ChatEdit::HideStory(true)).unwrap().unwrap();
+            let hide_story = match StorageRecord::decode(hidden.as_slice()).unwrap().record {
+                Some(Record::Contact(c)) => c.hide_story,
+                Some(Record::GroupV2(g)) => g.hide_story,
+                _ => panic!(),
+            };
+            assert!(hide_story, "group: {group}");
+        }
+    }
+
+    #[test]
+    fn story_lists_read_as_desktop_reads_them() {
+        use presage::proto::StoryDistributionListRecord;
+        let my_story = StoryDistributionListRecord {
+            identifier: vec![0; 16],
+            name: String::new(),
+            recipient_service_ids: vec!["ignored-when-binary-is-there".into()],
+            recipient_service_ids_binary: vec![Uuid::parse_str(ACI).unwrap().as_bytes().to_vec()],
+            is_block_list: true,
+            allows_replies: true,
+            ..Default::default()
+        };
+        let list = story_list(&my_story).unwrap();
+        assert_eq!(
+            (list.id.as_str(), list.members, list.block_list, list.allows_replies),
+            (crate::MY_STORY_ID, vec![ACI.to_owned()], true, true)
+        );
+        let deleted = StoryDistributionListRecord { identifier: vec![1; 16], deleted_at_timestamp: 5, ..Default::default() };
+        assert_eq!(story_list(&deleted), None);
     }
 
     #[test]

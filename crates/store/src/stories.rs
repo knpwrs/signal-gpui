@@ -5,6 +5,9 @@ use sqlx::Row as _;
 
 use crate::{AppDb, AttachmentMeta, ConversationId, LinkPreview, Result, StyleSpan};
 
+/// Settings key: chats whose stories are hidden (JSON conversation ids).
+pub const HIDDEN_STORIES: &str = "stories_hidden";
+
 /// A story lasts a day (Desktop's `expireTimer = DurationInSeconds.DAY`).
 pub const STORY_LIFETIME_MS: i64 = 24 * 60 * 60 * 1000;
 
@@ -287,6 +290,19 @@ impl AppDb {
     /// files to delete.
     pub async fn remove_all_stories(&self) -> Result<Vec<String>> {
         self.remove_expired_stories(i64::MAX).await
+    }
+
+    /// Hides (or shows again) a person's or group's stories: kept in the
+    /// `stories_hidden` setting (JSON conversation ids).
+    pub async fn set_story_hidden(&self, chat: &ConversationId, hidden: bool) -> Result<()> {
+        let mut ids: Vec<String> =
+            self.setting(HIDDEN_STORIES).await?.and_then(|json| serde_json::from_str(&json).ok()).unwrap_or_default();
+        ids.retain(|id| id != &chat.0);
+        if hidden {
+            ids.push(chat.0.clone());
+        }
+        ids.sort();
+        self.set_setting(HIDDEN_STORIES, &serde_json::to_string(&ids)?).await
     }
 
     /// When the next story goes (unix millis).

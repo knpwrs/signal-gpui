@@ -22,7 +22,7 @@ pub enum NavTab {
 /// Settings key: the tabs are hidden (Desktop's `navTabsCollapsed`).
 const NAV_COLLAPSED_SETTING: &str = "nav_tabs_collapsed";
 /// Settings key: chats whose stories are hidden (JSON conversation ids).
-const HIDDEN_STORIES_SETTING: &str = "stories_hidden";
+const HIDDEN_STORIES_SETTING: &str = signal_backend::SETTING_HIDDEN_STORIES;
 
 /// A person's or group's stories, for the list and the viewer.
 #[derive(Debug, Clone, PartialEq)]
@@ -536,6 +536,7 @@ impl AppState {
             }
             Event::ConversationsChanged => self.reload_conversations(cx),
             Event::StoriesChanged => self.reload_stories(cx),
+            Event::StorySettingsChanged => self.load_settings(cx),
             Event::Megaphones(megaphones) => {
                 self.megaphones = megaphones;
                 cx.notify();
@@ -799,12 +800,12 @@ impl AppState {
     }
 
     /// Hides (or shows again) a person's or group's stories.
+    /// Hides (or shows again) a person's or group's stories, on every
+    /// device (Storage Service's `hideStory`).
     pub fn set_story_hidden(&mut self, chat: ConversationId, hidden: bool, cx: &mut Context<Self>) {
-        let changed = if hidden { self.hidden_stories.insert(chat) } else { self.hidden_stories.remove(&chat) };
+        let changed = if hidden { self.hidden_stories.insert(chat.clone()) } else { self.hidden_stories.remove(&chat) };
         if changed {
-            let mut ids: Vec<&str> = self.hidden_stories.iter().map(|c| c.0.as_str()).collect();
-            ids.sort();
-            self.save_setting(HIDDEN_STORIES_SETTING, serde_json::to_string(&ids).unwrap_or_default(), cx);
+            self.send(Command::SetChat { conversation: chat, change: signal_backend::ChatChange::HideStory(hidden) });
             cx.notify();
         }
     }

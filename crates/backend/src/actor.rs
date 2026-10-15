@@ -1652,6 +1652,7 @@ impl Actor {
             ChatChange::MutedUntil(until) => self.db.set_muted_until(&conversation, until).await,
             ChatChange::MarkedUnread(on) => self.db.set_marked_unread(&conversation, on).await,
             ChatChange::Blocked(on) => self.db.set_blocked(&conversation, on).await,
+            ChatChange::HideStory(on) => self.set_story_hidden(&conversation, on).await,
         };
         if let Err(error) = local {
             return self.error("failed to update chat", error);
@@ -1662,6 +1663,7 @@ impl Actor {
             ChatChange::MutedUntil(until) => storage::ChatEdit::MutedUntil(until.max(0) as u64),
             ChatChange::MarkedUnread(on) => storage::ChatEdit::MarkedUnread(on),
             ChatChange::Blocked(on) => storage::ChatEdit::Blocked(on),
+            ChatChange::HideStory(on) => storage::ChatEdit::HideStory(on),
         };
         match storage::write_chat(&manager, &conversation, edit).await {
             Ok(()) => self.storage_written(),
@@ -1680,7 +1682,16 @@ impl Actor {
     /// Reads names, profile keys, pins and archived/muted state from the
     /// Storage Service, then re-titles.
     async fn sync_storage(self: &Rc<Self>, manager: &SignalManager) {
-        let storage::StorageSnapshot { contacts, pinned, chats, link_previews } = match storage::fetch(manager).await {
+        let storage::StorageSnapshot {
+            contacts,
+            pinned,
+            chats,
+            link_previews,
+            story_lists,
+            hidden_stories,
+            stories_disabled,
+            story_view_receipts,
+        } = match storage::fetch(manager).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 warn!(error = %format!("{error:#}"), "storage service sync failed");
@@ -1700,6 +1711,7 @@ impl Actor {
         {
             warn!(%error, "failed to save link preview setting");
         }
+        self.save_story_settings(story_lists, hidden_stories, stories_disabled, story_view_receipts).await;
         match self.db.apply_chat_states(&chats).await {
             Ok(true) => self.emit(Event::ConversationsChanged),
             Ok(false) => {}

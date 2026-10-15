@@ -245,7 +245,28 @@ pub enum ChatChange {
     MutedUntil(i64),
     MarkedUnread(bool),
     Blocked(bool),
+    /// Their stories hidden (Desktop's Hide story).
+    HideStory(bool),
 }
+
+/// A story list (Desktop's distribution list), from Storage Service.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoryList {
+    /// Its UUID; My Story's is [`MY_STORY_ID`].
+    pub id: String,
+    pub name: String,
+    /// Who it's shared with, or (`block_list`) who it isn't.
+    pub members: Vec<String>,
+    pub block_list: bool,
+    pub allows_replies: bool,
+}
+
+/// Desktop's `MY_STORY_ID`.
+pub const MY_STORY_ID: &str = "00000000-0000-0000-0000-000000000000";
+/// Settings key: the story lists (JSON [`StoryList`]s), from Storage Service.
+pub const SETTING_STORY_LISTS: &str = "story_lists";
+/// Settings key: chats whose stories are hidden (JSON conversation ids).
+pub const SETTING_HIDDEN_STORIES: &str = signal_store::HIDDEN_STORIES;
 
 /// Pinned messages per chat (Desktop's `global.pinnedMessageLimit` default).
 pub const MAX_PINNED_MESSAGES: usize = 3;
@@ -471,6 +492,9 @@ pub enum Event {
     Megaphones(Vec<megaphones::MegaphoneView>),
     /// Stories came, went, were viewed or replied to.
     StoriesChanged,
+    /// Stories' settings changed (hidden stories, stories off, view
+    /// receipts, story lists), here or from Storage Service.
+    StorySettingsChanged,
     /// A message was inserted or updated (status, reaction, edit, delete, attachment).
     MessageChanged { conversation: ConversationId, message_id: i64 },
     Typing { conversation: ConversationId, author: String, started: bool },
