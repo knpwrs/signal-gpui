@@ -173,6 +173,9 @@ struct Actor {
     names: RefCell<HashMap<String, Option<String>>>,
     /// Conversations whose title has been resolved this session.
     titled: RefCell<HashSet<ConversationId>>,
+    /// Each group's revision when its details (members, admins, access) were
+    /// last read, to read them again when a message names a newer one.
+    group_revisions: RefCell<HashMap<ConversationId, u32>>,
     /// Group identifier -> master key, for typing indicators.
     group_ids: RefCell<HashMap<Vec<u8>, [u8; 32]>>,
     profile_fetches: RefCell<HashSet<String>>,
@@ -260,6 +263,7 @@ pub(crate) async fn run(
         self_aci: RefCell::new(String::new()),
         names: RefCell::default(),
         titled: RefCell::default(),
+        group_revisions: RefCell::default(),
         group_ids: RefCell::default(),
         profile_fetches: RefCell::default(),
         receiver: RefCell::new(None),
@@ -781,6 +785,18 @@ impl Actor {
                 }
                 if let Some((key, change, at)) = mapping::group_change_of(&content) {
                     self.apply_group_change(key, &change, at).await;
+                }
+                // A newer revision can come without the change itself (the
+                // field is optional). presage has fetched the group again by
+                // now, so read its admins and access again too.
+                if let Some((key, revision)) = mapping::group_revision_of(&content) {
+                    let conversation = ConversationId::group(&key);
+                    let stale = self.group_revisions.borrow().get(&conversation).is_some_and(|seen| *seen < revision);
+                    if stale {
+                        self.titled.borrow_mut().remove(&conversation);
+                        self.ensure_title(&conversation).await;
+                        self.emit(Event::ConversationsChanged);
+                    }
                 }
                 // Like Desktop, nothing from someone you blocked gets through.
                 if sender != self_aci && self.is_blocked(&ConversationId::direct(&sender)).await {
@@ -2228,6 +2244,7 @@ impl Actor {
         if let Some(key) = conversation.as_group() {
             let key: [u8; 32] = key.try_into().ok()?;
             let group = self.store.group(key).await.ok().flatten()?;
+            self.group_revisions.borrow_mut().insert(conversation.clone(), group.revision);
             // Signal colors a group by its group id, and its members' names
             // by their place among the sorted member ACIs.
             let id = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(key)).get_group_identifier();

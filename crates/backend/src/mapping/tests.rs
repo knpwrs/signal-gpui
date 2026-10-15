@@ -766,3 +766,21 @@ fn viewed_receipts_count_story_views() {
     let actions = map_content(&content(ME, sync), &ctx());
     assert!(actions.iter().any(|a| matches!(a, Action::ViewedSync(v) if v == &[(Some(ALICE.into()), 400)])));
 }
+
+#[test]
+fn group_revisions_come_from_messages_and_our_transcripts() {
+    let mut dm = text("hi", 100);
+    assert_eq!(group_revision_of(&content(ALICE, dm.clone())), None);
+    dm.group_v2 = Some(GroupContextV2 { master_key: Some(group_key()), revision: Some(4), ..Default::default() });
+    let key: [u8; 32] = group_key().try_into().unwrap();
+    assert_eq!(group_revision_of(&content(ALICE, dm.clone())), Some((key, 4)));
+    let sync = SyncMessage {
+        content: Some(sync_message::Content::Sent(sync_message::Sent {
+            timestamp: Some(100),
+            message: Some(dm),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    assert_eq!(group_revision_of(&content(ME, sync)), Some((key, 4)));
+}

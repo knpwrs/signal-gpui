@@ -179,22 +179,35 @@ pub fn summarize_group_change(changes: &presage::libsignal_service::groups_v2::G
     summary
 }
 
+/// The data message an incoming message or our own sync transcript holds.
+fn data_message_of(content: &Content) -> Option<&DataMessage> {
+    match &content.body {
+        ContentBody::DataMessage(dm) => Some(dm),
+        ContentBody::SynchronizeMessage(sync) => match &sync.content {
+            Some(sync_message::Content::Sent(sent)) => sent.message.as_ref(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// A group change carried by an incoming message (or our own sync
 /// transcript): the group's master key, the signed change and when.
 pub fn group_change_of(content: &Content) -> Option<([u8; 32], Vec<u8>, i64)> {
-    let data = match &content.body {
-        ContentBody::DataMessage(dm) => dm,
-        ContentBody::SynchronizeMessage(sync) => match &sync.content {
-            Some(sync_message::Content::Sent(sent)) => sent.message.as_ref()?,
-            _ => return None,
-        },
-        _ => return None,
-    };
+    let data = data_message_of(content)?;
     let context = data.group_v2.as_ref()?;
     let change = context.group_change.clone().filter(|c| !c.is_empty())?;
     let key: [u8; 32] = context.master_key.as_deref()?.try_into().ok()?;
     let at = data.timestamp.map_or_else(|| content.metadata.client_timestamp.timestamp_millis(), |t| t as i64);
     Some((key, change, at))
+}
+
+/// The group a message was sent in and the group revision its sender had.
+/// presage fetches the group again when the revision is newer than its copy.
+pub fn group_revision_of(content: &Content) -> Option<([u8; 32], u32)> {
+    let context = data_message_of(content)?.group_v2.as_ref()?;
+    let key: [u8; 32] = context.master_key.as_deref()?.try_into().ok()?;
+    Some((key, context.revision?))
 }
 
 /// Whether `me` may set our member label: admins always; members when the
