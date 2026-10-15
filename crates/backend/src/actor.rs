@@ -3156,7 +3156,8 @@ impl Actor {
             warn!("not sending to the Signal chat");
             return DeliveryStatus::Failed;
         }
-        let body = self.stamp_timer(conversation, body).await;
+        let mut body = self.stamp_timer(conversation, body).await;
+        self.attach_quote_thumbnail(manager, &mut body).await;
         let result = match (conversation.as_group(), mapping::service_id_of(conversation)) {
             (Some(key), _) => manager.send_message_to_group(&key, body, timestamp).await,
             (None, Some(recipient)) => manager.send_message(recipient, body, timestamp).await,
@@ -3171,6 +3172,52 @@ impl Actor {
                 self.error("failed to send", error);
                 DeliveryStatus::Failed
             }
+        }
+    }
+
+    /// A quote of a photo goes with a thumbnail of it, as Desktop's do
+    /// (`makeQuote`), so their client shows it beside the quote. Without one
+    /// (the photo isn't here, or the upload failed) the quote still goes.
+    async fn attach_quote_thumbnail(&self, manager: &SignalManager, body: &mut ContentBody) {
+        let ContentBody::DataMessage(data) = body else { return };
+        let Some(quote) = data.quote.as_mut() else { return };
+        let Some(first) = quote.attachments.first_mut() else { return };
+        if first.thumbnail.is_some() || !first.content_type.as_deref().is_some_and(|t| t.starts_with("image/")) {
+            return;
+        }
+        let (Some(sent_at), Some(author)) = (quote.id, quote.author_aci.clone()) else { return };
+        let author = (author != self.self_aci()).then_some(author);
+        let Ok(Some(quoted)) = self.db.find_message_any(author.as_deref(), sent_at as i64).await else { return };
+        let Some(path) =
+            quoted.attachments.iter().find(|a| a.content_type.starts_with("image/")).and_then(|a| a.local_path.clone())
+        else {
+            return;
+        };
+        let uploaded = async {
+            let bytes = tokio::fs::read(&path).await?;
+            let png = tokio::task::spawn_blocking(move || media::quote_thumbnail(&bytes)).await??;
+            let (_, width, height) = media::probe(&png).context("the thumbnail isn't an image")?;
+            let spec = AttachmentSpec {
+                content_type: "image/png".into(),
+                length: png.len(),
+                file_name: None,
+                preview: None,
+                voice_note: None,
+                borderless: None,
+                width: Some(width),
+                height: Some(height),
+                caption: None,
+                blur_hash: None,
+            };
+            manager
+                .upload_attachment(spec, png)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .map_err(|e| anyhow::anyhow!("uploading quote thumbnail: {e}"))
+        };
+        match uploaded.await {
+            Ok(pointer) => first.thumbnail = Some(pointer),
+            Err(error) => warn!(error = %format!("{error:#}"), "quote sent without its thumbnail"),
         }
     }
 

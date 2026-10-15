@@ -133,6 +133,23 @@ pub fn normalize(bytes: Vec<u8>) -> anyhow::Result<Vec<u8>> {
 
 /// Cheap check before optimizing: the kind and displayed size, or `None` if
 /// this isn't an image we can send.
+/// The longest side of a quote's thumbnail (Desktop's `THUMBNAIL_SIZE`).
+pub const QUOTE_THUMBNAIL_SIZE: u32 = 150;
+
+/// A small PNG of an image, upright, for a quote of it (Desktop sends one
+/// with a quoted photo so the reply shows it).
+pub fn quote_thumbnail(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use image::ImageDecoder as _;
+    let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?.into_decoder()?;
+    let orientation = decoder.orientation()?;
+    let mut image = image::DynamicImage::from_decoder(decoder)?;
+    image.apply_orientation(orientation);
+    let thumbnail = image.thumbnail(QUOTE_THUMBNAIL_SIZE, QUOTE_THUMBNAIL_SIZE);
+    let mut out = Vec::new();
+    thumbnail.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)?;
+    Ok(out)
+}
+
 pub fn probe(bytes: &[u8]) -> Option<(ImageKind, u32, u32)> {
     let kind = ImageKind::sniff(bytes)?;
     let size = imagesize::blob_size(bytes).ok()?;
@@ -535,6 +552,16 @@ mod tests {
         assert!(prepared.bytes.len() < original.len(), "{} >= {}", prepared.bytes.len(), original.len());
         assert!(!contains(&prepared.bytes, b"47.6N"));
         assert_eq!(decode_png(&prepared.bytes), gradient(64, 48));
+    }
+
+    #[test]
+    fn quote_thumbnails_are_small_upright_pngs() {
+        let thumbnail = quote_thumbnail(&encode_jpeg(600, 300)).unwrap();
+        assert_eq!(probe(&thumbnail).map(|(kind, w, h)| (kind.content_type(), w, h)), Some(("image/png", 150, 75)));
+        // Turned a quarter (EXIF orientation 6): upright, so tall.
+        let turned = quote_thumbnail(&with_metadata(&encode_jpeg(600, 300), 6)).unwrap();
+        assert_eq!(probe(&turned).map(|(_, w, h)| (w, h)), Some((75, 150)));
+        assert!(quote_thumbnail(b"not an image").is_err());
     }
 
     fn encode_jpeg(width: u16, height: u16) -> Vec<u8> {

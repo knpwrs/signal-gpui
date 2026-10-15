@@ -61,7 +61,8 @@ oxipng = { version = "10", default-features = false, features = ["parallel"] }
 mozjpeg-sys = { version = "2", default-features = false, features = ["unwinding"] }
 imagesize = "0.15"
 # TIFF/BMP (what macOS often puts on the clipboard) become PNG before sending.
-image = { version = "0.25", default-features = false, features = ["png", "tiff", "bmp", "ico"] }
+# Quote thumbnails decode what was quoted (JPEG, WebP and GIF too).
+image = { version = "0.25", default-features = false, features = ["png", "tiff", "bmp", "ico", "jpeg", "webp", "gif"] }
 
 [dev-dependencies]
 jpeg-encoder = "0.6"
