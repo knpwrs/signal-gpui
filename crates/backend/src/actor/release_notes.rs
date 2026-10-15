@@ -5,6 +5,7 @@
 use signal_store::{CallToAction, ConversationKind, ConversationUpdate, SIGNAL_ACI};
 
 use super::*;
+use crate::megaphones::{self, Conditions, Megaphone, MegaphoneCta};
 use crate::release_notes;
 
 /// Desktop's `FETCH_INTERVAL` and `ERROR_RETRY_DELAY`.
@@ -17,6 +18,10 @@ const SETTING_WATERMARK: &str = "release_notes.watermark";
 /// The Desktop version the manifest was last read for: a new one reads it
 /// again, as a new Desktop version does there.
 const SETTING_DESKTOP_VERSION: &str = "release_notes.desktop_version";
+/// The saved megaphones (JSON `Megaphone`s).
+const SETTING_MEGAPHONES: &str = "megaphones";
+/// Desktop's `CHECK_INTERVAL` for which megaphones to show.
+const MEGAPHONE_CHECK: Duration = Duration::from_secs(12 * 60 * 60);
 
 impl Actor {
     /// Runs for the life of the account: fetches when due, then waits.
@@ -59,6 +64,11 @@ impl Actor {
             return Ok(());
         }
         let manifest = release_notes::manifest(&client).await?;
+        // Megaphones first, as Desktop: a failure there doesn't stop the notes.
+        if let Err(error) = self.save_megaphones(&client, &manifest.megaphones, phone).await {
+            warn!(error = %format!("{error:#}"), "megaphones: couldn't save");
+        }
+        self.megaphone_check.notify_one();
         let due = release_notes::due(&manifest.announcements, &watermark, &current);
         if due.is_empty() {
             debug!("release notes: none new");
@@ -192,5 +202,151 @@ impl Actor {
             voice: false,
             remote: None,
         })
+    }
+
+    /// Desktop's `deleteUnknownMegaphones` and `saveNewMegaphones`: keeps
+    /// what the manifest still lists, and saves new ones (their words and
+    /// image) that haven't ended and are for our country.
+    async fn save_megaphones(
+        &self,
+        client: &reqwest::Client,
+        listed: &[megaphones::ManifestMegaphone],
+        phone: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let listed: Vec<_> = listed.iter().filter(|m| m.desktop_min_version.is_some()).collect();
+        let mut saved = self.saved_megaphones().await;
+        let before = saved.len();
+        saved.retain(|m| {
+            let keep = listed.iter().any(|l| l.uuid == m.id);
+            if !keep {
+                info!(id = m.id, "megaphones: no longer listed");
+                let _ = std::fs::remove_file(&m.image_path);
+            }
+            keep
+        });
+        let mut changed = saved.len() != before;
+        let aci = self.self_aci();
+        let locales = release_notes::locales(&sys_locale::get_locale().unwrap_or_else(|| "en".into()));
+        let now_seconds = now_millis() / 1000;
+        for megaphone in listed {
+            if now_seconds > megaphone.dont_show_after_epoch_seconds
+                || !release_notes::for_us(megaphone.countries.as_deref(), phone, &aci)
+                || saved.iter().any(|m| m.id == megaphone.uuid)
+            {
+                continue;
+            }
+            // One failing is tried again next time; the rest go on.
+            match self.fetch_megaphone(client, megaphone, &locales).await {
+                Ok(new) => {
+                    info!(id = new.id, "megaphones: saved");
+                    saved.push(new);
+                    changed = true;
+                }
+                Err(error) => warn!(id = megaphone.uuid, error = %format!("{error:#}"), "megaphones: skipped"),
+            }
+        }
+        if changed {
+            self.db.set_setting(SETTING_MEGAPHONES, &serde_json::to_string(&saved)?).await?;
+        }
+        Ok(())
+    }
+
+    async fn fetch_megaphone(
+        &self,
+        client: &reqwest::Client,
+        megaphone: &megaphones::ManifestMegaphone,
+        locales: &[String],
+    ) -> anyhow::Result<Megaphone> {
+        let (text, locale) = release_notes::megaphone_text(client, &megaphone.uuid, locales).await?;
+        // Desktop needs an image to show one.
+        let image = text.image.clone().context("no image")?;
+        let (bytes, _) = release_notes::media(client, &image).await?;
+        let name = image.rsplit('/').next().unwrap_or("image");
+        let dir = self.config.data_dir.join("megaphones");
+        tokio::fs::create_dir_all(&dir).await?;
+        let path = dir.join(format!("{}-{}", media::safe_file_name(&megaphone.uuid), media::safe_file_name(name)));
+        tokio::fs::write(&path, &bytes).await?;
+        Ok(Megaphone::new(megaphone, text, locale, path.to_string_lossy().into_owned()))
+    }
+
+    async fn saved_megaphones(&self) -> Vec<Megaphone> {
+        self.db
+            .setting(SETTING_MEGAPHONES)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default()
+    }
+
+    /// Desktop's megaphone service: checks which to show every 12 hours,
+    /// and whenever they change.
+    pub(super) async fn megaphone_loop(self: Rc<Self>) {
+        loop {
+            self.check_megaphones().await;
+            tokio::select! {
+                () = tokio::time::sleep(MEGAPHONE_CHECK) => {}
+                () = self.megaphone_check.notified() => {}
+            }
+        }
+    }
+
+    /// Drops ended ones and shows the rest that should be.
+    async fn check_megaphones(&self) {
+        let now = now_millis();
+        let mut saved = self.saved_megaphones().await;
+        let before = saved.len();
+        saved.retain(|m| {
+            if m.expired(now) {
+                let _ = std::fs::remove_file(&m.image_path);
+            }
+            !m.expired(now)
+        });
+        if saved.len() != before
+            && let Ok(json) = serde_json::to_string(&saved)
+        {
+            let _ = self.db.set_setting(SETTING_MEGAPHONES, &json).await;
+        }
+        let conditions = self.megaphone_conditions(&saved).await;
+        self.emit(Event::Megaphones(megaphones::visible(&saved, &conditions, now)));
+    }
+
+    /// What the saved megaphones' conditions need, looked up only if one
+    /// has a condition.
+    async fn megaphone_conditions(&self, saved: &[Megaphone]) -> Conditions {
+        if saved.iter().all(|m| m.conditional_id.is_none()) {
+            return Conditions::default();
+        }
+        let device_created_at = match self.db.setting(SETTING_DEVICE_CREATED).await.ok().flatten().and_then(|v| v.parse().ok()) {
+            Some(at) => Some(at),
+            None => self.db.created_at().await.ok().flatten(),
+        };
+        let has_badges = match (self.manager(), Aci::parse_from_service_id_string(&self.self_aci())) {
+            (Some(manager), Some(aci)) => {
+                let key = manager.registration_data().profile_key();
+                crate::profiles::has_badges(&manager, aci, key)
+                    .await
+                    .inspect_err(|error| warn!(error = %format!("{error:#}"), "megaphones: couldn't read our badges"))
+                    .ok()
+            }
+            _ => None,
+        };
+        Conditions { device_created_at, has_badges }
+    }
+
+    /// A megaphone's button (Desktop's `interactWithMegaphone`).
+    pub(super) async fn press_megaphone(&self, id: String, cta: MegaphoneCta) {
+        let mut saved = self.saved_megaphones().await;
+        let Some(megaphone) = saved.iter_mut().find(|m| m.id == id) else { return };
+        megaphone.press(cta, now_millis());
+        match serde_json::to_string(&saved) {
+            Ok(json) => {
+                if let Err(error) = self.db.set_setting(SETTING_MEGAPHONES, &json).await {
+                    self.error("couldn't save the megaphone", error);
+                }
+            }
+            Err(error) => self.error("couldn't save the megaphone", error),
+        }
+        self.megaphone_check.notify_one();
     }
 }

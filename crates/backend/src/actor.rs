@@ -52,6 +52,8 @@ use anyhow::Context as _;
 pub(crate) type SignalManager = Manager<SqliteStore, Registered>;
 
 /// Images up to this size are downloaded as soon as they arrive.
+/// When this device was linked (unix millis).
+const SETTING_DEVICE_CREATED: &str = "device.created_at";
 /// "1" while the history transfer after linking hasn't finished.
 const SETTING_HISTORY_PENDING: &str = "history.pending";
 /// `avatar.checked.<service id>`: when we last fetched their profile for
@@ -147,6 +149,9 @@ struct Actor {
     receiver: RefCell<Option<tokio::task::JoinHandle<()>>>,
     /// Fetches release notes into the Signal chat.
     release_notes: RefCell<Option<tokio::task::JoinHandle<()>>>,
+    /// Shows megaphones; notified when they change.
+    megaphones: RefCell<Option<tokio::task::JoinHandle<()>>>,
+    megaphone_check: tokio::sync::Notify,
     /// Read syncs that arrived before their message, `(author, sent_at)`,
     /// applied when it does (as Desktop keeps them). Newest last.
     early_reads: RefCell<std::collections::VecDeque<(String, i64)>>,
@@ -223,6 +228,8 @@ pub(crate) async fn run(
         profile_fetches: RefCell::default(),
         receiver: RefCell::new(None),
         release_notes: RefCell::new(None),
+        megaphones: RefCell::new(None),
+        megaphone_check: tokio::sync::Notify::new(),
         early_reads: RefCell::default(),
         identities_seen: RefCell::default(),
         calls: RefCell::new(None),
@@ -346,6 +353,8 @@ impl Actor {
             if manager.registration_data().ephemeral_backup_key().is_some() {
                 let _ = self.db.set_setting(SETTING_HISTORY_PENDING, "1").await;
             }
+            // Desktop's device age, for a donation megaphone's condition.
+            let _ = self.db.set_setting(SETTING_DEVICE_CREATED, &now_millis().to_string()).await;
         }
         // The history transfer, also resumed if the app quit during it.
         let pending = self.db.setting(SETTING_HISTORY_PENDING).await.ok().flatten().is_some_and(|v| v == "1");
@@ -363,6 +372,10 @@ impl Actor {
         // Release notes for the Signal chat, as Desktop fetches them.
         let task = tokio::task::spawn_local(self.clone().release_notes_loop(phone_for_notes));
         if let Some(old) = self.release_notes.borrow_mut().replace(task) {
+            old.abort();
+        }
+        let task = tokio::task::spawn_local(self.clone().megaphone_loop());
+        if let Some(old) = self.megaphones.borrow_mut().replace(task) {
             old.abort();
         }
     }
@@ -510,6 +523,7 @@ impl Actor {
                 Command::SetMemberLabel { conversation, emoji, text } => self.set_member_label(conversation, emoji, text).await,
                 Command::LoadSafetyNumber { conversation } => self.emit_safety_number(conversation).await,
                 Command::SetVerified { conversation, verified } => self.set_verified(conversation, verified).await,
+                Command::PressMegaphone { id, cta } => self.press_megaphone(id, cta).await,
                 Command::StartCall { conversation, video } => self.start_call(conversation, video),
                 Command::AcceptCall { video } => self.accept_call(video),
                 Command::DeclineCall | Command::HangUp => self.hang_up(),

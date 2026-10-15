@@ -881,6 +881,10 @@ impl Render for Sidebar {
                     )
                     .child(Scrollbar::vertical(&self.list).mode(ScrollbarMode::Hover)),
             )
+            // Desktop shows Signal's megaphone under the chats.
+            .when_some(state.megaphones.first().filter(|_| !searching).cloned(), |d, megaphone| {
+                d.child(render_megaphone(&self.state, megaphone, palette))
+            })
             .when(searching && row_count == 0 && self.hits.is_empty(), |d| {
                 d.child(
                     div()
@@ -912,6 +916,68 @@ impl Render for Sidebar {
             })
             .when(searching && self.hits.is_empty(), |d| d.child(div().flex_1()))
     }
+}
+
+
+/// Desktop's megaphone (`Megaphone`): its image, title and body, and its
+/// buttons, the main one last. Donate also opens Signal's donation page,
+/// as there's no donation screen here.
+fn render_megaphone(
+    state: &Entity<AppState>,
+    megaphone: signal_backend::megaphones::MegaphoneView,
+    palette: Palette,
+) -> impl IntoElement {
+    use gpui_kit::component::button::{Button, ButtonVariants as _};
+    use signal_backend::megaphones::MegaphoneCta;
+    let button = |which: &'static str, (cta, text): (MegaphoneCta, String), primary: bool| {
+        let (state, id) = (state.clone(), megaphone.id.clone());
+        let button = Button::new(SharedString::from(format!("megaphone-{which}"))).label(text).on_click(move |_, _, cx| {
+            if cta == MegaphoneCta::Donate {
+                cx.open_url("https://signal.org/donate/");
+            }
+            state.read(cx).send(signal_backend::Command::PressMegaphone { id: id.clone(), cta });
+        });
+        if primary { button.primary() } else { button.outline() }
+    };
+    div()
+        .debug_selector(|| "megaphone".into())
+        .flex_none()
+        .m_3()
+        .p_3()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .rounded_xl()
+        .bg(palette.popover)
+        .border_1()
+        .border_color(palette.panel_border)
+        .child(
+            div()
+                .flex()
+                .items_start()
+                .gap_3()
+                .child(
+                    gpui_kit::img(std::path::PathBuf::from(&megaphone.image_path))
+                        .flex_none()
+                        .size(px(56.))
+                        .object_fit(gpui_kit::ObjectFit::Cover),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(megaphone.title.clone()))
+                        .child(div().mt_0p5().text_xs().text_color(palette.text_secondary).child(megaphone.body.clone())),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .justify_end()
+                .gap_1p5()
+                .when_some(megaphone.secondary.clone(), |d, b| d.child(button("secondary", b, false)))
+                .when_some(megaphone.primary.clone(), |d, b| d.child(button("primary", b, true))),
+        )
 }
 
 #[cfg(test)]
@@ -1122,6 +1188,58 @@ mod tests {
         cx.simulate_keystrokes("backspace");
         cx.run_until_parked();
         assert!(sidebar.read_with(&cx, |s, _| s.chat_search.is_none()));
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn a_megaphone_shows_under_the_chats_until_its_button(cx: &mut TestAppContext) {
+        use gpui_kit::VisualTestContext;
+        cx.update(gpui_kit::init);
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config { data_dir: dir.path().to_owned(), db_key: [7; 32], device_name: "test".into(), demo: true };
+        let (backend, mut events) = Backend::start(config).unwrap();
+        let state = cx.update(|cx| crate::state::new_state(backend.clone(), cx));
+        // As the app does: backend events into the model.
+        cx.update(|cx| {
+            use futures::StreamExt as _;
+            let state = state.clone();
+            cx.spawn(async move |cx| {
+                while let Some(event) = events.next().await {
+                    state.update(cx, |state, cx| state.handle(event, cx));
+                }
+            })
+            .detach();
+        });
+        let (window, _sidebar) = cx.update(|cx| {
+            let state = state.clone();
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| cx.new(|cx| Sidebar::new(state, window, cx)))
+                .unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window, cx);
+        let shown = |cx: &mut VisualTestContext| {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            cx.debug_bounds("megaphone").is_some()
+        };
+        for _ in 0..300 {
+            if shown(&mut cx) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(shown(&mut cx), "the demo's megaphone");
+        // "Got it" (finish): gone.
+        let id = state.read_with(&cx, |s, _| s.megaphones[0].id.clone());
+        let cta = signal_backend::megaphones::MegaphoneCta::Finish;
+        state.read_with(&cx, |s, _| s.send(signal_backend::Command::PressMegaphone { id, cta }));
+        for _ in 0..300 {
+            if !shown(&mut cx) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!shown(&mut cx));
         backend.shutdown();
     }
 

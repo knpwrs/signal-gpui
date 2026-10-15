@@ -512,6 +512,17 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
         aci: SELF.trim_start_matches("d:").into(),
     });
     emit(Event::Connection(ConnectionState::Online));
+    // A made-up megaphone, with a drawn image.
+    let megaphone_image = data_dir.join("attachments").join("demo-megaphone.png");
+    let mut megaphone = (write_demo_sticker(&megaphone_image, 0.62).is_ok()).then(|| crate::megaphones::MegaphoneView {
+        id: "demo-megaphone".into(),
+        title: "A banner from Signal".into(),
+        body: "Signal's megaphones show here, under your chats.".into(),
+        image_path: megaphone_image.to_string_lossy().into_owned(),
+        primary: Some((crate::megaphones::MegaphoneCta::Finish, "Got it".into())),
+        secondary: Some((crate::megaphones::MegaphoneCta::Snooze, "Not now".into())),
+    });
+    emit(Event::Megaphones(megaphone.clone().into_iter().collect()));
     // A pretend call: (the call, when it started, whether it connected).
     let call: std::rc::Rc<std::cell::RefCell<Option<(crate::CallUpdate, i64, bool)>>> = Default::default();
 
@@ -1081,6 +1092,12 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
             Command::LoadSafetyNumber { conversation } => {
                 let verified = db.setting(&format!("demo.verified.{}", conversation.0)).await.ok().flatten().is_some_and(|v| v == "1");
                 emit(Event::SafetyNumber { conversation: conversation.clone(), result: Ok(demo_safety_number(&conversation, verified)) });
+            }
+            Command::PressMegaphone { id, .. } => {
+                if megaphone.as_ref().is_some_and(|m| m.id == id) {
+                    megaphone = None;
+                    emit(Event::Megaphones(Vec::new()));
+                }
             }
             Command::SetVerified { conversation, verified } => {
                 let _ = db.set_setting(&format!("demo.verified.{}", conversation.0), if verified { "1" } else { "" }).await;

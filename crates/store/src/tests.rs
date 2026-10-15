@@ -1122,3 +1122,11 @@ async fn release_notes_keep_their_button() {
         .unwrap();
     assert!(db.people().await.unwrap().iter().all(|p| !p.id.is_signal()));
 }
+
+#[tokio::test]
+async fn knows_when_it_was_made() {
+    let db = test_db().await;
+    let made = db.created_at().await.unwrap().expect("a time");
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    assert!((now - made).abs() < 60_000, "{made} vs {now}");
+}

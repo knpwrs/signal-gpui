@@ -2206,6 +2206,16 @@ impl AppDb {
             .collect()
     }
 
+    /// When this database was made (unix millis): when the device was
+    /// linked, for a database made by linking.
+    pub async fn created_at(&self) -> Result<Option<i64>> {
+        Ok(sqlx::query_scalar(
+            "SELECT CAST((julianday(MIN(installed_on)) - 2440587.5) * 86400000 AS INTEGER) FROM _sqlx_migrations",
+        )
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     /// Small key/value table for UI settings.
     pub async fn setting(&self, key: &str) -> Result<Option<String>> {
         Ok(sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")

@@ -12,8 +12,8 @@ use presage::libsignal_service::push_service::HttpAuthOverride;
 
 use crate::actor::SignalManager;
 
-/// The CDN path of their current profile photo, `None` when they have none.
-pub(crate) async fn avatar_path(manager: &SignalManager, aci: Aci, key: ProfileKey) -> anyhow::Result<Option<String>> {
+/// Their profile as the server has it now.
+async fn profile(manager: &SignalManager, aci: Aci, key: ProfileKey) -> anyhow::Result<serde_json::Value> {
     let service = crate::storage::push_service(manager)?;
     let version = key.get_profile_key_version(aci);
     let uuid: presage::libsignal_service::prelude::Uuid = aci.into();
@@ -23,8 +23,20 @@ pub(crate) async fn avatar_path(manager: &SignalManager, aci: Aci, key: ProfileK
         .send()
         .await?
         .error_for_status()?;
-    let profile: serde_json::Value = serde_json::from_slice(&response.bytes().await?)?;
+    Ok(serde_json::from_slice(&response.bytes().await?)?)
+}
+
+/// The CDN path of their current profile photo, `None` when they have none.
+pub(crate) async fn avatar_path(manager: &SignalManager, aci: Aci, key: ProfileKey) -> anyhow::Result<Option<String>> {
+    let profile = profile(manager, aci, key).await?;
     Ok(profile["avatar"].as_str().filter(|p| !p.is_empty()).map(str::to_owned))
+}
+
+/// Whether their profile has donor badges (what Desktop checks of ours for
+/// a donation megaphone).
+pub(crate) async fn has_badges(manager: &SignalManager, aci: Aci, key: ProfileKey) -> anyhow::Result<bool> {
+    let profile = profile(manager, aci, key).await?;
+    Ok(profile["badges"].as_array().is_some_and(|b| !b.is_empty()))
 }
 
 /// Downloads and decrypts the photo at `path` with their profile key.

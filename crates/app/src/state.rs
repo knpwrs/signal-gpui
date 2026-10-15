@@ -152,6 +152,8 @@ pub struct AppState {
     /// The audio attachment or voice message playing (or paused), as
     /// Desktop plays one at a time, whichever chat is open.
     pub audio: Option<AudioPlaying>,
+    /// Signal's megaphones to show, highest priority first.
+    pub megaphones: Vec<signal_backend::megaphones::MegaphoneView>,
     /// Starts recording a voice message (the microphone; a stand-in in
     /// tests).
     pub start_recorder: crate::recorder::StartRecorder,
@@ -227,6 +229,7 @@ impl AppState {
             loops: Default::default(),
             audio: None,
             start_recorder: crate::recorder::start_microphone,
+            megaphones: Vec::new(),
             waveforms: HashMap::new(),
             posters: HashMap::new(),
             recent_stickers: Vec::new(),
@@ -477,6 +480,10 @@ impl AppState {
                 }
             }
             Event::ConversationsChanged => self.reload_conversations(cx),
+            Event::Megaphones(megaphones) => {
+                self.megaphones = megaphones;
+                cx.notify();
+            }
             Event::MessageChanged {
                 conversation,
                 message_id,

@@ -30,6 +30,8 @@ const MAX_MEDIA_BYTES: usize = 25 * 1024 * 1024;
 pub struct Manifest {
     #[serde(default)]
     pub announcements: Vec<Announcement>,
+    #[serde(default)]
+    pub megaphones: Vec<crate::megaphones::ManifestMegaphone>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -241,6 +243,25 @@ pub async fn manifest(client: &reqwest::Client) -> anyhow::Result<Manifest> {
 
 /// A note in the first of `locales` it's written in.
 pub async fn note(client: &reqwest::Client, uuid: &str, locales: &[String]) -> anyhow::Result<Note> {
+    localized::<Note>(client, uuid, locales, |n| &n.uuid).await.map(|(note, _)| note)
+}
+
+/// A megaphone's words in the first of `locales` it's written in, and that
+/// locale (megaphones share the notes' paths).
+pub async fn megaphone_text(
+    client: &reqwest::Client,
+    uuid: &str,
+    locales: &[String],
+) -> anyhow::Result<(crate::megaphones::MegaphoneText, String)> {
+    localized::<crate::megaphones::MegaphoneText>(client, uuid, locales, |m| &m.uuid).await
+}
+
+async fn localized<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    uuid: &str,
+    locales: &[String],
+    uuid_of: impl Fn(&T) -> &str,
+) -> anyhow::Result<(T, String)> {
     for locale in locales {
         let url = format!("{RESOURCES}{NOTES}/{uuid}/{locale}.json");
         // Desktop asks whether the language exists before fetching it.
@@ -253,10 +274,10 @@ pub async fn note(client: &reqwest::Client, uuid: &str, locales: &[String]) -> a
         }
         let fetched = async {
             let bytes = client.get(&url).send().await?.error_for_status()?.bytes().await?;
-            anyhow::Ok(serde_json::from_slice::<Note>(&bytes)?)
+            anyhow::Ok(serde_json::from_slice::<T>(&bytes)?)
         };
         match fetched.await {
-            Ok(note) if note.uuid == uuid => return Ok(note),
+            Ok(item) if uuid_of(&item) == uuid => return Ok((item, locale.clone())),
             Ok(_) => tracing::warn!(uuid, locale, "release note's uuid doesn't match"),
             Err(error) => tracing::warn!(uuid, locale, error = %format!("{error:#}"), "couldn't fetch release note"),
         }

@@ -29,6 +29,7 @@ pub mod sticker_upload;
 pub mod deletes;
 pub mod edits;
 pub mod release_notes;
+pub mod megaphones;
 
 /// Most conversations an account can pin (Signal's limit).
 pub use storage::MAX_PINNED;
@@ -187,6 +188,9 @@ pub enum Command {
     /// Marks a 1:1 contact's current identity verified (or clears it), here
     /// and on our other devices; answered with `Event::SafetyNumber`.
     SetVerified { conversation: ConversationId, verified: bool },
+    /// A megaphone's button: done with it (donate, finish) or put off
+    /// (snooze). Answered with `Event::Megaphones`.
+    PressMegaphone { id: String, cta: megaphones::MegaphoneCta },
     /// Calls a 1:1 chat (Desktop's call buttons, after the lobby).
     StartCall { conversation: ConversationId, video: bool },
     /// Answers the ringing call, with our camera on or off.
@@ -448,6 +452,8 @@ pub enum Event {
     Connection(ConnectionState),
     /// Conversation list rows changed (title, preview, unread, ...).
     ConversationsChanged,
+    /// Signal's megaphones to show now, highest priority first.
+    Megaphones(Vec<megaphones::MegaphoneView>),
     /// A message was inserted or updated (status, reaction, edit, delete, attachment).
     MessageChanged { conversation: ConversationId, message_id: i64 },
     Typing { conversation: ConversationId, author: String, started: bool },
