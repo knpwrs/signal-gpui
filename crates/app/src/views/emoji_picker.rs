@@ -882,7 +882,7 @@ mod tests {
         state.update(cx, |state, cx| {
             let pack = state.sticker_packs[0].clone();
             let sticker = pack.stickers[2].clone();
-            state.send_sticker(conversation, pack, sticker, cx);
+            state.send_sticker(conversation, pack, sticker, None, cx);
         });
         cx.update_window(window, |_, _, cx| picker.update(cx, |p, _| p.query.clear())).unwrap();
         assert_eq!(

@@ -519,7 +519,9 @@ impl Actor {
                     let packs = self.load_stickers().await;
                     self.emit(Event::Stickers(packs));
                 }
-                Command::SendSticker { conversation, pack, sticker } => self.send_sticker(conversation, &pack, sticker).await,
+                Command::SendSticker { conversation, pack, sticker, quote } => {
+                    self.send_sticker(conversation, &pack, sticker, quote).await
+                }
                 Command::UploadStickerPack(pack) => self.upload_sticker_pack(pack).await,
                 Command::FindRecipient { query } => {
                     let result = self.find_recipient(&query).await;
@@ -1889,7 +1891,15 @@ impl Actor {
         Ok(pointer)
     }
 
-    async fn send_sticker(self: Rc<Self>, conversation: ConversationId, pack: &crate::StickerPackView, sticker: crate::StickerView) {
+    /// A sticker, replying to `quote` when given (Desktop's
+    /// `stickerReply.send`, `ts/state/ducks/composer.preload.ts`).
+    async fn send_sticker(
+        self: Rc<Self>,
+        conversation: ConversationId,
+        pack: &crate::StickerPackView,
+        sticker: crate::StickerView,
+        quote: Option<i64>,
+    ) {
         let Ok(bytes) = tokio::fs::read(&sticker.path).await else {
             return self.error("can't send sticker", "sticker image is missing");
         };
@@ -1906,7 +1916,7 @@ impl Actor {
             voice: false,
             remote: None,
         };
-        let Some((id, mut data, timestamp)) = self.store_outgoing(&conversation, String::new(), None, vec![meta], None).await
+        let Some((id, mut data, timestamp)) = self.store_outgoing(&conversation, String::new(), quote, vec![meta], None).await
         else {
             return;
         };

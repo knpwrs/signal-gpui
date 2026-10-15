@@ -1209,6 +1209,21 @@ impl ConversationView {
                 .flex()
                 .flex_col()
                 .when(outgoing, |d| d.items_end())
+                // A sticker reply: the quote, in a bubble, above the sticker
+                // (Desktop's `isStickerReply`).
+                .when_some(message.quote.clone(), |d, quote| {
+                    d.child(
+                        div()
+                            .max_w(px(STICKER_SIZE))
+                            .mb_1()
+                            .px_2()
+                            .py_1p5()
+                            .rounded_lg()
+                            .bg(bg)
+                            .text_color(fg)
+                            .child(self.render_quote(message.id, quote, fg, palette, cx)),
+                    )
+                })
                 .child(match &sticker.local_path {
                     Some(path) => img(std::path::PathBuf::from(path))
                         .w(px(w))

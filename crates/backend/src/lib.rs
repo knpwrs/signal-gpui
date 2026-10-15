@@ -114,11 +114,13 @@ pub enum Command {
     /// Uploads a new sticker pack and installs it; answered with
     /// `Event::StickerUpload`.
     UploadStickerPack(sticker_upload::NewStickerPack),
-    /// Sends a sticker from an installed pack.
+    /// Sends a sticker from an installed pack, replying to `quote` (our
+    /// row id) when given.
     SendSticker {
         conversation: ConversationId,
         pack: std::sync::Arc<StickerPackView>,
         sticker: StickerView,
+        quote: Option<i64>,
     },
     /// Looks up a username or phone number on Signal; answered with
     /// `Event::RecipientFound`.

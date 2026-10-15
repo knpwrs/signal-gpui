@@ -1024,7 +1024,8 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     let _ = events.unbounded_send(Event::StickerUpload(StickerUpload::Done { pack_id, pack_key, url }));
                 });
             }
-            Command::SendSticker { conversation, pack: _, sticker } => {
+            Command::SendSticker { conversation, pack: _, sticker, quote } => {
+                let quote = demo_quote(&db, quote).await;
                 let sent_at = next_sent_at();
                 let msg = NewMessage {
                     conversation_id: conversation.clone(),
@@ -1035,7 +1036,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     author_name: None,
                     body: String::new(),
                     status: DeliveryStatus::Sent,
-                    quote: None,
+                    quote,
                     attachments: vec![AttachmentMeta {
                         content_type: "image/png".into(),
                         file_name: None,

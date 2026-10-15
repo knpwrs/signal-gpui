@@ -1022,12 +1022,14 @@ impl AppState {
         None
     }
 
-    /// Sends a sticker and remembers it as recently used.
+    /// Sends a sticker (replying to `quote` when given) and remembers it
+    /// as recently used.
     pub fn send_sticker(
         &mut self,
         conversation: ConversationId,
         pack: std::sync::Arc<signal_backend::StickerPackView>,
         sticker: signal_backend::StickerView,
+        quote: Option<i64>,
         cx: &mut Context<Self>,
     ) {
         let key = (pack.id.clone(), sticker.id);
@@ -1041,7 +1043,7 @@ impl AppState {
             let _ = save.await;
         })
         .detach();
-        self.send(Command::SendSticker { conversation, pack, sticker });
+        self.send(Command::SendSticker { conversation, pack, sticker, quote });
         cx.notify();
     }
 

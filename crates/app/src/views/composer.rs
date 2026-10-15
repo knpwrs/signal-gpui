@@ -246,7 +246,14 @@ impl Composer {
                     PickerEvent::Sticker(pack, sticker) => {
                         let conversation = this.conversation.clone();
                         let (pack, sticker) = (pack.clone(), sticker.clone());
-                        this.state.update(cx, |state, cx| state.send_sticker(conversation, pack, sticker, cx));
+                        // The sticker replies; the reply stays for a draft
+                        // still to send, as in Desktop's `sendStickerMessage`
+                        // (`ts/state/ducks/composer.preload.ts`).
+                        let quote = this.reply_to.as_ref().map(|m| m.id);
+                        if this.input.read(cx).value().is_empty() && this.images.is_empty() && this.files.is_empty() {
+                            this.reply_to = None;
+                        }
+                        this.state.update(cx, |state, cx| state.send_sticker(conversation, pack, sticker, quote, cx));
                         this.close_picker(window, cx);
                         cx.emit(ComposerEvent::Sent);
                     }
@@ -1928,6 +1935,72 @@ mod tests {
         assert_eq!((csv.body.as_str(), csv.attachments[0].content_type.as_str()), ("", "text/csv"));
         let saved = std::fs::read(pdf.attachments[0].local_path.as_ref().unwrap()).unwrap();
         assert_eq!(saved, b"%PDF-1.7");
+    }
+
+    #[gpui_kit::test]
+    fn a_sticker_sent_while_replying_carries_the_reply(cx: &mut TestAppContext) {
+        let f = mount(cx);
+        let target = input_id(&f, cx);
+        cx.update_window(f.window, |_, window, cx| {
+            window.click(target, cx);
+            window.input("the original", cx);
+            f.composer.update(cx, |c, cx| c.submit(window, cx));
+        })
+        .unwrap();
+        let original =
+            sent(&f, |m| m.body == "the original").into_iter().find(|m| m.body == "the original").unwrap();
+        let path = f._dir.path().join("sticker.png");
+        std::fs::write(&path, b"made up").unwrap();
+        let pack = std::sync::Arc::new(signal_backend::StickerPackView {
+            id: vec![1],
+            key: vec![0; 32],
+            title: "Pack".into(),
+            author: "Someone".into(),
+            stickers: vec![signal_backend::StickerView { id: 0, emoji: Some("🔥".into()), path: path.clone() }],
+        });
+        let send_sticker = |cx: &mut TestAppContext| {
+            cx.update_window(f.window, |_, _, cx| {
+                f.composer.update(cx, |c, _| c.picker_open = true);
+                let picker = f.composer.read(cx).picker.clone();
+                picker.update(cx, |_, cx| cx.emit(PickerEvent::Sticker(pack.clone(), pack.stickers[0].clone())));
+            })
+            .unwrap();
+            cx.run_until_parked();
+        };
+        let replying = |cx: &mut TestAppContext| cx.update(|cx| f.composer.read(cx).reply_to.as_ref().map(|m| m.id));
+
+        // With a draft to send, the reply stays for it, as in Desktop.
+        cx.update_window(f.window, |_, window, cx| {
+            f.composer.update(cx, |c, cx| c.reply_to(original.clone(), window, cx));
+            window.input("still typing", cx);
+        })
+        .unwrap();
+        send_sticker(cx);
+        assert_eq!(replying(cx), Some(original.id));
+        let stickers = |f: &Fixture| {
+            sent(f, |m| m.attachments.iter().any(|a| a.sticker))
+                .into_iter()
+                .filter(|m| m.attachments.iter().any(|a| a.sticker))
+                .collect::<Vec<_>>()
+        };
+        let first = stickers(&f);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].quote.as_ref().map(|q| (q.sent_at, q.text.as_str())), Some((original.sent_at, "the original")));
+
+        // Without one, the sticker takes the reply with it.
+        cx.update_window(f.window, |_, window, cx| {
+            f.composer.update(cx, |c, cx| c.input.update(cx, |input, cx| input.set_value("", window, cx)));
+        })
+        .unwrap();
+        send_sticker(cx);
+        assert_eq!(replying(cx), None);
+        for _ in 0..300 {
+            if stickers(&f).len() == 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(stickers(&f).iter().all(|m| m.quote.as_ref().is_some_and(|q| q.sent_at == original.sent_at)));
     }
 
     thread_local! {
