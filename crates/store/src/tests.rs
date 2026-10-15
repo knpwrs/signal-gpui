@@ -762,6 +762,7 @@ async fn drop_later_migrations(db: &AppDb) {
     sqlx::query("DELETE FROM _sqlx_migrations WHERE version > ?").bind(INIT_VERSION).execute(&db.writer).await.unwrap();
     sqlx::query("DROP INDEX messages_author").execute(&db.writer).await.unwrap();
     sqlx::query("DROP INDEX messages_quote_author").execute(&db.writer).await.unwrap();
+    sqlx::query("ALTER TABLE messages DROP COLUMN styles").execute(&db.writer).await.unwrap();
 }
 
 /// Rewrites the migration history to look like a pre-squash database that
@@ -1053,4 +1054,35 @@ async fn renaming_an_author_looks_up_their_messages_by_index() {
     )
     .await;
     assert!(quotes.contains("messages_quote_author"), "{quotes}");
+}
+
+#[tokio::test]
+async fn styles_are_kept_and_spoilers_stay_out_of_previews() {
+    let db = test_db().await;
+    let id = db.insert_message(&incoming("d:a", "a", 1, "the ending: he was a ghost")).await.unwrap();
+    let styles = [
+        StyleSpan { start: 0, len: 3, style: TextStyle::Bold },
+        StyleSpan { start: 12, len: 14, style: TextStyle::Spoiler },
+    ];
+    db.set_styles(id, &styles).await.unwrap();
+    assert_eq!(db.message(id).await.unwrap().unwrap().styles, styles);
+    let chat = db.conversation(&conv("d:a")).await.unwrap().unwrap();
+    assert_eq!(chat.last_message_preview.as_deref(), Some("the ending: ■■■■"));
+    // Edited: the old formatting doesn't fit the new text.
+    db.edit_message(id, "the ending is a surprise", 2).await.unwrap();
+    assert!(db.message(id).await.unwrap().unwrap().styles.is_empty());
+    db.set_styles(id, &styles[..1]).await.unwrap();
+    // Deleted for everyone: its formatting goes too.
+    db.mark_deleted(id).await.unwrap();
+    assert!(db.message(id).await.unwrap().unwrap().styles.is_empty());
+}
+
+#[test]
+fn spoilers_hide_whole_and_overlapping() {
+    let spoiler = |start, len| StyleSpan { start, len, style: TextStyle::Spoiler };
+    assert_eq!(hide_spoilers("a secret b", &[spoiler(2, 6)]), "a ■■■■ b");
+    assert_eq!(hide_spoilers("abcdef", &[spoiler(0, 3), spoiler(2, 2)]), "■■■■ef");
+    assert_eq!(hide_spoilers("abc", &[spoiler(1, 9)]), "abc", "out of range: left alone");
+    let bold = StyleSpan { start: 0, len: 3, style: TextStyle::Bold };
+    assert_eq!(hide_spoilers("abc", &[bold]), "abc");
 }

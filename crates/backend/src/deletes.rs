@@ -57,6 +57,7 @@ mod tests {
             edit_count: 0,
             notice: None,
             mentions: Vec::new(),
+            styles: Vec::new(),
         }
     }
 

@@ -228,6 +228,8 @@ pub struct Message {
     pub notice: Option<Notice>,
     /// Where its @mentions are in `body`.
     pub mentions: Vec<MentionSpan>,
+    /// Its formatting (bold, spoilers…), in `body`'s bytes.
+    pub styles: Vec<StyleSpan>,
 }
 
 /// A group member's label: a short text with an optional emoji.
@@ -244,6 +246,55 @@ pub struct MentionSpan {
     pub len: usize,
     /// Who is mentioned (service id).
     pub aci: String,
+}
+
+/// Signal's text styles (`BodyRange.Style`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextStyle {
+    Bold,
+    Italic,
+    Strikethrough,
+    Monospace,
+    /// Hidden until clicked; previews and notifications show `■■■■`.
+    Spoiler,
+}
+
+/// Formatting over `body[start..start + len]` (bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StyleSpan {
+    pub start: usize,
+    pub len: usize,
+    pub style: TextStyle,
+}
+
+/// What stands in for spoiler text where it can't be revealed (previews,
+/// notifications, quotes), as in Desktop.
+pub const SPOILER_REPLACEMENT: &str = "■■■■";
+
+/// `body` with each spoiler's text replaced by [`SPOILER_REPLACEMENT`].
+pub fn hide_spoilers(body: &str, styles: &[StyleSpan]) -> String {
+    let mut spoilers: Vec<(usize, usize)> = styles
+        .iter()
+        .filter(|s| s.style == TextStyle::Spoiler)
+        .map(|s| (s.start, s.start + s.len))
+        .filter(|(start, end)| *end <= body.len() && body.is_char_boundary(*start) && body.is_char_boundary(*end))
+        .collect();
+    spoilers.sort();
+    let mut out = String::with_capacity(body.len());
+    let mut last = 0;
+    for (start, end) in spoilers {
+        // Overlapping ones are one spoiler.
+        if start < last {
+            last = last.max(end);
+            continue;
+        }
+        out.push_str(&body[last..start]);
+        out.push_str(SPOILER_REPLACEMENT);
+        last = end;
+    }
+    out.push_str(&body[last..]);
+    out
 }
 
 /// Something that happened in a chat, shown centered in the timeline.
@@ -535,7 +586,7 @@ const CONVERSATION_COLUMNS: &str = "id, kind, title, phone, color, members, last
       AS last_outgoing_status";
 
 const MESSAGE_COLUMNS: &str = "id, conversation_id, sent_at, received_at, direction, author, \
-     author_name, body, status, reactions, quote, attachments, link_preview, deleted, edited, expires_in, expire_start, edit_count, notice, mentions";
+     author_name, body, status, reactions, quote, attachments, link_preview, deleted, edited, expires_in, expire_start, edit_count, notice, mentions, styles";
 
 /// SQL matching a message whose own timestamp, or one of its edits', is
 /// the bound parameter `{param}`.
@@ -717,6 +768,11 @@ fn message_from_row(row: &SqliteRow) -> Result<Message> {
         mentions: row
             .try_get::<Option<String>, _>("mentions")?
             .map(|m| serde_json::from_str(&m))
+            .transpose()?
+            .unwrap_or_default(),
+        styles: row
+            .try_get::<Option<String>, _>("styles")?
+            .map(|s| serde_json::from_str(&s))
             .transpose()?
             .unwrap_or_default(),
     })
@@ -1521,7 +1577,7 @@ impl AppDb {
         self.update_and_refresh(
             message_id,
             "UPDATE messages SET deleted = 1, body = '', attachments = '[]', reactions = '[]', \
-             quote = NULL, link_preview = NULL, mentions = NULL WHERE id = ? RETURNING conversation_id",
+             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL WHERE id = ? RETURNING conversation_id",
             None,
         )
         .await
@@ -1533,7 +1589,8 @@ impl AppDb {
     pub async fn edit_message(&self, message_id: i64, body: &str, edit_sent_at: i64) -> Result<()> {
         let mut tx = self.write().await?;
         let conversation: Option<String> = sqlx::query_scalar(
-            "UPDATE messages SET body = ?2, edited = 1, edit_count = edit_count + 1 WHERE id = ?1 AND deleted = 0 \
+            // The old formatting doesn't fit the new text; callers set the edit's.
+            "UPDATE messages SET body = ?2, styles = NULL, edited = 1, edit_count = edit_count + 1 WHERE id = ?1 AND deleted = 0 \
              RETURNING conversation_id",
         )
         .bind(message_id)
@@ -1678,6 +1735,24 @@ impl AppDb {
     pub async fn set_mentions(&self, message_id: i64, mentions: &[MentionSpan]) -> Result<()> {
         let json = (!mentions.is_empty()).then(|| serde_json::to_string(mentions)).transpose()?;
         sqlx::query("UPDATE messages SET mentions = ? WHERE id = ?").bind(json).bind(message_id).execute(&self.writer).await?;
+        Ok(())
+    }
+
+    /// Records a message's formatting. Its chat's preview follows, as it
+    /// hides spoilers.
+    pub async fn set_styles(&self, message_id: i64, styles: &[StyleSpan]) -> Result<()> {
+        let json = (!styles.is_empty()).then(|| serde_json::to_string(styles)).transpose()?;
+        let mut tx = self.write().await?;
+        let conversation: Option<String> =
+            sqlx::query_scalar("UPDATE messages SET styles = ? WHERE id = ? RETURNING conversation_id")
+                .bind(json)
+                .bind(message_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if let Some(conversation) = conversation {
+            refresh_preview(&mut tx, &ConversationId(conversation)).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2125,7 +2200,7 @@ async fn ensure_conversation(
 /// Recomputes the conversation's preview from its newest message.
 async fn refresh_preview(conn: &mut sqlx::SqliteConnection, id: &ConversationId) -> Result<()> {
     let row = sqlx::query(
-        "SELECT m.sent_at, m.body, m.deleted, m.attachments, m.direction, m.author_name, c.kind \
+        "SELECT m.sent_at, m.body, m.styles, m.deleted, m.attachments, m.direction, m.author_name, c.kind \
          FROM messages m JOIN conversations c ON c.id = m.conversation_id \
          WHERE m.conversation_id = ? AND m.notice IS NULL ORDER BY m.sent_at DESC, m.id DESC LIMIT 1",
     )
@@ -2135,7 +2210,9 @@ async fn refresh_preview(conn: &mut sqlx::SqliteConnection, id: &ConversationId)
     let (preview, at) = match row {
         None => (None, 0i64),
         Some(row) => {
-            let body: String = row.try_get("body")?;
+            let styles: Vec<StyleSpan> =
+                row.try_get::<Option<String>, _>("styles")?.map(|s| serde_json::from_str(&s)).transpose()?.unwrap_or_default();
+            let body = hide_spoilers(&row.try_get::<String, _>("body")?, &styles);
             let text = if row.try_get::<bool, _>("deleted")? {
                 "This message was deleted".to_owned()
             } else if !body.is_empty() {
