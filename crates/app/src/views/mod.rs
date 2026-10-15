@@ -20,3 +20,4 @@ pub mod settings;
 pub mod sidebar;
 pub mod sticker_creator;
 pub mod syncing;
+pub mod video_viewer;

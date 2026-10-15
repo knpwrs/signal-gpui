@@ -46,6 +46,11 @@ block2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSSound"] }
 # Playing audio attachments and voice messages, and their waveforms.
 objc2-avf-audio = { version = "0.3", default-features = false, features = ["std", "AVAudioPlayer", "AVAudioFile", "AVAudioBuffer", "AVAudioFormat", "AVAudioTypes"] }
+# Playing video attachments: AVPlayer, with its frames read out as BGRA.
+objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "AVPlayer", "AVPlayerItem", "AVPlayerItemOutput", "objc2-core-media", "objc2-core-video"] }
+objc2-core-media = { version = "0.3", default-features = false, features = ["std", "CMTime"] }
+objc2-core-video = { version = "0.3", default-features = false, features = ["std", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFString"] }
 
 
 [build-dependencies]

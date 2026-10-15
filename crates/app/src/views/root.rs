@@ -20,6 +20,7 @@ pub struct RootView {
     picker: Entity<EmojiPicker>,
     conversation: Option<Entity<ConversationView>>,
     viewer: Option<(Entity<ImageViewer>, Subscription)>,
+    video_viewer: Option<(Entity<crate::views::video_viewer::VideoViewer>, Subscription)>,
     /// The lobby or call, while there is one.
     call: Option<Entity<crate::views::call::CallView>>,
     _subscriptions: Vec<Subscription>,
@@ -48,6 +49,20 @@ impl RootView {
                         cx.notify();
                     });
                     this.viewer = Some((viewer, closed));
+                    cx.notify();
+                }
+                if let AppEvent::ViewVideo(video) = event {
+                    let viewer = cx.new(|cx| crate::views::video_viewer::VideoViewer::new(video.clone(), cx));
+                    window.focus(&viewer.focus_handle(cx), cx);
+                    let closed = cx.subscribe_in(&viewer, window, |this, _, _: &ViewerEvent, window, cx| {
+                        // Dropping it stops the video.
+                        this.video_viewer = None;
+                        if let Some(conversation) = &this.conversation {
+                            window.focus(&conversation.focus_handle(cx), cx);
+                        }
+                        cx.notify();
+                    });
+                    this.video_viewer = Some((viewer, closed));
                     cx.notify();
                 }
                 if let AppEvent::Error(message) = event {
@@ -84,6 +99,7 @@ impl RootView {
             picker,
             conversation: None,
             viewer: None,
+            video_viewer: None,
             call: None,
             _subscriptions: subscriptions,
         }
@@ -145,6 +161,7 @@ impl Render for RootView {
         };
 
         let viewer = self.viewer.as_ref().map(|(viewer, _)| viewer.clone());
+        let video_viewer = self.video_viewer.as_ref().map(|(viewer, _)| viewer.clone());
         div()
             .key_context("Signal")
             .relative()
@@ -194,5 +211,6 @@ impl Render for RootView {
             .child(body)
             .when_some(self.call.clone().filter(|_| call_shown), |d, call| d.child(call))
             .when_some(viewer, |d, viewer| d.child(viewer))
+            .when_some(video_viewer, |d, viewer| d.child(viewer))
     }
 }

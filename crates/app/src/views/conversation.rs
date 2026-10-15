@@ -2588,6 +2588,69 @@ fn render_audio(
         .into_any_element()
 }
 
+/// A video in a message: its first frame with a play button (Desktop's
+/// look), which opens the player; before it's downloaded, a download button
+/// and its size.
+fn render_video(
+    message_id: i64,
+    index: usize,
+    attachment: &AttachmentMeta,
+    state: &Entity<AppState>,
+    cx: &mut Context<ConversationView>,
+) -> AnyElement {
+    let (w, h) = media_size(attachment.width, attachment.height);
+    let path = attachment.local_path.as_ref().map(std::path::PathBuf::from);
+    let poster = path.as_ref().and_then(|p| state.update(cx, |state, cx| state.poster(p, cx)));
+    let white = gpui_kit::hsla(0., 0., 1., 1.);
+    let badge = |icon: IconName| {
+        div()
+            .size(px(48.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .bg(gpui_kit::hsla(0., 0., 0., 0.55))
+            .child(Icon::new(icon).size_6().text_color(white))
+    };
+    let file_name = attachment.file_name.clone();
+    let size = attachment.size;
+    div()
+        .id(SharedString::from(format!("video-{message_id}-{index}")))
+        .relative()
+        .w(px(w))
+        .h(px(h))
+        .rounded_lg()
+        .overflow_hidden()
+        .cursor_pointer()
+        .bg(gpui_kit::hsla(0., 0., 0.1, 1.))
+        .when_some(poster, |d, poster| d.child(img(poster).absolute().inset_0().size_full().object_fit(gpui_kit::ObjectFit::Cover)))
+        .child(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .child(badge(if path.is_some() { IconName::Play } else { IconName::Download }))
+                .when(path.is_none(), |d| {
+                    d.child(div().text_xs().text_color(white).child(crate::views::common::format_size(size)))
+                }),
+        )
+        .on_click({
+            let state = state.clone();
+            move |_, _, cx| match &path {
+                Some(path) => state.update(cx, |state, cx| {
+                    let video = crate::views::video_viewer::ViewedVideo { path: path.clone(), file_name: file_name.clone() };
+                    state.view_video(video, cx);
+                }),
+                None => state.read(cx).send(Command::FetchAttachment { message_id, index }),
+            }
+        })
+        .into_any_element()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_attachment(
     message_id: i64,
@@ -2600,6 +2663,9 @@ fn render_attachment(
 ) -> AnyElement {
     if attachment.content_type.starts_with("audio/") {
         return render_audio(message_id, index, attachment, fg, state, cx);
+    }
+    if attachment.content_type.starts_with("video/") && !attachment.gif && !attachment.sticker {
+        return render_video(message_id, index, attachment, state, cx);
     }
     let is_image = attachment.content_type.starts_with("image/");
     if let (true, Some(path)) = (is_image, attachment.local_path.as_ref()) {

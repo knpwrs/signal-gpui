@@ -113,6 +113,36 @@ pub fn decode_loop(path: &Path, max_width: u32) -> anyhow::Result<RenderImage> {
     Ok(RenderImage::new(frames))
 }
 
+/// A still of the video's first frame (at most `MAX_POSTER_WIDTH` wide),
+/// saved beside it, for showing it in a message. Made once; blocking.
+pub fn poster(path: &Path) -> anyhow::Result<PathBuf> {
+    let out = path.with_extension("poster.png");
+    if out.exists() {
+        return Ok(out);
+    }
+    // Made under another name, and renamed once whole: a run that dies
+    // partway leaves no poster to be reused.
+    let partial = path.with_extension("poster.partial.png");
+    let made = Command::new(tool("ffmpeg"))
+        .args(["-v", "error", "-y", "-i"])
+        .arg(path)
+        .args(["-frames:v", "1", "-vf", &format!("scale='min({MAX_POSTER_WIDTH},iw)':-2")])
+        .arg(&partial)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("running ffmpeg (install ffmpeg: brew install ffmpeg)")?;
+    if !made.success() || !partial.exists() {
+        let _ = std::fs::remove_file(&partial);
+        bail!("ffmpeg made no still: {made}");
+    }
+    std::fs::rename(&partial, &out)?;
+    Ok(out)
+}
+
+/// A poster is shown at most this wide (Desktop's media width, at 2×).
+const MAX_POSTER_WIDTH: u32 = 600;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +174,27 @@ mod tests {
         let image = decode_loop(&clip, 160).unwrap();
         assert_eq!(image.frame_count(), 10);
         assert_eq!((image.size(0).width.0, image.size(0).height.0), (160, 90));
+    }
+
+    /// Needs ffmpeg installed.
+    #[test]
+    fn a_video_gets_a_poster_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("wide.mp4");
+        let made = Command::new(tool("ffmpeg"))
+            .args(["-v", "error", "-f", "lavfi", "-i", "testsrc=size=1280x720:rate=10:duration=1", "-pix_fmt", "yuv420p"])
+            .arg(&clip)
+            .status();
+        if !made.is_ok_and(|s| s.success()) {
+            eprintln!("ffmpeg not available; skipping");
+            return;
+        }
+        let poster = poster(&clip).unwrap();
+        assert_eq!(poster, dir.path().join("wide.poster.png"));
+        let size = image::image_dimensions(&poster).unwrap();
+        assert_eq!(size, (600, 338), "at most 600 wide, its shape kept");
+        let made_at = std::fs::metadata(&poster).unwrap().modified().unwrap();
+        assert_eq!(super::poster(&clip).unwrap(), poster);
+        assert_eq!(std::fs::metadata(&poster).unwrap().modified().unwrap(), made_at, "made once");
     }
 }

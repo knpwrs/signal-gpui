@@ -142,6 +142,7 @@ impl Sidebar {
                 | AppEvent::LinkPreview { .. }
                 | AppEvent::StickerUpload(_)
                 | AppEvent::ViewImage(_)
+                | AppEvent::ViewVideo(_)
                 | AppEvent::Gifs { .. } => {}
             }),
         ];

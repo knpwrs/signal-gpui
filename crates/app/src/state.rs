@@ -86,6 +86,7 @@ pub enum AppEvent {
     SearchInChat(ConversationId),
     /// Show an image full-window.
     ViewImage(crate::views::image_viewer::ViewedImage),
+    ViewVideo(crate::views::video_viewer::ViewedVideo),
     /// A link preview the composer asked for (`None`: nothing to show).
     LinkPreview { url: String, preview: Option<std::rc::Rc<signal_backend::LinkPreviewDraft>> },
     /// How the sticker pack creator's upload is going.
@@ -152,6 +153,9 @@ pub struct AppState {
     /// Audio files' waveforms and lengths (`None` while decoding, or if it
     /// can't be).
     waveforms: HashMap<std::path::PathBuf, Option<Waveform>>,
+    /// Video attachments' first frames (`None` while being made, or if
+    /// they can't be).
+    posters: HashMap<std::path::PathBuf, Option<std::path::PathBuf>>,
     /// Recently sent stickers, newest first: (pack id, sticker id).
     pub recent_stickers: Vec<(Vec<u8>, u32)>,
     /// How images are optimized before sending (our setting, not Signal's).
@@ -218,6 +222,7 @@ impl AppState {
             loops: Default::default(),
             audio: None,
             waveforms: HashMap::new(),
+            posters: HashMap::new(),
             recent_stickers: Vec::new(),
             reload_task: None,
             reload_pending: false,
@@ -906,6 +911,42 @@ impl AppState {
         })
         .detach();
         None
+    }
+
+    /// A downloaded video's first frame, made (once, in the background) the
+    /// first time it's asked for.
+    pub fn poster(&mut self, path: &std::path::Path, cx: &mut Context<Self>) -> Option<std::path::PathBuf> {
+        if let Some(known) = self.posters.get(path) {
+            return known.clone();
+        }
+        self.posters.insert(path.to_owned(), None);
+        let path = path.to_owned();
+        let make = cx.background_executor().spawn({
+            let path = path.clone();
+            async move { crate::video::poster(&path) }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = make.await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(poster) => {
+                        this.posters.insert(path, Some(poster));
+                    }
+                    Err(error) => tracing::warn!(error = %format!("{error:#}"), "couldn't make a video's poster"),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        None
+    }
+
+    /// Plays a video in the viewer; any audio playing pauses, as in Desktop.
+    pub fn view_video(&mut self, video: crate::views::video_viewer::ViewedVideo, cx: &mut Context<Self>) {
+        if let Some(audio) = &self.audio {
+            audio.player.pause();
+        }
+        cx.emit(AppEvent::ViewVideo(video));
     }
 
     pub fn view_image(&self, image: crate::views::image_viewer::ViewedImage, cx: &mut Context<Self>) {

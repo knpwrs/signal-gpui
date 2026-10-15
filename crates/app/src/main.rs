@@ -14,6 +14,7 @@ mod state;
 mod sticker_image;
 mod theme;
 mod video;
+mod video_player;
 mod views;
 
 use std::path::PathBuf;
