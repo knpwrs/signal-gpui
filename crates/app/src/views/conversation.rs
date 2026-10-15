@@ -1554,10 +1554,7 @@ impl ConversationView {
         let ids: Vec<i64> = selected.iter().copied().collect();
         let chosen: Vec<Message> = self.messages.iter().filter(|m| selected.contains(&m.id)).cloned().collect();
         let note_to_self = self.note_to_self(cx);
-        let now = now_millis();
-        let for_everyone = !chosen.is_empty()
-            && chosen.len() <= signal_backend::deletes::MAX_FOR_EVERYONE
-            && chosen.iter().all(|m| signal_backend::deletes::can_send(m, note_to_self, now));
+        let everyone = everyone_delete(&chosen, self.delete_chat(cx), now_millis());
         let forwardable = !chosen.is_empty()
             && chosen.len() <= crate::views::forward::MAX_MESSAGES
             && chosen.iter().all(|m| !m.deleted);
@@ -1601,7 +1598,7 @@ impl ConversationView {
                     .disabled(count == 0)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         let ids = delete_ids.clone();
-                        confirm_delete(this.state.clone(), ids, note_to_self, for_everyone, window, cx);
+                        confirm_delete(this.state.clone(), ids, note_to_self, everyone, window, cx);
                         this.selecting = None;
                         cx.notify();
                     })),
@@ -1610,6 +1607,20 @@ impl ConversationView {
 
     fn note_to_self(&self, cx: &App) -> bool {
         self.state.read(cx).account.as_ref().is_some_and(|a| self.id.as_direct() == Some(a.aci.as_str()))
+    }
+
+    /// What the delete-for-everyone rules need to know about this chat.
+    fn delete_chat(&self, cx: &App) -> signal_backend::deletes::Chat {
+        let state = self.state.read(cx);
+        let me = state.account.as_ref().map(|a| a.aci.as_str());
+        let we_are_admin = state
+            .conversation(&self.id)
+            .is_some_and(|c| !c.left && me.is_some_and(|me| c.admins.iter().any(|a| a == me)));
+        signal_backend::deletes::Chat {
+            note_to_self: self.note_to_self(cx),
+            group: self.id.as_group().is_some(),
+            we_are_admin,
+        }
     }
 
     /// What a deleted message says, in Desktop's words (`Message.dom.tsx`):
@@ -3157,8 +3168,9 @@ fn message_menu(
     use gpui_kit::component::menu::PopupMenuItem;
     let Some(this) = view.upgrade() else { return menu };
     let id = message.id;
-    let (state, note_to_self) = this.read_with(cx, |this, cx| (this.state.clone(), this.note_to_self(cx)));
-    let for_everyone = signal_backend::deletes::can_send(message, note_to_self, now_millis());
+    let (state, note_to_self, chat) =
+        this.read_with(cx, |this, cx| (this.state.clone(), this.note_to_self(cx), this.delete_chat(cx)));
+    let everyone = everyone_delete(std::slice::from_ref(message), chat, now_millis());
     let failed = message.direction == Direction::Outgoing && message.status == DeliveryStatus::Failed;
     let with_view = |f: fn(&mut ConversationView, i64, &mut Window, &mut Context<ConversationView>)| {
         let view = view.clone();
@@ -3223,7 +3235,7 @@ fn message_menu(
     );
     let delete_state = state.clone();
     menu = menu.item(PopupMenuItem::new("Delete").icon(IconName::Trash).on_click(move |_, window, cx| {
-        confirm_delete(delete_state.clone(), vec![id], note_to_self, for_everyone, window, cx)
+        confirm_delete(delete_state.clone(), vec![id], note_to_self, everyone, window, cx)
     }));
     if failed {
         menu = menu.item(
@@ -3361,13 +3373,32 @@ fn download_attachments(attachments: Vec<AttachmentMeta>, cx: &mut App) {
     .detach();
 }
 
+/// Whether messages can be deleted for everyone, and whether Desktop's
+/// admin delete confirmation goes first (`getMessagesCanDeleteForEveryone`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct EveryoneDelete {
+    allowed: bool,
+    /// Some need a group admin's delete, and not all are ours.
+    confirm_admin: bool,
+}
+
+fn everyone_delete(messages: &[Message], chat: signal_backend::deletes::Chat, now: i64) -> EveryoneDelete {
+    use signal_backend::deletes::{Kind, MAX_FOR_EVERYONE, send_kind};
+    let kinds: Option<Vec<Kind>> = messages.iter().map(|m| send_kind(m, chat, now)).collect();
+    let Some(kinds) = kinds.filter(|k| !k.is_empty() && k.len() <= MAX_FOR_EVERYONE) else {
+        return EveryoneDelete::default();
+    };
+    let own = messages.iter().all(|m| m.direction == Direction::Outgoing);
+    EveryoneDelete { allowed: true, confirm_admin: !own && kinds.contains(&Kind::Admin) }
+}
+
 /// Desktop's delete dialog: for you (on all your devices), or for everyone
 /// while that's still allowed. Note to Self only has the first.
 fn confirm_delete(
     state: Entity<AppState>,
     message_ids: Vec<i64>,
     note_to_self: bool,
-    for_everyone: bool,
+    everyone: EveryoneDelete,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -3378,7 +3409,7 @@ fn confirm_delete(
     window.open_dialog(cx, move |dialog, _, cx| {
         let palette = Palette::get(cx);
         let (one, these) = if count == 1 { ("message", "this message") } else { ("messages", "these messages") };
-        let (mine, everyone) = (state.clone(), state.clone());
+        let (mine, for_all) = (state.clone(), state.clone());
         let (my_ids, all_ids) = (message_ids.clone(), message_ids.clone());
         dialog
             .title(if count == 1 { "Delete selected message?".to_owned() } else { format!("Delete selected {count} {one}?") })
@@ -3402,19 +3433,63 @@ fn confirm_delete(
                                 window.close_all_dialogs(cx);
                             }),
                     )
-                    .when(for_everyone && !note_to_self, |footer| {
+                    .when(everyone.allowed && !note_to_self, |footer| {
                         footer.child(
                             Button::new("delete-for-everyone")
                                 .label("Delete for everyone")
                                 .danger()
                                 .on_click(move |_, window, cx| {
-                                    for message_id in &all_ids {
-                                        everyone.read(cx).send(Command::DeleteForEveryone { message_id: *message_id });
-                                    }
                                     window.close_all_dialogs(cx);
+                                    if everyone.confirm_admin && !for_all.read(cx).seen_admin_delete_education {
+                                        confirm_admin_delete(for_all.clone(), all_ids.clone(), window, cx);
+                                    } else {
+                                        delete_for_everyone(&for_all, &all_ids, cx);
+                                    }
                                 }),
                         )
                     }),
+            )
+    });
+}
+
+fn delete_for_everyone(state: &Entity<AppState>, message_ids: &[i64], cx: &mut App) {
+    for message_id in message_ids {
+        state.read(cx).send(Command::DeleteForEveryone { message_id: *message_id });
+    }
+}
+
+/// Desktop's admin delete confirmation, shown until it's been confirmed
+/// once (`DeleteMessagesConfirmAdminDeleteDialog`, with the rollout
+/// wording Desktop uses now). Cancel goes back to the first dialog.
+fn confirm_admin_delete(state: Entity<AppState>, message_ids: Vec<i64>, window: &mut Window, cx: &mut App) {
+    use gpui_kit::component::WindowExt as _;
+    use gpui_kit::component::button::{Button, ButtonVariants as _};
+    use gpui_kit::component::dialog::DialogFooter;
+    let these = if message_ids.len() == 1 { "this message" } else { "these messages" };
+    window.open_dialog(cx, move |dialog, _, cx| {
+        let palette = Palette::get(cx);
+        let (back, confirm) = (state.clone(), state.clone());
+        let (back_ids, ids) = (message_ids.clone(), message_ids.clone());
+        dialog
+            .title("Delete for everyone?")
+            .w(px(420.))
+            .child(div().text_sm().text_color(palette.text_secondary).child(format!(
+                "Group members on the latest versions of Signal will see that you deleted {these}."
+            )))
+            .footer(
+                DialogFooter::new()
+                    .child(Button::new("admin-delete-cancel").label("Cancel").outline().on_click(move |_, window, cx| {
+                        window.close_all_dialogs(cx);
+                        let everyone = EveryoneDelete { allowed: true, confirm_admin: true };
+                        confirm_delete(back.clone(), back_ids.clone(), false, everyone, window, cx);
+                    }))
+                    .child(Button::new("admin-delete-confirm").label("Delete for everyone").danger().on_click(
+                        move |_, window, cx| {
+                            confirm.update(cx, |state, cx| state.set_seen_admin_delete_education(cx));
+                            delete_for_everyone(&confirm, &ids, cx);
+                            window.close_all_dialogs(cx);
+                        },
+                    )),
             )
     });
 }
@@ -3426,9 +3501,8 @@ fn capitalize(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn reactions_end_a_group_as_in_desktop() {
-        let message = |id: i64, at: i64| Message {
+    fn message(id: i64, at: i64) -> Message {
+        Message {
             id,
             conversation_id: signal_store::ConversationId("d:a".into()),
             sent_at: at,
@@ -3452,12 +3526,35 @@ mod tests {
             styles: Vec::new(),
             cta: None,
             deleted_by_admin: None,
-        };
+        }
+    }
+
+    #[test]
+    fn reactions_end_a_group_as_in_desktop() {
         let (older, newer) = (message(1, 1_000), message(2, 2_000));
         assert!(super::same_group(&older, &newer));
         let mut reacted = older.clone();
         reacted.reactions.push(signal_store::Reaction { emoji: "😂".into(), author: None, sent_at: 1_500 });
         assert!(!super::same_group(&reacted, &newer), "the reacted message ends its group");
+    }
+
+    /// As a group admin, deleting theirs asks first; deleting only ours
+    /// doesn't (Desktop's `isDeletingOwnMessages`).
+    #[test]
+    fn admin_deletes_confirm_unless_all_are_ours() {
+        use signal_backend::deletes::Chat;
+        let now = 10_000;
+        let admin = Chat { note_to_self: false, group: true, we_are_admin: true };
+        let theirs = message(3, now - 100);
+        let ours = Message { direction: Direction::Outgoing, author: None, ..message(4, now - 100) };
+        let everyone = |m: &[Message], chat| super::everyone_delete(m, chat, now);
+        let confirm = super::EveryoneDelete { allowed: true, confirm_admin: true };
+        assert_eq!(everyone(std::slice::from_ref(&theirs), admin), confirm);
+        assert_eq!(everyone(&[theirs.clone(), ours.clone()], admin), confirm);
+        assert_eq!(everyone(std::slice::from_ref(&ours), admin), super::EveryoneDelete { allowed: true, confirm_admin: false });
+        assert_eq!(everyone(std::slice::from_ref(&theirs), Chat { we_are_admin: false, ..admin }), super::EveryoneDelete::default());
+        assert_eq!(everyone(&[], admin), super::EveryoneDelete::default());
+        assert_eq!(everyone(&vec![theirs; 31], admin), super::EveryoneDelete::default(), "Desktop's limit of 30");
     }
 
     #[test]

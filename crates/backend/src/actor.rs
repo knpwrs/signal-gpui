@@ -3122,16 +3122,49 @@ impl Actor {
         });
     }
 
+    /// Deletes a message for everyone: our own with Signal's normal delete
+    /// while it's allowed, else anyone's in a group we're an admin of
+    /// (Desktop's `sendDeleteForEveryoneMessage`). Our other devices learn
+    /// of it from the sent transcript, as with any message we send.
     async fn delete_for_everyone(self: Rc<Self>, message_id: i64) {
         let Some(target) = self.db.message(message_id).await.ok().flatten() else {
             return;
         };
-        let note_to_self = self.is_note_to_self(&target.conversation_id);
-        if !crate::deletes::can_send(&target, note_to_self, now_millis()) {
-            return self.error("cannot delete for everyone", "only your own sent messages from the last 24 hours");
-        }
-        if let Err(error) = self.db.mark_deleted(message_id).await {
-            return self.error("failed to delete message", error);
+        let conversation = &target.conversation_id;
+        let left = self.db.conversation(conversation).await.ok().flatten().is_some_and(|c| c.left);
+        let chat = crate::deletes::Chat {
+            note_to_self: self.is_note_to_self(conversation),
+            group: conversation.as_group().is_some(),
+            we_are_admin: !left && self.is_group_admin(conversation, &self.self_aci()).await,
+        };
+        let Some(kind) = crate::deletes::send_kind(&target, chat, now_millis()) else {
+            return self.error(
+                "cannot delete for everyone",
+                "only your own sent messages, or anyone's in a group you're an admin of, from the last 24 hours",
+            );
+        };
+        let target_sent_timestamp = Some(target.sent_at as u64);
+        let (marked, delete, admin_delete) = match kind {
+            crate::deletes::Kind::Normal => (
+                self.db.mark_deleted(message_id).await.map(|()| true),
+                Some(data_message::Delete { target_sent_timestamp }),
+                None,
+            ),
+            crate::deletes::Kind::Admin => {
+                let author = target.author.clone().unwrap_or_else(|| self.self_aci());
+                let Some(author) = Aci::parse_from_service_id_string(&author).map(|a| a.service_id_binary()) else {
+                    return self.error("cannot delete for everyone", "the message's author has no ACI");
+                };
+                let by = signal_store::DeletedByAdmin { by: None };
+                let admin_delete =
+                    data_message::AdminDelete { target_author_aci_binary: Some(author), target_sent_timestamp };
+                (self.db.mark_deleted_by_admin(message_id, &by).await, None, Some(admin_delete))
+            }
+        };
+        match marked {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => return self.error("failed to delete message", error),
         }
         self.emit(Event::MessageChanged { conversation: target.conversation_id.clone(), message_id });
         self.emit(Event::ConversationsChanged);
@@ -3139,7 +3172,8 @@ impl Actor {
         let timestamp = self.next_timestamp() as u64;
         let data = DataMessage {
             timestamp: Some(timestamp),
-            delete: Some(data_message::Delete { target_sent_timestamp: Some(target.sent_at as u64) }),
+            delete,
+            admin_delete,
             group_v2: self.group_context(&target.conversation_id).await,
             ..Default::default()
         };

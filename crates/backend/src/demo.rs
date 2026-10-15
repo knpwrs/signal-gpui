@@ -106,7 +106,12 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
     .await?;
     db.upsert_conversation(
         &ConversationId(HOUSE.into()),
-        ConversationUpdate { members: Some(vec![aci(ANA).into(), aci(LEO).into()]), ..Default::default() },
+        ConversationUpdate {
+            members: Some(vec![aci(ANA).into(), aci(LEO).into()]),
+            // We're its admin, so admin delete can be tried here.
+            admins: Some(vec![aci(SELF).into()]),
+            ..Default::default()
+        },
     )
     .await?;
 
@@ -795,9 +800,15 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 emit(Event::ConversationsChanged);
             }
             Command::DeleteForEveryone { message_id } => {
-                if db.mark_deleted(message_id).await.is_ok()
-                    && let Ok(Some(m)) = db.message(message_id).await
-                {
+                // Someone else's message can only be ours to delete as a
+                // group admin (we are one in the house group).
+                let Ok(Some(m)) = db.message(message_id).await else { continue };
+                let deleted = if m.direction == Direction::Incoming {
+                    db.mark_deleted_by_admin(message_id, &signal_store::DeletedByAdmin { by: None }).await.is_ok()
+                } else {
+                    db.mark_deleted(message_id).await.is_ok()
+                };
+                if deleted {
                     emit(Event::MessageChanged { conversation: m.conversation_id, message_id });
                 }
             }

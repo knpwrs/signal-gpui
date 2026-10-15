@@ -21,7 +21,7 @@ flag as on whenever it's set.
 
 | Flag | What it gates in Desktop | Here |
 |---|---|---|
-| `adminDelete.receive` / `.send` | Group admins deleting anyone's message for everyone (see below). | Not done. |
+| `adminDelete.receive` / `.send` | Group admins deleting anyone's message for everyone. Desktop turns receiving and sending on separately (`isAdminDeleteReceiveEnabled` / `isAdminDeleteSendEnabled`). | Done, both always on. People whose clients don't know `adminDelete` yet still see the message. |
 | `stickerReply.send` | Sending a sticker as a reply (with a quote). | Not done. Sticker sends drop the reply. |
 | `pollSend1to1` | Creating polls in 1:1 chats (groups already have polls). | Polls aren't supported: received ones show only as "📊 Poll: question". |
 | `groupMemberLabels.edit` | Editing your own member label in a group. | Done (Group settings), always on: whether you may set one follows the group's label access, as Desktop's `getCanAddLabel`. |
@@ -38,7 +38,7 @@ flag as on whenever it's set.
 | Key | Desktop default | Here |
 |---|---|---|
 | `normalDeleteMaxAgeInSeconds` | 1 day (receivers add a day of grace) | Same, hard-coded (`crates/backend/src/deletes.rs`). |
-| `adminDeleteMaxAgeInSeconds` | 1 day (plus a day of grace) | Not used until admin delete exists. |
+| `adminDeleteMaxAgeInSeconds` | 1 day (receivers add a day of grace) | Same, hard-coded (`deletes::ADMIN_MAX_AGE_MS`). |
 | `pinnedChatLimit` | 4 | Same (`storage::MAX_PINNED`). |
 | `pinnedMessageLimit` | 3 | Same (`MAX_PINNED_MESSAGES`). |
 | `attachments.maxBytes` | 100 MiB | Same (`MAX_ATTACHMENT_BYTES`). |
@@ -57,51 +57,12 @@ digest or plaintext hash), which is what the phone fills for link and sync.
 Attachments only in the backup (media) tier need backup-tier credentials
 and aren't downloaded.
 
-## Admin delete
+## Deletes that arrive before their message
 
-The admin delete flags and limit are behind remote config, so this follows
-Desktop's code paths:
-
-- `ts/util/canDeleteForEveryone.preload.ts`
-- `ts/textsecure/processDataMessage.preload.ts`
-- `ts/components/DeleteMessagesModal.dom.tsx`
-
-Group admins can delete anyone's message in a group for everyone. Our proto
-already has the field: `DataMessage.adminDelete = 29`, holding
-`AdminDelete { targetAuthorAciBinary, targetSentTimestamp }`.
-
-### Receiving
-
-- Accept it only in a group, only from someone who is an admin of that group
-  when it arrives, and within `adminDeleteMaxAgeInSeconds` plus a day of
-  grace.
-- Don't accept it in Note to Self, in an ended group, or on an
-  already-deleted message.
-- This needs member roles, which we don't store: `conversations.members` is
-  sorted ACIs only. Store roles from the decrypted group state.
-- Show the message as deleted.
-
-### Sending
-
-- When we're an admin and our own normal delete doesn't apply (someone else's
-  message, or ours after 24 hours), still offer "Delete for everyone" within
-  the admin window.
-- Confirm first, as Desktop does: "Delete for everyone?" / "As an admin,
-  group members will see that you deleted this message." Desktop shows this
-  only until you've seen it once.
-- Send `adminDelete` with the target's author ACI (binary) and sent
-  timestamp.
-- Desktop prefers a normal delete for your own messages while it's still
-  allowed.
-
-### Gating
-
-- Desktop gates sending and receiving separately
-  (`isAdminDeleteSendEnabled` / `isAdminDeleteReceiveEnabled`).
-- Without remote config we'd either ship it always on or behind our own
-  setting. Receiving is safe to turn on once roles are stored.
-- Sending is visible to other people. Clients that don't know `adminDelete`
-  yet won't apply it, so the message stays for them.
+Desktop keeps a delete for everyone (the author's or an admin's) whose
+message hasn't arrived yet and applies it when the message does
+(`ts/messageModifiers/Deletes.preload.ts`, `forMessage`). We drop it, so
+the message shows when it comes.
 
 ## Sticker pack creator
 

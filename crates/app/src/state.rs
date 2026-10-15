@@ -21,6 +21,7 @@ pub enum NavTab {
 
 /// Settings key: the tabs are hidden (Desktop's `navTabsCollapsed`).
 const NAV_COLLAPSED_SETTING: &str = "nav_tabs_collapsed";
+const ADMIN_DELETE_EDUCATION_SETTING: &str = "admin_delete_education_seen";
 /// Settings key: chats whose stories are hidden (JSON conversation ids).
 const HIDDEN_STORIES_SETTING: &str = signal_backend::SETTING_HIDDEN_STORIES;
 
@@ -203,6 +204,9 @@ pub struct AppState {
     pub hidden_stories: std::collections::HashSet<ConversationId>,
     /// Stories are turned off.
     pub stories_disabled: bool,
+    /// Desktop's admin delete confirmation has been confirmed once
+    /// (`hasSeenAdminDeleteEducationDialog`), so it isn't shown again.
+    pub seen_admin_delete_education: bool,
     /// Story view receipts, if set (unset follows read receipts).
     pub story_view_receipts: Option<bool>,
     /// Starts recording a voice message (the microphone; a stand-in in
@@ -286,6 +290,7 @@ impl AppState {
             stories: Vec::new(),
             hidden_stories: Default::default(),
             stories_disabled: false,
+            seen_admin_delete_education: false,
             story_view_receipts: None,
             waveforms: HashMap::new(),
             posters: HashMap::new(),
@@ -656,6 +661,7 @@ impl AppState {
                 self.sticker_packs.clear();
                 self.has_giphy_key = std::env::var_os("GIPHY_API_KEY").is_some();
                 self.image_optimization = Default::default();
+                self.seen_admin_delete_education = false;
                 self.history = None;
                 self.catching_up = None;
                 self.held_notification = None;
@@ -747,10 +753,11 @@ impl AppState {
                 db.setting(HIDDEN_STORIES_SETTING).await?,
                 db.setting(signal_backend::SETTING_STORIES_DISABLED).await?,
                 db.setting(signal_backend::SETTING_STORY_VIEW_RECEIPTS).await?,
+                db.setting(ADMIN_DELETE_EDUCATION_SETTING).await?,
             ))
         });
         cx.spawn(async move |this, cx| {
-            let (optimization, recents, giphy, notifications, collapsed, hidden, stories_off, view_receipts) =
+            let (optimization, recents, giphy, notifications, collapsed, hidden, stories_off, view_receipts, admin_delete_seen) =
                 read.await.unwrap_or_default();
             let _ = this.update(cx, |this, cx| {
                 this.nav_collapsed = collapsed.as_deref() == Some("true");
@@ -761,6 +768,7 @@ impl AppState {
                     .map(ConversationId)
                     .collect();
                 this.stories_disabled = stories_off.as_deref() == Some("true");
+                this.seen_admin_delete_education = admin_delete_seen.as_deref() == Some("true");
                 this.story_view_receipts = view_receipts.map(|v| v != "false");
                 this.notification_setting = crate::notifications::NotificationSetting::from_setting(notifications.as_deref());
                 this.has_giphy_key |= giphy.is_some_and(|k| !k.trim().is_empty());
@@ -835,6 +843,14 @@ impl AppState {
             .detach();
         }
         cx.notify();
+    }
+
+    /// Desktop's admin delete confirmation was confirmed; it isn't shown again.
+    pub fn set_seen_admin_delete_education(&mut self, cx: &mut Context<Self>) {
+        if !self.seen_admin_delete_education {
+            self.seen_admin_delete_education = true;
+            self.save_setting(ADMIN_DELETE_EDUCATION_SETTING, "true".into(), cx);
+        }
     }
 
     /// Whether we tell people we viewed their stories (and see who viewed

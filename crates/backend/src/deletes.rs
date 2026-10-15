@@ -6,7 +6,8 @@
 //!
 //! A group admin may also delete anyone's message in the group (Desktop's
 //! admin delete, `DataMessage.adminDelete`), within its own limit
-//! (`global.adminDeleteMaxAgeInSeconds`, also a day by default).
+//! (`global.adminDeleteMaxAgeInSeconds`, also a day by default). Our own
+//! messages use the normal delete while it's allowed, as in Desktop.
 
 use signal_store::{DeliveryStatus, Direction, Message};
 
@@ -19,6 +20,49 @@ pub const RECEIVE_GRACE_MS: i64 = DAY_MS;
 pub const ADMIN_MAX_AGE_MS: i64 = DAY_MS;
 /// Desktop deletes at most this many messages for everyone at once.
 pub const MAX_FOR_EVERYONE: usize = 30;
+
+/// Which delete for everyone applies to a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// The author's own (`DataMessage.delete`).
+    Normal,
+    /// A group admin's (`DataMessage.adminDelete`).
+    Admin,
+}
+
+/// What the rules need to know about a message's chat.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Chat {
+    pub note_to_self: bool,
+    pub group: bool,
+    /// We're an admin of the group (and still in it).
+    pub we_are_admin: bool,
+}
+
+/// Which delete for everyone we can send for `message` at `now`, if any:
+/// the normal one for our own messages while it's allowed, else an admin
+/// delete (Desktop's `canSendDeleteForEveryone`).
+pub fn send_kind(message: &Message, chat: Chat, now: i64) -> Option<Kind> {
+    if can_send(message, chat.note_to_self, now) {
+        return Some(Kind::Normal);
+    }
+    can_send_as_admin(message, chat, now).ok().map(|()| Kind::Admin)
+}
+
+/// Whether we can delete `message` for everyone as a group admin at `now`,
+/// or why not. Our own message must have gone out to someone.
+pub fn can_send_as_admin(message: &Message, chat: Chat, now: i64) -> Result<(), &'static str> {
+    if chat.note_to_self {
+        return Err("note to self");
+    }
+    common(message)?;
+    if message.direction == Direction::Outgoing
+        && !matches!(message.status, DeliveryStatus::Sent | DeliveryStatus::Delivered | DeliveryStatus::Read)
+    {
+        return Err("not sent");
+    }
+    admin(chat.group, chat.we_are_admin, now - message.sent_at, 0)
+}
 
 /// Whether a group admin's delete sent at `deleted_at` applies to `target`,
 /// or why not (Desktop's `canReceiveDeleteForEveryone` with
@@ -123,6 +167,34 @@ mod tests {
         assert!(can_receive(&target, false, 2 * DAY_MS));
         assert!(!can_receive(&target, false, 2 * DAY_MS + 1));
         assert!(!can_receive(&target, true, 1));
+    }
+
+    const GROUP: Chat = Chat { note_to_self: false, group: true, we_are_admin: true };
+
+    #[test]
+    fn admins_delete_anyones_message_in_a_group() {
+        let now = 10 * DAY_MS;
+        let theirs = message(Direction::Incoming, DeliveryStatus::Read, now - DAY_MS + 1);
+        assert_eq!(send_kind(&theirs, GROUP, now), Some(Kind::Admin));
+        assert_eq!(send_kind(&theirs, Chat { we_are_admin: false, ..GROUP }, now), None);
+        assert_eq!(send_kind(&theirs, Chat { group: false, ..GROUP }, now), None, "only in groups");
+        assert_eq!(send_kind(&theirs, Chat { note_to_self: true, ..GROUP }, now), None);
+        let old = message(Direction::Incoming, DeliveryStatus::Read, now - DAY_MS - 1);
+        assert_eq!(can_send_as_admin(&old, GROUP, now), Err("too old"));
+        let deleted = Message { deleted: true, ..theirs.clone() };
+        assert_eq!(can_send_as_admin(&deleted, GROUP, now), Err("already deleted"));
+        let notice = Message { notice: Some(signal_store::Notice::GroupCall { by: None, era: None }), ..theirs };
+        assert_eq!(can_send_as_admin(&notice, GROUP, now), Err("not a message"));
+    }
+
+    #[test]
+    fn our_own_messages_prefer_the_normal_delete() {
+        let now = 10 * DAY_MS;
+        let ours = message(Direction::Outgoing, DeliveryStatus::Delivered, now - 1000);
+        assert_eq!(send_kind(&ours, GROUP, now), Some(Kind::Normal));
+        // Never sent: no normal delete, and no admin delete either.
+        let failed = message(Direction::Outgoing, DeliveryStatus::Failed, now - 1000);
+        assert_eq!(send_kind(&failed, GROUP, now), None);
     }
 
     #[test]
