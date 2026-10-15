@@ -85,8 +85,19 @@ pub struct Sidebar {
     chat_search: Option<ChatSearch>,
     /// The message results' scroll position, for their scrollbar.
     hits_scroll: gpui_kit::ScrollHandle,
+    /// Desktop's narrow left pane: avatars only (set by the root view from
+    /// the width).
+    pub narrow: bool,
     _subscriptions: Vec<Subscription>,
 }
+
+/// Asks the root view for more room.
+pub enum SidebarEvent {
+    /// Widen a narrow sidebar (Desktop's `expandNarrowLeftPane`).
+    Expand,
+}
+
+impl gpui_kit::EventEmitter<SidebarEvent> for Sidebar {}
 
 /// The search box while it's searching one chat. It has its own input, for
 /// its "Search chat" placeholder.
@@ -160,11 +171,25 @@ impl Sidebar {
             layout_key: Vec::new(),
             chat_search: None,
             hits_scroll: gpui_kit::ScrollHandle::new(),
+            narrow: false,
             _subscriptions: subscriptions,
         }
     }
 
     /// The search box in use: the chat search's while there is one.
+    /// Searching or the archive need names to read (Desktop's
+    /// `requiresFullWidth`).
+    pub fn requires_full_width(&self) -> bool {
+        !self.query.is_empty() || self.chat_search.is_some() || self.archive_open
+    }
+
+    /// The narrow sidebar's search button: widen, then search.
+    fn expand_to_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(SidebarEvent::Expand);
+        let search = self.search_input();
+        search.update(cx, |search, cx| search.focus(window, cx));
+    }
+
     pub fn search_input(&self) -> Entity<InputState> {
         match &self.chat_search {
             Some(search) => search.input.clone(),
@@ -310,6 +335,33 @@ impl Sidebar {
     fn render_item(&self, ix: usize, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let palette = Palette::get(cx);
         let selected = self.state.read(cx).selected.clone();
+        if self.narrow {
+            match self.items.get(ix) {
+                Some(Item::Conversation { conversation, .. }) => {
+                    let is_selected = selected.as_ref() == Some(&conversation.id);
+                    return self.render_narrow_row(conversation, is_selected, palette, cx).into_any_element();
+                }
+                // Desktop's archive button, as an icon.
+                Some(Item::ArchiveButton(count)) => {
+                    let count = *count;
+                    return div()
+                        .h(px(ARCHIVE_BUTTON_HEIGHT))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            Button::new("archived-chats")
+                                .ghost()
+                                .icon(IconName::Archive)
+                                .tooltip(format!("Archived chats ({count})"))
+                                .on_click(cx.listener(|this, _, _, cx| this.set_archive_open(true, cx))),
+                        )
+                        .into_any_element();
+                }
+                Some(item) => return div().h(px(item.height())).into_any_element(),
+                None => return div().into_any_element(),
+            }
+        }
         match self.items.get(ix) {
             Some(Item::Header(title)) => div()
                 .h(px(HEADER_HEIGHT))
@@ -407,6 +459,101 @@ impl Sidebar {
                     || c.phone.as_deref().is_some_and(|p| p.contains(&query))
             })
             .collect()
+    }
+
+    /// The narrow sidebar's top (Desktop's narrow NavSidebar): room for the
+    /// window's buttons, then new group, settings and search, stacked.
+    fn render_narrow_header(&self, palette: Palette, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let _ = palette;
+        div()
+            .flex_none()
+            .pt(px(44.)) // under the macOS traffic lights
+            .pb_2()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_1()
+            .child(
+                Button::new("new-group-button")
+                    .ghost()
+                    .icon(IconName::SquarePen)
+                    .tooltip("New group")
+                    .on_click(cx.listener(|this, _, window, cx| crate::views::new_group::open(this.state.clone(), window, cx))),
+            )
+            .child(
+                Button::new("settings-button")
+                    .ghost()
+                    .icon(IconName::Settings)
+                    .tooltip("Settings (⌘,)")
+                    .on_click(cx.listener(|this, _, window, cx| crate::views::settings::open(this.state.clone(), window, cx))),
+            )
+            .child(
+                Button::new("narrow-search")
+                    .ghost()
+                    .icon(IconName::Search)
+                    .tooltip("Search")
+                    .on_click(cx.listener(|this, _, window, cx| this.expand_to_search(window, cx))),
+            )
+            .into_any_element()
+    }
+
+    /// A chat in the narrow sidebar: its avatar, with the unread count on
+    /// it, and its name on hover.
+    fn render_narrow_row(&self, conversation: &Conversation, selected: bool, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let id = conversation.id.clone();
+        let unread = conversation.unread_count;
+        let title: SharedString = match conversation.kind {
+            ConversationKind::NoteToSelf => "Note to Self".into(),
+            _ => conversation.title.clone().into(),
+        };
+        div().w_full().h(px(ROW_HEIGHT)).px_2().py(px(2.)).child(
+            div()
+                .id(SharedString::from(format!("conv-{}", conversation.id.0)))
+                .debug_selector({
+                    let id = conversation.id.0.clone();
+                    move || format!("conv-{id}")
+                })
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_lg()
+                .cursor_pointer()
+                .when(selected, |d| d.bg(palette.row_selected))
+                .when(!selected, |d| d.hover(|d| d.bg(palette.row_hover)))
+                .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(title.clone()).build(window, cx))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let id = id.clone();
+                    this.state.update(cx, |state, cx| state.select(Some(id), cx));
+                }))
+                .child(
+                    div()
+                        .relative()
+                        .child(conversation_avatar(conversation, px(48.)))
+                        .when(unread > 0 || conversation.marked_unread, |d| {
+                            d.child(
+                                div()
+                                    .absolute()
+                                    .top(px(-4.))
+                                    .right(px(-6.))
+                                    .min_w(px(18.))
+                                    .h(px(18.))
+                                    .px_1()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .border_2()
+                                    .border_color(palette.sidebar)
+                                    .bg(palette.badge)
+                                    .text_color(gpui_kit::Hsla { h: 0., s: 0., l: 1., a: 1. })
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .when(unread > 0, |d| d.child(if unread > 99 { "99+".to_string() } else { unread.to_string() })),
+                            )
+                        }),
+                ),
+        )
     }
 
     fn render_row(&self, conversation: &Conversation, selected: bool, typing: bool, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
@@ -727,6 +874,7 @@ impl Focusable for Sidebar {
 impl Render for Sidebar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::get(cx);
+        let narrow_header = self.narrow.then(|| self.render_narrow_header(palette, cx));
         let state = self.state.read(cx);
         let connection = state.connection.clone();
         self.rebuild_items(cx);
@@ -734,6 +882,8 @@ impl Render for Sidebar {
         let search_height: f32 = self.items.iter().map(Item::height).sum();
         let entity = cx.entity();
         let searching = !self.query.is_empty();
+        let narrow = self.narrow;
+        let megaphone = state.megaphones.first().filter(|_| !searching).cloned();
 
         use signal_backend::HistoryProgress;
         let banner: Option<(SharedString, IconName)> = match &state.history {
@@ -754,7 +904,8 @@ impl Render for Sidebar {
             .flex_col()
             .bg(palette.sidebar)
             .text_color(palette.text)
-            .child(
+            .when(!narrow, |d| {
+                d.child(
                 div()
                     .flex()
                     .items_center()
@@ -849,7 +1000,21 @@ impl Render for Sidebar {
                         }
                     })),
             )
-            .when_some(banner, |d, (text, icon)| {
+            })
+            .when_some(narrow_header, |d, header| d.child(header))
+            // Narrow: the banner's icon, its words on hover.
+            .when_some(banner.clone().filter(|_| narrow), |d, (text, icon)| {
+                d.child(
+                    div()
+                        .id("sidebar-banner")
+                        .mb_2()
+                        .flex()
+                        .justify_center()
+                        .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(text.clone()).build(window, cx))
+                        .child(Icon::new(icon).size_5().text_color(palette.text_secondary)),
+                )
+            })
+            .when_some(banner.filter(|_| !narrow), |d, (text, icon)| {
                 d.child(
                     div()
                         .mx_3()
@@ -882,8 +1047,33 @@ impl Render for Sidebar {
                     .child(Scrollbar::vertical(&self.list).mode(ScrollbarMode::Hover)),
             )
             // Desktop shows Signal's megaphone under the chats.
-            .when_some(state.megaphones.first().filter(|_| !searching).cloned(), |d, megaphone| {
-                d.child(render_megaphone(&self.state, megaphone, palette))
+            .when_some(megaphone, |d, megaphone| {
+                if narrow {
+                    // Desktop's narrow megaphone: its image, which widens the list.
+                    d.child(
+                        div()
+                            .id("megaphone-narrow")
+                            .debug_selector(|| "megaphone".into())
+                            .flex_none()
+                            .m_2()
+                            .p_2()
+                            .flex()
+                            .justify_center()
+                            .rounded_xl()
+                            .cursor_pointer()
+                            .bg(palette.popover)
+                            .border_1()
+                            .border_color(palette.panel_border)
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::Expand)))
+                            .child(
+                                gpui_kit::img(std::path::PathBuf::from(&megaphone.image_path))
+                                    .size(px(48.))
+                                    .object_fit(gpui_kit::ObjectFit::Cover),
+                            ),
+                    )
+                } else {
+                    d.child(render_megaphone(&self.state, megaphone, palette))
+                }
             })
             .when(searching && row_count == 0 && self.hits.is_empty(), |d| {
                 d.child(

@@ -10,6 +10,7 @@ mod loop_cache;
 mod notifications;
 mod platform;
 mod recorder;
+mod sidebar_width;
 mod ringtone;
 mod state;
 mod sticker_image;

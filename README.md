@@ -109,6 +109,7 @@ The ⋯ menu in a chat's header (and right-clicking a chat in the list) works li
 - **Safety number** (Chat settings in a 1:1 chat): the 60 digits and QR code, computed as Signal does (libsignal's fingerprint over both ACIs and identity keys), to compare with the other person's device. **Mark as verified** is tied to their current identity key, so it lapses when their key changes, and it's synced with your other devices both ways (Signal's Verified sync message).
 - **Search in chat** (⌘⇧F, or the magnifying glass in the header) works as in Desktop: the sidebar's search box shows the chat's avatar and searches only that chat, listing each match under its sender; picking one jumps to it. The ✕ beside the avatar, Escape, or Backspace in the empty box goes back to searching everything. Results from the main search jump too.
 - **Chat details:** click the avatar or name in a chat's header.
+- **Chat list width:** drag its edge, from 280 to 380 pixels, or below 200 to shrink it to avatars only, as in Desktop. Searching widens it again.
 
 ## Messages
 

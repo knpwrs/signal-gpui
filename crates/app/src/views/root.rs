@@ -12,7 +12,12 @@ use crate::views::image_viewer::{ImageViewer, ViewerEvent};
 use crate::views::sidebar::Sidebar;
 use crate::{About, FocusSearch, NextConversation, OpenSettings, PreviousConversation, SearchInChat, ShowDebugLog};
 
-const SIDEBAR_WIDTH: f32 = 340.;
+/// Settings key: the chat list's width as last dragged (not a Signal
+/// setting; Desktop keeps its own the same way).
+const SETTING_SIDEBAR_WIDTH: &str = "sidebar_width";
+
+/// What's dragged to resize the chat list.
+struct SidebarResize;
 
 pub struct RootView {
     state: Entity<AppState>,
@@ -23,6 +28,8 @@ pub struct RootView {
     video_viewer: Option<(Entity<crate::views::video_viewer::VideoViewer>, Subscription)>,
     /// The lobby or call, while there is one.
     call: Option<Entity<crate::views::call::CallView>>,
+    /// The chat list's width as dragged (see `crate::sidebar_width`).
+    sidebar_preferred: f32,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -31,6 +38,9 @@ impl RootView {
         let sidebar = cx.new(|cx| Sidebar::new(state.clone(), window, cx));
         let picker = cx.new(|cx| EmojiPicker::new(state.clone(), window, cx));
         let subscriptions = vec![
+            cx.subscribe(&sidebar, |this, _, event: &crate::views::sidebar::SidebarEvent, cx| match event {
+                crate::views::sidebar::SidebarEvent::Expand => this.expand_sidebar(cx),
+            }),
             // No notifications for the chat you're looking at.
             cx.observe_window_activation(window, |this, window, cx| {
                 let active = window.is_window_active();
@@ -93,7 +103,7 @@ impl RootView {
                 cx.notify()
             }),
         ];
-        Self {
+        let this = Self {
             state,
             sidebar,
             picker,
@@ -101,7 +111,52 @@ impl RootView {
             viewer: None,
             video_viewer: None,
             call: None,
+            sidebar_preferred: crate::sidebar_width::DEFAULT_WIDTH,
             _subscriptions: subscriptions,
+        };
+        this.load_sidebar_width(cx);
+        this
+    }
+
+    /// The width last dragged to, from the settings.
+    fn load_sidebar_width(&self, cx: &mut Context<Self>) {
+        let backend = self.state.read(cx).backend.clone();
+        cx.spawn(async move |this, cx| {
+            let db = backend.db().clone();
+            let saved = backend.spawn(async move { db.setting(SETTING_SIDEBAR_WIDTH).await }).await;
+            let width = saved.ok().flatten().and_then(|w| w.parse::<f32>().ok());
+            if let Some(width) = width.filter(|w| w.is_finite()) {
+                let _ = this.update(cx, |this, cx| {
+                    this.sidebar_preferred = width;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Settles the width (snapped, as drawn) and keeps it.
+    fn save_sidebar_width(&mut self, cx: &mut Context<Self>) {
+        let requires_full = self.sidebar.read(cx).requires_full_width();
+        // A forced full width isn't a choice: keep the narrow one chosen.
+        if !requires_full {
+            self.sidebar_preferred = crate::sidebar_width::width(self.sidebar_preferred, false);
+        }
+        let width = self.sidebar_preferred;
+        let backend = self.state.read(cx).backend.clone();
+        cx.spawn(async move |_, _| {
+            let db = backend.db().clone();
+            let _ = backend.spawn(async move { db.set_setting(SETTING_SIDEBAR_WIDTH, &width.to_string()).await }).await;
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Desktop's `expandNarrowLeftPane`.
+    fn expand_sidebar(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_preferred < crate::sidebar_width::MIN_FULL_WIDTH {
+            self.sidebar_preferred = crate::sidebar_width::MIN_FULL_WIDTH;
+            self.save_sidebar_width(cx);
         }
     }
 }
@@ -110,6 +165,16 @@ impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::get(cx);
         let screen = self.state.read(cx).screen.clone();
+        // Desktop's left pane width: narrow (avatars) below the snap.
+        let requires_full = self.sidebar.read(cx).requires_full_width();
+        let sidebar_width = crate::sidebar_width::width(self.sidebar_preferred, requires_full);
+        let narrow = crate::sidebar_width::is_narrow(sidebar_width);
+        if self.sidebar.read(cx).narrow != narrow {
+            self.sidebar.update(cx, |sidebar, cx| {
+                sidebar.narrow = narrow;
+                cx.notify();
+            });
+        }
         let syncing = self.state.read(cx).syncing_history().cloned();
         // Calls show through the history transfer too (they ring then).
         let call_shown = matches!(screen, Screen::Main);
@@ -133,14 +198,33 @@ impl Render for RootView {
             Screen::Main => div()
                 .size_full()
                 .flex()
+                // Dragging the chat list's edge (Desktop's drag handle).
+                .on_drag_move(cx.listener(|this, event: &gpui_kit::DragMoveEvent<SidebarResize>, _, cx| {
+                    this.sidebar_preferred = f32::from(event.event.position.x);
+                    cx.notify();
+                }))
+                .on_drop(cx.listener(|this, _: &SidebarResize, _, cx| this.save_sidebar_width(cx)))
                 .child(
                     div()
-                        .w(px(SIDEBAR_WIDTH))
+                        .relative()
+                        .w(px(sidebar_width))
                         .flex_none()
                         .h_full()
                         .border_r_1()
                         .border_color(palette.panel_border)
-                        .child(self.sidebar.clone()),
+                        .child(self.sidebar.clone())
+                        .child(
+                            div()
+                                .id("sidebar-resize")
+                                .debug_selector(|| "sidebar-resize".into())
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .right(px(-4.))
+                                .w(px(8.))
+                                .cursor_col_resize()
+                                .on_drag(SidebarResize, |_, _, _, cx| cx.new(|_| gpui_kit::EmptyView)),
+                        ),
                 )
                 .child(div().flex_1().min_w_0().h_full().child(match &self.conversation {
                     Some(view) => view.clone().into_any_element(),
@@ -173,6 +257,8 @@ impl Render for RootView {
                 if this.state.read(cx).is_loading() {
                     return;
                 }
+                // A narrow list widens to search, as Desktop's does.
+                this.expand_sidebar(cx);
                 let search = this.sidebar.read(cx).search_input();
                 search.update(cx, |search, cx| search.focus(window, cx));
             }))
@@ -212,5 +298,77 @@ impl Render for RootView {
             .when_some(self.call.clone().filter(|_| call_shown), |d, call| d.child(call))
             .when_some(viewer, |d, viewer| d.child(viewer))
             .when_some(video_viewer, |d, viewer| d.child(viewer))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::{Modifiers, MouseButton, TestAppContext, VisualTestContext, WindowBounds, WindowOptions, point, size};
+    use signal_backend::{Backend, Config};
+
+    use super::*;
+
+    #[gpui_kit::test]
+    fn dragging_the_list_narrow_shows_avatars_and_search_widens_it(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config { data_dir: dir.path().to_owned(), db_key: [7; 32], device_name: "test".into(), demo: true };
+        let (backend, mut events) = Backend::start(config).unwrap();
+        let state = cx.update(|cx| crate::state::new_state(backend.clone(), cx));
+        // As the app does: backend events into the model.
+        cx.update(|cx| {
+            use futures::StreamExt as _;
+            let state = state.clone();
+            cx.spawn(async move |cx| {
+                while let Some(event) = events.next().await {
+                    state.update(cx, |state, cx| state.handle(event, cx));
+                }
+            })
+            .detach();
+        });
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(gpui_kit::Bounds { origin: Default::default(), size: size(px(1000.), px(700.)) })),
+            ..Default::default()
+        };
+        let (window, root) = cx.update(|cx| {
+            let state = state.clone();
+            gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| RootView::new(state, window, cx))).unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window, cx);
+        let mut handle = None;
+        for _ in 0..300 {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            handle = cx.debug_bounds("sidebar-resize");
+            if handle.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let handle = handle.expect("the chat list's edge").center();
+        assert!(!root.read_with(&cx, |r, cx| r.sidebar.read(cx).narrow));
+
+        // Drag the edge to 150: under the snap, so narrow.
+        cx.simulate_mouse_down(handle, MouseButton::Left, Modifiers::none());
+        for x in [300., 250., 200., 150.] {
+            cx.simulate_mouse_move(point(px(x), handle.y), MouseButton::Left, Modifiers::none());
+            cx.run_until_parked();
+        }
+        cx.simulate_mouse_up(point(px(150.), handle.y), MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        root.read_with(&cx, |r, cx| {
+            assert!(r.sidebar.read(cx).narrow, "avatars only");
+            assert_eq!(r.sidebar_preferred, crate::sidebar_width::MIN_WIDTH, "snapped and kept");
+        });
+
+        // Its search button (or a megaphone) widens it.
+        root.update(&mut cx, |r, cx| r.expand_sidebar(cx));
+        cx.run_until_parked();
+        root.read_with(&cx, |r, cx| {
+            assert!(!r.sidebar.read(cx).narrow);
+            assert_eq!(r.sidebar_preferred, crate::sidebar_width::MIN_FULL_WIDTH);
+        });
+        backend.shutdown();
     }
 }
