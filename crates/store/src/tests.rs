@@ -1,5 +1,13 @@
 use super::*;
 
+/// A database on disk, opened as the app opens it: reads on their own
+/// connections, which can't write, and writes queued for one. (The
+/// directory is left for the OS to clear.)
+async fn test_db() -> AppDb {
+    let dir = tempfile::tempdir().unwrap().keep();
+    AppDb::open(&dir.join("app.db"), &[3; 32]).await.unwrap()
+}
+
 fn conv(s: &str) -> ConversationId {
     ConversationId(s.to_owned())
 }
@@ -33,7 +41,7 @@ fn outgoing(c: &str, sent_at: i64, body: &str) -> NewMessage {
 
 #[tokio::test]
 async fn conversation_upsert_and_ordering() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     db.upsert_conversation(
         &conv("d:alice"),
         ConversationUpdate {
@@ -81,7 +89,7 @@ async fn conversation_upsert_and_ordering() {
 
 #[tokio::test]
 async fn insert_dedupes_and_tracks_unread_and_preview() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     let id1 = db.insert_message(&incoming("g:aa", "bob", 10, "first")).await.unwrap();
     let dup = db.insert_message(&incoming("g:aa", "bob", 10, "first again")).await.unwrap();
     assert_eq!(id1, dup);
@@ -114,7 +122,7 @@ async fn insert_dedupes_and_tracks_unread_and_preview() {
 
 #[tokio::test]
 async fn group_preview_has_author_prefix() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     db.insert_message(&incoming("g:aa", "bob", 10, "hello\nsecond line")).await.unwrap();
     let c = db.conversation(&conv("g:aa")).await.unwrap().unwrap();
     assert_eq!(c.last_message_preview.as_deref(), Some("bob: hello second line"));
@@ -125,7 +133,7 @@ async fn group_preview_has_author_prefix() {
 
 #[tokio::test]
 async fn pagination_is_oldest_first() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     for i in 0..10 {
         db.insert_message(&incoming("d:a", "a", 100 + i, &format!("m{i}"))).await.unwrap();
     }
@@ -142,7 +150,7 @@ async fn pagination_is_oldest_first() {
 
 #[tokio::test]
 async fn status_only_moves_forward() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     let id = db.insert_message(&outgoing("d:a", 1, "x")).await.unwrap();
     let status = |db: AppDb| async move { db.message(id).await.unwrap().unwrap().status };
 
@@ -166,7 +174,7 @@ async fn status_only_moves_forward() {
 
 #[tokio::test]
 async fn reactions_replace_per_author() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     let id = db.insert_message(&incoming("d:a", "a", 1, "x")).await.unwrap();
     let r = |emoji: &str, author: Option<&str>| Reaction {
         emoji: emoji.into(),
@@ -187,7 +195,7 @@ async fn reactions_replace_per_author() {
 
 #[tokio::test]
 async fn delete_edit_attachments_and_search() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     let mut m = incoming("d:a", "a", 1, "the quick brown fox");
     m.attachments = vec![AttachmentMeta {
         content_type: "image/png".into(),
@@ -249,7 +257,7 @@ async fn delete_edit_attachments_and_search() {
 
 #[tokio::test]
 async fn attachment_only_preview() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     let mut m = incoming("d:a", "a", 1, "");
     m.attachments = vec![AttachmentMeta {
         content_type: "image/jpeg".into(),
@@ -271,7 +279,7 @@ async fn attachment_only_preview() {
 
 #[tokio::test]
 async fn emoji_usage_and_settings() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     db.record_emoji_use("👍").await.unwrap();
     db.record_emoji_use("👍").await.unwrap();
     db.record_emoji_use("🎉").await.unwrap();
@@ -325,7 +333,7 @@ async fn encrypted_file_rejects_wrong_key() {
 
 #[tokio::test]
 async fn read_sync_marks_single_message() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     db.insert_message(&incoming("d:a", "a", 1, "one")).await.unwrap();
     db.insert_message(&incoming("d:a", "a", 2, "two")).await.unwrap();
     assert_eq!(db.mark_message_read("a", 1).await.unwrap(), Some(conv("d:a")));
@@ -337,7 +345,7 @@ async fn read_sync_marks_single_message() {
 
 #[tokio::test]
 async fn last_outgoing_status_follows_latest_message() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     db.upsert_conversation(&conv("d:jon"), ConversationUpdate::default()).await.unwrap();
     let status = |db: AppDb| async move { db.conversation(&conv("d:jon")).await.unwrap().unwrap().last_outgoing_status };
     assert_eq!(status(db.clone()).await, None);
@@ -358,7 +366,7 @@ async fn last_outgoing_status_follows_latest_message() {
 
 #[tokio::test]
 async fn contact_names_are_replaced_wholesale() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     db.replace_contact_names(&[("a".into(), "Jon".into()), ("b".into(), "Bo".into())]).await.unwrap();
     assert_eq!(db.contact_name("a").await.unwrap().as_deref(), Some("Jon"));
     db.replace_contact_names(&[("a".into(), "Jonathan".into())]).await.unwrap();
@@ -368,7 +376,7 @@ async fn contact_names_are_replaced_wholesale() {
 
 #[tokio::test]
 async fn rename_authors_updates_messages_and_quotes() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     let mut first = incoming("g:01", "jon", 1, "hi");
     first.author_name = None;
     let first = db.insert_message(&first).await.unwrap();
@@ -389,7 +397,7 @@ async fn rename_authors_updates_messages_and_quotes() {
 
 #[tokio::test]
 async fn pinned_conversations_follow_the_account_order() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     db.insert_message(&incoming("d:a", "a", 1, "old")).await.unwrap();
     db.insert_message(&incoming("d:b", "b", 2, "newer")).await.unwrap();
     db.insert_message(&incoming("d:c", "c", 3, "newest")).await.unwrap();
@@ -414,7 +422,7 @@ async fn pinned_conversations_follow_the_account_order() {
 
 #[tokio::test]
 async fn chat_states_apply_to_existing_conversations_only() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     db.insert_message(&incoming("d:a", "a", 1, "hi")).await.unwrap();
     db.insert_message(&incoming("d:b", "b", 2, "hi")).await.unwrap();
     let state = |id: &str, archived, muted_until| ChatState {
@@ -449,7 +457,7 @@ async fn chat_states_apply_to_existing_conversations_only() {
 
 #[tokio::test]
 async fn directory_search_skips_existing_conversations() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     let entry = |id: &str, kind, title: &str, phone: Option<&str>| DirectoryEntry {
         id: conv(id),
         kind,
@@ -477,7 +485,7 @@ async fn directory_search_skips_existing_conversations() {
 
 #[tokio::test]
 async fn previews_say_who_sent_it_in_groups_only() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     let preview = |db: AppDb, id: &'static str| async move {
         db.conversation(&conv(id)).await.unwrap().unwrap().last_message_preview.unwrap_or_default()
     };
@@ -508,7 +516,7 @@ fn avatar_colors_match_signal_desktop() {
 
 #[tokio::test]
 async fn removing_messages_and_conversations() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     let first = db.insert_message(&incoming("d:a", "a", 1, "first")).await.unwrap();
     let second = db.insert_message(&incoming("d:a", "a", 2, "second")).await.unwrap();
     assert_eq!(db.remove_message(second).await.unwrap(), Some(conv("d:a")));
@@ -525,7 +533,7 @@ async fn removing_messages_and_conversations() {
 
 #[tokio::test]
 async fn removing_messages_through_one_keeps_newer() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     db.insert_message(&incoming("d:a", "a", 1, "old")).await.unwrap();
     let named = db.insert_message(&incoming("d:a", "a", 2, "named")).await.unwrap();
     db.insert_message(&incoming("d:a", "a", 3, "newer")).await.unwrap();
@@ -538,7 +546,7 @@ async fn removing_messages_through_one_keeps_newer() {
 
 #[tokio::test]
 async fn partial_chat_deletes_take_their_pins() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     let old = db.insert_message(&incoming("d:a", "a", 1, "old")).await.unwrap();
     let new = db.insert_message(&incoming("d:a", "a", 2, "new")).await.unwrap();
     db.pin_message(&conv("d:a"), old, 10, None, 3).await.unwrap();
@@ -552,7 +560,7 @@ async fn partial_chat_deletes_take_their_pins() {
 
 #[tokio::test]
 async fn clearing_forgets_the_whole_account() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     db.insert_message(&incoming("d:a", "a", 1, "hi")).await.unwrap();
     db.replace_directory(&[DirectoryEntry {
         id: conv("d:jon"),
@@ -571,7 +579,7 @@ async fn clearing_forgets_the_whole_account() {
 
 #[tokio::test]
 async fn marked_unread_and_blocked_flags() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     db.insert_message(&incoming("d:a", "a", 1, "hi")).await.unwrap();
     let state = ChatState { id: conv("d:a"), archived: false, muted_until: 0, marked_unread: true, blocked: true };
     assert!(db.apply_chat_states(std::slice::from_ref(&state)).await.unwrap());
@@ -587,7 +595,7 @@ async fn marked_unread_and_blocked_flags() {
 
 #[tokio::test]
 async fn disappearing_countdowns_start_on_send_and_on_read() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     let mut mine = outgoing("d:a", 1_000, "mine");
     mine.expires_in = 30;
     let mine = db.insert_message(&mine).await.unwrap();
@@ -613,7 +621,7 @@ async fn disappearing_countdowns_start_on_send_and_on_read() {
 
 #[tokio::test]
 async fn timer_and_version_are_stored() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     db.set_expire_timer(&conv("d:a"), 3600, 4).await.unwrap();
     let c = db.conversation(&conv("d:a")).await.unwrap().unwrap();
     assert_eq!((c.expire_timer, c.expire_timer_version), (3600, 4));
@@ -621,7 +629,7 @@ async fn timer_and_version_are_stored() {
 
 #[tokio::test]
 async fn searching_one_chat_and_paging_around_a_message() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     let mut ids = Vec::new();
     for n in 1..=9 {
         ids.push(db.insert_message(&incoming("d:a", "a", n * 100, &format!("hike {n}"))).await.unwrap());
@@ -644,7 +652,7 @@ async fn searching_one_chat_and_paging_around_a_message() {
 
 #[tokio::test]
 async fn notices_are_read_and_stay_out_of_the_preview() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     db.insert_message(&incoming("d:a", "a", 100, "hello")).await.unwrap();
     let notice = Notice::Timer { by: None, seconds: 3600 };
     let id = db.insert_notice(&conv("d:a"), 200, &notice).await.unwrap().unwrap();
@@ -657,7 +665,7 @@ async fn notices_are_read_and_stay_out_of_the_preview() {
 
 #[tokio::test]
 async fn pins_keep_the_newest_three() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     let mut ids = Vec::new();
     for n in 1..=4 {
         ids.push(db.insert_message(&incoming("d:a", "a", n * 100, &format!("m{n}"))).await.unwrap());
@@ -678,7 +686,7 @@ async fn pins_keep_the_newest_three() {
 
 #[tokio::test]
 async fn media_messages_are_those_with_attachments_or_previews() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     db.insert_message(&incoming("d:a", "a", 1, "just text")).await.unwrap();
     let mut photo = incoming("d:a", "a", 2, "");
     photo.attachments = vec![AttachmentMeta {
@@ -699,7 +707,7 @@ async fn media_messages_are_those_with_attachments_or_previews() {
 
 #[tokio::test]
 async fn people_are_direct_chats_and_contacts() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     db.upsert_conversation(&conv("d:a"), ConversationUpdate { kind: Some(ConversationKind::Direct), title: Some("Alice".into()), ..Default::default() })
         .await
         .unwrap();
@@ -716,7 +724,7 @@ async fn people_are_direct_chats_and_contacts() {
 
 #[tokio::test]
 async fn deleting_for_everyone_clears_previews_and_mentions() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     let mut message = incoming("d:a", "a", 1, "see https://example.org @Bob");
     message.link_preview = Some(LinkPreview {
         url: "https://example.org".into(),
@@ -735,13 +743,20 @@ async fn deleting_for_everyone_clears_previews_and_mentions() {
 
 #[tokio::test]
 async fn notices_dont_hide_the_last_receipt() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     let mut mine = outgoing("d:a", 100, "hi");
     mine.status = DeliveryStatus::Read;
     db.insert_message(&mine).await.unwrap();
     db.insert_notice(&conv("d:a"), 200, &Notice::Timer { by: None, seconds: 60 }).await.unwrap();
     let chat = db.conversation(&conv("d:a")).await.unwrap().unwrap();
     assert_eq!(chat.last_outgoing_status, Some(DeliveryStatus::Read));
+}
+
+/// Undoes the migrations after the init, which an old database never had.
+async fn drop_later_migrations(db: &AppDb) {
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version > ?").bind(INIT_VERSION).execute(&db.writer).await.unwrap();
+    sqlx::query("DROP INDEX messages_author").execute(&db.writer).await.unwrap();
+    sqlx::query("DROP INDEX messages_quote_author").execute(&db.writer).await.unwrap();
 }
 
 /// Rewrites the migration history to look like a pre-squash database that
@@ -752,16 +767,17 @@ async fn fake_pre_squash_history(db: &AppDb, applied: usize) {
         20261019000000, 20261020000000, 20261021000000, 20261022000000, 20261023000000, 20261024000000,
         20261025000000, 20261026000000, 20261027000000, 20261028000000,
     ];
-    sqlx::query("DELETE FROM _sqlx_migrations").execute(&db.pool).await.unwrap();
+    sqlx::query("DELETE FROM _sqlx_migrations").execute(&db.writer).await.unwrap();
     // Nor had it anything from migrations after the squash.
-    sqlx::query("DROP TABLE message_edits").execute(&db.pool).await.unwrap();
+    sqlx::query("DROP TABLE message_edits").execute(&db.writer).await.unwrap();
+    drop_later_migrations(db).await;
     for version in &VERSIONS[..applied] {
         sqlx::query(
             "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
              VALUES (?, 'old', TRUE, x'00', 0)",
         )
         .bind(version)
-        .execute(&db.pool)
+        .execute(&db.writer)
         .await
         .unwrap();
     }
@@ -827,7 +843,7 @@ async fn refuses_partly_migrated_database_with_chats() {
 
 #[tokio::test]
 async fn an_edited_message_answers_to_its_edits_timestamps() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     let theirs = db.insert_message(&incoming("d:a", "a", 100, "hi")).await.unwrap();
     db.edit_message(theirs, "hi there", 200).await.unwrap();
     // A reaction (or reply) to the edited message names the edit.
@@ -866,17 +882,18 @@ async fn an_edited_message_answers_to_its_edits_timestamps() {
 /// A database made by the first init (`message_edits` came later), with
 /// or without the `message_edits` migration applied.
 async fn fake_first_init(db: &AppDb, with_edits_migration: bool) {
-    sqlx::query("UPDATE _sqlx_migrations SET checksum = x'00'").execute(&db.pool).await.unwrap();
+    drop_later_migrations(db).await;
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = x'00'").execute(&db.writer).await.unwrap();
     if with_edits_migration {
         sqlx::query(
             "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
              VALUES (20261029000000, 'message edits', TRUE, x'00', 0)",
         )
-        .execute(&db.pool)
+        .execute(&db.writer)
         .await
         .unwrap();
     } else {
-        sqlx::query("DROP TABLE message_edits").execute(&db.pool).await.unwrap();
+        sqlx::query("DROP TABLE message_edits").execute(&db.writer).await.unwrap();
     }
 }
 
@@ -897,8 +914,11 @@ async fn adopts_a_database_from_the_first_init() {
         let id = db.find_message(&conv("d:a"), Some("a"), 1).await.unwrap().unwrap().id;
         db.edit_message(id, "edited", 2).await.unwrap();
         assert_eq!(db.find_message(&conv("d:a"), Some("a"), 2).await.unwrap().map(|m| m.id), Some(id));
-        let versions: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations").fetch_all(&db.pool).await.unwrap();
-        assert_eq!(versions, vec![20261013000000]);
+        // The init stands in for the old history; later migrations then apply.
+        let versions: Vec<i64> =
+            sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version").fetch_all(&db.pool).await.unwrap();
+        let ours: Vec<i64> = sqlx::migrate!("./migrations").iter().map(|m| m.version).collect();
+        assert_eq!(versions, ours);
         db.close().await;
         AppDb::open(&path, &key).await.unwrap().close().await;
     }
@@ -933,7 +953,7 @@ async fn concurrent_writers_wait_for_each_other() {
 
 #[tokio::test]
 async fn a_read_sync_reads_everything_older_in_its_chat() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     for (author, at) in [("a", 1), ("b", 2), ("a", 3), ("a", 4)] {
         db.insert_message(&incoming("g:00ff", author, at, "hi")).await.unwrap();
     }
@@ -954,7 +974,7 @@ async fn a_read_sync_reads_everything_older_in_its_chat() {
 
 #[tokio::test]
 async fn safety_number_notices_round_trip() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     let notice = Notice::SafetyNumberChanged { who: "a".into() };
     let id = db.insert_notice(&conv("d:a"), 5, &notice).await.unwrap().unwrap();
     assert_eq!(db.message(id).await.unwrap().unwrap().notice, Some(notice));
@@ -962,7 +982,7 @@ async fn safety_number_notices_round_trip() {
 
 #[tokio::test]
 async fn a_call_seen_here_and_on_another_device_is_one_notice() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     let call = |outcome| Notice::Call { incoming: true, video: false, outcome, call_id: Some(-7) };
     // It rang here and went unanswered…
     let id = db.record_call(&conv("d:a"), 1_000, &call(CallOutcome::Missed)).await.unwrap().unwrap();
@@ -981,7 +1001,7 @@ async fn a_call_seen_here_and_on_another_device_is_one_notice() {
 
 #[tokio::test]
 async fn a_group_call_is_noted_once_per_era() {
-    let db = AppDb::open_in_memory().await.unwrap();
+    let db = test_db().await;
     let started = |by: &str, era: &str| Notice::GroupCall { by: Some(by.into()), era: Some(era.into()) };
     assert!(db.record_group_call(&conv("g:a"), 1_000, &started("alice", "e1")).await.unwrap().is_some());
     // Bob joined the same call: his update notes nothing new.
@@ -989,4 +1009,43 @@ async fn a_group_call_is_noted_once_per_era() {
     // The next call has its own era, and the same era in another group is its own call.
     assert!(db.record_group_call(&conv("g:a"), 3_000, &started("bob", "e2")).await.unwrap().is_some());
     assert!(db.record_group_call(&conv("g:b"), 3_000, &started("bob", "e1")).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn writes_queue_rather_than_fail_while_another_holds_the_lock() {
+    let db = test_db().await;
+    // A long write: a transaction kept open for a while.
+    let mut tx = db.write().await.unwrap();
+    sqlx::query("INSERT INTO settings (key, value) VALUES ('a', '1')").execute(&mut *tx).await.unwrap();
+    let other = db.clone();
+    let queued = tokio::spawn(async move { other.set_setting("b", "2").await });
+    // Past the busy timeout's 5 seconds would fail it; queued, it waits.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!queued.is_finished(), "waits its turn");
+    tx.commit().await.unwrap();
+    queued.await.unwrap().unwrap();
+    assert_eq!(db.setting("b").await.unwrap().as_deref(), Some("2"));
+    // Reads go on meanwhile, and can't write.
+    assert!(sqlx::query("DELETE FROM settings").execute(&db.pool).await.is_err());
+}
+
+#[tokio::test]
+async fn renaming_an_author_looks_up_their_messages_by_index() {
+    let db = test_db().await;
+    let plan = |sql: &'static str| {
+        let db = db.clone();
+        async move {
+            let rows: Vec<(i64, i64, i64, String)> =
+                sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}"))).fetch_all(&db.pool).await.unwrap();
+            rows.into_iter().map(|r| r.3).collect::<Vec<_>>().join("; ")
+        }
+    };
+    let names = plan("UPDATE messages SET author_name = 'x' WHERE author_key = 'a' AND author_name IS NOT 'x'").await;
+    assert!(names.contains("messages_author"), "{names}");
+    let quotes = plan(
+        "UPDATE messages SET quote = json_set(quote, '$.author_name', 'x') \
+         WHERE quote IS NOT NULL AND json_extract(quote, '$.author') = 'a' AND json_extract(quote, '$.author_name') IS NOT 'x'",
+    )
+    .await;
+    assert!(quotes.contains("messages_quote_author"), "{quotes}");
 }

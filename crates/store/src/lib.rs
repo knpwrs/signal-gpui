@@ -724,19 +724,45 @@ fn message_from_row(row: &SqliteRow) -> Result<Message> {
 
 /// Handle to the encrypted application database. Cheap to clone.
 /// All methods must be awaited on a Tokio runtime.
+///
+/// Writes queue for one connection (`writer`) rather than racing for
+/// SQLite's lock: two connections writing at once would leave one waiting
+/// out the busy timeout and then failing with "database is locked". Reads
+/// use `pool`, whose connections can't write (`query_only`), so a write sent
+/// there by mistake fails at once rather than racing.
 #[derive(Clone, Debug)]
 pub struct AppDb {
     pool: SqlitePool,
+    writer: SqlitePool,
 }
+
+/// How long a write may wait for the ones queued ahead of it.
+const WRITE_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 impl AppDb {
     /// Opens (creating if needed) the database at `path`, keyed with the raw
     /// 32-byte `key`, and runs migrations.
     pub async fn open(path: &Path, key: &[u8; 32]) -> Result<Self> {
-        let options = SqliteConnectOptions::new()
-            .filename(path)
-            .create_if_missing(true);
-        Self::connect(keyed(options, key), 4).await
+        let options = keyed(SqliteConnectOptions::new().filename(path).create_if_missing(true), key);
+        let writer = SqlitePoolOptions::new()
+            .max_connections(1)
+            .min_connections(1)
+            .acquire_timeout(WRITE_QUEUE_TIMEOUT)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connect_with(options.clone().foreign_keys(true))
+            .await?;
+        let migrator = sqlx::migrate!("./migrations");
+        adopt_squashed_history(&writer, &migrator).await?;
+        migrator.run(&writer).await?;
+        // (WAL mode lets these read while the writer writes.)
+        let pool = SqlitePoolOptions::new()
+            .max_connections(4)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connect_with(options.foreign_keys(true).pragma("query_only", "ON"))
+            .await?;
+        Ok(Self { pool, writer })
     }
 
     /// In-memory database (tests).
@@ -744,14 +770,12 @@ impl AppDb {
         let options = SqliteConnectOptions::new()
             .in_memory(true)
             .journal_mode(SqliteJournalMode::Memory);
-        // Each in-memory connection is a separate database, so use exactly one.
-        Self::connect(options, 1).await
-    }
-
-    async fn connect(options: SqliteConnectOptions, max_connections: u32) -> Result<Self> {
+        // Each in-memory connection is a separate database, so use exactly
+        // one, for reads and writes alike.
         let pool = SqlitePoolOptions::new()
-            .max_connections(max_connections)
-            .min_connections(if max_connections == 1 { 1 } else { 0 })
+            .max_connections(1)
+            .min_connections(1)
+            .acquire_timeout(WRITE_QUEUE_TIMEOUT)
             .idle_timeout(None)
             .max_lifetime(None)
             .connect_with(options.foreign_keys(true))
@@ -759,7 +783,7 @@ impl AppDb {
         let migrator = sqlx::migrate!("./migrations");
         adopt_squashed_history(&pool, &migrator).await?;
         migrator.run(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self { writer: pool.clone(), pool })
     }
 
     /// Replaces all Storage Service contact names.
@@ -840,9 +864,11 @@ impl AppDb {
     /// Rewrites the stored author names (on messages and their quotes) for
     /// each `(service_id, name)`. Returns how many rows changed.
     pub async fn rename_authors(&self, names: &[(String, String)]) -> Result<u64> {
-        let mut tx = self.write().await?;
+        // One transaction per person, so other writes queued behind this
+        // one (a reaction arriving, say) wait for one rename, not all.
         let mut changed = 0;
         for (service_id, name) in names {
+            let mut tx = self.write().await?;
             changed += sqlx::query(
                 "UPDATE messages SET author_name = ?1 WHERE author_key = ?2 AND author_name IS NOT ?1",
             )
@@ -861,9 +887,11 @@ impl AppDb {
             .execute(&mut *tx)
             .await?
             .rows_affected();
+            tx.commit().await?;
         }
         if changed > 0 {
             // Group previews carry the sender's name.
+            let mut tx = self.write().await?;
             let ids: Vec<String> = sqlx::query_scalar(
                 "SELECT id FROM conversations WHERE kind = 'group' AND last_message_preview IS NOT NULL",
             )
@@ -872,8 +900,8 @@ impl AppDb {
             for id in ids {
                 refresh_preview(&mut tx, &ConversationId(id)).await?;
             }
+            tx.commit().await?;
         }
-        tx.commit().await?;
         Ok(changed)
     }
 
@@ -881,7 +909,7 @@ impl AppDb {
         sqlx::query("UPDATE conversations SET avatar_path = ? WHERE id = ?")
             .bind(path)
             .bind(&id.0)
-            .execute(&self.pool)
+            .execute(&self.writer)
             .await?;
         Ok(())
     }
@@ -890,7 +918,7 @@ impl AppDb {
         sqlx::query("INSERT OR REPLACE INTO person_avatars (service_id, path) VALUES (?, ?)")
             .bind(service_id)
             .bind(path)
-            .execute(&self.pool)
+            .execute(&self.writer)
             .await?;
         Ok(())
     }
@@ -898,7 +926,7 @@ impl AppDb {
     /// `(service id, photo path)` for everyone with a downloaded photo.
     /// They have no profile photo (anymore).
     pub async fn remove_person_avatar(&self, service_id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM person_avatars WHERE service_id = ?").bind(service_id).execute(&self.pool).await?;
+        sqlx::query("DELETE FROM person_avatars WHERE service_id = ?").bind(service_id).execute(&self.writer).await?;
         Ok(())
     }
 
@@ -984,7 +1012,7 @@ impl AppDb {
         sqlx::query(AssertSqlSafe(format!("UPDATE conversations SET {column} = ? WHERE id = ?")))
             .bind(value)
             .bind(&id.0)
-            .execute(&self.pool)
+            .execute(&self.writer)
             .await?;
         Ok(())
     }
@@ -1038,7 +1066,7 @@ impl AppDb {
         sqlx::query("UPDATE conversations SET muted_until = ? WHERE id = ?")
             .bind(until)
             .bind(&id.0)
-            .execute(&self.pool)
+            .execute(&self.writer)
             .await?;
         Ok(())
     }
@@ -1084,7 +1112,7 @@ impl AppDb {
         sqlx::query("UPDATE conversations SET draft = ? WHERE id = ?")
             .bind(draft.filter(|d| !d.is_empty()))
             .bind(&id.0)
-            .execute(&self.pool)
+            .execute(&self.writer)
             .await?;
         Ok(())
     }
@@ -1400,7 +1428,7 @@ impl AppDb {
             .bind(status_to_i64(DeliveryStatus::Sending))
             .bind(message_id)
             .bind(status_to_i64(DeliveryStatus::Failed))
-            .execute(&self.pool)
+            .execute(&self.writer)
             .await?;
         Ok(done.rows_affected() > 0)
     }
@@ -1420,7 +1448,7 @@ impl AppDb {
         .bind(status_to_i64(status))
         .bind(&conversation.0)
         .bind(sent_at)
-        .execute(&self.pool)
+        .execute(&self.writer)
         .await?;
         Ok(())
     }
@@ -1442,7 +1470,7 @@ impl AppDb {
         )))
         .bind(status_to_i64(status))
         .bind(sent_at)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.writer)
         .await?;
         rows.iter()
             .map(|r| Ok((ConversationId(r.try_get("conversation_id")?), r.try_get("id")?)))
@@ -1649,7 +1677,7 @@ impl AppDb {
     /// Records where a message's @mentions are.
     pub async fn set_mentions(&self, message_id: i64, mentions: &[MentionSpan]) -> Result<()> {
         let json = (!mentions.is_empty()).then(|| serde_json::to_string(mentions)).transpose()?;
-        sqlx::query("UPDATE messages SET mentions = ? WHERE id = ?").bind(json).bind(message_id).execute(&self.pool).await?;
+        sqlx::query("UPDATE messages SET mentions = ? WHERE id = ?").bind(json).bind(message_id).execute(&self.writer).await?;
         Ok(())
     }
 
@@ -1691,7 +1719,7 @@ impl AppDb {
                 sqlx::query("UPDATE messages SET notice = ?2 WHERE id = ?1")
                     .bind(id)
                     .bind(serde_json::to_string(notice)?)
-                    .execute(&self.pool)
+                    .execute(&self.writer)
                     .await?;
                 return Ok(Some(id));
             }
@@ -1732,7 +1760,7 @@ impl AppDb {
         )
         .bind(&conversation.0)
         .bind(call_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.writer)
         .await?)
     }
 
@@ -1786,7 +1814,7 @@ impl AppDb {
         let done = sqlx::query("DELETE FROM pinned_messages WHERE conversation_id = ? AND message_id = ?")
             .bind(&conversation.0)
             .bind(message_id)
-            .execute(&self.pool)
+            .execute(&self.writer)
             .await?;
         Ok(done.rows_affected() > 0)
     }
@@ -1993,7 +2021,7 @@ impl AppDb {
         )
         .bind(emoji)
         .bind(now_millis())
-        .execute(&self.pool)
+        .execute(&self.writer)
         .await?;
         Ok(())
     }
@@ -2026,7 +2054,7 @@ impl AppDb {
         sqlx::query("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
             .bind(key)
             .bind(value)
-            .execute(&self.pool)
+            .execute(&self.writer)
             .await?;
         Ok(())
     }
@@ -2052,12 +2080,13 @@ impl AppDb {
     /// connection has committed in between, SQLite fails it with "database
     /// is locked" at once instead of waiting out the busy timeout.
     async fn write(&self) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
-        Ok(self.pool.begin_with(BEGIN_WRITE).await?)
+        Ok(self.writer.begin_with(BEGIN_WRITE).await?)
     }
 
     /// Closes the pool, waiting for connections to finish.
     pub async fn close(&self) {
         self.pool.close().await;
+        self.writer.close().await;
     }
 }
 
