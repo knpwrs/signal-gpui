@@ -6,6 +6,7 @@ use std::time::Duration;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::ContextMenuExt as _;
+use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::{Icon, Sizable as _};
 use gpui_kit::assets::IconName;
 use gpui_kit::prelude::*;
@@ -82,6 +83,8 @@ pub struct Sidebar {
     layout_key: Vec<u8>,
     /// Desktop's "Search in chat": the search box searches this chat only.
     chat_search: Option<ChatSearch>,
+    /// The message results' scroll position, for their scrollbar.
+    hits_scroll: gpui_kit::ScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -154,6 +157,7 @@ impl Sidebar {
             archive_open: false,
             layout_key: Vec::new(),
             chat_search: None,
+            hits_scroll: gpui_kit::ScrollHandle::new(),
             _subscriptions: subscriptions,
         }
     }
@@ -171,6 +175,7 @@ impl Sidebar {
     fn set_query(&mut self, query: String, cx: &mut Context<Self>) {
         if query != self.query {
             self.list.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(0.) });
+            self.hits_scroll.set_offset(gpui_kit::Point::default());
         }
         self.query = query;
         self.run_search(cx);
@@ -850,6 +855,7 @@ impl Render for Sidebar {
             })
             .child(
                 div()
+                    .relative()
                     .min_h_0()
                     .when(!searching, |d| d.flex_1())
                     // Leave room for message hits below the matching chats.
@@ -859,7 +865,8 @@ impl Render for Sidebar {
                             entity.update(cx, |this, cx| this.render_item(ix, cx))
                         })
                         .size_full(),
-                    ),
+                    )
+                    .child(Scrollbar::vertical(&self.list).mode(ScrollbarMode::Hover)),
             )
             .when(searching && row_count == 0 && self.hits.is_empty(), |d| {
                 d.child(
@@ -874,7 +881,21 @@ impl Render for Sidebar {
                 )
             })
             .when(searching && !self.hits.is_empty(), |d| {
-                d.child(div().id("hits").flex_1().overflow_y_scroll().child(self.render_hits(palette, cx)))
+                d.child(
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_h_0()
+                        .child(
+                            div()
+                                .id("hits")
+                                .size_full()
+                                .overflow_y_scroll()
+                                .track_scroll(&self.hits_scroll)
+                                .child(self.render_hits(palette, cx)),
+                        )
+                        .child(Scrollbar::vertical(&self.hits_scroll).mode(ScrollbarMode::Hover)),
+                )
             })
             .when(searching && self.hits.is_empty(), |d| d.child(div().flex_1()))
     }

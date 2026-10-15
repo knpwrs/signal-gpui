@@ -2344,6 +2344,10 @@ impl Render for ConversationView {
                         })
                         .size_full(),
                     )
+                    .child(
+                        gpui_kit::component::scroll::Scrollbar::vertical(&self.list)
+                            .mode(gpui_kit::component::scroll::ScrollbarMode::Hover),
+                    )
                     .when(scrolled_up, |d| {
                         d.child(
                             div()
