@@ -1402,7 +1402,21 @@ impl ConversationView {
     }
 
     fn render_reaction_bar(&self, message: &Message, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        use gpui_kit::{Animation, AnimationExt as _};
         let id = message.id;
+        // Desktop (stylesheets/components/ReactionPickerPicker.scss): the
+        // bar fades in while each button rises 24px and fades in, 10ms after
+        // the one before, all over 400ms of ease-out-expo.
+        let appear = |button: gpui_kit::Stateful<gpui_kit::Div>, ix: usize| {
+            button.relative().with_animation(
+                ("reaction-appear", ix),
+                Animation::new(std::time::Duration::from_millis(REACTION_APPEAR_MS + REACTION_STAGGER_MS * ix as u64)),
+                move |button, t| {
+                    let p = reaction_appear(t, ix);
+                    button.opacity(p).top(px(24. * (1. - p)))
+                },
+            )
+        };
         let mine = message.reactions.iter().find(|r| r.author.is_none()).map(|r| r.emoji.clone());
         let tone = self.picker.read(cx).skin_tone();
         let outgoing = message.direction == Direction::Outgoing;
@@ -1428,7 +1442,7 @@ impl ConversationView {
                     .to_owned();
                 let selected = mine.as_deref() == Some(glyph.as_str());
                 let emoji = glyph.clone();
-                div()
+                let button = div()
                     .id(("quick-reaction", ix))
                     .size(px(36.))
                     .flex()
@@ -1440,9 +1454,10 @@ impl ConversationView {
                     .when(selected, |d| d.bg(palette.reaction_chip_mine))
                     .hover(|d| d.bg(palette.row_hover))
                     .on_click(cx.listener(move |this, _, _, cx| this.react(id, emoji.clone(), cx)))
-                    .child(glyph)
+                    .child(glyph);
+                appear(button, ix)
             }))
-            .child(
+            .child(appear(
                 div()
                     .id("more-reactions")
                     .size(px(36.))
@@ -1464,6 +1479,13 @@ impl ConversationView {
                         cx.notify();
                     }))
                     .child(Icon::new(IconName::Plus).size_4().text_color(palette.text_secondary)),
+                QUICK_REACTIONS.len(),
+            ))
+            // Keyed by message so moving the bar to another message replays it.
+            .with_animation(
+                ("reaction-bar-appear", id as usize),
+                Animation::new(std::time::Duration::from_millis(REACTION_APPEAR_MS)).with_easing(ease_out_expo),
+                |bar, p| bar.opacity(p),
             )
     }
 
@@ -1974,6 +1996,41 @@ fn author_line(name: String, color: Hsla, label: Option<signal_store::MemberLabe
                     .child(label.text),
             )
         })
+}
+
+/// Length of the reaction bar's entrance and the delay between its buttons
+/// (Desktop's `animation-duration` and `animation-delay`).
+const REACTION_APPEAR_MS: u64 = 400;
+const REACTION_STAGGER_MS: u64 = 10;
+
+/// Eased progress of quick-reaction button `ix`, given progress `t` through
+/// its animation, which runs `ix` stagger delays longer than the others so
+/// it can wait them out first. GPUI animations have no delay of their own.
+pub(crate) fn reaction_appear(t: f32, ix: usize) -> f32 {
+    let delay = (REACTION_STAGGER_MS * ix as u64) as f32;
+    let elapsed = t * (REACTION_APPEAR_MS as f32 + delay);
+    ease_out_expo(((elapsed - delay) / REACTION_APPEAR_MS as f32).clamp(0., 1.))
+}
+
+/// Desktop's `$ease-out-expo` (stylesheets/_variables.scss),
+/// `cubic-bezier(0.19, 1, 0.22, 1)`.
+pub(crate) fn ease_out_expo(x: f32) -> f32 {
+    cubic_bezier(0.19, 1., 0.22, 1., x)
+}
+
+/// CSS `cubic-bezier(x1, y1, x2, y2)` at `x`: find the curve parameter whose
+/// x is `x` by bisection (x is monotonic for x1, x2 in 0..=1), then take its y.
+fn cubic_bezier(x1: f32, y1: f32, x2: f32, y2: f32, x: f32) -> f32 {
+    if x <= 0. || x >= 1. {
+        return x.clamp(0., 1.);
+    }
+    let at = |a: f32, b: f32, s: f32| 3. * a * s * (1. - s).powi(2) + 3. * b * s * s * (1. - s) + s.powi(3);
+    let (mut lo, mut hi) = (0f32, 1f32);
+    for _ in 0..24 {
+        let mid = (lo + hi) / 2.;
+        if at(x1, x2, mid) < x { lo = mid } else { hi = mid }
+    }
+    at(y1, y2, (lo + hi) / 2.)
 }
 
 pub(crate) fn typing_dot(t: f32, ix: usize) -> (f32, f32) {
@@ -2992,6 +3049,19 @@ mod tests {
         assert_eq!(unread(&backend), 0);
         assert_eq!(view.read_with(&cx, |v, _| v.unseen), 0);
         backend.shutdown();
+    }
+
+    #[test]
+    fn reaction_buttons_appear_in_turn() {
+        assert!(ease_out_expo(0.).abs() < 1e-4);
+        assert!((ease_out_expo(1.) - 1.).abs() < 1e-4);
+        // Expo out: most of the way there by a quarter of the time.
+        assert!(ease_out_expo(0.25) > 0.8);
+        // The seventh button waits 60ms of its 460ms, then ends with the rest.
+        assert_eq!(reaction_appear(59. / 460., 6), 0.);
+        assert!(reaction_appear(61. / 460., 6) > 0.);
+        assert!((reaction_appear(1., 6) - 1.).abs() < 1e-4);
+        assert!(reaction_appear(0.1, 0) > reaction_appear(0.1, 3));
     }
 
     #[test]
