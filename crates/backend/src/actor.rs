@@ -980,6 +980,30 @@ impl Actor {
                     Err(error) => self.error("failed to delete message", error),
                 }
             }
+            Action::AdminDelete { conversation, target_author, target_sent_at, by, sent_at } => {
+                let Some(message) = self.db.find_message(&conversation, target_author.as_deref(), target_sent_at).await.ok().flatten() else {
+                    tracing::info!("ignoring an admin delete: no such message");
+                    return;
+                };
+                // Their role when it arrives (presage has fetched the group
+                // again if the message names a newer revision).
+                let deleter = by.clone().unwrap_or_else(|| self.self_aci());
+                let is_admin = self.is_group_admin(&conversation, &deleter).await;
+                let group = conversation.as_group().is_some();
+                if let Err(reason) = crate::deletes::can_receive_as_admin(&message, group, is_admin, sent_at) {
+                    tracing::info!(reason, "ignoring an admin delete");
+                    return;
+                }
+                let target = message.id;
+                match self.db.mark_deleted_by_admin(target, &signal_store::DeletedByAdmin { by }).await {
+                    Ok(true) => {
+                        self.emit(Event::MessageChanged { conversation, message_id: target });
+                        self.emit(Event::ConversationsChanged);
+                    }
+                    Ok(false) => {}
+                    Err(error) => self.error("failed to delete message", error),
+                }
+            }
             Action::Edit { conversation, target_author, target_sent_at, sent_at, body, mentions, styles } => {
                 let Some(target) = self.find(&conversation, target_author.as_deref(), target_sent_at).await else {
                     return;
@@ -2401,6 +2425,15 @@ impl Actor {
 
     fn is_note_to_self(&self, conversation: &ConversationId) -> bool {
         conversation.as_direct() == Some(self.self_aci().as_str())
+    }
+
+    /// Whether `aci` is an admin of the group `conversation`, by presage's
+    /// copy of the group (Desktop's `isMemberGroupAdmin`).
+    async fn is_group_admin(&self, conversation: &ConversationId, aci: &str) -> bool {
+        use presage::libsignal_service::groups_v2::Role;
+        let Some(key) = conversation.as_group().and_then(|k| <[u8; 32]>::try_from(k).ok()) else { return false };
+        let Some(group) = self.store.group(key).await.ok().flatten() else { return false };
+        group.members.iter().any(|m| m.role == Role::Administrator && m.aci.service_id_string() == aci)
     }
 
     /// The newest of `named` that we have.

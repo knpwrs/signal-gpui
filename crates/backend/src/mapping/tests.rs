@@ -784,3 +784,44 @@ fn group_revisions_come_from_messages_and_our_transcripts() {
     };
     assert_eq!(group_revision_of(&content(ME, sync)), Some((key, 4)));
 }
+
+#[test]
+fn admin_deletes_name_the_author_and_the_admin() {
+    let aci = |s: &str| presage::libsignal_service::protocol::Aci::parse_from_service_id_string(s).unwrap().service_id_binary();
+    let delete = |author: &str| DataMessage {
+        timestamp: Some(900),
+        group_v2: Some(GroupContextV2 { master_key: Some(group_key()), revision: Some(2), ..Default::default() }),
+        admin_delete: Some(data_message::AdminDelete {
+            target_author_aci_binary: Some(aci(author)),
+            target_sent_timestamp: Some(100),
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        map_content(&content(BOB, delete(ALICE)), &ctx()),
+        vec![Action::AdminDelete {
+            conversation: ConversationId::group(&group_key()),
+            target_author: Some(ALICE.into()),
+            target_sent_at: 100,
+            by: Some(BOB.into()),
+            sent_at: 900,
+        }]
+    );
+    // Ours, deleted by an admin; and one we sent from another device.
+    let actions = map_content(&content(BOB, delete(ME)), &ctx());
+    assert!(matches!(&actions[..], [Action::AdminDelete { target_author: None, by: Some(_), .. }]), "{actions:?}");
+    let sync = SyncMessage {
+        content: Some(sync_message::Content::Sent(sync_message::Sent {
+            timestamp: Some(900),
+            message: Some(delete(ALICE)),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let actions = map_content(&content(ME, sync), &ctx());
+    assert!(matches!(&actions[..], [Action::AdminDelete { by: None, target_author: Some(_), .. }]), "{actions:?}");
+    // Without its author it names nothing.
+    let mut bare = delete(ALICE);
+    bare.admin_delete.as_mut().unwrap().target_author_aci_binary = None;
+    assert!(map_content(&content(BOB, bare), &ctx()).is_empty());
+}

@@ -52,6 +52,17 @@ pub enum Action {
         /// When the delete was sent (it only applies to young messages).
         sent_at: i64,
     },
+    /// A group admin deleting someone's message for everyone.
+    AdminDelete {
+        conversation: ConversationId,
+        /// The message's author; `None` = self.
+        target_author: Option<String>,
+        target_sent_at: i64,
+        /// The admin; `None` = self (from another of our devices).
+        by: Option<String>,
+        /// When the delete was sent.
+        sent_at: i64,
+    },
     Edit {
         conversation: ConversationId,
         target_author: Option<String>,
@@ -590,6 +601,21 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
             author,
             sent_at: ts,
             remove: reaction.remove.unwrap_or(false),
+        }];
+    }
+
+    // Desktop's `processAdminDelete` needs both the author and the time.
+    if let Some(delete) = &dm.admin_delete {
+        let (Some(target), Some(sent_at)) = (target_author(&delete.target_author_aci_binary), delete.target_sent_timestamp)
+        else {
+            return Vec::new();
+        };
+        return vec![Action::AdminDelete {
+            conversation,
+            target_author: target,
+            target_sent_at: sent_at as i64,
+            by: author,
+            sent_at: ts,
         }];
     }
 

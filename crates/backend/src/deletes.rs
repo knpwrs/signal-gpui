@@ -3,6 +3,10 @@
 //! Note to Self, and only while the message is young. Desktop reads the
 //! limit from remote config (`global.normalDeleteMaxAgeInSeconds`) and
 //! defaults to a day; receivers allow a further day for slow delivery.
+//!
+//! A group admin may also delete anyone's message in the group (Desktop's
+//! admin delete, `DataMessage.adminDelete`), within its own limit
+//! (`global.adminDeleteMaxAgeInSeconds`, also a day by default).
 
 use signal_store::{DeliveryStatus, Direction, Message};
 
@@ -11,8 +15,44 @@ const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 pub const MAX_AGE_MS: i64 = DAY_MS;
 /// Extra time a delete may take to arrive.
 pub const RECEIVE_GRACE_MS: i64 = DAY_MS;
+/// How long after a message was sent a group admin can delete it.
+pub const ADMIN_MAX_AGE_MS: i64 = DAY_MS;
 /// Desktop deletes at most this many messages for everyone at once.
 pub const MAX_FOR_EVERYONE: usize = 30;
+
+/// Whether a group admin's delete sent at `deleted_at` applies to `target`,
+/// or why not (Desktop's `canReceiveDeleteForEveryone` with
+/// `isAdminDelete`). `sender_is_admin` is their role when it arrives.
+pub fn can_receive_as_admin(target: &Message, group: bool, sender_is_admin: bool, deleted_at: i64) -> Result<(), &'static str> {
+    common(target)?;
+    admin(group, sender_is_admin, deleted_at - target.sent_at, RECEIVE_GRACE_MS)
+}
+
+/// Desktop's `checkCommon`: not already deleted, and a message rather than
+/// a timeline notice. (Note to Self and the Signal chat aren't groups.)
+fn common(message: &Message) -> Result<(), &'static str> {
+    if message.deleted {
+        return Err("already deleted");
+    }
+    if message.notice.is_some() {
+        return Err("not a message");
+    }
+    Ok(())
+}
+
+/// Desktop's `canUseAdminDelete`.
+fn admin(group: bool, is_admin: bool, age: i64, grace: i64) -> Result<(), &'static str> {
+    if !group {
+        return Err("not a group");
+    }
+    if !is_admin {
+        return Err("not an admin");
+    }
+    if age.abs() > ADMIN_MAX_AGE_MS + grace {
+        return Err("too old");
+    }
+    Ok(())
+}
 
 /// Whether we can still delete our `message` for everyone at `now`.
 /// It must have actually gone out to someone.
@@ -83,5 +123,16 @@ mod tests {
         assert!(can_receive(&target, false, 2 * DAY_MS));
         assert!(!can_receive(&target, false, 2 * DAY_MS + 1));
         assert!(!can_receive(&target, true, 1));
+    }
+
+    #[test]
+    fn admin_deletes_arrive_from_admins_within_two_days() {
+        let target = message(Direction::Incoming, DeliveryStatus::Read, 0);
+        assert_eq!(can_receive_as_admin(&target, true, true, 2 * DAY_MS), Ok(()));
+        assert_eq!(can_receive_as_admin(&target, true, true, 2 * DAY_MS + 1), Err("too old"));
+        assert_eq!(can_receive_as_admin(&target, true, false, 1), Err("not an admin"));
+        assert_eq!(can_receive_as_admin(&target, false, true, 1), Err("not a group"));
+        let deleted = Message { deleted: true, ..target };
+        assert_eq!(can_receive_as_admin(&deleted, true, true, 1), Err("already deleted"));
     }
 }

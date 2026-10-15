@@ -1407,11 +1407,7 @@ impl ConversationView {
             .children(message.attachments.iter().enumerate().map(|(ix, a)| render_attachment(message.id, ix, a, &title, fg, palette, &self.state, cx)))
             .map(|d| {
                 if message.deleted {
-                    d.child(div().italic().child(if outgoing {
-                        "You deleted this message."
-                    } else {
-                        "This message was deleted."
-                    }))
+                    d.child(div().italic().child(self.deleted_text(message, cx)))
                 } else if !message.body.is_empty() {
                     d.child(message_text(message, fg, self.revealed_spoilers.contains(&message.id), spacer.as_deref().map(|s| (s, bg)), cx))
                 } else {
@@ -1614,6 +1610,19 @@ impl ConversationView {
 
     fn note_to_self(&self, cx: &App) -> bool {
         self.state.read(cx).account.as_ref().is_some_and(|a| self.id.as_direct() == Some(a.aci.as_str()))
+    }
+
+    /// What a deleted message says, in Desktop's words (`Message.dom.tsx`):
+    /// a group admin's delete names the admin.
+    fn deleted_text(&self, message: &Message, cx: &App) -> String {
+        match &message.deleted_by_admin {
+            Some(signal_store::DeletedByAdmin { by: Some(admin) }) => {
+                format!("Admin {} deleted this message.", self.reactor_name(Some(admin), cx))
+            }
+            Some(signal_store::DeletedByAdmin { by: None }) => "You deleted this message.".into(),
+            None if message.direction == Direction::Outgoing => "You deleted this message.".into(),
+            None => "This message was deleted.".into(),
+        }
     }
 
     fn render_reaction_bar(&self, message: &Message, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
