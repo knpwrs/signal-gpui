@@ -344,6 +344,76 @@ impl ConversationView {
             .into_any_element()
     }
 
+    /// Desktop's mini player (`MiniPlayer`), under the header while audio
+    /// is loaded, whichever chat it's from: play or pause, who sent it, the
+    /// time, the rate while it plays, and close, which stops it.
+    fn render_mini_player(&self, palette: Palette, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let audio = self.state.read(cx).audio.as_ref()?;
+        let playing = audio.is_playing();
+        let (position, _) = audio.progress();
+        let label = format!("{} · {}", audio.title, crate::audio::clock(position));
+        let rate = crate::audio::rate_label(audio.rate);
+        let state = self.state.clone();
+        let button = |id: &'static str| {
+            div()
+                .id(id)
+                .flex_none()
+                .size(px(28.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .cursor_pointer()
+                .hover(|d| d.bg(palette.row_hover))
+        };
+        Some(
+            div()
+                .id("mini-player")
+                .debug_selector(|| "mini-player".into())
+                .flex_none()
+                .h(px(40.))
+                .flex()
+                .items_center()
+                .gap_3()
+                .px_4()
+                .bg(palette.input_bg)
+                .border_b_1()
+                .border_color(palette.panel_border)
+                .child(
+                    button("mini-player-play")
+                        .on_click({
+                            let state = state.clone();
+                            move |_, _, cx| state.update(cx, |state, cx| state.toggle_current_audio(cx))
+                        })
+                        .child(Icon::new(if playing { IconName::Pause } else { IconName::Play }).size_4().text_color(palette.text)),
+                )
+                .child(div().flex_1().min_w_0().truncate().text_sm().child(label))
+                .when(playing, |d| {
+                    d.child(
+                        div()
+                            .id("mini-player-rate")
+                            .flex_none()
+                            .px_2()
+                            .rounded_full()
+                            .cursor_pointer()
+                            .bg(Hsla { a: 0.15, ..palette.text })
+                            .text_xs()
+                            .on_click({
+                                let state = state.clone();
+                                move |_, _, cx| state.update(cx, |state, cx| state.cycle_audio_rate(cx))
+                            })
+                            .child(rate),
+                    )
+                })
+                .child(
+                    button("mini-player-close")
+                        .on_click(move |_, _, cx| state.update(cx, |state, cx| state.close_audio(cx)))
+                        .child(Icon::new(IconName::X).size_4().text_color(palette.text_secondary)),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// Desktop's pinned messages bar: the current pin's preview; a click
     /// shows it and moves to the next.
     fn render_pins(&self, palette: Palette, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -1117,6 +1187,8 @@ impl ConversationView {
         }
 
         let author_name = message.author_name.clone().unwrap_or_else(|| "Unknown".into());
+        // The mini player's title for its audio: who sent it.
+        let title = self.reactor_name(message.author.as_deref(), cx);
         let author_color = {
             let members = self.state.read(cx).conversation(&self.id).map(|c| c.members.clone()).unwrap_or_default();
             crate::theme::name_color(&members, message.author.as_deref().unwrap_or(""), gpui_kit::component::ActiveTheme::theme(&**cx).is_dark())
@@ -1223,7 +1295,7 @@ impl ConversationView {
                             .pt_1p5()
                             .pb_2()
                             .children(rest.iter().enumerate().map(|(ix, a)| {
-                                render_attachment(message.id, ix + 1, a, fg, palette, &self.state, cx)
+                                render_attachment(message.id, ix + 1, a, &title, fg, palette, &self.state, cx)
                             }))
                             .when(caption, |d| d.child(message_text(message, fg, self.revealed_spoilers.contains(&message.id), spacer.as_deref().map(|s| (s, bg)), cx)))
                             .when_some(meta, |d, m| d.child(place_meta(m, inline_meta))),
@@ -1296,7 +1368,7 @@ impl ConversationView {
                 d.child(author_line(author_name, author_color, author_label))
             })
             .when_some(message.quote.clone(), |d, quote| d.child(render_quote(quote, fg, palette)))
-            .children(message.attachments.iter().enumerate().map(|(ix, a)| render_attachment(message.id, ix, a, fg, palette, &self.state, cx)))
+            .children(message.attachments.iter().enumerate().map(|(ix, a)| render_attachment(message.id, ix, a, &title, fg, palette, &self.state, cx)))
             .map(|d| {
                 if message.deleted {
                     d.child(div().italic().child(if outgoing {
@@ -2499,6 +2571,7 @@ fn render_audio(
     message_id: i64,
     index: usize,
     attachment: &AttachmentMeta,
+    title: &str,
     fg: Hsla,
     state: &Entity<AppState>,
     cx: &mut Context<ConversationView>,
@@ -2536,9 +2609,9 @@ fn render_audio(
             .text_color(fg),
         )
         .on_click({
-            let (state, path) = (state.clone(), path.clone());
+            let (state, path, title) = (state.clone(), path.clone(), title.to_owned());
             move |_, _, cx| match &path {
-                Some(path) => state.update(cx, |state, cx| state.toggle_audio(message_id, index, path.clone(), cx)),
+                Some(path) => state.update(cx, |state, cx| state.toggle_audio(message_id, index, path.clone(), title.clone(), cx)),
                 None => state.read(cx).send(Command::FetchAttachment { message_id, index }),
             }
         });
@@ -2554,10 +2627,10 @@ fn render_audio(
             .flex()
             .items_center()
             .when_some(path.clone(), |d, path| {
-                let state = state.clone();
+                let (state, title) = (state.clone(), title.to_owned());
                 d.cursor_pointer().on_click(move |_, _, cx| {
                     let fraction = bar as f64 / crate::audio::BARS as f64;
-                    state.update(cx, |state, cx| state.seek_audio(message_id, index, path.clone(), fraction, cx));
+                    state.update(cx, |state, cx| state.seek_audio(message_id, index, path.clone(), fraction, title.clone(), cx));
                 })
             })
             .child(div().w(px(WAVE_BAR)).h(px(height)).rounded_full().bg(if done { fg } else { Hsla { a: 0.4, ..fg } }))
@@ -2676,13 +2749,14 @@ fn render_attachment(
     message_id: i64,
     index: usize,
     attachment: &AttachmentMeta,
+    title: &str,
     fg: Hsla,
     palette: Palette,
     state: &Entity<AppState>,
     cx: &mut Context<ConversationView>,
 ) -> AnyElement {
     if attachment.content_type.starts_with("audio/") {
-        return render_audio(message_id, index, attachment, fg, state, cx);
+        return render_audio(message_id, index, attachment, title, fg, state, cx);
     }
     if attachment.content_type.starts_with("video/") && !attachment.gif && !attachment.sticker {
         return render_video(message_id, index, attachment, state, cx);
@@ -2777,6 +2851,7 @@ impl Render for ConversationView {
             .bg(palette.background)
             .text_color(palette.text)
             .child(self.render_header(palette, cx))
+            .children(self.render_mini_player(palette, cx))
             .children(self.render_pins(palette, cx))
             .child(
                 div()

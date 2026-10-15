@@ -97,6 +97,8 @@ pub enum AppEvent {
 pub struct AudioPlaying {
     pub message_id: i64,
     pub index: usize,
+    /// Who sent it ("You" for ours), for the mini player.
+    pub title: String,
     player: crate::audio::Player,
     pub rate: f32,
     /// Where it was when last seen playing: near the end, a stop is the end.
@@ -816,7 +818,7 @@ impl AppState {
 
     /// Plays or pauses an audio attachment (`path`, downloaded); another
     /// one playing stops, as in Desktop.
-    pub fn toggle_audio(&mut self, message_id: i64, index: usize, path: std::path::PathBuf, cx: &mut Context<Self>) {
+    pub fn toggle_audio(&mut self, message_id: i64, index: usize, path: std::path::PathBuf, title: String, cx: &mut Context<Self>) {
         if let Some(audio) = self.audio.as_ref().filter(|a| a.message_id == message_id && a.index == index) {
             if audio.player.is_playing() {
                 audio.player.pause();
@@ -826,17 +828,44 @@ impl AppState {
             cx.notify();
             return;
         }
-        self.start_audio(message_id, index, &path, 0., cx);
+        self.start_audio(message_id, index, &path, 0., title, cx);
     }
 
     /// Plays from `fraction` of the way through (a click on the waveform).
-    pub fn seek_audio(&mut self, message_id: i64, index: usize, path: std::path::PathBuf, fraction: f64, cx: &mut Context<Self>) {
+    pub fn seek_audio(
+        &mut self,
+        message_id: i64,
+        index: usize,
+        path: std::path::PathBuf,
+        fraction: f64,
+        title: String,
+        cx: &mut Context<Self>,
+    ) {
         match self.audio.as_ref().filter(|a| a.message_id == message_id && a.index == index) {
             Some(audio) => {
                 audio.player.seek(fraction * audio.player.duration());
                 cx.notify();
             }
-            None => self.start_audio(message_id, index, &path, fraction, cx),
+            None => self.start_audio(message_id, index, &path, fraction, title, cx),
+        }
+    }
+
+    /// The mini player's play and pause.
+    pub fn toggle_current_audio(&mut self, cx: &mut Context<Self>) {
+        if let Some(audio) = &self.audio {
+            if audio.player.is_playing() {
+                audio.player.pause();
+            } else {
+                audio.player.play();
+            }
+            cx.notify();
+        }
+    }
+
+    /// The mini player's close: stops it (Desktop's `unloadMessageAudio`).
+    pub fn close_audio(&mut self, cx: &mut Context<Self>) {
+        if self.audio.take().is_some() {
+            cx.notify();
         }
     }
 
@@ -849,7 +878,15 @@ impl AppState {
         }
     }
 
-    fn start_audio(&mut self, message_id: i64, index: usize, path: &std::path::Path, fraction: f64, cx: &mut Context<Self>) {
+    fn start_audio(
+        &mut self,
+        message_id: i64,
+        index: usize,
+        path: &std::path::Path,
+        fraction: f64,
+        title: String,
+        cx: &mut Context<Self>,
+    ) {
         // The one playing stops first.
         self.audio = None;
         let player = match crate::audio::Player::open(path) {
@@ -885,7 +922,7 @@ impl AppState {
                 }
             }
         });
-        self.audio = Some(AudioPlaying { message_id, index, player, rate: 1., last_position: 0., _poll: poll });
+        self.audio = Some(AudioPlaying { message_id, index, title, player, rate: 1., last_position: 0., _poll: poll });
         cx.notify();
     }
 
