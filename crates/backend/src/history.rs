@@ -259,6 +259,13 @@ fn who(recipient: &proto::Recipient) -> Who {
             members.sort();
             Who::Group { key: group.masterKey.clone(), title, members, blocked: group.blocked }
         }
+        // The phone's release notes chat is Desktop's Signal chat.
+        Some(Destination::ReleaseNotes(_)) => Who::Contact {
+            sid: signal_store::SIGNAL_ACI.into(),
+            name: "Signal".into(),
+            e164: None,
+            blocked: false,
+        },
         _ => Who::Other,
     }
 }
@@ -719,6 +726,7 @@ mod tests {
         snapshot.members.push(member);
         group.snapshot = Some(snapshot).into();
         push(recipient(3, Destination::Group(group)));
+        push(recipient(4, Destination::ReleaseNotes(Default::default())));
         let chat = |id, recipient: u64, archived, pinned: Option<u32>| {
             let mut c = proto::Chat::new();
             c.id = id;
@@ -730,6 +738,7 @@ mod tests {
         push(chat(10, 1, false, None));
         push(chat(20, 2, false, Some(1)));
         push(chat(30, 3, true, None));
+        push(chat(40, 4, false, None));
         let text = |body: &str| {
             let mut t = proto::Text::new();
             t.body = body.into();
@@ -803,6 +812,10 @@ mod tests {
         reaction.sentTimestamp = 2_100;
         standard.reactions.push(reaction);
         push(proto::Frame { item: Some(proto::frame::Item::ChatItem(item(20, 1, 2_000, false, Item::StandardMessage(standard)))), ..Default::default() });
+        // A release note in the phone's release notes chat.
+        let mut note = proto::StandardMessage::new();
+        note.text = Some(text("Something new")).into();
+        push(proto::Frame { item: Some(proto::frame::Item::ChatItem(item(40, 4, 1_500, true, Item::StandardMessage(note)))), ..Default::default() });
         // Deleted, then one that has already disappeared.
         push(proto::Frame {
             item: Some(proto::frame::Item::ChatItem(item(20, 2, 3_000, true, Item::RemoteDeletedMessage(Default::default())))),
@@ -829,7 +842,7 @@ mod tests {
         // Progress only moves forward and ends at the whole backup.
         assert!(seen.windows(2).all(|w| w[0] < w[1]));
         assert_eq!(seen.last(), Some(&(plain.len() as u64)));
-        assert_eq!((imported.chats, imported.messages), (3, 3));
+        assert_eq!((imported.chats, imported.messages), (4, 4));
         assert_eq!(imported.sticker_packs, vec![(vec![0xab; 16], vec![0xcd; 32])]);
 
         let alice_sid = Aci::from_uuid_bytes([0xa1; 16]).service_id_string();
@@ -864,5 +877,11 @@ mod tests {
         assert_eq!(remote.digest.as_deref(), Some(hex::encode([2; 32]).as_str()));
         assert_eq!(imported.downloads, vec![(reply.id, 0)]);
         assert!(with_alice[1].deleted);
+
+        // The phone's release notes are the Signal chat's.
+        let signal = db.conversation(&ConversationId::signal()).await.unwrap().unwrap();
+        assert_eq!(signal.title, "Signal");
+        let notes = db.messages(&signal.id, None, 10).await.unwrap();
+        assert_eq!((notes[0].body.as_str(), notes[0].author.as_deref()), ("Something new", Some(signal_store::SIGNAL_ACI)));
     }
 }
