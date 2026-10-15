@@ -28,6 +28,10 @@ const PAGE: u32 = 60;
 const GROUP_WINDOW_MS: i64 = 3 * 60 * 1000;
 /// Signal's default reaction set.
 const QUICK_REACTIONS: [&str; 6] = ["❤️", "👍", "👎", "😂", "😮", "😢"];
+/// The reactions viewer's size (Desktop's `ReactionViewer`: fixed, the
+/// list scrolling).
+const REACTION_VIEWER_WIDTH: f32 = 320.;
+const REACTION_VIEWER_HEIGHT: f32 = 320.;
 
 pub struct ConversationView {
     state: Entity<AppState>,
@@ -1806,6 +1810,7 @@ impl ConversationView {
             div()
                 .debug_selector(|| key.clone())
                 .id(SharedString::from(key))
+                .flex_none()
                 .flex()
                 .items_center()
                 .h(px(32.))
@@ -1827,8 +1832,9 @@ impl ConversationView {
             .debug_selector(|| format!("reaction-viewer-{id}"))
             // Clicks land here, not on the message or pills underneath.
             .occlude()
-            .w(px(320.))
-            .max_h(px(320.))
+            // Desktop's is one size whatever it holds; the list scrolls.
+            .w(px(REACTION_VIEWER_WIDTH))
+            .h(px(REACTION_VIEWER_HEIGHT))
             .flex()
             .flex_col()
             .rounded_lg()
@@ -1844,10 +1850,13 @@ impl ConversationView {
             }))
             .child(
                 div()
+                    .id(SharedString::from(format!("reaction-tabs-{id}")))
+                    .flex_none()
                     .flex()
-                    .flex_wrap()
                     .gap_1()
                     .p_2()
+                    // One row of tabs, scrolling sideways when there are many.
+                    .overflow_x_scroll()
                     .child(tab_button(
                         format!("reaction-tab-{id}-all"),
                         tab.is_none(),
@@ -1866,6 +1875,8 @@ impl ConversationView {
             .child(
                 div()
                     .id(SharedString::from(format!("reaction-list-{id}")))
+                    .flex_1()
+                    .min_h_0()
                     .flex()
                     .flex_col()
                     .overflow_y_scroll()
@@ -4332,6 +4343,8 @@ mod tests {
         assert!(viewer.top() >= px(0.), "{viewer:?}");
         assert!(viewer.bottom() <= pills.top() || viewer.top() >= pills.top(), "{viewer:?} vs {pills:?}");
         assert_eq!(viewer.left(), pills.left(), "outgoing: aligned with the pills' left edge");
+        // Desktop's fixed size, however few the reactions.
+        assert_eq!((viewer.size.width, viewer.size.height), (px(REACTION_VIEWER_WIDTH), px(REACTION_VIEWER_HEIGHT)));
         let tab = cx.update(|_, cx| view.read(cx).reaction_viewer.clone());
         assert_eq!(tab, Some((plan.id, None)));
 
