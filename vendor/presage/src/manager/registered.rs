@@ -245,7 +245,9 @@ impl<S: Store> Manager<S, Registered> {
         {
             Some(ws) => Ok(ws.clone()),
             None => {
-                let headers = &[("X-Signal-Receive-Stories", "false")];
+                // signal-gpui: stories are shown, so the server may send them
+                // (Desktop sends "true" unless stories are turned off).
+                let headers = &[("X-Signal-Receive-Stories", "true")];
                 let ws = self
                     .identified_push_service()
                     .ws(
