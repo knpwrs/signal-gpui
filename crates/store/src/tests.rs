@@ -262,6 +262,32 @@ async fn delete_edit_attachments_and_search() {
 }
 
 #[tokio::test]
+async fn admin_deletes_note_the_admin_once() {
+    let db = test_db().await;
+    let id = db.insert_message(&incoming("g:x", "a", 10, "off topic")).await.unwrap();
+    let mut reacted = db.message(id).await.unwrap().unwrap();
+    assert!(reacted.deleted_by_admin.is_none());
+    db.set_reaction(id, Reaction { emoji: "👍".into(), author: Some("b".into()), sent_at: 11 }).await.unwrap();
+
+    let admin = DeletedByAdmin { by: Some("b".into()) };
+    assert!(db.mark_deleted_by_admin(id, &admin).await.unwrap());
+    reacted = db.message(id).await.unwrap().unwrap();
+    assert!(reacted.deleted && reacted.body.is_empty() && reacted.reactions.is_empty());
+    assert_eq!(reacted.deleted_by_admin, Some(admin.clone()));
+    let preview = db.conversation(&conv("g:x")).await.unwrap().unwrap().last_message_preview.unwrap();
+    assert!(preview.ends_with("This message was deleted"), "{preview}");
+
+    // A second delete, ours this time, changes nothing.
+    assert!(!db.mark_deleted_by_admin(id, &DeletedByAdmin { by: None }).await.unwrap());
+    assert_eq!(db.message(id).await.unwrap().unwrap().deleted_by_admin, Some(admin));
+
+    // The author's own delete leaves it unset.
+    let own = db.insert_message(&incoming("g:x", "a", 20, "mine")).await.unwrap();
+    db.mark_deleted(own).await.unwrap();
+    assert!(db.message(own).await.unwrap().unwrap().deleted_by_admin.is_none());
+}
+
+#[tokio::test]
 async fn attachment_only_preview() {
     let db = test_db().await;
     let mut m = incoming("d:a", "a", 1, "");
@@ -768,6 +794,7 @@ async fn drop_later_migrations(db: &AppDb) {
     sqlx::query("ALTER TABLE messages DROP COLUMN styles").execute(&db.writer).await.unwrap();
     sqlx::query("ALTER TABLE messages DROP COLUMN cta").execute(&db.writer).await.unwrap();
     sqlx::query("DROP TABLE stories").execute(&db.writer).await.unwrap();
+    sqlx::query("ALTER TABLE messages DROP COLUMN deleted_by_admin").execute(&db.writer).await.unwrap();
 }
 
 /// Rewrites the migration history to look like a pre-squash database that

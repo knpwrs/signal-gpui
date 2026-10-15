@@ -59,6 +59,7 @@ mod tests {
             mentions: Vec::new(),
             styles: Vec::new(),
             cta: None,
+            deleted_by_admin: None,
         }
     }
 

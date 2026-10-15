@@ -3442,6 +3442,7 @@ mod tests {
             mentions: Vec::new(),
             styles: Vec::new(),
             cta: None,
+            deleted_by_admin: None,
         };
         let (older, newer) = (message(1, 1_000), message(2, 2_000));
         assert!(super::same_group(&older, &newer));

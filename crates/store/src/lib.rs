@@ -289,6 +289,17 @@ pub struct Message {
     pub styles: Vec<StyleSpan>,
     /// A release note's button (the Signal chat's only).
     pub cta: Option<CallToAction>,
+    /// Deleted for everyone by a group admin rather than its author.
+    pub deleted_by_admin: Option<DeletedByAdmin>,
+}
+
+/// The group admin who deleted a message for everyone (Desktop's
+/// `deletedForEveryoneByAdminAci`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeletedByAdmin {
+    /// Their ACI; `None` for us.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
 }
 
 /// A release note's button: what it does (Desktop's `callToActionId`,
@@ -692,7 +703,7 @@ const CONVERSATION_COLUMNS: &str = "id, kind, title, phone, color, members, last
       AS last_outgoing_status";
 
 const MESSAGE_COLUMNS: &str = "id, conversation_id, sent_at, received_at, direction, author, \
-     author_name, body, status, reactions, quote, attachments, link_preview, deleted, edited, expires_in, expire_start, edit_count, notice, mentions, styles, cta";
+     author_name, body, status, reactions, quote, attachments, link_preview, deleted, edited, expires_in, expire_start, edit_count, notice, mentions, styles, cta, deleted_by_admin";
 
 /// SQL matching a message whose own timestamp, or one of its edits', is
 /// the bound parameter `{param}`.
@@ -882,6 +893,10 @@ fn message_from_row(row: &SqliteRow) -> Result<Message> {
             .transpose()?
             .unwrap_or_default(),
         cta: row.try_get::<Option<String>, _>("cta")?.map(|c| serde_json::from_str(&c)).transpose()?,
+        deleted_by_admin: row
+            .try_get::<Option<String>, _>("deleted_by_admin")?
+            .map(|d| serde_json::from_str(&d))
+            .transpose()?,
     })
 }
 
@@ -1690,6 +1705,27 @@ impl AppDb {
             None,
         )
         .await
+    }
+
+    /// Deletes a message for everyone on a group admin's say (Desktop's
+    /// admin delete), noting who. Returns false when it was already deleted,
+    /// which keeps whoever deleted it first.
+    pub async fn mark_deleted_by_admin(&self, message_id: i64, by: &DeletedByAdmin) -> Result<bool> {
+        let mut tx = self.write().await?;
+        let conversation: Option<String> = sqlx::query_scalar(
+            "UPDATE messages SET deleted = 1, deleted_by_admin = ?2, body = '', attachments = '[]', reactions = '[]', \
+             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL WHERE id = ?1 AND deleted = 0 \
+             RETURNING conversation_id",
+        )
+        .bind(message_id)
+        .bind(serde_json::to_string(by)?)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(conversation) = &conversation {
+            refresh_preview(&mut tx, &ConversationId(conversation.clone())).await?;
+        }
+        tx.commit().await?;
+        Ok(conversation.is_some())
     }
 
     /// Applies an edit sent at `edit_sent_at`, which then names the message
