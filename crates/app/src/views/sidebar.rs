@@ -140,6 +140,7 @@ impl Sidebar {
                 | AppEvent::AuthorNamesChanged(_)
                 | AppEvent::Error(_)
                 | AppEvent::LinkPreview { .. }
+                | AppEvent::StickerUpload(_)
                 | AppEvent::ViewImage(_)
                 | AppEvent::Gifs { .. } => {}
             }),

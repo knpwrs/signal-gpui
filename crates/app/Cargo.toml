@@ -28,8 +28,11 @@ hex = "0.4"
 linkify = "0.10"
 url = "2"
 # Frames for looping video (GIFs) handed to gpui.
-image = { version = "0.25", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png", "webp"] }
 qrcode = { version = "0.14", default-features = false }
+# Stickers for the pack creator: decoded, fitted to 512px, then lossy WebP
+# (libwebp), as Desktop's creator encodes them.
+webp = { version = "0.3", default-features = false }
 rand = "0.9"
 
 [target.'cfg(target_os = "macos")'.dependencies]

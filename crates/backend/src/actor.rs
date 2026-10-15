@@ -412,6 +412,7 @@ impl Actor {
                     self.emit(Event::Stickers(packs));
                 }
                 Command::SendSticker { conversation, pack, sticker } => self.send_sticker(conversation, &pack, sticker).await,
+                Command::UploadStickerPack(pack) => self.upload_sticker_pack(pack).await,
                 Command::FindRecipient { query } => {
                     let result = self.find_recipient(&query).await;
                     self.emit(Event::RecipientFound { query, result });
@@ -3354,6 +3355,28 @@ impl Actor {
 
     /// The sticker packs installed on the phone, from the transfer: each
     /// downloaded unless it's already here.
+    async fn upload_sticker_pack(&self, pack: crate::sticker_upload::NewStickerPack) {
+        use crate::sticker_upload::{StickerUpload, share_url, upload};
+        let Some(mut manager) = self.manager() else {
+            self.emit(Event::StickerUpload(StickerUpload::Failed("not linked".into())));
+            return;
+        };
+        let progress = |done, total| self.emit(Event::StickerUpload(StickerUpload::Progress { done, total }));
+        match upload(&mut manager, &pack, progress).await {
+            Ok((pack_id, pack_key)) => {
+                info!(stickers = pack.stickers.len(), "uploaded a sticker pack");
+                let url = share_url(&pack_id, &pack_key);
+                self.emit(Event::StickerUpload(StickerUpload::Done { pack_id, pack_key, url }));
+                let packs = self.load_stickers().await;
+                self.emit(Event::Stickers(packs));
+            }
+            Err(error) => {
+                warn!(error = format!("{error:#}"), "couldn't upload a sticker pack");
+                self.emit(Event::StickerUpload(StickerUpload::Failed(format!("{error:#}"))));
+            }
+        }
+    }
+
     async fn install_sticker_packs(self: Rc<Self>, mut manager: SignalManager, packs: Vec<(Vec<u8>, Vec<u8>)>) {
         let installed: Vec<Vec<u8>> = match self.store.sticker_packs().await {
             Ok(packs) => packs.flatten().map(|p| p.id).collect(),

@@ -8,6 +8,7 @@ mod loop_cache;
 mod notifications;
 mod platform;
 mod state;
+mod sticker_image;
 mod theme;
 mod video;
 mod views;
@@ -25,7 +26,7 @@ use signal_backend::{Backend, Config};
 
 use crate::views::root::RootView;
 
-gpui_kit::actions!(signal, [Quit, About, OpenSettings, ShowDebugLog, FocusSearch, SearchInChat, NextConversation, PreviousConversation]);
+gpui_kit::actions!(signal, [Quit, About, OpenSettings, ShowDebugLog, FocusSearch, SearchInChat, NextConversation, PreviousConversation, CreateStickerPack]);
 
 /// `$SIGNAL_GPUI_DATA_DIR` (a development profile, keyed by a file), or the
 /// platform's application data directory (keyed by the Keychain).
@@ -128,6 +129,10 @@ fn bind_keys(cx: &mut App) {
         ],
         disabled: false,
     }, Menu {
+        name: "File".into(),
+        items: vec![MenuItem::action("Create/upload sticker pack", CreateStickerPack)],
+        disabled: false,
+    }, Menu {
         name: "Help".into(),
         items: vec![MenuItem::action("Debug Log…", ShowDebugLog)],
         disabled: false,
@@ -155,6 +160,15 @@ fn main() -> Result<()> {
         cx.on_action(move |_: &Quit, cx| {
             quit_state.read(cx).backend.shutdown();
             cx.quit();
+        });
+
+        // Desktop's File → Create/upload sticker pack: its own window. It
+        // uploads as this account, so only once one is linked.
+        let creator_state = state.clone();
+        cx.on_action(move |_: &CreateStickerPack, cx| {
+            if creator_state.read(cx).account.is_some() {
+                views::sticker_creator::open(creator_state.clone(), cx);
+            }
         });
 
         // Pump backend events into the model on the UI thread.

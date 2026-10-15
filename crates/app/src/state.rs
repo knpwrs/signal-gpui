@@ -78,6 +78,8 @@ pub enum AppEvent {
     ViewImage(crate::views::image_viewer::ViewedImage),
     /// A link preview the composer asked for (`None`: nothing to show).
     LinkPreview { url: String, preview: Option<std::rc::Rc<signal_backend::LinkPreviewDraft>> },
+    /// How the sticker pack creator's upload is going.
+    StickerUpload(signal_backend::sticker_upload::StickerUpload),
 }
 
 pub struct AppState {
@@ -449,6 +451,7 @@ impl AppState {
             Event::Stickers(packs) => {
                 self.sticker_packs = packs.into_iter().map(std::sync::Arc::new).collect();
             }
+            Event::StickerUpload(upload) => cx.emit(AppEvent::StickerUpload(upload)),
             Event::RecipientFound { query, result } => cx.emit(AppEvent::RecipientFound { query, result }),
             Event::LinkPreview { url, preview } => {
                 cx.emit(AppEvent::LinkPreview { url, preview: preview.map(std::rc::Rc::new) })

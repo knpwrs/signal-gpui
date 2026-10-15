@@ -24,6 +24,7 @@ pub mod link_preview;
 pub mod debug_log;
 pub mod recipients;
 pub mod giphy;
+pub mod sticker_upload;
 pub mod deletes;
 pub mod edits;
 
@@ -80,6 +81,9 @@ pub enum Command {
     SendGif { conversation: ConversationId, gif: giphy::Gif },
     /// Lists installed sticker packs; answered with `Event::Stickers`.
     LoadStickers,
+    /// Uploads a new sticker pack and installs it; answered with
+    /// `Event::StickerUpload`.
+    UploadStickerPack(sticker_upload::NewStickerPack),
     /// Sends a sticker from an installed pack.
     SendSticker {
         conversation: ConversationId,
@@ -329,6 +333,8 @@ pub enum Event {
     Gifs { query: String, offset: u32, result: Result<GifResults, String> },
     /// Installed sticker packs (answer to `Command::LoadStickers`).
     Stickers(Vec<StickerPackView>),
+    /// How a `Command::UploadStickerPack` is going.
+    StickerUpload(sticker_upload::StickerUpload),
     /// Answer to `Command::FindRecipient`: who it is, or why not.
     RecipientFound { query: String, result: Result<signal_store::DirectoryEntry, String> },
     /// Answer to `Command::FetchLinkPreview` (`None`: no preview for it).

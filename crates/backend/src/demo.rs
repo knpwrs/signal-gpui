@@ -744,6 +744,21 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 }
             }
             Command::LoadStickers => emit(Event::Stickers(demo_stickers(&data_dir))),
+            // Pretends to upload, a sticker at a time; nothing is installed.
+            Command::UploadStickerPack(pack) => {
+                use crate::sticker_upload::{StickerUpload, share_url};
+                let events = events.clone();
+                tokio::task::spawn_local(async move {
+                    let total = pack.stickers.len();
+                    for done in 1..=total {
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        let _ = events.unbounded_send(Event::StickerUpload(StickerUpload::Progress { done, total }));
+                    }
+                    let (pack_id, pack_key) = (vec![0xde, 0x71], vec![0; 32]);
+                    let url = share_url(&pack_id, &pack_key);
+                    let _ = events.unbounded_send(Event::StickerUpload(StickerUpload::Done { pack_id, pack_key, url }));
+                });
+            }
             Command::SendSticker { conversation, pack: _, sticker } => {
                 let sent_at = next_sent_at();
                 let msg = NewMessage {

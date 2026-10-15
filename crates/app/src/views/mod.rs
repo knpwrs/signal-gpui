@@ -17,4 +17,5 @@ pub mod root;
 pub mod safety_number;
 pub mod settings;
 pub mod sidebar;
+pub mod sticker_creator;
 pub mod syncing;
