@@ -19,6 +19,22 @@ pub fn notice_text(notice: &Notice, name: impl Fn(&str) -> String) -> String {
         Notice::Pinned { by: Some(by), .. } => format!("{} pinned a message", name(by)),
         Notice::Group { by, change } => group_text(by.as_deref(), change, name),
         Notice::SafetyNumberChanged { who } => format!("Your safety number with {} has changed.", name(who)),
+        Notice::Call { incoming, video, outcome, .. } => call_text(*incoming, *video, *outcome),
+        Notice::GroupCall { by: None, .. } => "You started a group call".into(),
+        Notice::GroupCall { by: Some(by), .. } => format!("{} started a group call", name(by)),
+    }
+}
+
+/// Desktop's call history wording (`icu:missedIncomingAudioCall` and the rest).
+pub fn call_text(incoming: bool, video: bool, outcome: signal_store::CallOutcome) -> String {
+    use signal_store::CallOutcome;
+    let kind = if video { "video" } else { "voice" };
+    match outcome {
+        CallOutcome::Accepted if incoming => format!("Incoming {kind} call"),
+        CallOutcome::Accepted => format!("Outgoing {kind} call"),
+        CallOutcome::Missed => format!("Missed {kind} call"),
+        CallOutcome::Declined => format!("Declined {kind} call"),
+        CallOutcome::Unanswered => format!("Unanswered {kind} call"),
     }
 }
 
@@ -77,6 +93,13 @@ mod tests {
         let by = |s: &str| Some(s.to_owned());
         assert_eq!(text(Notice::Timer { by: None, seconds: 86_400 }), "You set the disappearing message time to 1 day.");
         assert_eq!(text(Notice::Timer { by: by("a"), seconds: 0 }), "Alice disabled disappearing messages.");
+        use signal_store::CallOutcome;
+        let call = |incoming, video, outcome| text(Notice::Call { incoming, video, outcome, call_id: None });
+        assert_eq!(call(true, false, CallOutcome::Missed), "Missed voice call");
+        assert_eq!(call(false, true, CallOutcome::Accepted), "Outgoing video call");
+        assert_eq!(call(true, true, CallOutcome::Accepted), "Incoming video call");
+        assert_eq!(call(true, false, CallOutcome::Declined), "Declined voice call");
+        assert_eq!(call(false, false, CallOutcome::Unanswered), "Unanswered voice call");
         assert_eq!(
             text(Notice::SafetyNumberChanged { who: "a".into() }),
             "Your safety number with Alice has changed."

@@ -207,6 +207,48 @@ pub(crate) async fn download_avatar(manager: &SignalManager, master_key: [u8; 32
     Ok(operations.decrypt_avatar(&encrypted))
 }
 
+/// Signal's `GroupExternalCredential` (Groups.proto): a group call's
+/// membership proof.
+#[derive(Clone, PartialEq, prost::Message)]
+struct GroupExternalCredential {
+    #[prost(string, tag = "1")]
+    token: String,
+}
+
+impl GroupSession {
+    /// A group call's membership proof (`GET /v1/groups/token`, as
+    /// Desktop's `getGroupExternalCredential`): the token, as bytes.
+    pub(crate) async fn call_proof(&self) -> anyhow::Result<Vec<u8>> {
+        let response = self
+            .service
+            .request(reqwest::Method::GET, Endpoint::storage("/v1/groups/token"), HttpAuthOverride::Identified(self.auth.clone()))?
+            .header("Content-Type", "application/x-protobuf")
+            .send()
+            .await?
+            .error_for_status()?;
+        let credential = GroupExternalCredential::decode(response.bytes().await?)?;
+        Ok(credential.token.into_bytes())
+    }
+}
+
+/// A group's identifier (what RingRTC calls the group id).
+pub(crate) fn group_identifier(master_key: [u8; 32]) -> Vec<u8> {
+    GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key)).get_group_identifier().to_vec()
+}
+
+/// A group call's member list for RingRTC: each ACI with its ciphertext
+/// under the group's key (as the group server lists members).
+pub(crate) fn call_members(master_key: [u8; 32], members: &[Aci]) -> Vec<signal_calls::GroupMember> {
+    let secret = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key));
+    members
+        .iter()
+        .map(|aci| signal_calls::GroupMember {
+            user_id: uuid_of(*aci).into_bytes().to_vec(),
+            member_id: zkgroup::serialize(&secret.encrypt_service_id((*aci).into())),
+        })
+        .collect()
+}
+
 fn uuid_of(aci: Aci) -> presage::libsignal_service::prelude::Uuid {
     aci.into()
 }

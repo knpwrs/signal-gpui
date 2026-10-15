@@ -123,6 +123,19 @@ Deleting works as in Signal Desktop:
 - **Delete for everyone** is offered only for your own messages that actually went out, within 24 hours of sending, and never in Note to Self. Deletes from others are honored only from the message's author and within 48 hours (a day, plus a day for slow delivery).
 - When a chat is deleted on another device, only messages up to the newest one that device had are removed. The chat itself goes only if nothing newer has arrived here.
 
+## Calls
+
+Voice and video calls, 1:1 and in groups, work as in Signal Desktop, through RingRTC (Signal's calling library, which Desktop also uses), Signal's TURN relays and, for groups, Signal's calling server:
+
+- **Call buttons** in a chat's header open Desktop's lobby: your camera's preview (or "Your camera is off"), camera and microphone toggles, and Start. A 1:1 lobby says "Signal will ring" them; a group's says who's already in the call ("Maya is in this call", with Join) or who will be rung (groups of up to 16; bigger groups are only notified).
+- **The call screen** shows their video (or their photo, name and "Ringing…", "Connecting…" or how long the call has run), your camera in the corner, and camera, microphone, Present and End controls. A group call shows everyone in a grid, named, with their video or photo and a muted mark; whoever presents fills the screen. Minimize shrinks it to a small window in the corner; clicking that brings it back.
+- **Presenting** shares a screen or a window (picked from a list) in place of your camera, which comes back after. macOS asks for screen recording access the first time.
+- **Incoming calls** show Desktop's bar across the top (Decline, Answer, and for video calls Answer without video), play Desktop's ringtone, and post a notification. A group ring says who's calling.
+- **Call history:** each 1:1 call leaves a notice in the chat ("Missed voice call", "Outgoing video call", …) with Call back or Call again, synced with your other devices' call lists. Starting a group call tells the group ("Alice started a group call", with Join).
+- Calls with someone you have no chat with go entirely through Signal's relays, as in Desktop, so they don't learn your IP address.
+
+Settings → Calls picks the microphone, speaker and camera. macOS asks for camera and microphone access the first time (this needs the app bundle; see Running). Call links aren't done yet.
+
 ## Message history when linking
 
 Like Signal Desktop's "link and sync", the link QR code asks your phone to send your message history (`capabilities=backup5`). After linking, the app waits for the phone to upload it (up to an hour), downloads it, checks and decrypts it with the one-time key from linking, and imports your chats: names, archived, muted, pinned and unread state, timers, and messages with their quotes, reactions, mentions, pins and read state. Messages that have already disappeared are skipped, and an edited message keeps its edit history's timestamps. Attachments still on Signal's transit tier (where the phone puts them for the transfer, for a limited time) download from there: photos and GIFs right after the import, other files when you open them. Sticker packs installed on the phone are installed here too. The chat list shows how it's going, and if the app quits partway it carries on next time.
@@ -133,7 +146,7 @@ Search covers your chats, then (like Signal Desktop) everyone in your Signal con
 
 ## Running
 
-Building needs `cmake` (for BoringSSL, used by Signal's contact discovery), and playing GIFs needs `ffmpeg`: `brew install cmake ffmpeg`.
+Building needs `cmake` (for BoringSSL, used by Signal's contact discovery) and `protoc` (for RingRTC, Signal's calling library), and playing GIFs needs `ffmpeg`: `brew install cmake protobuf ffmpeg`. The first build downloads Signal's prebuilt WebRTC for calls (about 28 MB) into `target/webrtc`.
 
 ```sh
 cargo run --release                     # real account: shows a QR code to scan from Signal on your phone
@@ -157,7 +170,7 @@ cargo bench -p signal-emoji
 
 ## Not yet implemented
 
-Voice/video calls, stories, adding and removing group members, and most settings. New identity keys are trusted automatically: a key change shows Desktop's "Your safety number with … has changed" notice (in the 1:1 chat and shared groups) and clears a verification, but sending isn't held for confirmation. Attachments in transferred history that are only in the backup (media) tier, which needs a backup subscription, aren't downloaded. See `todo.md` for more.
+Call links, stories, adding and removing group members, and most settings. New identity keys are trusted automatically: a key change shows Desktop's "Your safety number with … has changed" notice (in the 1:1 chat and shared groups) and clears a verification, but sending isn't held for confirmation. Attachments in transferred history that are only in the backup (media) tier, which needs a backup subscription, aren't downloaded. See `todo.md` for more.
 
 ## License
 

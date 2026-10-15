@@ -552,3 +552,53 @@ fn sync_verified() {
         vec![Action::Verified { aci: ALICE.into(), identity_key: vec![5; 33], verified: false }]
     );
 }
+
+#[test]
+fn sync_call_event() {
+    use presage::proto::sync_message::call_event::{Direction, Event, Type};
+    let event = |kind: Type, direction: Direction, event: Event| SyncMessage {
+        content: Some(sync_message::Content::CallEvent(sync_message::CallEvent {
+            conversation_id: Some(presage::libsignal_service::protocol::Aci::parse_from_service_id_string(ALICE).unwrap().service_id_binary()),
+            call_id: Some(u64::MAX),
+            timestamp: Some(500),
+            r#type: Some(kind.into()),
+            direction: Some(direction.into()),
+            event: Some(event.into()),
+        })),
+        ..Default::default()
+    };
+    let actions = map_content(&content(ME, event(Type::VideoCall, Direction::Incoming, Event::Accepted)), &ctx());
+    assert_eq!(
+        actions,
+        vec![Action::CallEvent(CallEventSync {
+            peer: ALICE.into(),
+            call_id: -1,
+            timestamp: 500,
+            video: true,
+            incoming: true,
+            outcome: Some(signal_store::CallOutcome::Accepted),
+        })]
+    );
+    let declined = map_content(&content(ME, event(Type::AudioCall, Direction::Incoming, Event::NotAccepted)), &ctx());
+    assert!(matches!(&declined[..], [Action::CallEvent(e)] if e.outcome == Some(signal_store::CallOutcome::Declined)));
+    let deleted = map_content(&content(ME, event(Type::AudioCall, Direction::Outgoing, Event::Delete)), &ctx());
+    assert!(matches!(&deleted[..], [Action::CallEvent(e)] if e.outcome.is_none()));
+    // Group calls aren't recorded this way.
+    assert!(map_content(&content(ME, event(Type::GroupCall, Direction::Incoming, Event::Accepted)), &ctx()).is_empty());
+}
+
+#[test]
+fn group_call_updates_become_notices() {
+    let mut dm = DataMessage { timestamp: Some(900), ..Default::default() };
+    dm.group_v2 = Some(GroupContextV2 { master_key: Some(group_key()), ..Default::default() });
+    dm.group_call_update = Some(data_message::GroupCallUpdate { era_id: Some("era".into()) });
+    assert_eq!(
+        map_content(&content(ALICE, dm), &ctx()),
+        vec![Action::GroupCallStarted {
+            conversation: ConversationId::group(&group_key()),
+            by: Some(ALICE.into()),
+            era: Some("era".into()),
+            at: 900
+        }]
+    );
+}

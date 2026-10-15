@@ -1,6 +1,9 @@
 //! The backend actor: owns the presage manager and applies incoming content to
 //! the app database. Runs on a `LocalSet` because presage's futures are `!Send`.
 
+mod calls;
+mod group_calls;
+
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -142,6 +145,23 @@ struct Actor {
     /// Read syncs that arrived before their message, `(author, sent_at)`,
     /// applied when it does (as Desktop keeps them). Newest last.
     early_reads: RefCell<std::collections::VecDeque<(String, i64)>>,
+    /// RingRTC, once a call needs it.
+    calls: RefCell<Option<signal_calls::Calls>>,
+    /// The call in progress.
+    call: RefCell<Option<calls::ActiveCall>>,
+    /// The group call we're in, or being rung for.
+    group_call: RefCell<Option<group_calls::GroupCall>>,
+    /// Lobby peeks awaiting their answer, by request id.
+    peeks: RefCell<HashMap<u32, ConversationId>>,
+    next_peek: std::cell::Cell<u32>,
+    /// The microphone, speaker and camera chosen in Settings.
+    call_choices: RefCell<crate::CallDevices>,
+    /// RingRTC's events, for `call_loop`.
+    call_events: mpsc::UnboundedSender<signal_calls::CallEvent>,
+    /// Call messages to send, in RingRTC's order (an offer before its ICE).
+    call_sends: mpsc::UnboundedSender<(Aci, presage::proto::CallMessage)>,
+    /// The call's video frames, shared with the UI.
+    video: crate::CallVideo,
     /// Identity keys (hex) seen this session, ahead of `SETTING_IDENTITY`.
     identities_seen: RefCell<HashMap<String, String>>,
     /// A later batch of profile photo checks is scheduled.
@@ -163,6 +183,7 @@ struct Actor {
 pub(crate) async fn run(
     config: Config,
     db: AppDb,
+    video: crate::CallVideo,
     mut commands: mpsc::UnboundedReceiver<Command>,
     events: mpsc::UnboundedSender<Event>,
 ) {
@@ -182,6 +203,8 @@ pub(crate) async fn run(
     };
 
     let (outbound, outbound_rx) = mpsc::unbounded();
+    let (call_events, call_events_rx) = mpsc::unbounded();
+    let (call_sends, call_sends_rx) = mpsc::unbounded();
     let actor = Rc::new(Actor {
         config,
         db,
@@ -196,6 +219,15 @@ pub(crate) async fn run(
         receiver: RefCell::new(None),
         early_reads: RefCell::default(),
         identities_seen: RefCell::default(),
+        calls: RefCell::new(None),
+        call: RefCell::new(None),
+        group_call: RefCell::new(None),
+        peeks: RefCell::default(),
+        next_peek: std::cell::Cell::new(0),
+        call_choices: RefCell::default(),
+        call_events,
+        call_sends,
+        video,
         avatar_batch_pending: std::cell::Cell::new(false),
         history: RefCell::new(None),
         outbound,
@@ -207,6 +239,9 @@ pub(crate) async fn run(
 
     tokio::task::spawn_local(actor.clone().outbound_loop(outbound_rx));
     tokio::task::spawn_local(actor.clone().expiry_loop());
+    tokio::task::spawn_local(actor.clone().call_loop(call_events_rx));
+    tokio::task::spawn_local(actor.clone().call_send_loop(call_sends_rx));
+    actor.load_call_choices().await;
 
     if actor.store.is_registered().await {
         match Manager::load_registered(actor.store.clone()).await {
@@ -461,6 +496,17 @@ impl Actor {
                 Command::SetMemberLabel { conversation, emoji, text } => self.set_member_label(conversation, emoji, text).await,
                 Command::LoadSafetyNumber { conversation } => self.emit_safety_number(conversation).await,
                 Command::SetVerified { conversation, verified } => self.set_verified(conversation, verified).await,
+                Command::StartCall { conversation, video } => self.start_call(conversation, video),
+                Command::AcceptCall { video } => self.accept_call(video),
+                Command::DeclineCall | Command::HangUp => self.hang_up(),
+                Command::SetCallAudio(enabled) => self.set_call_audio(enabled),
+                Command::SetCallVideo(enabled) => self.set_call_video(enabled),
+                Command::LoadCallDevices => self.load_call_devices().await,
+                Command::LoadShareSources => self.load_share_sources().await,
+                Command::StartSharing { source } => self.start_sharing(source),
+                Command::StopSharing => self.stop_sharing(),
+                Command::SetCallDevice { kind, id } => self.set_call_device(kind, id).await,
+                Command::PeekGroupCall { conversation } => self.peek_group_call(conversation).await,
                 Command::Unlink => self.unlink().await,
                 Command::SkipHistory => self.skip_history().await,
             }
@@ -518,6 +564,11 @@ impl Actor {
     }
 
     async fn unlink(self: Rc<Self>) {
+        // Any call ends with the account (RingRTC closes when dropped).
+        self.call.borrow_mut().take();
+        self.group_call.borrow_mut().take();
+        let calls = self.calls.borrow_mut().take();
+        drop(calls);
         if let Some(task) = self.receiver.borrow_mut().take() {
             task.abort();
         }
@@ -635,6 +686,16 @@ impl Actor {
                 let sender = content.metadata.sender.service_id_string();
                 if sender != self_aci {
                     self.check_identity(&sender).await;
+                }
+                if let ContentBody::CallMessage(call) = &content.body {
+                    // Nothing from someone you blocked, calls included.
+                    if sender != self_aci && self.is_blocked(&ConversationId::direct(&sender)).await {
+                        return;
+                    }
+                    let device = u32::from(content.metadata.sender_device);
+                    let at = content.metadata.server_timestamp.timestamp_millis();
+                    self.on_call_message(&content.metadata.sender, device, at, call).await;
+                    return;
                 }
                 if let Some((key, change, at)) = mapping::group_change_of(&content) {
                     self.apply_group_change(key, &change, at).await;
@@ -838,6 +899,13 @@ impl Actor {
                     },
                 };
                 self.emit(Event::Typing { conversation, author: sender, started });
+            }
+            Action::CallEvent(event) => self.on_call_event(event).await,
+            Action::GroupCallStarted { conversation, by, era, at } => {
+                // (Not from a blocked group.)
+                if by.is_none() || !self.is_blocked(&conversation).await {
+                    self.on_group_call_started(conversation, by, era, at).await
+                }
             }
             Action::Verified { aci, identity_key, verified } => {
                 let conversation = ConversationId::direct(&aci);

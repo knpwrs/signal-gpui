@@ -1,4 +1,5 @@
 pub mod about;
+pub mod call;
 pub mod all_media;
 pub mod chat_menu;
 pub mod chat_settings;

@@ -18,6 +18,7 @@ mod storage;
 mod groups;
 mod history;
 mod safety;
+mod calling;
 mod profiles;
 pub mod media;
 pub mod link_preview;
@@ -161,6 +162,30 @@ pub enum Command {
     /// Marks a 1:1 contact's current identity verified (or clears it), here
     /// and on our other devices; answered with `Event::SafetyNumber`.
     SetVerified { conversation: ConversationId, verified: bool },
+    /// Calls a 1:1 chat (Desktop's call buttons, after the lobby).
+    StartCall { conversation: ConversationId, video: bool },
+    /// Answers the ringing call, with our camera on or off.
+    AcceptCall { video: bool },
+    /// Declines the ringing call.
+    DeclineCall,
+    /// Ends the call (or stops calling).
+    HangUp,
+    /// Mutes (`false`) or unmutes our microphone.
+    SetCallAudio(bool),
+    /// Turns our camera on or off: in a call, or for the lobby's preview.
+    SetCallVideo(bool),
+    /// Who's in a group's call, for the lobby; answered with `Event::GroupPeek`.
+    PeekGroupCall { conversation: ConversationId },
+    /// Lists screens and windows to present; answered with `Event::ShareSources`.
+    LoadShareSources,
+    /// Presents a screen or window (an id from `Event::ShareSources`).
+    StartSharing { source: String },
+    /// Stops presenting; the camera comes back if it was on.
+    StopSharing,
+    /// Lists microphones, speakers and cameras; answered with `Event::CallDevices`.
+    LoadCallDevices,
+    /// Chooses a device for calls (`id` from `Event::CallDevices`), saved.
+    SetCallDevice { kind: DeviceKind, id: String },
     /// Unlinks this device and wipes local state.
     Unlink,
     /// Stops waiting for the history transfer and continues without it.
@@ -263,6 +288,93 @@ pub struct OutgoingImage {
     pub file_name: Option<String>,
 }
 
+/// The call in progress, as the UI shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallUpdate {
+    pub conversation: ConversationId,
+    pub status: CallStatus,
+    /// Started (or offered) as a video call.
+    pub video: bool,
+    /// They called us.
+    pub incoming: bool,
+    /// Their camera, and their microphone, are on.
+    pub remote_video: bool,
+    pub remote_audio: bool,
+    /// We're presenting our screen; they're presenting theirs.
+    pub sharing: bool,
+    pub remote_sharing: bool,
+    /// A group call; its participants (not us), in Desktop's order.
+    pub group: bool,
+    pub participants: Vec<CallParticipant>,
+    /// Who's ringing us, for a group call's ring (their ACI).
+    pub ringer: Option<String>,
+}
+
+/// Someone in a group call (one of their devices).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallParticipant {
+    /// Their ACI.
+    pub aci: String,
+    /// Their video's frames: `CallVideo::group.slot(demux_id)`.
+    pub demux_id: u32,
+    pub video: bool,
+    pub audio: bool,
+    pub presenting: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallStatus {
+    /// They're calling; not answered yet.
+    Ringing,
+    /// We're calling: Desktop's "Connecting…", then "Ringing…".
+    Calling,
+    RingingThem,
+    /// Answered; the connection is being set up (or recovering).
+    Connecting,
+    /// Since this time (unix millis).
+    Connected { since: i64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceKind {
+    Microphone,
+    Speaker,
+    Camera,
+}
+
+impl DeviceKind {
+    /// Where the choice is saved.
+    pub(crate) fn setting(self) -> &'static str {
+        match self {
+            Self::Microphone => "calls.microphone",
+            Self::Speaker => "calls.speaker",
+            Self::Camera => "calls.camera",
+        }
+    }
+}
+
+/// The devices calls can use; a chosen one is `None` for the system default.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CallDevices {
+    pub devices: signal_calls::Devices,
+    pub microphone: Option<String>,
+    pub speaker: Option<String>,
+    pub camera: Option<String>,
+}
+
+pub use signal_calls::{Device, Devices, ShareSource};
+
+/// The call's video: their latest frame, and our camera's (mirrored).
+#[derive(Clone, Default)]
+pub struct CallVideo {
+    pub remote: signal_calls::FrameSlot,
+    pub local: signal_calls::FrameSlot,
+    /// A group call's participants' frames.
+    pub group: signal_calls::GroupFrames,
+}
+
+pub use signal_calls::{Frame, FrameSlot};
+
 /// A 1:1 contact's safety number, as Signal shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SafetyNumber {
@@ -316,6 +428,14 @@ pub enum Event {
     ConversationCleared(ConversationId),
     /// A chat's pinned messages changed.
     PinsChanged(ConversationId),
+    /// Who's in a group's call (their ACIs, one per device; empty: no call).
+    GroupPeek { conversation: ConversationId, users: Vec<String> },
+    /// Screens and windows to present, or why there are none.
+    ShareSources(Result<Vec<signal_calls::ShareSource>, String>),
+    /// The devices calls can use, and which are chosen.
+    CallDevices(CallDevices),
+    /// The call changed (`None`: no call any more).
+    Call(Option<CallUpdate>),
     /// A 1:1 chat's safety number, or why there isn't one.
     SafetyNumber { conversation: ConversationId, result: Result<SafetyNumber, String> },
     /// A group we created is ready to open.
@@ -350,6 +470,7 @@ pub enum Event {
 #[derive(Clone)]
 pub struct Backend {
     db: AppDb,
+    video: CallVideo,
     commands: mpsc::UnboundedSender<Command>,
     runtime: tokio::runtime::Handle,
     data_dir: std::path::PathBuf,
@@ -391,8 +512,10 @@ impl Backend {
 
         let (commands, command_rx) = mpsc::unbounded();
         let (event_tx, events) = mpsc::unbounded();
+        let video = CallVideo::default();
         let backend = Backend {
             db: db.clone(),
+            video: video.clone(),
             commands,
             runtime: runtime.handle().clone(),
             data_dir: config.data_dir.clone(),
@@ -407,7 +530,7 @@ impl Backend {
                 if config.demo {
                     runtime.block_on(local.run_until(demo::run(db, config.data_dir.clone(), command_rx, event_tx)));
                 } else {
-                    runtime.block_on(local.run_until(actor::run(config, db, command_rx, event_tx)));
+                    runtime.block_on(local.run_until(actor::run(config, db, video, command_rx, event_tx)));
                 }
                 // `Backend::spawn` and `shutdown` use this runtime's handle
                 // even if the actor stopped early (signal.db failed to open,
@@ -430,6 +553,11 @@ impl Backend {
 
     pub fn db(&self) -> &AppDb {
         &self.db
+    }
+
+    /// The call's video frames.
+    pub fn call_video(&self) -> &CallVideo {
+        &self.video
     }
 
     pub fn send(&self, command: Command) {

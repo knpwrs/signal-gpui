@@ -34,6 +34,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key><string>1</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>NSHighResolutionCapable</key><true/>
+    <key>NSCameraUsageDescription</key><string>Signal GPUI uses your camera for video calls.</string>
+    <key>NSMicrophoneUsageDescription</key><string>Signal GPUI uses your microphone for calls.</string>
 </dict>
 </plist>
 PLIST

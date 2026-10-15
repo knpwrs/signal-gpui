@@ -42,6 +42,16 @@ impl CatchUp {
 /// How long to wait for the connection before showing the app anyway.
 const CATCH_UP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Desktop's lobby: the camera preview and toggles before a call starts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallLobby {
+    pub conversation: ConversationId,
+    pub video: bool,
+    pub audio: bool,
+    /// Who's in a group's call already (their ACIs); `None` until we know.
+    pub peek: Option<Vec<String>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Account {
     pub phone: Option<String>,
@@ -121,6 +131,21 @@ pub struct AppState {
     pub window_active: bool,
     /// The message history transfer after linking, while it runs.
     pub history: Option<signal_backend::HistoryProgress>,
+    /// The call in progress (Desktop's call screen or incoming call bar).
+    pub call: Option<signal_backend::CallUpdate>,
+    /// Desktop's call lobby, before calling.
+    pub lobby: Option<CallLobby>,
+    /// Our microphone and camera in the call.
+    pub call_audio: bool,
+    pub call_video: bool,
+    /// The call screen is minimized to a small window.
+    pub call_minimized: bool,
+    /// Screens and windows to present (loaded for the picker).
+    pub share_sources: Option<Result<Vec<signal_backend::ShareSource>, String>>,
+    /// Microphones, speakers and cameras, for Settings (loaded on opening it).
+    pub call_devices: Option<signal_backend::CallDevices>,
+    /// Ringing for an incoming call.
+    ringtone: Option<crate::ringtone::Ringtone>,
     /// The safety number last loaded (`Command::LoadSafetyNumber`).
     pub safety_number: Option<(ConversationId, Result<signal_backend::SafetyNumber, String>)>,
     pub catching_up: Option<CatchUp>,
@@ -163,6 +188,14 @@ impl AppState {
             window_active: true,
             history: None,
             safety_number: None,
+            call: None,
+            lobby: None,
+            call_audio: true,
+            call_video: false,
+            call_minimized: false,
+            ringtone: None,
+            call_devices: None,
+            share_sources: None,
             catching_up: None,
             held_notification: None,
         };
@@ -407,6 +440,14 @@ impl AppState {
             }
             Event::PinsChanged(conversation) => cx.emit(AppEvent::PinsChanged(conversation)),
             Event::SafetyNumber { conversation, result } => self.safety_number = Some((conversation, result)),
+            Event::Call(update) => self.on_call(update, cx),
+            Event::CallDevices(devices) => self.call_devices = Some(devices),
+            Event::ShareSources(sources) => self.share_sources = Some(sources),
+            Event::GroupPeek { conversation, users } => {
+                if let Some(lobby) = self.lobby.as_mut().filter(|l| l.conversation == conversation) {
+                    lobby.peek = Some(users);
+                }
+            }
             Event::History(progress) => self.on_history(progress, cx),
             Event::GroupCreated(conversation) => {
                 self.reload_conversations(cx);
@@ -464,11 +505,16 @@ impl AppState {
             Event::Unlinked => {
                 // The old account's notifications and badge go too.
                 if let Some(notifier) = self.notifier.clone() {
-                    let shown: Vec<String> = self.shown_notifications.drain().flat_map(|(_, ids)| ids).collect();
+                    let mut shown: Vec<String> = self.shown_notifications.drain().flat_map(|(_, ids)| ids).collect();
+                    shown.push(INCOMING_CALL_NOTIFICATION.to_owned());
                     notifier.remove(&shown);
                     notifier.set_badge(0);
                 }
                 self.account = None;
+                // And its call (the backend's ended with it).
+                self.call = None;
+                self.lobby = None;
+                self.ringtone = None;
                 self.conversations.clear();
                 self.archived.clear();
                 self.person_avatars.clear();
@@ -725,6 +771,151 @@ impl AppState {
     }
 
     /// Opens `conversation` scrolled to `message_id`.
+    /// Desktop's call buttons: the lobby first, camera on for a video call.
+    pub fn open_call_lobby(&mut self, conversation: ConversationId, video: bool, cx: &mut Context<Self>) {
+        if self.call.is_some() || self.lobby.is_some() {
+            return;
+        }
+        if conversation.as_group().is_some() {
+            self.send(Command::PeekGroupCall { conversation: conversation.clone() });
+        }
+        self.lobby = Some(CallLobby { conversation, video, audio: true, peek: None });
+        if video {
+            self.send(Command::SetCallVideo(true));
+        }
+        cx.notify();
+    }
+
+    pub fn set_lobby_video(&mut self, video: bool, cx: &mut Context<Self>) {
+        if let Some(lobby) = &mut self.lobby {
+            lobby.video = video;
+            self.backend.send(Command::SetCallVideo(video));
+            cx.notify();
+        }
+    }
+
+    pub fn set_lobby_audio(&mut self, audio: bool, cx: &mut Context<Self>) {
+        if let Some(lobby) = &mut self.lobby {
+            lobby.audio = audio;
+            cx.notify();
+        }
+    }
+
+    pub fn close_call_lobby(&mut self, cx: &mut Context<Self>) {
+        if let Some(lobby) = self.lobby.take() {
+            if lobby.video {
+                self.send(Command::SetCallVideo(false));
+            }
+            cx.notify();
+        }
+    }
+
+    /// The lobby's Start.
+    pub fn start_call(&mut self, cx: &mut Context<Self>) {
+        let Some(lobby) = self.lobby.take() else { return };
+        self.call_audio = lobby.audio;
+        self.call_video = lobby.video;
+        self.call_minimized = false;
+        self.send(Command::StartCall { conversation: lobby.conversation, video: lobby.video });
+        if !lobby.audio {
+            self.send(Command::SetCallAudio(false));
+        }
+        cx.notify();
+    }
+
+    /// Answers, with the camera on (`video`) or not.
+    pub fn accept_call(&mut self, video: bool, cx: &mut Context<Self>) {
+        self.call_audio = true;
+        self.call_video = video;
+        self.call_minimized = false;
+        self.send(Command::AcceptCall { video });
+        cx.notify();
+    }
+
+    pub fn decline_call(&mut self) {
+        self.send(Command::DeclineCall);
+    }
+
+    pub fn hang_up(&mut self) {
+        self.send(Command::HangUp);
+    }
+
+    pub fn toggle_call_audio(&mut self, cx: &mut Context<Self>) {
+        self.call_audio = !self.call_audio;
+        self.send(Command::SetCallAudio(self.call_audio));
+        cx.notify();
+    }
+
+    pub fn toggle_call_video(&mut self, cx: &mut Context<Self>) {
+        self.call_video = !self.call_video;
+        self.send(Command::SetCallVideo(self.call_video));
+        cx.notify();
+    }
+
+    pub fn set_call_minimized(&mut self, minimized: bool, cx: &mut Context<Self>) {
+        self.call_minimized = minimized;
+        cx.notify();
+    }
+
+    fn on_call(&mut self, update: Option<signal_backend::CallUpdate>, cx: &mut Context<Self>) {
+        let ringing = update.as_ref().is_some_and(|c| c.incoming && c.status == signal_backend::CallStatus::Ringing);
+        let was_ringing = self.call.as_ref().is_some_and(|c| c.incoming && c.status == signal_backend::CallStatus::Ringing);
+        if ringing && !was_ringing {
+            self.notify_incoming_call(update.as_ref(), cx);
+            if self.notification_setting != crate::notifications::NotificationSetting::Off {
+                self.ringtone = crate::ringtone::Ringtone::start();
+            }
+        }
+        if !ringing {
+            self.ringtone = None;
+        }
+        if !ringing && was_ringing && let Some(notifier) = &self.notifier {
+            notifier.remove(&[INCOMING_CALL_NOTIFICATION.to_owned()]);
+        }
+        // A call (theirs, say) replaces the lobby, and its camera preview.
+        // (Our own call takes the lobby first, in `start_call`.)
+        if update.is_some()
+            && let Some(lobby) = self.lobby.take()
+            && lobby.video
+        {
+            self.send(Command::SetCallVideo(false));
+        }
+        if update.is_none() {
+            self.call_audio = true;
+            self.call_video = false;
+            self.call_minimized = false;
+        }
+        self.call = update;
+    }
+
+    /// Desktop's incoming call notification ("Incoming voice call"), which
+    /// goes once the call is answered or over.
+    fn notify_incoming_call(&self, call: Option<&signal_backend::CallUpdate>, _cx: &mut Context<Self>) {
+        use crate::notifications::NotificationSetting;
+        let (Some(notifier), Some(call)) = (&self.notifier, call) else { return };
+        let (conversation, video) = (call.conversation.clone(), call.video);
+        if self.notification_setting == NotificationSetting::Off {
+            return;
+        }
+        let name = self.conversation(&conversation).map(|c| c.title.clone()).unwrap_or_else(|| "Someone".into());
+        let title = match self.notification_setting {
+            NotificationSetting::NameAndMessage | NotificationSetting::NameOnly => name,
+            _ => "Signal".into(),
+        };
+        let body = match (call.group, video) {
+            (true, _) => "Incoming group call",
+            (false, true) => "Incoming video call",
+            (false, false) => "Incoming voice call",
+        };
+        notifier.post(&crate::notifications::Notification {
+            id: INCOMING_CALL_NOTIFICATION,
+            conversation: &conversation,
+            title: &title,
+            subtitle: None,
+            body,
+        });
+    }
+
     pub fn search_in_chat(&mut self, conversation: ConversationId, cx: &mut Context<Self>) {
         cx.emit(AppEvent::SearchInChat(conversation));
     }
@@ -839,6 +1030,9 @@ fn notification_preview(message: &signal_store::Message) -> String {
 pub fn new_state(backend: Backend, cx: &mut gpui_kit::App) -> Entity<AppState> {
     cx.new(|cx| AppState::new(backend, cx))
 }
+
+/// The incoming call notification's id (one call at a time).
+const INCOMING_CALL_NOTIFICATION: &str = "incoming-call";
 
 const RECENT_STICKERS_SETTING: &str = "stickers.recent";
 /// Desktop keeps a row or so of recent stickers.

@@ -959,3 +959,34 @@ async fn safety_number_notices_round_trip() {
     let id = db.insert_notice(&conv("d:a"), 5, &notice).await.unwrap().unwrap();
     assert_eq!(db.message(id).await.unwrap().unwrap().notice, Some(notice));
 }
+
+#[tokio::test]
+async fn a_call_seen_here_and_on_another_device_is_one_notice() {
+    let db = AppDb::open_in_memory().await.unwrap();
+    let call = |outcome| Notice::Call { incoming: true, video: false, outcome, call_id: Some(-7) };
+    // It rang here and went unanswered…
+    let id = db.record_call(&conv("d:a"), 1_000, &call(CallOutcome::Missed)).await.unwrap().unwrap();
+    // …because the phone answered it (its time differs a little).
+    let again = db.record_call(&conv("d:a"), 1_200, &call(CallOutcome::Accepted)).await.unwrap().unwrap();
+    assert_eq!(again, id);
+    assert_eq!(db.message(id).await.unwrap().unwrap().notice, Some(call(CallOutcome::Accepted)));
+    // Another call at the same moment is its own notice.
+    let other = Notice::Call { incoming: false, video: true, outcome: CallOutcome::Unanswered, call_id: Some(8) };
+    let second = db.record_call(&conv("d:a"), 1_000, &other).await.unwrap().unwrap();
+    assert_ne!(second, id);
+    // Deleted from the call history elsewhere.
+    assert_eq!(db.remove_call(&conv("d:a"), -7).await.unwrap(), Some(id));
+    assert!(db.message(id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_group_call_is_noted_once_per_era() {
+    let db = AppDb::open_in_memory().await.unwrap();
+    let started = |by: &str, era: &str| Notice::GroupCall { by: Some(by.into()), era: Some(era.into()) };
+    assert!(db.record_group_call(&conv("g:a"), 1_000, &started("alice", "e1")).await.unwrap().is_some());
+    // Bob joined the same call: his update notes nothing new.
+    assert!(db.record_group_call(&conv("g:a"), 2_000, &started("bob", "e1")).await.unwrap().is_none());
+    // The next call has its own era, and the same era in another group is its own call.
+    assert!(db.record_group_call(&conv("g:a"), 3_000, &started("bob", "e2")).await.unwrap().is_some());
+    assert!(db.record_group_call(&conv("g:b"), 3_000, &started("bob", "e1")).await.unwrap().is_some());
+}

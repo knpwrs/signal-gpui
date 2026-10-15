@@ -153,6 +153,20 @@ pub struct AttachmentMeta {
     pub remote: Option<RemoteAttachment>,
 }
 
+/// How a call went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallOutcome {
+    /// Answered (here or on another device).
+    Accepted,
+    /// Theirs, not answered.
+    Missed,
+    /// Theirs, declined.
+    Declined,
+    /// Ours, not answered.
+    Unanswered,
+}
+
 /// What a read sync did (`AppDb::apply_read_sync`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadSync {
@@ -246,6 +260,23 @@ pub enum Notice {
     /// Their identity key changed (Desktop's "Your safety number with …
     /// has changed"): `who` is their service id.
     SafetyNumberChanged { who: String },
+    /// Desktop's "Alice started a group call" (`by`: `None` for us). `era`
+    /// names the call (each run of it has its own), so a call is noted once.
+    GroupCall {
+        by: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        era: Option<String>,
+    },
+    /// A call, in Desktop's call history words. `call_id` (RingRTC's id, its
+    /// bits as an i64 so SQLite's JSON reads it exactly) ties our record of
+    /// a call to our other devices'.
+    Call {
+        incoming: bool,
+        video: bool,
+        outcome: CallOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<i64>,
+    },
 }
 
 /// One change to a group, as a notice shows it. Service ids are `None`
@@ -1642,6 +1673,67 @@ impl AppDb {
         .await?;
         tx.commit().await?;
         Ok(id)
+    }
+
+    /// Records a call's notice, or updates the one for the same call (seen
+    /// here and on another device, say). Returns its row id.
+    pub async fn record_call(&self, conversation: &ConversationId, at: i64, notice: &Notice) -> Result<Option<i64>> {
+        if let Notice::Call { call_id: Some(call_id), .. } = notice {
+            let existing: Option<i64> = sqlx::query_scalar(
+                "SELECT id FROM messages WHERE conversation_id = ?1 AND author_key = 'notice' \
+                   AND json_extract(notice, '$.type') = 'call' AND json_extract(notice, '$.call_id') = ?2",
+            )
+            .bind(&conversation.0)
+            .bind(call_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            if let Some(id) = existing {
+                sqlx::query("UPDATE messages SET notice = ?2 WHERE id = ?1")
+                    .bind(id)
+                    .bind(serde_json::to_string(notice)?)
+                    .execute(&self.pool)
+                    .await?;
+                return Ok(Some(id));
+            }
+        }
+        // Notices dedupe by time: step past another in the same millisecond.
+        for offset in 0..10 {
+            if let Some(id) = self.insert_notice(conversation, at + offset, notice).await? {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Notes a group call ("… started a group call") unless its era is
+    /// noted already. `None`: it was.
+    pub async fn record_group_call(&self, conversation: &ConversationId, at: i64, notice: &Notice) -> Result<Option<i64>> {
+        if let Notice::GroupCall { era: Some(era), .. } = notice {
+            let existing: Option<i64> = sqlx::query_scalar(
+                "SELECT id FROM messages WHERE conversation_id = ?1 AND author_key = 'notice' \
+                   AND json_extract(notice, '$.type') = 'group_call' AND json_extract(notice, '$.era') = ?2",
+            )
+            .bind(&conversation.0)
+            .bind(era)
+            .fetch_optional(&self.pool)
+            .await?;
+            if existing.is_some() {
+                return Ok(None);
+            }
+        }
+        self.insert_notice(conversation, at, notice).await
+    }
+
+    /// Removes a call's notice (deleted from the call history elsewhere).
+    pub async fn remove_call(&self, conversation: &ConversationId, call_id: i64) -> Result<Option<i64>> {
+        Ok(sqlx::query_scalar(
+            "DELETE FROM messages WHERE conversation_id = ?1 AND author_key = 'notice' \
+               AND json_extract(notice, '$.type') = 'call' AND json_extract(notice, '$.call_id') = ?2 RETURNING id",
+        )
+        .bind(&conversation.0)
+        .bind(call_id)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     pub async fn set_left(&self, id: &ConversationId, left: bool) -> Result<()> {

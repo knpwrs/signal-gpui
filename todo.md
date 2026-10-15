@@ -31,7 +31,7 @@ flag as on whenever it's set.
 | `sendMessageViaLibsignal` | Sending through libsignal's network stack. | Not applicable. |
 | `keyTransparency` | Key transparency checks in safety numbers. | Not done: safety numbers are shown and can be verified, without key transparency. |
 | `localBackups` | Local (on-disk) backups. | Not applicable. |
-| `disappearingCalls`, `remoteMute.send` | Calls. | Not applicable: no calls. |
+| `disappearingCalls`, `remoteMute.send` | Calls. | Not done: call notices don't follow the disappearing timer, and there's no remote mute. |
 
 ### Limits (`global.*`), with Desktop's defaults
 
@@ -136,40 +136,26 @@ current rules before building.
 
 ## Calls
 
-Voice and video calls, one-to-one and group, as in Signal Desktop. Nothing
-exists yet. Incoming `CallMessage`s are dropped, so a call to this device
-doesn't ring and leaves nothing in the chat.
+1:1 and group voice and video calls work (see the README): `crates/calls`
+drives RingRTC v2.72.1 with Signal's prebuilt WebRTC, signaling travels as
+`CallMessage`s through presage, TURN relays come from
+`GET /v2/calling/relays`, and group calls go through Signal's calling server
+with a membership proof from `GET /v1/groups/token`. Not done yet:
 
-- **Media engine:** Signal calls run on [RingRTC](https://github.com/signalapp/ringrtc),
-  Signal's Rust library over its fork of WebRTC. Desktop uses it through
-  Node bindings. We'd link its Rust API directly. That means building
-  Signal's WebRTC fork, a large native build, so check how RingRTC's own
-  scripts produce prebuilt libraries first. It also has to pin to a RingRTC
-  version compatible with the libsignal we use.
-- **One-to-one signalling:** offers, answers, ICE candidates, hangups and busy
-  signals travel as `CallMessage` content through the normal message path.
-  RingRTC produces and consumes these; we'd route them between it and
-  presage. TURN servers come from the chat service; check when Desktop
-  fetches them.
-- **Group calls:** they go through Signal's calling server (SFU), using
-  group-scoped credentials. Ring and peek updates arrive as group
-  `CallMessage`s (opaque). Call links are a separate, later step.
-- **Devices:** microphone, camera and speaker selection, permissions (macOS
-  asks for microphone and camera access, which needs an app bundle with the
-  usage strings, as notifications already do), and screen sharing later.
-- **Interface:**
-  - Ringing with accept and decline, plus a call window: local and remote
-    video, mute, camera, hang up, and a participant grid for groups.
-  - Call buttons in the conversation header.
-  - Call events in the timeline (missed, incoming, outgoing, with duration).
-- **Sync:**
-  - Answering or declining on one device stops the ringing on the others,
-    via call event sync messages.
-  - The call history list syncs as well.
+- **Call links** and adhoc calls.
+- **Group call history:** a group call leaves "… started a group call" in
+  the chat, but no call event is synced for it, and joining or missing one
+  isn't recorded the way Desktop's call history does.
+- **Group call extras:** reactions, raised hands, remote mute, the speaker
+  view (the grid is all there is), and paging through more participants
+  than fit on screen.
+- **Live testing:** written against RingRTC's API and Desktop's behavior,
+  checked with unit tests and demo-mode flow tests; not yet tried between
+  real devices (group calls least of all).
 - **Related flags:** `disappearingCalls` (call events follow the chat's
   disappearing timer) and `remoteMute.send` (muting someone in a group call),
   listed above.
+- **libsignal versions:** RingRTC pins libsignal v0.99.1 for zkgroup while
+  presage uses v0.99.0; both build side by side. Keep RingRTC's pin in step
+  when presage moves.
 
-A smaller first step: show incoming and missed calls in the timeline and
-the chat list from `CallMessage`s and call event syncs, without answering.
-That alone tells you someone called.

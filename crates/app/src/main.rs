@@ -7,6 +7,7 @@ mod keys;
 mod loop_cache;
 mod notifications;
 mod platform;
+mod ringtone;
 mod state;
 mod sticker_image;
 mod theme;

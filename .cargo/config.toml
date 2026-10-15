@@ -2,3 +2,10 @@
 # (scripts/setup-dev-signing.sh explains why).
 [target.'cfg(target_os = "macos")']
 runner = "scripts/cargo-runner.sh"
+# Screen sharing's ScreenCaptureKit bridge is Swift: every binary and test
+# that links it needs the system's Swift runtime (in /usr/lib/swift).
+rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/lib/swift"]
+
+[env]
+# Where RingRTC's build fetches Signal's prebuilt WebRTC (once, ~28 MB).
+OUTPUT_DIR = { value = "target/webrtc", relative = true }

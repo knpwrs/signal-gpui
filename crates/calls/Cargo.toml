@@ -1,0 +1,22 @@
+[package]
+name = "signal-calls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "1:1 Signal calls through RingRTC"
+
+[dependencies]
+# Signal's calling library, with Signal's prebuilt WebRTC (fetched at build
+# time into OUTPUT_DIR; see .cargo/config.toml).
+ringrtc = { git = "https://github.com/signalapp/ringrtc", tag = "v2.72.1", features = ["prebuilt_webrtc"] }
+# Camera capture (AVFoundation on macOS).
+nokhwa = { version = "0.10.11", features = ["input-native", "output-threaded"] }
+anyhow.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Screen sharing (ScreenCaptureKit).
+screencapturekit = "11"
+

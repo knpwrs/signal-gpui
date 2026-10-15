@@ -20,6 +20,8 @@ pub struct RootView {
     picker: Entity<EmojiPicker>,
     conversation: Option<Entity<ConversationView>>,
     viewer: Option<(Entity<ImageViewer>, Subscription)>,
+    /// The lobby or call, while there is one.
+    call: Option<Entity<crate::views::call::CallView>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -63,7 +65,18 @@ impl RootView {
                     cx.notify();
                 }
             }),
-            cx.observe(&state, |_, _, cx| cx.notify()),
+            cx.observe(&state, |this, state, cx| {
+                let active = {
+                    let s = state.read(cx);
+                    s.call.is_some() || s.lobby.is_some()
+                };
+                if active && this.call.is_none() {
+                    this.call = Some(cx.new(|cx| crate::views::call::CallView::new(state.clone(), cx)));
+                } else if !active {
+                    this.call = None;
+                }
+                cx.notify()
+            }),
         ];
         Self {
             state,
@@ -71,6 +84,7 @@ impl RootView {
             picker,
             conversation: None,
             viewer: None,
+            call: None,
             _subscriptions: subscriptions,
         }
     }
@@ -81,6 +95,8 @@ impl Render for RootView {
         let palette = Palette::get(cx);
         let screen = self.state.read(cx).screen.clone();
         let syncing = self.state.read(cx).syncing_history().cloned();
+        // Calls show through the history transfer too (they ring then).
+        let call_shown = matches!(screen, Screen::Main);
         let catching_up = self.state.read(cx).catching_up.clone();
         let body = match screen {
             Screen::Loading => div()
@@ -176,6 +192,7 @@ impl Render for RootView {
                 });
             }))
             .child(body)
+            .when_some(self.call.clone().filter(|_| call_shown), |d, call| d.child(call))
             .when_some(viewer, |d, viewer| d.child(viewer))
     }
 }

@@ -12,6 +12,7 @@ pub fn open(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
     if window.has_active_dialog(cx) {
         return;
     }
+    state.read(cx).send(signal_backend::Command::LoadCallDevices);
     window.open_dialog(cx, move |dialog, _, cx| {
         let palette = Palette::get(cx);
         let account = state.read(cx).account.clone();
@@ -41,6 +42,8 @@ pub fn open(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
                     )
                     .child(section("Notifications", palette))
                     .child(notifications(&state, cx))
+                    .child(section("Calls", palette))
+                    .child(call_devices(&state, cx))
                     .child(section("Images", palette))
                     .child(image_optimization(&state, cx))
                     .child(section("Linked device", palette))
@@ -123,6 +126,49 @@ fn notifications(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
         .child(choice("notify-name", "Name only", NotificationSetting::NameOnly))
         .child(choice("notify-none", "No name or content", NotificationSetting::NoNameOrMessage))
         .child(choice("notify-off", "Off", NotificationSetting::Off))
+}
+
+/// Desktop's call device choices: microphone, speaker and camera.
+fn call_devices(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
+    use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+    use signal_backend::{Device, DeviceKind};
+    let palette = Palette::get(cx);
+    let Some(current) = state.read(cx).call_devices.clone() else {
+        return div().text_sm().text_color(palette.text_secondary).child("Loading devices…").into_any_element();
+    };
+    let row = |id: &'static str, label: &'static str, kind: DeviceKind, devices: Vec<Device>, chosen: Option<String>| {
+        let name = chosen
+            .as_ref()
+            .and_then(|c| devices.iter().find(|d| &d.id == c))
+            .map_or_else(|| "Default".to_owned(), |d| d.name.clone());
+        let state = state.clone();
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(div().w(px(96.)).text_sm().text_color(palette.text_secondary).child(label))
+            .child(Button::new(id).outline().small().label(name).dropdown_menu(move |mut menu, _, _| {
+                for device in &devices {
+                    let (state, device_id) = (state.clone(), device.id.clone());
+                    menu = menu.item(
+                        PopupMenuItem::new(device.name.clone())
+                            .checked(chosen.as_ref() == Some(&device.id))
+                            .on_click(move |_, _, cx| {
+                                state.read(cx).send(signal_backend::Command::SetCallDevice { kind, id: device_id.clone() })
+                            }),
+                    );
+                }
+                menu
+            }))
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(row("call-microphone", "Microphone", DeviceKind::Microphone, current.devices.microphones, current.microphone))
+        .child(row("call-speaker", "Speaker", DeviceKind::Speaker, current.devices.speakers, current.speaker))
+        .child(row("call-camera", "Camera", DeviceKind::Camera, current.devices.cameras, current.camera))
+        .into_any_element()
 }
 
 /// Lossless optimization of images you send (not a Signal setting).

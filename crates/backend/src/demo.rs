@@ -460,9 +460,128 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
         aci: SELF.trim_start_matches("d:").into(),
     });
     emit(Event::Connection(ConnectionState::Online));
+    // A pretend call: (the call, when it started, whether it connected).
+    let call: std::rc::Rc<std::cell::RefCell<Option<(crate::CallUpdate, i64, bool)>>> = Default::default();
 
     while let Some(command) = commands.next().await {
         match command {
+            // Calls ring, then connect, without going anywhere.
+            Command::StartCall { conversation, video } => {
+                if call.borrow().is_some() {
+                    continue;
+                }
+                // A group's call has its members in it, cameras off.
+                let members = match conversation.as_group() {
+                    Some(_) => db.conversation(&conversation).await.ok().flatten().map(|c| c.members).unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                let group = conversation.as_group().is_some();
+                let update = crate::CallUpdate {
+                    conversation,
+                    status: if group { crate::CallStatus::Connecting } else { crate::CallStatus::Calling },
+                    video,
+                    incoming: false,
+                    remote_video: false,
+                    remote_audio: true,
+                    sharing: false,
+                    remote_sharing: false,
+                    group,
+                    participants: members
+                        .into_iter()
+                        .enumerate()
+                        .map(|(ix, aci)| crate::CallParticipant {
+                            aci,
+                            demux_id: ix as u32 + 1,
+                            video: false,
+                            audio: ix % 2 == 0,
+                            presenting: false,
+                        })
+                        .collect(),
+                    ringer: None,
+                };
+                let started = next_sent_at();
+                *call.borrow_mut() = Some((update.clone(), started, false));
+                emit(Event::Call(Some(update)));
+                let (call, events) = (call.clone(), events.clone());
+                tokio::task::spawn_local(async move {
+                    // A group's call has no one to ring: it connects.
+                    let steps: &[(u64, crate::CallStatus)] = if group {
+                        &[(1, crate::CallStatus::Connected { since: 0 })]
+                    } else {
+                        &[(1, crate::CallStatus::RingingThem), (2, crate::CallStatus::Connected { since: 0 })]
+                    };
+                    for (delay, status) in steps.iter().cloned() {
+                        tokio::time::sleep(Duration::from_secs(delay)).await;
+                        let mut current = call.borrow_mut();
+                        // Only this call: one hung up quickly leaves its timer behind.
+                        let Some((update, _, connected)) = current.as_mut().filter(|(_, at, _)| *at == started) else { return };
+                        update.status = match status {
+                            crate::CallStatus::Connected { .. } => {
+                                *connected = true;
+                                update.remote_video = update.video;
+                                crate::CallStatus::Connected { since: now() }
+                            }
+                            status => status,
+                        };
+                        let _ = events.unbounded_send(Event::Call(Some(update.clone())));
+                    }
+                });
+            }
+            Command::HangUp | Command::DeclineCall => {
+                let Some((update, started, connected)) = call.borrow_mut().take() else { continue };
+                // A group call's notice is "You started a group call", from the start.
+                if update.group {
+                    if let Ok(Some(id)) = db.insert_notice(&update.conversation, started, &signal_store::Notice::GroupCall { by: None, era: None }).await {
+                        emit(Event::MessageChanged { conversation: update.conversation.clone(), message_id: id });
+                    }
+                    emit(Event::Call(None));
+                    continue;
+                }
+                let outcome = if connected { signal_store::CallOutcome::Accepted } else { signal_store::CallOutcome::Unanswered };
+                let notice = signal_store::Notice::Call { incoming: false, video: update.video, outcome, call_id: None };
+                if let Ok(Some(id)) = db.insert_notice(&update.conversation, started, &notice).await {
+                    emit(Event::MessageChanged { conversation: update.conversation.clone(), message_id: id });
+                }
+                emit(Event::Call(None));
+            }
+            Command::AcceptCall { .. } | Command::SetCallAudio(_) | Command::SetCallVideo(_) => {}
+            // Maya's in the hiking group's call; no one's in the others'.
+            Command::PeekGroupCall { conversation } => {
+                let users = if conversation.0 == GROUP { vec![aci(MAYA).to_owned()] } else { Vec::new() };
+                emit(Event::GroupPeek { conversation, users });
+            }
+            Command::LoadShareSources => {
+                let source = |id: &str, name: &str, is_display| crate::ShareSource { id: id.into(), name: name.into(), is_display };
+                emit(Event::ShareSources(Ok(vec![
+                    source("display:1", "Entire screen", true),
+                    source("window:1", "Notes: Trail plan", false),
+                ])));
+            }
+            Command::StartSharing { .. } | Command::StopSharing => {
+                let mut current = call.borrow_mut();
+                if let Some((update, _, _)) = current.as_mut() {
+                    update.sharing = matches!(command, Command::StartSharing { .. });
+                    emit(Event::Call(Some(update.clone())));
+                }
+            }
+            // Made-up devices; choices are saved like the real ones.
+            Command::LoadCallDevices | Command::SetCallDevice { .. } => {
+                if let Command::SetCallDevice { kind, id } = &command {
+                    let _ = db.set_setting(kind.setting(), id).await;
+                }
+                let device = |id: &str, name: &str| crate::Device { id: id.into(), name: name.into() };
+                let saved = async |kind: crate::DeviceKind| db.setting(kind.setting()).await.ok().flatten().filter(|s| !s.is_empty());
+                emit(Event::CallDevices(crate::CallDevices {
+                    devices: crate::Devices {
+                        microphones: vec![device("mic-1", "MacBook Pro Microphone"), device("mic-2", "USB Microphone")],
+                        speakers: vec![device("out-1", "MacBook Pro Speakers"), device("out-2", "Headphones")],
+                        cameras: vec![device("FaceTime HD Camera", "FaceTime HD Camera")],
+                    },
+                    microphone: saved(crate::DeviceKind::Microphone).await,
+                    speaker: saved(crate::DeviceKind::Speaker).await,
+                    camera: saved(crate::DeviceKind::Camera).await,
+                }));
+            }
             // The one thing the demo fetches: previews of links you type.
             Command::FetchLinkPreview { url } => {
                 let events = events.clone();

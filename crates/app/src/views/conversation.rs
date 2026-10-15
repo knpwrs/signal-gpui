@@ -256,6 +256,13 @@ impl ConversationView {
             Notice::Pinned { author, sent_at, .. } => Some((author.clone(), *sent_at)),
             _ => None,
         };
+        // Desktop's "Call back" / "Call again".
+        let call_back = match notice {
+            Notice::Call { incoming, video, .. } if self.id.as_direct().is_some() => Some((*incoming, *video)),
+            _ => None,
+        };
+        // Desktop's "Join" on a group call's notice.
+        let join = matches!(notice, Notice::GroupCall { .. });
         // Their safety number (they may have no 1:1 chat, only a group).
         let safety_with = match notice {
             Notice::SafetyNumberChanged { who } => Some((ConversationId::direct(who), self.reactor_name(Some(who), cx))),
@@ -295,6 +302,28 @@ impl ConversationView {
                                 .label("Go to message")
                                 .ghost()
                                 .on_click(cx.listener(move |this, _, _, cx| this.go_to(author.clone(), at, cx))),
+                        )
+                    })
+                    .when_some(call_back, |d, (incoming, video)| {
+                        d.child(
+                            Button::new(SharedString::from(format!("notice-call-{sent_at}")))
+                                .label(if incoming { "Call back" } else { "Call again" })
+                                .ghost()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let chat = this.id.clone();
+                                    this.state.update(cx, |state, cx| state.open_call_lobby(chat, video, cx));
+                                })),
+                        )
+                    })
+                    .when(join, |d| {
+                        d.child(
+                            Button::new(SharedString::from(format!("notice-join-{sent_at}")))
+                                .label("Join")
+                                .ghost()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let chat = this.id.clone();
+                                    this.state.update(cx, |state, cx| state.open_call_lobby(chat, true, cx));
+                                })),
                         )
                     })
                     .when_some(safety_with, |d, (chat, name)| {
@@ -731,6 +760,34 @@ impl ConversationView {
                         .text_color(palette.text_secondary)
                         .child(Icon::new(IconName::Timer).size_4())
                         .child(format_timer(timer)),
+                )
+            })
+            // Desktop's call buttons: a 1:1 chat's two.
+            .when(conversation.is_some_and(|c| c.kind == ConversationKind::Direct && !c.blocked), |d| {
+                use gpui_kit::component::button::ButtonVariants as _;
+                let call = |id: &'static str, icon: IconName, tooltip: &'static str, video: bool| {
+                    gpui_kit::component::button::Button::new(id).ghost().icon(icon).tooltip(tooltip).on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            let chat = this.id.clone();
+                            this.state.update(cx, |state, cx| state.open_call_lobby(chat, video, cx));
+                        },
+                    ))
+                };
+                d.child(call("video-call", IconName::Video, "Start a video call", true))
+                    .child(call("voice-call", IconName::Phone, "Start a call", false))
+            })
+            // A group's: one button, as Desktop's.
+            .when(conversation.is_some_and(|c| c.kind == ConversationKind::Group && !c.left && !c.blocked), |d| {
+                use gpui_kit::component::button::ButtonVariants as _;
+                d.child(
+                    gpui_kit::component::button::Button::new("group-call")
+                        .ghost()
+                        .icon(IconName::Video)
+                        .tooltip("Start a group call")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let chat = this.id.clone();
+                            this.state.update(cx, |state, cx| state.open_call_lobby(chat, true, cx));
+                        })),
                 )
             })
             .when(conversation.is_some(), |d| {

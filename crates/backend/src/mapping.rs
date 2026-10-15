@@ -69,6 +69,10 @@ pub enum Action {
     },
     /// Our other device read these incoming messages: `(author, sent_at)`.
     ReadSync(Vec<(String, i64)>),
+    /// Someone (`None`: us, on another device) started a group call.
+    GroupCallStarted { conversation: ConversationId, by: Option<String>, era: Option<String>, at: i64 },
+    /// Another of our devices' record of a 1:1 call.
+    CallEvent(CallEventSync),
     /// Our other device marked a contact's identity key verified (or not).
     Verified { aci: String, identity_key: Vec<u8>, verified: bool },
     /// Our primary device changed the Storage Service (pins, names, ...).
@@ -389,6 +393,14 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
         }];
     }
 
+    // Desktop's "… started a group call" (sent by each who joins; the era
+    // tells one call from the next).
+    if let Some(update) = &dm.group_call_update
+        && conversation.as_group().is_some()
+    {
+        return vec![Action::GroupCallStarted { conversation, by: author, era: update.era_id.clone(), at: ts }];
+    }
+
     // Pins name their target by ACI; `None` when it's one of ours.
     let target_author = |binary: &Option<Vec<u8>>| -> Option<Option<String>> {
         let aci = presage::libsignal_service::protocol::Aci::parse_from_service_id_binary(binary.as_deref()?)?;
@@ -551,6 +563,11 @@ fn map_sync(sync: &SyncMessage, envelope_ts: i64, ctx: &MapContext) -> Vec<Actio
     if !reads.is_empty() {
         out.push(Action::ReadSync(reads));
     }
+    if let Some(sync_message::Content::CallEvent(event)) = &sync.content
+        && let Some(sync) = call_event(event)
+    {
+        out.push(Action::CallEvent(sync));
+    }
     if let Some(sync_message::Content::Verified(v)) = &sync.content
         && let Some(aci) = parse_aci_with_fallback(v.destination_aci_binary.as_deref(), v.destination_aci.as_deref())
         && let Some(identity_key) = v.identity_key.clone()
@@ -702,3 +719,49 @@ pub fn service_id_of(conversation: &ConversationId) -> Option<ServiceId> {
 
 #[cfg(test)]
 mod tests;
+
+/// A call event from another of our devices (1:1 calls; group calls
+/// aren't recorded here).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallEventSync {
+    /// Their ACI.
+    pub peer: String,
+    /// RingRTC's call id, its bits as an i64 (as call notices keep it).
+    pub call_id: i64,
+    pub timestamp: i64,
+    pub video: bool,
+    pub incoming: bool,
+    /// `None`: deleted from the call history.
+    pub outcome: Option<signal_store::CallOutcome>,
+}
+
+fn call_event(event: &sync_message::CallEvent) -> Option<CallEventSync> {
+    use sync_message::call_event::{Direction, Event, Type};
+    use signal_store::CallOutcome;
+    let video = match event.r#type() {
+        Type::AudioCall => false,
+        Type::VideoCall => true,
+        _ => return None,
+    };
+    let peer = parse_aci_with_fallback(event.conversation_id.as_deref(), None)?.service_id_string();
+    let incoming = match event.direction() {
+        Direction::Incoming => true,
+        Direction::Outgoing => false,
+        Direction::UnknownDirection => return None,
+    };
+    let outcome = match (event.event(), incoming) {
+        (Event::Accepted, _) => Some(CallOutcome::Accepted),
+        (Event::NotAccepted, true) => Some(CallOutcome::Declined),
+        (Event::NotAccepted, false) => Some(CallOutcome::Unanswered),
+        (Event::Delete, _) => None,
+        _ => return None,
+    };
+    Some(CallEventSync {
+        peer,
+        call_id: event.call_id? as i64,
+        timestamp: event.timestamp? as i64,
+        video,
+        incoming,
+        outcome,
+    })
+}
