@@ -236,3 +236,23 @@ mod tests {
     }
 }
 
+
+/// Where a mouse-down outside a popover closed it. Popovers close on mouse
+/// down outside, as menus do, but the button that toggles one acts on the
+/// click that follows, so clicking it while open would close the popover and
+/// then reopen it. The button skips the click that began where this recorded.
+#[derive(Default)]
+pub(crate) struct ClosedByClick(Option<gpui_kit::Point<Pixels>>);
+
+impl ClosedByClick {
+    pub(crate) fn record(&mut self, event: &gpui_kit::MouseDownEvent) {
+        self.0 = Some(event.position);
+    }
+
+    /// Whether `click` is the one that closed the popover. Forgets it either
+    /// way.
+    pub(crate) fn take(&mut self, click: &gpui_kit::ClickEvent) -> bool {
+        let at = self.0.take();
+        matches!(click, gpui_kit::ClickEvent::Mouse(m) if at == Some(m.down.position))
+    }
+}

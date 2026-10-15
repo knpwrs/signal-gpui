@@ -21,6 +21,7 @@ use signal_store::{ConversationId, ConversationKind, Message};
 
 use crate::state::AppState;
 use crate::theme::Palette;
+use crate::views::common::ClosedByClick;
 use crate::views::emoji_picker::{EmojiPicker, PickerEvent};
 
 /// Rows shown in the type-ahead popup.
@@ -125,6 +126,7 @@ pub struct Composer {
     pub(crate) input: Entity<TextareaState>,
     picker: Entity<EmojiPicker>,
     picker_open: bool,
+    picker_closed_by: ClosedByClick,
     typeahead: Option<Typeahead>,
     reply_to: Option<Message>,
     /// The sent message being edited ("Edit message").
@@ -218,6 +220,7 @@ impl Composer {
             input,
             picker,
             picker_open: false,
+            picker_closed_by: ClosedByClick::default(),
             typeahead: None,
             reply_to: None,
             editing: None,
@@ -831,6 +834,11 @@ impl Composer {
             .bg(palette.popover)
             .shadow_lg()
             .occlude()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                if this.typeahead.take().is_some() {
+                    cx.notify();
+                }
+            }))
             .children((0..typeahead.results.len()).map(|ix| {
                 let selected = ix == typeahead.selected;
                 let row = div()
@@ -1047,6 +1055,12 @@ impl Render for Composer {
                         .bottom_full()
                         .left_2()
                         .mb_1()
+                        // Leaves focus to whatever was clicked, unlike close_picker.
+                        .on_mouse_down_out(cx.listener(|this, event, _, cx| {
+                            this.picker_closed_by.record(event);
+                            this.picker_open = false;
+                            cx.notify();
+                        }))
                         .child(self.picker.clone()),
                 ))
             })
@@ -1084,6 +1098,7 @@ impl Render for Composer {
                     .child(
                         div()
                             .id("emoji-button")
+                            .debug_selector(|| "emoji-button".into())
                             .flex_none()
                             .size(px(32.))
                             .flex()
@@ -1092,7 +1107,11 @@ impl Render for Composer {
                             .rounded_full()
                             .cursor_pointer()
                             .hover(|d| d.bg(palette.row_hover))
-                            .on_click(cx.listener(|this, _, window, cx| this.toggle_picker(window, cx)))
+                            .on_click(cx.listener(|this, click, window, cx| {
+                                if !this.picker_closed_by.take(click) {
+                                    this.toggle_picker(window, cx);
+                                }
+                            }))
                             .child(Icon::new(IconName::FaceSlightlySmiling).size_5().text_color(palette.text_secondary)),
                     )
                     .child(
@@ -1227,6 +1246,28 @@ mod tests {
 
     fn text(fixture: &Fixture, cx: &mut TestAppContext) -> String {
         cx.update(|cx| fixture.composer.read(cx).input.read(cx).value().to_string())
+    }
+
+    #[gpui_kit::test]
+    fn clicking_off_the_picker_closes_it(cx: &mut TestAppContext) {
+        let f = mount(cx);
+        let mut cx = gpui_kit::VisualTestContext::from_window(f.window, cx);
+        cx.run_until_parked();
+        let button = cx.debug_bounds("emoji-button").expect("emoji button drawn").center();
+        let open = |cx: &mut gpui_kit::VisualTestContext| cx.update(|_, cx| f.composer.read(cx).picker_open);
+        let click = |cx: &mut gpui_kit::VisualTestContext, at| {
+            cx.simulate_click(at, gpui_kit::Modifiers::none());
+            cx.run_until_parked();
+        };
+        click(&mut cx, button);
+        assert!(open(&mut cx));
+        // Its own button closes it rather than closing and reopening it.
+        click(&mut cx, button);
+        assert!(!open(&mut cx));
+        click(&mut cx, button);
+        assert!(open(&mut cx));
+        click(&mut cx, gpui_kit::point(px(790.), px(590.)));
+        assert!(!open(&mut cx), "a click off the picker closes it");
     }
 
     #[gpui_kit::test]

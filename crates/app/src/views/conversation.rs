@@ -19,7 +19,7 @@ use crate::state::{AppEvent, AppState};
 use crate::image_cache::LruImageCache;
 use crate::views::image_viewer::ViewedImage;
 use crate::theme::{Palette, color_for};
-use crate::views::common::{avatar, person_avatar, collapse_whitespace, find_links, conversation_avatar, day_label, message_time, same_day, status_icon, StatusPlace};
+use crate::views::common::{ClosedByClick, avatar, person_avatar, collapse_whitespace, find_links, conversation_avatar, day_label, message_time, same_day, status_icon, StatusPlace};
 use crate::views::composer::{Composer, ComposerEvent};
 use crate::views::emoji_picker::{EmojiPicker, PickerEvent};
 
@@ -40,6 +40,7 @@ pub struct ConversationView {
     has_more: bool,
     hovered: Option<i64>,
     reaction_bar_for: Option<i64>,
+    reaction_bar_closed_by: ClosedByClick,
     reaction_picker_for: Option<i64>,
     /// Incoming messages that arrived while scrolled up (shown on the
     /// jump-to-latest button); they're read once scrolled into view.
@@ -50,6 +51,7 @@ pub struct ConversationView {
     image_cache: Entity<LruImageCache>,
     /// The reaction viewer: which message, and which emoji tab (`None` = All).
     reaction_viewer: Option<(i64, Option<String>)>,
+    reaction_viewer_closed_by: ClosedByClick,
     /// Newer messages exist past the last loaded one (after jumping back).
     has_newer: bool,
     /// Bumped by each full reload; page results from an older one are stale.
@@ -185,8 +187,10 @@ impl ConversationView {
             has_more: true,
             hovered: None,
             reaction_bar_for: None,
+            reaction_bar_closed_by: ClosedByClick::default(),
             reaction_picker_for: None,
             reaction_viewer: None,
+            reaction_viewer_closed_by: ClosedByClick::default(),
             unseen: 0,
             window_active: window.is_window_active(),
             image_cache: LruImageCache::new(cx),
@@ -1280,7 +1284,10 @@ impl ConversationView {
             .flex()
             .flex_none()
             .items_center()
-            .child(button("react", IconName::FaceSlightlySmilingPlus).on_click(cx.listener(move |this, _, _, cx| {
+            .child(button("react", IconName::FaceSlightlySmilingPlus).on_click(cx.listener(move |this, click, _, cx| {
+                if this.reaction_bar_closed_by.take(click) {
+                    return;
+                }
                 this.reaction_bar_for = if this.reaction_bar_for == Some(id) { None } else { Some(id) };
                 cx.notify();
             })))
@@ -1436,6 +1443,11 @@ impl ConversationView {
             .border_color(palette.panel_border)
             .shadow_lg()
             .occlude()
+            .on_mouse_down_out(cx.listener(|this, event, _, cx| {
+                this.reaction_bar_closed_by.record(event);
+                this.reaction_bar_for = None;
+                cx.notify();
+            }))
             .children(QUICK_REACTIONS.iter().enumerate().map(|(ix, base)| {
                 let glyph = signal_emoji::by_glyph(base)
                     .map_or(*base, |(e, _)| e.glyph_with(tone))
@@ -1506,7 +1518,10 @@ impl ConversationView {
             .filter(|(open, _)| *open == id)
             .map(|(_, tab)| self.render_reaction_viewer(message, tab.clone(), palette, cx));
         let open = |emoji: Option<String>| {
-            cx.listener(move |this: &mut Self, _: &gpui_kit::ClickEvent, _, cx| {
+            cx.listener(move |this: &mut Self, click: &gpui_kit::ClickEvent, _, cx| {
+                if this.reaction_viewer_closed_by.take(click) {
+                    return;
+                }
                 this.reaction_viewer = match &this.reaction_viewer {
                     Some((open, _)) if *open == id => None,
                     _ => Some((id, emoji.clone())),
@@ -1623,7 +1638,8 @@ impl ConversationView {
             .border_color(palette.panel_border)
             .shadow_lg()
             .text_color(palette.text)
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+            .on_mouse_down_out(cx.listener(|this, event, _, cx| {
+                this.reaction_viewer_closed_by.record(event);
                 this.reaction_viewer = None;
                 cx.notify();
             }))
@@ -2465,6 +2481,10 @@ impl Render for ConversationView {
                                 .absolute()
                                 .bottom_2()
                                 .right_4()
+                                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                    this.reaction_picker_for = None;
+                                    cx.notify();
+                                }))
                                 .child(self.picker.clone()),
                         ))
                     }),
@@ -3446,6 +3466,18 @@ mod tests {
         cx.run_until_parked();
         let tab = cx.update(|_, cx| view.read(cx).reaction_viewer.clone());
         assert_eq!(tab, Some((plan.id, Some("👍".into()))));
+
+        // The pill that opened it closes it, and a click elsewhere does too.
+        let viewer = |cx: &mut VisualTestContext| cx.update(|_, cx| view.read(cx).reaction_viewer.clone());
+        cx.simulate_click(more.center(), gpui_kit::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(viewer(&mut cx), None);
+        cx.simulate_click(more.center(), gpui_kit::Modifiers::none());
+        cx.run_until_parked();
+        assert!(viewer(&mut cx).is_some());
+        cx.simulate_click(gpui_kit::point(px(450.), px(5.)), gpui_kit::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(viewer(&mut cx), None);
         backend.shutdown();
     }
 
