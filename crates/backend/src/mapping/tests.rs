@@ -235,6 +235,7 @@ fn incoming_edit() {
             sent_at: 300,
             body: "fixed".into(),
             mentions: vec![],
+            styles: vec![],
         }]
     );
 }
@@ -288,6 +289,7 @@ fn sync_sent_edit_to_group() {
             sent_at: 800,
             body: "edited".into(),
             mentions: vec![],
+            styles: vec![],
         }]
     );
 }
@@ -601,4 +603,55 @@ fn group_call_updates_become_notices() {
             at: 900
         }]
     );
+}
+
+#[test]
+fn styles_land_where_they_were_after_mentions_and_emoji() {
+    use presage::proto::body_range::{AssociatedValue, Style};
+    use signal_store::{StyleSpan, TextStyle};
+    // "😀 hi ￼ bold": the emoji is two UTF-16 units, the mention one.
+    let body = "😀 hi \u{FFFC} bold";
+    let range = |start, length, style: Style| presage::proto::BodyRange {
+        start: Some(start),
+        length: Some(length),
+        associated_value: Some(AssociatedValue::Style(style.into())),
+    };
+    let ranges = [range(3, 2, Style::Italic), range(6, 1, Style::Spoiler), range(8, 4, Style::Bold)];
+    let wire = styles(&ranges);
+    let (text, mentions, spans) = render_body(body, &[ALICE.to_owned()], &["Alice".to_owned()], &wire);
+    assert_eq!(text, "😀 hi @Alice bold");
+    assert_eq!(mentions[0].start, "😀 hi ".len());
+    let at = |s: &StyleSpan| &text[s.start..s.start + s.len];
+    assert_eq!(spans.iter().map(|s| (at(s), s.style)).collect::<Vec<_>>(), [
+        ("hi", TextStyle::Italic),
+        ("@Alice", TextStyle::Spoiler),
+        ("bold", TextStyle::Bold),
+    ]);
+    // And back out: byte spans over the body as sent become the same ranges.
+    let sent = [
+        StyleSpan { start: "😀 ".len(), len: 2, style: TextStyle::Italic },
+        StyleSpan { start: "😀 hi ".len(), len: '\u{FFFC}'.len_utf8(), style: TextStyle::Spoiler },
+        StyleSpan { start: body.len() - 4, len: 4, style: TextStyle::Bold },
+    ];
+    assert_eq!(style_ranges(&wire_styles(body, &sent)), ranges);
+}
+
+#[test]
+fn quoted_spoilers_stay_hidden() {
+    use presage::proto::body_range::{AssociatedValue, Style};
+    let mut dm = DataMessage { body: Some("ok".into()), timestamp: Some(500), ..Default::default() };
+    dm.quote = Some(presage::proto::data_message::Quote {
+        id: Some(400),
+        author_aci: Some(ALICE.into()),
+        text: Some("it was the butler".into()),
+        body_ranges: vec![presage::proto::BodyRange {
+            start: Some(7),
+            length: Some(10),
+            associated_value: Some(AssociatedValue::Style(Style::Spoiler.into())),
+        }],
+        ..Default::default()
+    });
+    let actions = map_data_message(&dm, Origin::Incoming { sender: ALICE.into() }, 500, &ctx());
+    let Some(Action::Insert { message, .. }) = actions.first() else { panic!("{actions:?}") };
+    assert_eq!(message.quote.as_ref().unwrap().text, "it was ■■■■");
 }

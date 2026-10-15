@@ -483,6 +483,11 @@ async fn import_item(
         _ => return Ok(false),
     };
 
+    // Its formatting, over the body as exported.
+    let styles = match &item.item {
+        Some(Item::StandardMessage(standard)) => standard.text.as_ref().map(|t| styles(&t.bodyRanges)).unwrap_or_default(),
+        _ => Vec::new(),
+    };
     // "@Name" in place of each mention placeholder.
     let names: Vec<String> = mentions
         .iter()
@@ -499,7 +504,7 @@ async fn import_item(
                 .unwrap_or_else(|| "Unknown".into())
         })
         .collect();
-    let (body, spans) = crate::mapping::render_mention_spans(&message.body, &mentions, &names);
+    let (body, spans, style_spans) = crate::mapping::render_body(&message.body, &mentions, &names, &styles);
     message.body = body;
     // An edited message is the latest version, dated by the latest edit; it
     // goes by its original (oldest) date, and its edits' dates name it too.
@@ -521,6 +526,9 @@ async fn import_item(
     }
     if !spans.is_empty() {
         db.set_mentions(id, &spans).await?;
+    }
+    if !style_spans.is_empty() {
+        db.set_styles(id, &style_spans).await?;
     }
     if deleted {
         db.mark_deleted(id).await?;
@@ -595,6 +603,28 @@ fn remote(locator: &proto::file_pointer::LocatorInfo) -> Option<RemoteAttachment
         _ => return None,
     };
     Some(RemoteAttachment { cdn: locator.transitCdnNumber.unwrap_or(0), cdn_key, key: hex::encode(&locator.key), digest, plaintext_hash })
+}
+
+/// A backup's text styles (as on the wire: UTF-16, over the body with its
+/// mention placeholders).
+fn styles(ranges: &[proto::BodyRange]) -> Vec<crate::mapping::WireStyle> {
+    use proto::body_range::{AssociatedValue, Style};
+    use signal_store::TextStyle;
+    ranges
+        .iter()
+        .filter_map(|r| {
+            let Some(AssociatedValue::Style(style)) = &r.associatedValue else { return None };
+            let style = match style.enum_value().ok()? {
+                Style::BOLD => TextStyle::Bold,
+                Style::ITALIC => TextStyle::Italic,
+                Style::SPOILER => TextStyle::Spoiler,
+                Style::STRIKETHROUGH => TextStyle::Strikethrough,
+                Style::MONOSPACE => TextStyle::Monospace,
+                Style::NONE => return None,
+            };
+            (r.length > 0).then_some(crate::mapping::WireStyle { start: r.start, len: r.length, style })
+        })
+        .collect()
 }
 
 #[cfg(test)]

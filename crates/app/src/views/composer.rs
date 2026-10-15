@@ -892,7 +892,7 @@ impl Composer {
                     .min_w_0()
                     .py_2()
                     .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Edit message"))
-                    .child(div().text_sm().truncate().text_color(palette.text_secondary).child(message.body.clone())),
+                    .child(div().text_sm().truncate().text_color(palette.text_secondary).child(signal_store::hide_spoilers(&message.body, &message.styles))),
             )
             .child(
                 div()
@@ -924,7 +924,7 @@ impl Composer {
                     .min_w_0()
                     .py_2()
                     .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(author))
-                    .child(div().text_sm().truncate().text_color(palette.text_secondary).child(message.body.clone())),
+                    .child(div().text_sm().truncate().text_color(palette.text_secondary).child(signal_store::hide_spoilers(&message.body, &message.styles))),
             )
             .child(
                 div()

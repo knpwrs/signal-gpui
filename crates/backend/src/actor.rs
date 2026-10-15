@@ -721,8 +721,9 @@ impl Actor {
 
     async fn apply(self: &Rc<Self>, manager: &SignalManager, action: Action) {
         match action {
-            Action::Insert { mut message, mentions, pointers, preview_image, timer_version } => {
+            Action::Insert { mut message, mentions, styles, pointers, preview_image, timer_version } => {
                 let mut spans = Vec::new();
+                let mut style_spans = Vec::new();
                 // Every 1:1 message carries the sender's timer (groups take
                 // theirs from the group).
                 if message.conversation_id.as_group().is_none() {
@@ -737,10 +738,11 @@ impl Actor {
                 if let Some(author) = &message.author {
                     message.author_name = self.name_of(author).await;
                 }
-                if !mentions.is_empty() {
-                    let rendered = self.render_mentions(&message.body, &mentions).await;
+                if !mentions.is_empty() || !styles.is_empty() {
+                    let rendered = self.render_body(&message.body, &mentions, &styles).await;
                     message.body = rendered.0;
                     spans = rendered.1;
+                    style_spans = rendered.2;
                 }
                 if let Some(quote) = &mut message.quote {
                     quote.author_name = match &quote.author {
@@ -776,6 +778,9 @@ impl Actor {
                     Ok(id) => {
                         if !spans.is_empty() {
                             let _ = self.db.set_mentions(id, &spans).await;
+                        }
+                        if !style_spans.is_empty() {
+                            let _ = self.db.set_styles(id, &style_spans).await;
                         }
                         // Already read on another device, before it got here.
                         let read_early = !repeat
@@ -860,14 +865,15 @@ impl Actor {
                     Err(error) => self.error("failed to delete message", error),
                 }
             }
-            Action::Edit { conversation, target_author, target_sent_at, sent_at, body, mentions } => {
+            Action::Edit { conversation, target_author, target_sent_at, sent_at, body, mentions, styles } => {
                 let Some(target) = self.find(&conversation, target_author.as_deref(), target_sent_at).await else {
                     return;
                 };
-                let (body, spans) = self.render_mentions(&body, &mentions).await;
+                let (body, spans, style_spans) = self.render_body(&body, &mentions, &styles).await;
                 match self.db.edit_message(target, &body, sent_at).await {
                     Ok(()) => {
                         let _ = self.db.set_mentions(target, &spans).await;
+                        let _ = self.db.set_styles(target, &style_spans).await;
                         // A read sync can name the edit, and come before it.
                         if let Some(author) = &target_author {
                             self.apply_early_read(author, sent_at).await;
@@ -1359,8 +1365,14 @@ impl Actor {
         }
     }
 
-    /// "@Name" for each mention placeholder, and where each one is.
-    async fn render_mentions(self: &Rc<Self>, body: &str, mentions: &[String]) -> (String, Vec<signal_store::MentionSpan>) {
+    /// "@Name" for each mention placeholder, and where each mention and
+    /// style lands.
+    async fn render_body(
+        self: &Rc<Self>,
+        body: &str,
+        mentions: &[String],
+        styles: &[mapping::WireStyle],
+    ) -> (String, Vec<signal_store::MentionSpan>, Vec<signal_store::StyleSpan>) {
         let mut names = Vec::with_capacity(mentions.len());
         for aci in mentions {
             names.push(if *aci == self.self_aci() {
@@ -1369,7 +1381,13 @@ impl Actor {
                 self.name_of(aci).await.unwrap_or_else(|| short_id(aci))
             });
         }
-        mapping::render_mention_spans(body, mentions, &names)
+        mapping::render_body(body, mentions, &names, styles)
+    }
+
+    /// "@Name" for each mention placeholder, and where each one is.
+    async fn render_mentions(self: &Rc<Self>, body: &str, mentions: &[String]) -> (String, Vec<signal_store::MentionSpan>) {
+        let (body, spans, _) = self.render_body(body, mentions, &[]).await;
+        (body, spans)
     }
 
     // ------------------------------------------------------------------ names
@@ -2738,7 +2756,8 @@ impl Actor {
                 Some(a) => m.author_name.clone().unwrap_or_else(|| short_id(a)),
             },
             sent_at: m.sent_at,
-            text: m.body.clone(),
+            // A quoted spoiler stays hidden, here and for them.
+            text: signal_store::hide_spoilers(&m.body, &m.styles),
             thumbnail: m.thumbnail(),
         });
 
@@ -2782,7 +2801,7 @@ impl Actor {
             quote: quoted.map(|m| data_message::Quote {
                 id: Some(m.sent_at as u64),
                 author_aci: Some(m.author.unwrap_or_else(|| self_aci.clone())),
-                text: Some(m.body),
+                text: Some(signal_store::hide_spoilers(&m.body, &m.styles)),
                 r#type: Some(data_message::quote::Type::Normal.into()),
                 ..Default::default()
             }),

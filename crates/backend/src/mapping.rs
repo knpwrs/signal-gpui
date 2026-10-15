@@ -10,7 +10,9 @@ use presage::proto::{
     AttachmentPointer, DataMessage, attachment_pointer, EditMessage, ReceiptMessage, SyncMessage, TypingMessage,
     body_range, data_message, receipt_message, sync_message, typing_message,
 };
-use signal_store::{AttachmentMeta, ConversationId, DeliveryStatus, Direction, LinkPreview, NewMessage, Quote};
+use signal_store::{
+    AttachmentMeta, ConversationId, DeliveryStatus, Direction, LinkPreview, NewMessage, Quote, StyleSpan, TextStyle,
+};
 
 /// Object replacement character Signal uses as the placeholder for mentions.
 pub const MENTION_PLACEHOLDER: char = '\u{FFFC}';
@@ -23,6 +25,8 @@ pub enum Action {
         message: NewMessage,
         /// ACIs of mentions, in body order; each replaces one [`MENTION_PLACEHOLDER`].
         mentions: Vec<String>,
+        /// Its formatting, over the body as received (placeholders and all).
+        styles: Vec<WireStyle>,
         /// Pointers matching `message.attachments`, for downloading.
         pointers: Vec<AttachmentPointer>,
         /// The link preview's image, for downloading.
@@ -57,6 +61,7 @@ pub enum Action {
         sent_at: i64,
         body: String,
         mentions: Vec<String>,
+        styles: Vec<WireStyle>,
     },
     Receipt {
         sent_at: Vec<i64>,
@@ -334,6 +339,102 @@ fn mentions(ranges: &[presage::proto::BodyRange]) -> Vec<String> {
     found.into_iter().map(|(_, aci)| aci).collect()
 }
 
+/// A style as Signal sends it: UTF-16 positions in the body as sent, where
+/// each mention is one placeholder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireStyle {
+    pub start: u32,
+    pub len: u32,
+    pub style: TextStyle,
+}
+
+pub(crate) fn styles(ranges: &[presage::proto::BodyRange]) -> Vec<WireStyle> {
+    use presage::proto::body_range::{AssociatedValue, Style};
+    ranges
+        .iter()
+        .filter_map(|r| {
+            let Some(AssociatedValue::Style(style)) = r.associated_value else { return None };
+            let style = match Style::try_from(style).ok()? {
+                Style::Bold => TextStyle::Bold,
+                Style::Italic => TextStyle::Italic,
+                Style::Spoiler => TextStyle::Spoiler,
+                Style::Strikethrough => TextStyle::Strikethrough,
+                Style::Monospace => TextStyle::Monospace,
+                Style::None => return None,
+            };
+            Some(WireStyle { start: r.start.unwrap_or(0), len: r.length.unwrap_or(0), style })
+        })
+        .filter(|s| s.len > 0)
+        .collect()
+}
+
+/// Wire styles as byte spans over the same text (placeholders left as
+/// they are).
+fn byte_spans(text: &str, styles: &[WireStyle]) -> Vec<StyleSpan> {
+    let mut at: Vec<(u32, usize)> = Vec::new();
+    let mut utf16 = 0u32;
+    for (byte, c) in text.char_indices() {
+        at.push((utf16, byte));
+        utf16 += c.len_utf16() as u32;
+    }
+    at.push((utf16, text.len()));
+    place_styles(&at, styles)
+}
+
+/// Styles placed through `at`: (UTF-16 position as sent, byte where it
+/// lands), in order. A position inside a character (half a surrogate pair)
+/// rounds outward.
+fn place_styles(at: &[(u32, usize)], styles: &[WireStyle]) -> Vec<StyleSpan> {
+    let byte = |pos: u32, up: bool| match at.binary_search_by_key(&pos, |(u, _)| *u) {
+        Ok(ix) => Some(at[ix].1),
+        Err(ix) => at.get(if up { ix } else { ix.checked_sub(1)? }).map(|(_, b)| *b),
+    };
+    styles
+        .iter()
+        .filter_map(|s| {
+            let start = byte(s.start, false)?;
+            let end = byte(s.start.saturating_add(s.len), true)?;
+            (end > start).then_some(StyleSpan { start, len: end - start, style: s.style })
+        })
+        .collect()
+}
+
+/// Signal's ranges for these styles.
+pub fn style_ranges(styles: &[WireStyle]) -> Vec<presage::proto::BodyRange> {
+    use presage::proto::body_range::{AssociatedValue, Style};
+    styles
+        .iter()
+        .map(|s| presage::proto::BodyRange {
+            start: Some(s.start),
+            length: Some(s.len),
+            associated_value: Some(AssociatedValue::Style(
+                match s.style {
+                    TextStyle::Bold => Style::Bold,
+                    TextStyle::Italic => Style::Italic,
+                    TextStyle::Spoiler => Style::Spoiler,
+                    TextStyle::Strikethrough => Style::Strikethrough,
+                    TextStyle::Monospace => Style::Monospace,
+                }
+                .into(),
+            )),
+        })
+        .collect()
+}
+
+/// Byte spans over `body` (as sent: placeholders and all) in UTF-16, as
+/// Signal counts.
+pub fn wire_styles(body: &str, spans: &[StyleSpan]) -> Vec<WireStyle> {
+    let utf16 = |byte: usize| body.get(..byte).map(|b| b.encode_utf16().count() as u32);
+    spans
+        .iter()
+        .filter_map(|s| {
+            let start = utf16(s.start)?;
+            let end = utf16(s.start + s.len)?;
+            (end > start).then_some(WireStyle { start, len: end - start, style: s.style })
+        })
+        .collect()
+}
+
 pub fn attachment_meta(p: &AttachmentPointer) -> AttachmentMeta {
     AttachmentMeta {
         content_type: p
@@ -471,7 +572,11 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
             author: other(aci_string(q.parse_author_aci()), ctx),
             author_name: String::new(),
             sent_at: q.id? as i64,
-            text: q.text.clone().unwrap_or_default(),
+            // A quoted spoiler stays hidden (as Desktop shows it).
+            text: signal_store::hide_spoilers(
+                q.text.as_deref().unwrap_or_default(),
+                &byte_spans(q.text.as_deref().unwrap_or_default(), &styles(&q.body_ranges)),
+            ),
             // Filled in from the quoted message once it's found locally.
             thumbnail: None,
         })
@@ -514,6 +619,7 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
             expires_in: dm.expire_timer.unwrap_or(0),
         },
         mentions: mentions(&dm.body_ranges),
+        styles: styles(&dm.body_ranges),
         pointers,
         preview_image,
         timer_version: dm.expire_timer_version,
@@ -532,6 +638,7 @@ fn map_edit(edit: &EditMessage, origin: Origin, envelope_ts: i64, ctx: &MapConte
         sent_at: dm.timestamp.map_or(envelope_ts, |t| t as i64),
         body: dm.body.clone().unwrap_or_default(),
         mentions: mentions(&dm.body_ranges),
+        styles: styles(&dm.body_ranges),
     })
 }
 
@@ -649,10 +756,27 @@ pub fn render_mentions(body: &str, names: &[String]) -> String {
 
 /// Replaces each placeholder with "@Name" and says where each landed.
 pub fn render_mention_spans(body: &str, acis: &[String], names: &[String]) -> (String, Vec<signal_store::MentionSpan>) {
+    let (body, mentions, _) = render_body(body, acis, names, &[]);
+    (body, mentions)
+}
+
+/// The body as kept: each placeholder as "@Name", with where each mention
+/// and each style (given over the body as sent) lands in it.
+pub fn render_body(
+    body: &str,
+    acis: &[String],
+    names: &[String],
+    styles: &[WireStyle],
+) -> (String, Vec<signal_store::MentionSpan>, Vec<StyleSpan>) {
+    // Where each UTF-16 position of the body as sent lands, in bytes.
+    let mut at: Vec<(u32, usize)> = Vec::with_capacity(body.len() + 1);
+    let mut utf16 = 0u32;
     let mut out = String::with_capacity(body.len());
     let mut spans = Vec::new();
     let mut ix = 0;
     for c in body.chars() {
+        at.push((utf16, out.len()));
+        utf16 += c.len_utf16() as u32;
         if c == MENTION_PLACEHOLDER {
             let start = out.len();
             out.push('@');
@@ -665,7 +789,9 @@ pub fn render_mention_spans(body: &str, acis: &[String], names: &[String]) -> (S
             out.push(c);
         }
     }
-    (out, spans)
+    at.push((utf16, out.len()));
+    let styles = place_styles(&at, styles);
+    (out, spans, styles)
 }
 
 /// The reverse of [`render_mention_spans`]: each "@Name" span back to a

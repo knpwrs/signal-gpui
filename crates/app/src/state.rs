@@ -1021,7 +1021,9 @@ impl AppState {
 /// A notification's text for a message: its text, or what it holds.
 fn notification_preview(message: &signal_store::Message) -> String {
     if !message.body.is_empty() {
-        let text: String = message.body.split_whitespace().collect::<Vec<_>>().join(" ");
+        // Spoilers stay hidden (Desktop shows "■■■■").
+        let body = signal_store::hide_spoilers(&message.body, &message.styles);
+        let text: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
         return text.chars().take(300).collect();
     }
     match message.attachments.first() {
@@ -1029,6 +1031,7 @@ fn notification_preview(message: &signal_store::Message) -> String {
         Some(a) if a.gif => "GIF".into(),
         Some(a) if a.content_type.starts_with("image/") => "📷 Photo".into(),
         Some(a) if a.content_type.starts_with("video/") => "🎥 Video".into(),
+        Some(a) if a.content_type.starts_with("audio/") => "🎤 Voice message".into(),
         Some(_) => "📎 File".into(),
         None => "New Message".into(),
     }

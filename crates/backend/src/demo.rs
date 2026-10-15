@@ -203,6 +203,21 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
     });
     db.insert_message(&trail).await?;
     db.insert_message(&incoming(GROUP, JORDAN, y + 21 * MINUTE, "Ridge loop. The lake trail was pure mud last time")).await?;
+    // Signal's formatting: one of each style.
+    let pack = "Pack list: water, layers, snacks. Gate code is 4417. Best part is the surprise at the top";
+    let pack_id = db.insert_message(&incoming(GROUP, PRIYA, y + 30 * MINUTE, pack)).await?;
+    let span = |text: &str, style| {
+        let start = pack.find(text).unwrap_or_default();
+        signal_store::StyleSpan { start, len: text.len(), style }
+    };
+    db.set_styles(pack_id, &[
+        span("Pack list", signal_store::TextStyle::Bold),
+        span("layers", signal_store::TextStyle::Italic),
+        span("snacks", signal_store::TextStyle::Strikethrough),
+        span("4417", signal_store::TextStyle::Monospace),
+        span("the surprise at the top", signal_store::TextStyle::Spoiler),
+    ])
+    .await?;
     let view = with_photo(incoming(GROUP, PRIYA, y + 40 * MINUTE, "View from the top last time. Bring layers, it's windy up there"));
     let view_id = db.insert_message(&view).await?;
     db.set_reaction(view_id, react("😍", Some(MAYA))).await?;

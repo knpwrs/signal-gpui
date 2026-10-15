@@ -42,6 +42,8 @@ pub struct ConversationView {
     reaction_bar_for: Option<i64>,
     reaction_bar_closed_by: ClosedByClick,
     reaction_picker_for: Option<i64>,
+    /// Messages whose spoilers were clicked to show.
+    revealed_spoilers: std::collections::HashSet<i64>,
     /// Incoming messages that arrived while scrolled up (shown on the
     /// jump-to-latest button); they're read once scrolled into view.
     unseen: usize,
@@ -177,6 +179,7 @@ impl ConversationView {
         ];
 
         let mut this = Self {
+            revealed_spoilers: Default::default(),
             state,
             id,
             messages: Vec::new(),
@@ -355,7 +358,7 @@ impl ConversationView {
         let id = pin.id;
         let author = self.reactor_name(pin.author.as_deref(), cx);
         let preview = if !pin.body.is_empty() {
-            collapse_whitespace(&pin.body)
+            collapse_whitespace(&signal_store::hide_spoilers(&pin.body, &pin.styles))
         } else {
             match pin.attachments.first() {
                 Some(a) if a.sticker => "Sticker".into(),
@@ -1228,7 +1231,7 @@ impl ConversationView {
                             .children(rest.iter().enumerate().map(|(ix, a)| {
                                 render_attachment(message.id, ix + 1, a, fg, palette, cx)
                             }))
-                            .when(caption, |d| d.child(message_text(message.id, &message.body, &message.mentions, spacer.as_deref().map(|s| (s, bg)))))
+                            .when(caption, |d| d.child(message_text(message, fg, self.revealed_spoilers.contains(&message.id), spacer.as_deref().map(|s| (s, bg)), cx)))
                             .when_some(meta, |d, m| d.child(place_meta(m, inline_meta))),
                     )
                 })
@@ -1274,7 +1277,7 @@ impl ConversationView {
                         .pt_1p5()
                         .pb_2()
                         .when(!message.body.is_empty(), |d| {
-                            d.child(message_text(message.id, &message.body, &message.mentions, spacer.as_deref().map(|s| (s, bg))))
+                            d.child(message_text(message, fg, self.revealed_spoilers.contains(&message.id), spacer.as_deref().map(|s| (s, bg)), cx))
                         })
                         .when_some(meta, |d, m| d.child(place_meta(m, inline_meta))),
                 )
@@ -1308,7 +1311,7 @@ impl ConversationView {
                         "This message was deleted."
                     }))
                 } else if !message.body.is_empty() {
-                    d.child(message_text(message.id, &message.body, &message.mentions, spacer.as_deref().map(|s| (s, bg))))
+                    d.child(message_text(message, fg, self.revealed_spoilers.contains(&message.id), spacer.as_deref().map(|s| (s, bg)), cx))
                 } else {
                     d
                 }
@@ -2259,52 +2262,135 @@ fn place_meta(meta: impl IntoElement, inline: bool) -> AnyElement {
     }
 }
 
-/// Message text with its web links underlined and clickable, and room for
-/// the time at the end when `spacer` is given (with the bubble's colour, to
-/// draw it in: gpui blends highlight colours over the text colour, so a
-/// transparent one would still show).
-fn message_text(message_id: i64, body: &str, mentions: &[signal_store::MentionSpan], spacer: Option<(&str, Hsla)>) -> AnyElement {
-    let text = div().text_size(px(BODY_SIZE)).line_height(px(BODY_LINE));
-    let links = find_links(body);
-    if links.is_empty() && mentions.is_empty() && spacer.is_none() {
-        return text.child(body.to_owned()).into_any_element();
+/// What a click on a stretch of message text does.
+#[derive(Debug, Clone, PartialEq)]
+enum TextClick {
+    Open(String),
+    /// Shows the message's spoilers.
+    Reveal,
+}
+
+/// Text, its runs, and what clicking where does.
+type TextLayout = (String, Vec<gpui_kit::TextRun>, Vec<(std::ops::Range<usize>, TextClick)>);
+
+/// Message text laid out as runs: links underlined, @mentions as pills,
+/// Signal's formatting (bold, italic, strikethrough, monospace), spoilers as
+/// solid blocks until revealed, and room for the time at the end when
+/// `spacer` is given (in the bubble's colour, `bg`, to draw it in). Returns
+/// the text, its runs and what clicking where does.
+fn text_runs(
+    body: &str,
+    mentions: &[signal_store::MentionSpan],
+    styles: &[signal_store::StyleSpan],
+    revealed: bool,
+    fg: Hsla,
+    spacer: Option<(&str, Hsla)>,
+) -> TextLayout {
+    use signal_store::TextStyle;
+    let valid = |r: &std::ops::Range<usize>| r.end <= body.len() && body.is_char_boundary(r.start) && body.is_char_boundary(r.end);
+    let links: Vec<(std::ops::Range<usize>, String)> = find_links(body);
+    let mentions: Vec<std::ops::Range<usize>> =
+        mentions.iter().map(|m| m.start..m.start + m.len).filter(|r| valid(r)).collect();
+    let styles: Vec<(std::ops::Range<usize>, TextStyle)> =
+        styles.iter().map(|s| (s.start..s.start + s.len, s.style)).filter(|(r, _)| valid(r)).collect();
+    let mut cuts = vec![0, body.len()];
+    cuts.extend(links.iter().flat_map(|(r, _)| [r.start, r.end]));
+    cuts.extend(mentions.iter().flat_map(|r| [r.start, r.end]));
+    cuts.extend(styles.iter().flat_map(|(r, _)| [r.start, r.end]));
+    cuts.sort_unstable();
+    cuts.dedup();
+    let covers = |r: &std::ops::Range<usize>, at: usize| r.start <= at && at < r.end;
+    let mut runs = Vec::new();
+    for pair in cuts.windows(2) {
+        let (start, end) = (pair[0], pair[1]);
+        if start == end {
+            continue;
+        }
+        let has = |style: TextStyle| styles.iter().any(|(r, s)| *s == style && covers(r, start));
+        let mention = mentions.iter().any(|r| covers(r, start));
+        let hidden = has(TextStyle::Spoiler) && !revealed;
+        let mut font = gpui_kit::font(if has(TextStyle::Monospace) { "Menlo" } else { ".SystemUIFont" });
+        font.weight = if has(TextStyle::Bold) {
+            FontWeight::BOLD
+        } else if mention {
+            FontWeight::SEMIBOLD
+        } else {
+            FontWeight::NORMAL
+        };
+        if has(TextStyle::Italic) {
+            font.style = gpui_kit::FontStyle::Italic;
+        }
+        runs.push(gpui_kit::TextRun {
+            len: end - start,
+            font,
+            color: fg,
+            // A hidden spoiler is a block of the text colour, as Desktop
+            // covers it; a mention a soft pill in either bubble colour.
+            background_color: if hidden {
+                Some(fg)
+            } else if mention {
+                Some(gpui_kit::hsla(0., 0., 0.5, 0.22))
+            } else {
+                None
+            },
+            underline: links.iter().any(|(r, _)| covers(r, start)).then_some(gpui_kit::UnderlineStyle {
+                thickness: px(1.),
+                ..Default::default()
+            }),
+            strikethrough: has(TextStyle::Strikethrough).then_some(gpui_kit::StrikethroughStyle {
+                thickness: px(1.),
+                ..Default::default()
+            }),
+        });
     }
-    let underline = gpui_kit::HighlightStyle {
-        underline: Some(gpui_kit::UnderlineStyle { thickness: px(1.), ..Default::default() }),
-        ..Default::default()
-    };
-    // Desktop shows @mentions as a tinted pill; a soft background works in
-    // both bubble colours.
-    let mention = gpui_kit::HighlightStyle {
-        font_weight: Some(FontWeight::SEMIBOLD),
-        background_color: Some(gpui_kit::hsla(0., 0., 0.5, 0.22)),
-        ..Default::default()
-    };
-    let (ranges, urls): (Vec<_>, Vec<_>) = links.into_iter().unzip();
+    let mut clicks: Vec<_> = links.into_iter().map(|(r, url)| (r, TextClick::Open(url))).collect();
+    if !revealed {
+        // A hidden spoiler takes the click, even over a link inside it.
+        let spoilers: Vec<_> = styles.iter().filter(|(_, s)| *s == TextStyle::Spoiler).map(|(r, _)| r.clone()).collect();
+        clicks.retain(|(r, _)| !spoilers.iter().any(|s| s.start < r.end && r.start < s.end));
+        clicks.extend(spoilers.into_iter().map(|r| (r, TextClick::Reveal)));
+    }
     let mut content = body.to_owned();
-    let mut highlights: Vec<_> = ranges.iter().map(|r| (r.clone(), underline)).collect();
-    highlights.extend(
-        mentions
-            .iter()
-            .filter(|m| body.is_char_boundary(m.start) && body.is_char_boundary(m.start + m.len) && m.start + m.len <= body.len())
-            .map(|m| (m.start..m.start + m.len, mention)),
-    );
-    // gpui wants highlights in order and not overlapping.
-    highlights.sort_by_key(|(r, _)| r.start);
-    highlights.dedup_by(|b, a| b.0.start < a.0.end);
-    if let Some((spacer, background)) = spacer {
-        let invisible = gpui_kit::HighlightStyle { color: Some(background), ..Default::default() };
-        highlights.push((content.len()..content.len() + spacer.len(), invisible));
+    if let Some((spacer, bg)) = spacer {
+        let mut font = gpui_kit::font(".SystemUIFont");
+        font.weight = FontWeight::NORMAL;
+        runs.push(gpui_kit::TextRun {
+            len: spacer.len(),
+            font,
+            color: bg,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        });
         content.push_str(spacer);
     }
-    let styled = gpui_kit::StyledText::new(content).with_highlights(highlights);
-    if ranges.is_empty() {
+    (content, runs, clicks)
+}
+
+/// A message's text: see [`text_runs`]. Clicking a hidden spoiler shows the
+/// message's spoilers.
+fn message_text(message: &Message, fg: Hsla, revealed: bool, spacer: Option<(&str, Hsla)>, cx: &mut Context<ConversationView>) -> AnyElement {
+    let text = div().text_size(px(BODY_SIZE)).line_height(px(BODY_LINE));
+    let (content, runs, clicks) = text_runs(&message.body, &message.mentions, &message.styles, revealed, fg, spacer);
+    let styled = gpui_kit::StyledText::new(content).with_runs(runs);
+    if clicks.is_empty() {
         return text.child(styled).into_any_element();
     }
-    text.child(
-        gpui_kit::InteractiveText::new(("message-text", message_id as u64), styled)
-            .on_click(ranges, move |ix, _, cx| cx.open_url(&urls[ix])),
-    )
+    let (ranges, actions): (Vec<_>, Vec<_>) = clicks.into_iter().unzip();
+    let message_id = message.id;
+    let view = cx.entity().downgrade();
+    text.child(gpui_kit::InteractiveText::new(("message-text", message_id as u64), styled).on_click(
+        ranges,
+        move |ix, _, cx| match &actions[ix] {
+            TextClick::Open(url) => cx.open_url(url),
+            TextClick::Reveal => {
+                let _ = view.update(cx, |this, cx| {
+                    this.revealed_spoilers.insert(message_id);
+                    cx.notify();
+                });
+            }
+        },
+    ))
     .into_any_element()
 }
 
@@ -2869,6 +2955,41 @@ fn capitalize(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn formatting_becomes_runs_and_spoilers_hide_until_shown() {
+        use signal_store::{StyleSpan, TextStyle};
+        let body = "bold it see https://x.org end";
+        let at = |text: &str| body.find(text).unwrap();
+        let styles = [
+            StyleSpan { start: 0, len: 4, style: TextStyle::Bold },
+            StyleSpan { start: at("it"), len: 2, style: TextStyle::Italic },
+            // A spoiler with a link in it.
+            StyleSpan { start: at("see"), len: "see https://x.org".len(), style: TextStyle::Spoiler },
+        ];
+        let fg = gpui_kit::hsla(0., 0., 0., 1.);
+        let (content, runs, clicks) = super::text_runs(body, &[], &styles, false, fg, None);
+        assert_eq!(content, body);
+        assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), body.len(), "runs cover the text");
+        let run_at = |offset: usize| {
+            let mut start = 0;
+            runs.iter()
+                .find(|r| {
+                    let found = (start..start + r.len).contains(&offset);
+                    start += r.len;
+                    found
+                })
+                .unwrap()
+        };
+        assert_eq!(run_at(0).font.weight, FontWeight::BOLD);
+        assert_eq!(run_at(at("it")).font.style, gpui_kit::FontStyle::Italic);
+        assert_eq!(run_at(at("see")).background_color, Some(fg), "hidden: a block");
+        // Hidden, the spoiler takes the click (its link waits until shown).
+        assert_eq!(clicks, [(at("see")..at(" end"), super::TextClick::Reveal)]);
+        let (_, runs, clicks) = super::text_runs(body, &[], &styles, true, fg, None);
+        assert!(runs.iter().all(|r| r.background_color.is_none()));
+        assert_eq!(clicks, [(at("https")..at(" end"), super::TextClick::Open("https://x.org".into()))]);
+    }
+
     use gpui_kit::{Bounds, Pixels, TestAppContext, VisualTestContext, WindowBounds, WindowOptions, px, size};
     use signal_backend::{Backend, Config};
 
