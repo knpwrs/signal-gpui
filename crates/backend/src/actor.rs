@@ -2015,7 +2015,8 @@ impl Actor {
                 ConversationKind::NoteToSelf => {}
             }
         }
-        people.remove(&me);
+        // Ours too (My Story shows it), with our own key.
+        people.insert(me.clone());
         // The Signal chat's account is made up: it has no profile.
         people.remove(signal_store::SIGNAL_ACI);
         let now = now_millis();
@@ -2034,7 +2035,8 @@ impl Actor {
             // No key, no photo: left out until one arrives, rather than
             // filling every batch and starving those after them.
             let Some(aci) = Aci::parse_from_service_id_string(&sid) else { continue };
-            let has_key = group_keys.contains_key(&aci)
+            let has_key = sid == me
+                || group_keys.contains_key(&aci)
                 || matches!(self.store.profile_key(&ServiceId::from(aci)).await, Ok(Some(_)));
             if !has_key {
                 keyless += 1;
@@ -2079,8 +2081,13 @@ impl Actor {
         dir: &std::path::Path,
     ) -> PhotoOutcome {
         let Some(aci) = Aci::parse_from_service_id_string(sid) else { return PhotoOutcome::NoKey };
-        // Someone known only from a group has their key in the group.
-        let Some(key) = self.profile_key_of(&ServiceId::from(aci)).await else { return PhotoOutcome::NoKey };
+        let ours = sid == self.self_aci();
+        // Ours is our own; someone known only from a group has theirs in
+        // the group.
+        let key = if ours { Some(manager.registration_data().profile_key()) } else { self.profile_key_of(&ServiceId::from(aci)).await };
+        let Some(key) = key else { return PhotoOutcome::NoKey };
+        // Our "chat" is Note to Self, which keeps its own icon (Desktop's).
+        let chat = if ours { None } else { Some(ConversationId::direct(sid)) };
         // Failures count as a check too, so a profile we can't read (or a
         // rate limit) isn't asked for again until tomorrow.
         let _ = self.db.set_setting(&format!("{SETTING_AVATAR_CHECKED}{sid}"), &now_millis().to_string()).await;
@@ -2091,10 +2098,12 @@ impl Actor {
                 return PhotoOutcome::ProfileFailed;
             }
         };
-        let chat = ConversationId::direct(sid);
         let Some(path) = path else {
             // No photo: drop ours, and their chat's (which can predate ours).
-            let chat_had = self.db.conversation(&chat).await.ok().flatten().and_then(|c| c.avatar_path);
+            let chat_had = match &chat {
+                Some(chat) => self.db.conversation(chat).await.ok().flatten().and_then(|c| c.avatar_path),
+                None => None,
+            };
             if saved.is_none() && chat_had.is_none() {
                 return PhotoOutcome::NoPhoto;
             }
@@ -2102,15 +2111,22 @@ impl Actor {
                 let _ = std::fs::remove_file(old);
             }
             let _ = self.db.remove_person_avatar(sid).await;
-            let _ = self.db.set_avatar(&chat, None).await;
+            if let Some(chat) = &chat {
+                let _ = self.db.set_avatar(chat, None).await;
+            }
             return PhotoOutcome::Changed;
         };
         let stem = crate::profiles::file_stem(sid, &path);
         let current = saved.map(std::path::Path::new).filter(|p| p.exists());
         if let Some(current) = current.filter(|p| p.file_stem().is_some_and(|s| s == stem.as_str())) {
             // Saved while they were only in a group: their 1:1 chat gets it too.
-            let chat_has = self.db.conversation(&chat).await.ok().flatten().map(|c| c.avatar_path);
-            if let Some(None) = chat_has && self.db.set_avatar(&chat, current.to_str()).await.is_ok() {
+            let chat_has = match &chat {
+                Some(chat) => self.db.conversation(chat).await.ok().flatten().map(|c| c.avatar_path),
+                None => None,
+            };
+            if let (Some(None), Some(chat)) = (chat_has, &chat)
+                && self.db.set_avatar(chat, current.to_str()).await.is_ok()
+            {
                 return PhotoOutcome::Changed;
             }
             return PhotoOutcome::Unchanged;
@@ -2132,7 +2148,9 @@ impl Actor {
         if let Some(old) = current.filter(|old| *old != std::path::Path::new(file)) {
             let _ = std::fs::remove_file(old);
         }
-        let _ = self.db.set_avatar(&chat, Some(file)).await;
+        if let Some(chat) = &chat {
+            let _ = self.db.set_avatar(chat, Some(file)).await;
+        }
         match self.db.set_person_avatar(sid, file).await {
             Ok(()) => PhotoOutcome::Changed,
             Err(_) => PhotoOutcome::DownloadFailed,
