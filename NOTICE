@@ -36,6 +36,9 @@ Bundled data and assets:
   - The ringtone from Signal Desktop (sounds/ringtone_minimal.ogg,
     AGPL-3.0-only), Copyright Signal Messenger, LLC, converted to AAC. See
     crates/app/assets/sounds.
+  - The app icon from Signal Desktop (build/icons/png, AGPL-3.0-only),
+    Copyright Signal Messenger, LLC, recolored from blue to rust. See
+    crates/app/assets/app-icon.
 
 JPEG optimization uses mozjpeg (IJG, BSD-3-Clause and Zlib licenses):
   This software is based in part on the work of the Independent JPEG Group.

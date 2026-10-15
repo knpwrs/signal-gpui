@@ -17,7 +17,17 @@ set -eu
 BIN="${1:-target/release/signal-gpui}"
 [ -x "$BIN" ] || { echo "no binary at $BIN; build it first" >&2; exit 1; }
 APP="$(dirname "$BIN")/Signal GPUI.app"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+# The app icon (Signal Desktop's, in rust), from its PNGs.
+ICONS="$(cd "$(dirname "$0")/.." && pwd)/crates/app/assets/app-icon"
+ICONSET="$(mktemp -d)/AppIcon.iconset"
+mkdir -p "$ICONSET"
+for n in 16 32 128 256 512; do
+    cp "$ICONS/${n}x${n}.png" "$ICONSET/icon_${n}x${n}.png"
+    cp "$ICONS/$((n * 2))x$((n * 2)).png" "$ICONSET/icon_${n}x${n}@2x.png"
+done
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+rm -rf "$(dirname "$ICONSET")"
 # A copy-on-write clone where the file system supports it.
 cp -c "$BIN" "$APP/Contents/MacOS/signal-gpui" 2>/dev/null || cp "$BIN" "$APP/Contents/MacOS/signal-gpui"
 cat > "$APP/Contents/Info.plist" <<PLIST
@@ -29,6 +39,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleName</key><string>Signal GPUI</string>
     <key>CFBundleDisplayName</key><string>Signal GPUI</string>
     <key>CFBundleExecutable</key><string>signal-gpui</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>0.1.0</string>
     <key>CFBundleVersion</key><string>1</string>
