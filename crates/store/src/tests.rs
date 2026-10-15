@@ -5,7 +5,12 @@ use super::*;
 /// directory is left for the OS to clear.)
 async fn test_db() -> AppDb {
     let dir = tempfile::tempdir().unwrap().keep();
-    AppDb::open(&dir.join("app.db"), &[3; 32]).await.unwrap()
+    let db = AppDb::open(&dir.join("app.db"), &[3; 32]).await.unwrap();
+    // Never closed, as the app keeps its pools: sqlx closing connections on
+    // its threads at exit races SQLCipher's exit-time shutdown, which
+    // crashed the test process after every test had passed.
+    std::mem::forget(db.clone());
+    db
 }
 
 fn conv(s: &str) -> ConversationId {
