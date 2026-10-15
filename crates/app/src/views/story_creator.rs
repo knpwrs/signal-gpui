@@ -59,20 +59,39 @@ enum TextBackground {
     Inverse,
 }
 
-/// An MP4's length in seconds, from its movie header (`mvhd`), as Desktop
-/// reads it before posting a video.
+/// The boxes in `data`: `(type, contents)`, as MP4 lays them out (a
+/// 32-bit size, or 1 and a 64-bit one, or 0 for "to the end").
+fn mp4_boxes(data: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
+    let mut at = 0usize;
+    std::iter::from_fn(move || {
+        let header = data.get(at..at + 8)?;
+        let kind = &header[4..8];
+        let size32 = u32::from_be_bytes(header[..4].try_into().ok()?) as usize;
+        let (start, size) = match size32 {
+            0 => (at + 8, data.len() - at),
+            1 => (at + 16, usize::try_from(u64::from_be_bytes(data.get(at + 8..at + 16)?.try_into().ok()?)).ok()?),
+            size => (at + 8, size),
+        };
+        let end = at.checked_add(size)?;
+        if size < start - at || end > data.len() {
+            return None;
+        }
+        let contents = &data[start..end];
+        at = end;
+        Some((kind, contents))
+    })
+}
+
+/// An MP4's length in seconds, from its movie header (`moov` → `mvhd`),
+/// as Desktop reads it before posting a video.
 pub fn mp4_seconds(bytes: &[u8]) -> Option<f64> {
-    let at = bytes.windows(4).position(|w| w == b"mvhd")? + 4;
-    let version = *bytes.get(at)?;
+    let (_, moov) = mp4_boxes(bytes).find(|(kind, _)| *kind == b"moov")?;
+    let (_, mvhd) = mp4_boxes(moov).find(|(kind, _)| *kind == b"mvhd")?;
+    let version = *mvhd.first()?;
     let read = |from: usize, len: usize| -> Option<u64> {
-        let slice = bytes.get(from..from + len)?;
-        Some(slice.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b)))
+        Some(mvhd.get(from..from + len)?.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b)))
     };
-    let (timescale, duration) = if version == 1 {
-        (read(at + 4 + 16, 4)?, read(at + 4 + 20, 8)?)
-    } else {
-        (read(at + 4 + 8, 4)?, read(at + 4 + 12, 4)?)
-    };
+    let (timescale, duration) = if version == 1 { (read(20, 4)?, read(24, 8)?) } else { (read(12, 4)?, read(16, 4)?) };
     (timescale > 0).then(|| duration as f64 / timescale as f64)
 }
 
@@ -421,20 +440,29 @@ impl Render for StoryCreator {
 mod tests {
     use super::*;
 
+    fn boxed(kind: &[u8; 4], contents: &[u8]) -> Vec<u8> {
+        let mut out = ((contents.len() + 8) as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(kind);
+        out.extend_from_slice(contents);
+        out
+    }
+
     fn mp4(version: u8, timescale: u32, duration: u64) -> Vec<u8> {
-        let mut out = b"\0\0\0\x20ftypisom".to_vec();
-        out.extend_from_slice(b"\0\0\0\x6cmvhd");
-        out.push(version);
-        out.extend_from_slice(&[0, 0, 0]);
+        let mut mvhd = vec![version, 0, 0, 0];
         if version == 1 {
-            out.extend_from_slice(&[0; 16]);
-            out.extend_from_slice(&timescale.to_be_bytes());
-            out.extend_from_slice(&duration.to_be_bytes());
+            mvhd.extend_from_slice(&[0; 16]);
+            mvhd.extend_from_slice(&timescale.to_be_bytes());
+            mvhd.extend_from_slice(&duration.to_be_bytes());
         } else {
-            out.extend_from_slice(&[0; 8]);
-            out.extend_from_slice(&timescale.to_be_bytes());
-            out.extend_from_slice(&(duration as u32).to_be_bytes());
+            mvhd.extend_from_slice(&[0; 8]);
+            mvhd.extend_from_slice(&timescale.to_be_bytes());
+            mvhd.extend_from_slice(&(duration as u32).to_be_bytes());
         }
+        let mut out = boxed(b"ftyp", b"isom");
+        // Video data before the movie box, holding the bytes "mvhd" (a
+        // decoy for anything that searches rather than reads the boxes).
+        out.extend(boxed(b"mdat", b"....mvhd\xff\xff\xff\xff...."));
+        out.extend(boxed(b"moov", &boxed(b"mvhd", &mvhd)));
         out
     }
 
