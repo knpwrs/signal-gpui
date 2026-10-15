@@ -12,3 +12,8 @@ upstream workspace). Changes:
 - `src/manager/registered.rs`: the receiving websocket sends
   `X-Signal-Receive-Stories: true`, so the server delivers stories (upstream
   hard-codes `false`).
+
+## libsignal-service
+
+whisperfish/libsignal-service-rs at `fb92b13c82fde40ba4d10696cf79aa4f36ce25f1`
+(presage's), without its examples and dev-dependencies. Unchanged so far.
