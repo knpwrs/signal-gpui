@@ -423,7 +423,10 @@ impl Actor {
             people
         };
         match my_story {
-            Some(list) if !list.block_list => (list.members, list.allows_replies),
+            Some(list) if !list.block_list => {
+                let members = list.members.into_iter().filter(|m| m != &me && m != signal_store::SIGNAL_ACI).collect();
+                (members, list.allows_replies)
+            }
             Some(list) => {
                 let mut people = connections().await;
                 people.retain(|p| !list.members.contains(p));
@@ -452,11 +455,12 @@ impl Actor {
                 }
             }
         };
-        for (ix, target) in targets.into_iter().enumerate() {
+        for target in targets {
             // Desktop: lists share one timestamp; each group gets its own.
             let timestamp = match &target {
                 crate::StoryTarget::MyStory => base,
-                crate::StoryTarget::Group(_) => base + ix as i64 + 1,
+                // Its own, so a later send never takes it.
+                crate::StoryTarget::Group(_) => self.next_timestamp(),
             };
             let (recipients, allows_replies, group) = match &target {
                 crate::StoryTarget::MyStory => {
