@@ -51,6 +51,30 @@ use anyhow::Context as _;
 
 pub(crate) type SignalManager = Manager<SqliteStore, Registered>;
 
+/// How checking someone's profile photo went, for the batch's log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhotoOutcome {
+    Changed,
+    Unchanged,
+    NoPhoto,
+    NoKey,
+    ProfileFailed,
+    DownloadFailed,
+}
+
+impl PhotoOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Changed => "updated",
+            Self::Unchanged => "unchanged",
+            Self::NoPhoto => "no photo",
+            Self::NoKey => "no profile key",
+            Self::ProfileFailed => "profile fetch failed",
+            Self::DownloadFailed => "download failed",
+        }
+    }
+}
+
 /// Images up to this size are downloaded as soon as they arrive.
 /// When this device was linked (unix millis).
 const SETTING_DEVICE_CREATED: &str = "device.created_at";
@@ -60,6 +84,9 @@ const SETTING_HISTORY_PENDING: &str = "history.pending";
 /// its photo (unix millis).
 const SETTING_AVATAR_CHECKED: &str = "avatar.checked.";
 const AVATAR_CHECK_INTERVAL_MS: i64 = 24 * 60 * 60 * 1000;
+/// `group.fetch_failed.<conversation id>`: when the group server last
+/// refused us that group (unix millis).
+const SETTING_GROUP_FETCH_FAILED: &str = "group.fetch_failed.";
 const AVATAR_CHECKS_PER_SYNC: usize = 100;
 const AVATAR_BATCH_DELAY: Duration = Duration::from_secs(5 * 60);
 /// Read syncs kept for messages not here yet.
@@ -1940,9 +1967,27 @@ impl Actor {
         // The Signal chat's account is made up: it has no profile.
         people.remove(signal_store::SIGNAL_ACI);
         let now = now_millis();
+        // Group members' profile keys, read once (a profile can't be read
+        // without one).
+        let group_keys: HashMap<Aci, ProfileKey> = self
+            .store
+            .groups()
+            .await
+            .map(|groups| groups.flatten().flat_map(|(_, g)| g.members.into_iter().map(|m| (m.aci, m.profile_key))).collect())
+            .unwrap_or_default();
         let mut due = Vec::new();
+        let mut keyless = 0usize;
         for sid in people {
             let has = saved.get(&sid).is_some_and(|p| std::path::Path::new(p).exists());
+            // No key, no photo: left out until one arrives, rather than
+            // filling every batch and starving those after them.
+            let Some(aci) = Aci::parse_from_service_id_string(&sid) else { continue };
+            let has_key = group_keys.contains_key(&aci)
+                || matches!(self.store.profile_key(&ServiceId::from(aci)).await, Ok(Some(_)));
+            if !has_key {
+                keyless += 1;
+                continue;
+            }
             let checked: i64 = self
                 .db
                 .setting(&format!("{SETTING_AVATAR_CHECKED}{sid}"))
@@ -1958,8 +2003,15 @@ impl Actor {
         due.sort();
         let more = due.len() > AVATAR_CHECKS_PER_SYNC;
         let mut changed = false;
+        let mut outcomes: HashMap<&'static str, usize> = HashMap::new();
+        let checking = due.len().min(AVATAR_CHECKS_PER_SYNC);
         for (_, _, sid) in due.into_iter().take(AVATAR_CHECKS_PER_SYNC) {
-            changed |= self.refresh_person_avatar(manager, &sid, saved.get(&sid).map(String::as_str), dir).await;
+            let outcome = self.refresh_person_avatar(manager, &sid, saved.get(&sid).map(String::as_str), dir).await;
+            changed |= outcome == PhotoOutcome::Changed;
+            *outcomes.entry(outcome.label()).or_default() += 1;
+        }
+        if checking > 0 || keyless > 0 {
+            info!(checked = checking, ?outcomes, no_profile_key = keyless, more, "profile photos");
         }
         (changed, more)
     }
@@ -1967,10 +2019,16 @@ impl Actor {
     /// Fetches their profile and brings their photo up to date: downloaded
     /// when its avatar path differs from the one saved, removed when they
     /// have none. Kept for their 1:1 chat and wherever they appear.
-    async fn refresh_person_avatar(&self, manager: &SignalManager, sid: &str, saved: Option<&str>, dir: &std::path::Path) -> bool {
-        let Some(aci) = Aci::parse_from_service_id_string(sid) else { return false };
+    async fn refresh_person_avatar(
+        &self,
+        manager: &SignalManager,
+        sid: &str,
+        saved: Option<&str>,
+        dir: &std::path::Path,
+    ) -> PhotoOutcome {
+        let Some(aci) = Aci::parse_from_service_id_string(sid) else { return PhotoOutcome::NoKey };
         // Someone known only from a group has their key in the group.
-        let Some(key) = self.profile_key_of(&ServiceId::from(aci)).await else { return false };
+        let Some(key) = self.profile_key_of(&ServiceId::from(aci)).await else { return PhotoOutcome::NoKey };
         // Failures count as a check too, so a profile we can't read (or a
         // rate limit) isn't asked for again until tomorrow.
         let _ = self.db.set_setting(&format!("{SETTING_AVATAR_CHECKED}{sid}"), &now_millis().to_string()).await;
@@ -1978,7 +2036,7 @@ impl Actor {
             Ok(path) => path,
             Err(error) => {
                 debug!(error = %format!("{error:#}"), member = %sid, "profile fetch failed");
-                return false;
+                return PhotoOutcome::ProfileFailed;
             }
         };
         let chat = ConversationId::direct(sid);
@@ -1986,44 +2044,47 @@ impl Actor {
             // No photo: drop ours, and their chat's (which can predate ours).
             let chat_had = self.db.conversation(&chat).await.ok().flatten().and_then(|c| c.avatar_path);
             if saved.is_none() && chat_had.is_none() {
-                return false;
+                return PhotoOutcome::NoPhoto;
             }
             for old in saved.into_iter().chain(chat_had.as_deref()) {
                 let _ = std::fs::remove_file(old);
             }
             let _ = self.db.remove_person_avatar(sid).await;
             let _ = self.db.set_avatar(&chat, None).await;
-            return true;
+            return PhotoOutcome::Changed;
         };
         let stem = crate::profiles::file_stem(sid, &path);
         let current = saved.map(std::path::Path::new).filter(|p| p.exists());
         if let Some(current) = current.filter(|p| p.file_stem().is_some_and(|s| s == stem.as_str())) {
             // Saved while they were only in a group: their 1:1 chat gets it too.
             let chat_has = self.db.conversation(&chat).await.ok().flatten().map(|c| c.avatar_path);
-            if let Some(None) = chat_has {
-                return self.db.set_avatar(&chat, current.to_str()).await.is_ok();
+            if let Some(None) = chat_has && self.db.set_avatar(&chat, current.to_str()).await.is_ok() {
+                return PhotoOutcome::Changed;
             }
-            return false;
+            return PhotoOutcome::Unchanged;
         }
         let bytes = match crate::profiles::download_avatar(manager, &path, key).await {
             Ok(bytes) => bytes,
             Err(error) => {
                 debug!(error = %format!("{error:#}"), member = %sid, "profile photo download failed");
-                return false;
+                return PhotoOutcome::DownloadFailed;
             }
         };
         let ext = if bytes.starts_with(b"\x89PNG") { "png" } else { "jpg" };
         let file = dir.join(format!("{stem}.{ext}"));
         if let Err(error) = std::fs::write(&file, &bytes) {
             warn!(%error, "failed to save avatar");
-            return false;
+            return PhotoOutcome::DownloadFailed;
         }
-        let Some(file) = file.to_str() else { return false };
+        let Some(file) = file.to_str() else { return PhotoOutcome::DownloadFailed };
         if let Some(old) = current.filter(|old| *old != std::path::Path::new(file)) {
             let _ = std::fs::remove_file(old);
         }
         let _ = self.db.set_avatar(&chat, Some(file)).await;
-        self.db.set_person_avatar(sid, file).await.is_ok()
+        match self.db.set_person_avatar(sid, file).await {
+            Ok(()) => PhotoOutcome::Changed,
+            Err(_) => PhotoOutcome::DownloadFailed,
+        }
     }
 
     /// Brings a group's photo up to date: downloaded when the group's avatar
@@ -2033,9 +2094,17 @@ impl Actor {
     async fn refresh_group_avatar(&self, manager: &SignalManager, key: [u8; 32], fetch: bool) -> bool {
         let conversation = ConversationId::group(&key);
         let stored = if fetch { None } else { self.store.group(key).await.ok().flatten().map(|g| g.avatar) };
+        let failed_key = format!("{SETTING_GROUP_FETCH_FAILED}{}", conversation.0);
         let path = match stored {
             Some(path) => path,
             None => {
+                // A group the server wouldn't give us (one we're no longer
+                // in) is asked again a day later, not every sync.
+                let failed_at: i64 =
+                    self.db.setting(&failed_key).await.ok().flatten().and_then(|v| v.parse().ok()).unwrap_or(0);
+                if !fetch && now_millis() - failed_at < AVATAR_CHECK_INTERVAL_MS {
+                    return false;
+                }
                 let fetched = async {
                     let group = crate::groups::GroupSession::new(manager, key).await?.fetch().await?;
                     let path = group.avatar.clone();
@@ -2046,7 +2115,8 @@ impl Actor {
                 match fetched {
                     Ok(path) => path,
                     Err(error) => {
-                        warn!(error = %format!("{error:#}"), "couldn't fetch a group for its photo");
+                        warn!(error = %format!("{error:#}"), "couldn't fetch a group for its photo (asking again tomorrow)");
+                        let _ = self.db.set_setting(&failed_key, &now_millis().to_string()).await;
                         return false;
                     }
                 }
