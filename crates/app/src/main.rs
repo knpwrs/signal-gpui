@@ -203,7 +203,9 @@ fn main() -> Result<()> {
             titlebar: Some(TitlebarOptions {
                 title: Some("Signal".into()),
                 appears_transparent: true,
-                traffic_light_position: Some(point(px(16.), px(18.))),
+                // Centered over the tabs' rail (80 wide; the three buttons
+                // span about 59), like Desktop's.
+                traffic_light_position: Some(point(px(10.5), px(18.))),
             }),
             app_id: Some("org.signal-gpui".into()),
             focus: !background,
