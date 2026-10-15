@@ -89,10 +89,12 @@ impl Actor {
             info!(count = due.len(), "release notes: adding");
             self.add_release_notes(&client, due, phone).await?;
         }
-        if megaphones_saved {
-            self.db.set_setting(SETTING_MANIFEST_HASH, &hash).await?;
-        }
         self.db.set_setting(SETTING_DESKTOP_VERSION, &current.to_string()).await?;
+        if !megaphones_saved {
+            // Tried again on the error schedule (three hours), not a day.
+            anyhow::bail!("a megaphone wasn't saved");
+        }
+        self.db.set_setting(SETTING_MANIFEST_HASH, &hash).await?;
         Ok(())
     }
 
