@@ -308,6 +308,8 @@ impl CallView {
         div()
             .absolute()
             .inset_0()
+            // (Clicks stop here, not on the chat beneath.)
+            .occlude()
             .flex()
             .flex_col()
             .bg(call_bg())
@@ -426,6 +428,8 @@ impl CallView {
         div()
             .absolute()
             .inset_0()
+            // (Clicks stop here, not on the chat beneath.)
+            .occlude()
             .bg(call_bg())
             .text_color(gpui_kit::white())
             // Their video fills the window; without it, their photo.
@@ -655,6 +659,7 @@ impl CallView {
         let remote_video = (call.remote_video || call.remote_sharing) && self.remote.read(cx).has_frame();
         div()
             .id("call-pip")
+            .occlude()
             .absolute()
             .right_4()
             .bottom(px(88.))
@@ -735,6 +740,7 @@ impl CallView {
             .child(
                 div()
                     .w(px(560.))
+                    .occlude()
                     .flex()
                     .items_center()
                     .gap_3()
