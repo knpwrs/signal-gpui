@@ -3994,7 +3994,9 @@ mod tests {
     #[gpui_kit::test]
     fn up_arrow_edits_your_last_message(cx: &mut TestAppContext) {
         let (backend, _dir) = demo_backend(cx);
-        wait_for_messages(&backend, NOTE_TO_SELF, 1, |m| !m.body.is_empty());
+        // The demo's last note, so the chat is done being seeded (an earlier
+        // one is a photo without text).
+        wait_for_messages(&backend, NOTE_TO_SELF, 1, |m| m.body.starts_with("Notes from the hike"));
         let (mut cx, view) = open_view(cx, &backend, NOTE_TO_SELF);
         let mut last = None;
         for _ in 0..300 {
