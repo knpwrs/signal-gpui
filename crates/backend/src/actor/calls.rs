@@ -433,6 +433,9 @@ impl Actor {
                     }
                     call.connected = true;
                 }
+                // What we chose before it connected (camera on in the lobby,
+                // say) went to no one; now it reaches them.
+                self.with_calls(|calls| calls.send_sender_status());
                 self.emit_call();
             }
             State::Ended(reason) => self.end_call(&peer, call_id, Some(reason)).await,

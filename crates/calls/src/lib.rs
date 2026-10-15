@@ -367,6 +367,8 @@ pub struct Calls {
     /// The chosen camera's name (`None`: the first).
     camera_choice: Option<String>,
     audio: AudioTrack,
+    /// Our microphone is on (as we last told them).
+    audio_on: bool,
     video: VideoTrack,
     source: VideoSource,
     remote: FrameSlot,
@@ -424,6 +426,7 @@ impl Calls {
             local,
             group_frames,
             emit,
+            audio_on: true,
             camera: None,
             share: None,
         })
@@ -490,6 +493,7 @@ impl Calls {
 
     /// Mutes or unmutes our microphone, and tells them.
     pub fn set_audio_enabled(&mut self, enabled: bool) {
+        self.audio_on = enabled;
         self.audio.set_enabled(enabled);
         if let Ok(mut connection) = self.manager.active_connection() {
             let _ = connection.update_sender_status(signaling::SenderStatus { audio_enabled: Some(enabled), ..Default::default() });
@@ -672,6 +676,20 @@ impl Calls {
         self.set_video_enabled(camera);
     }
 
+    /// Tells them our microphone, camera and sharing state. Set before
+    /// the call connected (in the lobby, say), it reached no one: what's
+    /// sent goes over the call's connection.
+    pub fn send_sender_status(&mut self) {
+        let (video, sharing, audio) = (self.camera.is_some() || self.share.is_some(), self.share.is_some(), self.audio_on);
+        if let Ok(mut connection) = self.manager.active_connection() {
+            let _ = connection.update_sender_status(signaling::SenderStatus {
+                video_enabled: Some(video),
+                sharing_screen: Some(sharing),
+                audio_enabled: Some(audio),
+            });
+        }
+    }
+
     pub fn camera_on(&self) -> bool {
         self.camera.is_some()
     }
@@ -709,6 +727,7 @@ impl Calls {
         self.local.clear();
         self.remote.clear();
         self.audio.set_enabled(true);
+        self.audio_on = true;
     }
 }
 
