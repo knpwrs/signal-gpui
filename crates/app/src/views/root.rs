@@ -30,6 +30,11 @@ pub struct RootView {
     call: Option<Entity<crate::views::call::CallView>>,
     /// The chat list's width as dragged (see `crate::sidebar_width`).
     sidebar_preferred: f32,
+    /// Whether an account was ready when last seen.
+    had_account: bool,
+    /// Counts account changes, so a width read for an earlier account
+    /// isn't applied to the next.
+    account_generation: u64,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -91,6 +96,18 @@ impl RootView {
                 }
             }),
             cx.observe(&state, |this, state, cx| {
+                // The width is the account's setting: an unlink wipes it, so
+                // start over, and read the next account's once it's ready.
+                let has_account = state.read(cx).account.is_some();
+                if this.had_account != has_account {
+                    this.account_generation += 1;
+                }
+                if this.had_account && !has_account {
+                    this.sidebar_preferred = crate::sidebar_width::DEFAULT_WIDTH;
+                } else if !this.had_account && has_account {
+                    this.load_sidebar_width(cx);
+                }
+                this.had_account = has_account;
                 let active = {
                     let s = state.read(cx);
                     s.call.is_some() || s.lobby.is_some()
@@ -112,23 +129,28 @@ impl RootView {
             video_viewer: None,
             call: None,
             sidebar_preferred: crate::sidebar_width::DEFAULT_WIDTH,
+            had_account: false,
+            account_generation: 0,
             _subscriptions: subscriptions,
         };
-        this.load_sidebar_width(cx);
+        // (The width loads once the account is ready: see the observer.)
         this
     }
 
     /// The width last dragged to, from the settings.
     fn load_sidebar_width(&self, cx: &mut Context<Self>) {
         let backend = self.state.read(cx).backend.clone();
+        let generation = self.account_generation;
         cx.spawn(async move |this, cx| {
             let db = backend.db().clone();
             let saved = backend.spawn(async move { db.setting(SETTING_SIDEBAR_WIDTH).await }).await;
             let width = saved.ok().flatten().and_then(|w| w.parse::<f32>().ok());
             if let Some(width) = width.filter(|w| w.is_finite()) {
                 let _ = this.update(cx, |this, cx| {
-                    this.sidebar_preferred = width;
-                    cx.notify();
+                    if this.account_generation == generation {
+                        this.sidebar_preferred = width;
+                        cx.notify();
+                    }
                 });
             }
         })
