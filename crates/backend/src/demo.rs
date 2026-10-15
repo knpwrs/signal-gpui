@@ -172,6 +172,7 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
             local_path: path.to_str().map(Into::into),
             sticker: false,
             gif: false,
+            voice: false,
             remote: None,
         })
     };
@@ -243,6 +244,24 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
     let home_id = db.insert_message(&home).await?;
     db.insert_message(&outgoing(MAYA, now - 2 * DAY - 3 * HOUR + 5 * MINUTE, "Yep! Thanks again for dinner", DeliveryStatus::Read)).await?;
     db.insert_message(&incoming(MAYA, MAYA, now - 2 * DAY - 3 * HOUR + 7 * MINUTE, "Anytime. Next one's at our place")).await?;
+    // A voice message: synthesized tones, not anyone's voice.
+    let voice_path = data_dir.join("attachments").join("demo-voice.wav");
+    if std::fs::write(&voice_path, demo_voice_wav()).is_ok() {
+        let mut voice = incoming(MAYA, MAYA, now - 2 * DAY - 3 * HOUR + 9 * MINUTE, "");
+        voice.attachments = vec![AttachmentMeta {
+            content_type: "audio/wav".into(),
+            file_name: None,
+            size: std::fs::metadata(&voice_path).map_or(0, |m| m.len()),
+            width: None,
+            height: None,
+            local_path: voice_path.to_str().map(Into::into),
+            sticker: false,
+            gif: false,
+            voice: true,
+            remote: None,
+        }];
+        db.insert_message(&voice).await?;
+    }
     db.set_reaction(home_id, react("❤️", None)).await?;
     let mut article = incoming(MAYA, MAYA, now - 50 * MINUTE, "This is the post I was telling you about: https://signal.org/blog/");
     let article_image = image("demo-preview-square.png", 160, 160);
@@ -299,6 +318,7 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
             local_path: clip.to_str().map(Into::into),
             sticker: false,
             gif: true,
+            voice: false,
             remote: None,
         }];
         db.insert_message(&gif).await?;
@@ -632,6 +652,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                             local_path: path.to_str().map(Into::into),
                             sticker: false,
                             gif: false,
+                            voice: false,
                             remote: None,
                         })
                     });
@@ -870,6 +891,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                         local_path: path.to_str().map(Into::into),
                         sticker: false,
                         gif: true,
+                        voice: false,
                         remote: None,
                     }],
                     link_preview: None,
@@ -916,6 +938,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                         local_path: sticker.path.to_str().map(Into::into),
                         sticker: true,
                         gif: false,
+                        voice: false,
                         remote: None,
                     }],
                     link_preview: None,
@@ -962,6 +985,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                         local_path: path.to_str().map(Into::into),
                         sticker: false,
                         gif: false,
+                        voice: false,
                         remote: None,
                     });
                 }
@@ -1019,6 +1043,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                         local_path: path.to_str().map(Into::into),
                         sticker: false,
                         gif: false,
+                        voice: false,
                         remote: None,
                     }],
                     link_preview: None,
@@ -1066,6 +1091,39 @@ async fn demo_mentions(
         names.push(chat.map_or_else(|| "Unknown".to_owned(), |c| c.title));
     }
     crate::mapping::render_body(body, mentions, &names, &crate::mapping::wire_styles(body, styles))
+}
+
+/// Six seconds of tones that rise and fall like speech (8 kHz mono WAV),
+/// for the demo's voice message.
+fn demo_voice_wav() -> Vec<u8> {
+    const RATE: u32 = 8000;
+    let samples: Vec<i16> = (0..RATE * 6)
+        .map(|i| {
+            let t = i as f32 / RATE as f32;
+            // Syllables: a loudness that swells and dips a few times a second.
+            let envelope = ((t * 2.7).sin() * (t * 0.9).sin()).abs().powf(0.7);
+            let tone = (t * std::f32::consts::TAU * (180. + 40. * (t * 1.3).sin())).sin();
+            (tone * envelope * 12_000.) as i16
+        })
+        .collect();
+    let data_len = samples.len() as u32 * 2;
+    let mut wav = Vec::with_capacity(44 + data_len as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&RATE.to_le_bytes());
+    wav.extend_from_slice(&(RATE * 2).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    for sample in samples {
+        wav.extend_from_slice(&sample.to_le_bytes());
+    }
+    wav
 }
 
 /// The quote for a reply to `quote`, as the real backend stores it.

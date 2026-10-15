@@ -449,6 +449,7 @@ pub fn attachment_meta(p: &AttachmentPointer) -> AttachmentMeta {
         local_path: None,
         sticker: false,
         gif: p.flags.unwrap_or(0) & attachment_pointer::Flags::Gif as u32 != 0,
+        voice: p.flags.unwrap_or(0) & attachment_pointer::Flags::VoiceMessage as u32 != 0,
         remote: None,
     }
 }

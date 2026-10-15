@@ -410,7 +410,15 @@ async fn import_item(
                 .unwrap_or_default();
             ranges.sort_by_key(|(start, _)| *start);
             let mentions: Vec<String> = ranges.into_iter().map(|(_, sid)| sid).collect();
-            let attachments = standard.attachments.iter().filter_map(|a| a.pointer.as_ref()).map(attachment).collect();
+            let attachments = standard
+                .attachments
+                .iter()
+                .filter_map(|a| {
+                    let mut meta = attachment(a.pointer.as_ref()?);
+                    meta.voice = a.flag.enum_value().ok() == Some(proto::message_attachment::Flag::VOICE_MESSAGE);
+                    Some(meta)
+                })
+                .collect();
             let link_preview = standard.linkPreview.first().map(|p| LinkPreview {
                 url: p.url.clone(),
                 title: p.title.clone(),
@@ -516,7 +524,7 @@ async fn import_item(
     }
     let id = db.insert_message(&message).await?;
     for (index, attachment) in message.attachments.iter().enumerate() {
-        let photo = attachment.gif || attachment.content_type.starts_with("image/");
+        let photo = attachment.gif || attachment.voice || attachment.content_type.starts_with("image/");
         if attachment.remote.is_some() && photo && attachment.size <= crate::actor::AUTO_DOWNLOAD_MAX {
             downloads.push((id, index));
         }
@@ -584,6 +592,7 @@ fn attachment(pointer: &proto::FilePointer) -> AttachmentMeta {
         local_path: None,
         sticker: false,
         gif: false,
+        voice: false,
         remote: locator.and_then(remote),
     }
 }

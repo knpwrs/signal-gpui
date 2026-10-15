@@ -1223,7 +1223,7 @@ impl ConversationView {
                             .pt_1p5()
                             .pb_2()
                             .children(rest.iter().enumerate().map(|(ix, a)| {
-                                render_attachment(message.id, ix + 1, a, fg, palette, cx)
+                                render_attachment(message.id, ix + 1, a, fg, palette, &self.state, cx)
                             }))
                             .when(caption, |d| d.child(message_text(message, fg, self.revealed_spoilers.contains(&message.id), spacer.as_deref().map(|s| (s, bg)), cx)))
                             .when_some(meta, |d, m| d.child(place_meta(m, inline_meta))),
@@ -1296,7 +1296,7 @@ impl ConversationView {
                 d.child(author_line(author_name, author_color, author_label))
             })
             .when_some(message.quote.clone(), |d, quote| d.child(render_quote(quote, fg, palette)))
-            .children(message.attachments.iter().enumerate().map(|(ix, a)| render_attachment(message.id, ix, a, fg, palette, cx)))
+            .children(message.attachments.iter().enumerate().map(|(ix, a)| render_attachment(message.id, ix, a, fg, palette, &self.state, cx)))
             .map(|d| {
                 if message.deleted {
                     d.child(div().italic().child(if outgoing {
@@ -2466,14 +2466,141 @@ fn viewed_image(attachment: &AttachmentMeta) -> Option<ViewedImage> {
     })
 }
 
+/// Desktop's waveform: bar width, the gap between bars, and heights.
+const WAVE_BAR: f32 = 2.;
+const WAVE_GAP: f32 = 2.;
+const WAVE_MIN: f32 = 4.;
+const WAVE_MAX: f32 = 20.;
+
+/// Desktop's audio player (`MessageAudio`): play or pause, the waveform
+/// (played bars in full colour, click one to go there), the time left (or
+/// the length), and while it plays the rate button.
+fn render_audio(
+    message_id: i64,
+    index: usize,
+    attachment: &AttachmentMeta,
+    fg: Hsla,
+    state: &Entity<AppState>,
+    cx: &mut Context<ConversationView>,
+) -> AnyElement {
+    let path = attachment.local_path.as_ref().map(std::path::PathBuf::from);
+    let wave = path.as_ref().and_then(|p| state.update(cx, |state, cx| state.waveform(p, cx)));
+    let (playing, position, duration, rate) = match state.read(cx).audio.as_ref() {
+        Some(audio) if audio.message_id == message_id && audio.index == index => {
+            let (position, duration) = audio.progress();
+            (Some(audio.is_playing()), position, duration, audio.rate)
+        }
+        _ => (None, 0., wave.as_ref().map_or(0., |(_, seconds)| *seconds), 1.),
+    };
+    let played = if duration > 0. { (position / duration).clamp(0., 1.) } else { 0. };
+    let peaks = wave.as_ref().map(|(peaks, _)| peaks.clone());
+    let id = |what: &str| SharedString::from(format!("audio-{what}-{message_id}-{index}"));
+    // The button: download first, then play or pause.
+    let button = div()
+        .id(id("button"))
+        .size(px(36.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .cursor_pointer()
+        .bg(Hsla { a: 0.15, ..fg })
+        .child(
+            Icon::new(match (&path, playing) {
+                (None, _) => IconName::Download,
+                (Some(_), Some(true)) => IconName::Pause,
+                _ => IconName::Play,
+            })
+            .size_4()
+            .text_color(fg),
+        )
+        .on_click({
+            let (state, path) = (state.clone(), path.clone());
+            move |_, _, cx| match &path {
+                Some(path) => state.update(cx, |state, cx| state.toggle_audio(message_id, index, path.clone(), cx)),
+                None => state.read(cx).send(Command::FetchAttachment { message_id, index }),
+            }
+        });
+    let bars = (0..crate::audio::BARS).map(|bar| {
+        let peak = peaks.as_ref().and_then(|p| p.get(bar).copied()).unwrap_or(0.);
+        // Not downloaded (or still decoding): flat, as Desktop shows it.
+        let height = if peaks.is_some() { WAVE_MIN + peak * (WAVE_MAX - WAVE_MIN) } else { WAVE_BAR };
+        let done = (bar as f64 + 0.5) / crate::audio::BARS as f64 <= played;
+        div()
+            .id(SharedString::from(format!("audio-bar-{message_id}-{index}-{bar}")))
+            .h(px(WAVE_MAX))
+            .w(px(WAVE_BAR + WAVE_GAP))
+            .flex()
+            .items_center()
+            .when_some(path.clone(), |d, path| {
+                let state = state.clone();
+                d.cursor_pointer().on_click(move |_, _, cx| {
+                    let fraction = bar as f64 / crate::audio::BARS as f64;
+                    state.update(cx, |state, cx| state.seek_audio(message_id, index, path.clone(), fraction, cx));
+                })
+            })
+            .child(div().w(px(WAVE_BAR)).h(px(height)).rounded_full().bg(if done { fg } else { Hsla { a: 0.4, ..fg } }))
+    });
+    // Desktop counts down while it plays.
+    let time = if playing.is_some() { crate::audio::clock(duration - position) } else { crate::audio::clock(duration) };
+    div()
+        .id(id("row"))
+        .flex()
+        .items_center()
+        .gap_2()
+        .py_1()
+        .child(button)
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().flex().items_center().children(bars))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_xs()
+                        .text_color(Hsla { a: 0.8, ..fg })
+                        .child(if path.is_some() {
+                            time
+                        } else {
+                            crate::views::common::format_size(attachment.size)
+                        })
+                        .when(playing.is_some(), |d| {
+                            let state = state.clone();
+                            d.child(
+                                div()
+                                    .id(id("rate"))
+                                    .px_1p5()
+                                    .rounded_full()
+                                    .cursor_pointer()
+                                    .bg(Hsla { a: 0.15, ..fg })
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(crate::audio::rate_label(rate))
+                                    .on_click(move |_, _, cx| state.update(cx, |state, cx| state.cycle_audio_rate(cx))),
+                            )
+                        }),
+                ),
+        )
+        .into_any_element()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_attachment(
     message_id: i64,
     index: usize,
     attachment: &AttachmentMeta,
     fg: Hsla,
     palette: Palette,
+    state: &Entity<AppState>,
     cx: &mut Context<ConversationView>,
 ) -> AnyElement {
+    if attachment.content_type.starts_with("audio/") {
+        return render_audio(message_id, index, attachment, fg, state, cx);
+    }
     let is_image = attachment.content_type.starts_with("image/");
     if let (true, Some(path)) = (is_image, attachment.local_path.as_ref()) {
         let (w, h) = match (attachment.width, attachment.height) {
@@ -3189,6 +3316,7 @@ mod tests {
                 local_path: Some("/tmp/x.png".into()),
                 sticker: false,
                 gif: false,
+                voice: false,
                 remote: None,
             }),
         };
@@ -3588,6 +3716,31 @@ mod tests {
         assert_eq!(sent.body, "hi @Maya Chen see you there");
         assert_eq!(sent.mentions.len(), 1);
         assert_eq!(&sent.body[sent.mentions[0].start..sent.mentions[0].start + sent.mentions[0].len], "@Maya Chen");
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn a_voice_message_shows_its_waveform(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        let voice = wait_for_messages(&backend, MAYA, 1, |m| m.attachments.first().is_some_and(|a| a.voice)).remove(0);
+        let path = std::path::PathBuf::from(voice.attachments[0].local_path.clone().unwrap());
+        let (mut cx, view) = open_view(cx, &backend, MAYA);
+        let state = view.read_with(&cx, |v, _| v.state.clone());
+        // Rendering the chat asks for the waveform; it's decoded in the
+        // background (nothing is played).
+        let mut wave = None;
+        for _ in 0..300 {
+            cx.run_until_parked();
+            wave = state.update(&mut cx, |s, cx| s.waveform(&path, cx));
+            if wave.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let (peaks, seconds) = wave.expect("decoded");
+        assert_eq!(peaks.len(), crate::audio::BARS);
+        assert!((seconds - 6.).abs() < 0.1, "{seconds}");
+        assert!(peaks.contains(&1.) && peaks.iter().any(|p| *p < 0.5), "it rises and falls");
         backend.shutdown();
     }
 

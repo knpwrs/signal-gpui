@@ -211,6 +211,7 @@ async fn delete_edit_attachments_and_search() {
         local_path: None,
         sticker: false,
         gif: false,
+        voice: false,
         remote: None,
     }];
     m.quote = Some(Quote { author: None, author_name: "You".into(), sent_at: 0, text: "q".into(), thumbnail: None });
@@ -273,6 +274,7 @@ async fn attachment_only_preview() {
         local_path: None,
         sticker: false,
         gif: false,
+        voice: false,
         remote: None,
     }];
     db.insert_message(&m).await.unwrap();
@@ -703,6 +705,7 @@ async fn media_messages_are_those_with_attachments_or_previews() {
         local_path: Some("/tmp/x.png".into()),
         sticker: false,
         gif: false,
+        voice: false,
         remote: None,
     }];
     let photo = db.insert_message(&photo).await.unwrap();

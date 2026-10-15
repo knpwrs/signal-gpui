@@ -147,6 +147,10 @@ pub struct AttachmentMeta {
     /// A looping, silent video sent as a GIF (Signal's GIF flag).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub gif: bool,
+    /// A voice message (Signal's voice-message flag): Desktop's audio player
+    /// and auto-download.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub voice: bool,
     /// Where to download it when no stored message holds its pointer (an
     /// attachment from transferred history).
     #[serde(default, skip_serializing_if = "Option::is_none")]

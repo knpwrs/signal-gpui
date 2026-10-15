@@ -762,9 +762,12 @@ impl Actor {
                     .into_iter()
                     .enumerate()
                     .filter(|(_, p)| {
-                        // Photos and GIFs (looping videos) download on their own.
-                        let gif = p.flags.unwrap_or(0) & attachment_pointer::Flags::Gif as u32 != 0;
-                        (gif || p.content_type.as_deref().is_some_and(|c| c.starts_with("image/")))
+                        // Photos, GIFs (looping videos) and voice messages
+                        // download on their own (as in Desktop).
+                        let flags = p.flags.unwrap_or(0);
+                        let gif = flags & attachment_pointer::Flags::Gif as u32 != 0;
+                        let voice = flags & attachment_pointer::Flags::VoiceMessage as u32 != 0;
+                        (gif || voice || p.content_type.as_deref().is_some_and(|c| c.starts_with("image/")))
                             && p.size.is_some_and(|size| u64::from(size) <= AUTO_DOWNLOAD_MAX)
                     })
                     .collect();
@@ -1694,6 +1697,7 @@ impl Actor {
             local_path: Some(path.to_string_lossy().into_owned()),
             sticker: false,
             gif: true,
+            voice: false,
             remote: None,
         };
         let Some((id, data, timestamp)) = self.store_outgoing(&conversation, String::new(), None, vec![meta], None).await
@@ -1747,6 +1751,7 @@ impl Actor {
             local_path: Some(sticker.path.to_string_lossy().into_owned()),
             sticker: true,
             gif: false,
+            voice: false,
             remote: None,
         };
         let Some((id, mut data, timestamp)) = self.store_outgoing(&conversation, String::new(), None, vec![meta], None).await
@@ -2561,6 +2566,7 @@ impl Actor {
                                 local_path: Some(path.to_string_lossy().into_owned()),
                                 sticker: false,
                                 gif: false,
+                                voice: false,
                                 remote: None,
                             })
                         }
@@ -2646,6 +2652,7 @@ impl Actor {
                 local_path: Some(path.to_string_lossy().into_owned()),
                 sticker: false,
                 gif: false,
+                voice: false,
                 remote: None,
             });
             files.push(Upload { path, file_name: image.file_name, file_type: None });
@@ -2704,6 +2711,7 @@ impl Actor {
             local_path: Some(path.to_string_lossy().into_owned()),
             sticker: false,
             gif: false,
+            voice: false,
             remote: None,
         };
         let wire_caption = caption.trim_end().to_owned();

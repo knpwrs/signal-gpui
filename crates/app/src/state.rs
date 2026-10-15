@@ -92,6 +92,38 @@ pub enum AppEvent {
     StickerUpload(signal_backend::sticker_upload::StickerUpload),
 }
 
+/// The audio attachment being played.
+pub struct AudioPlaying {
+    pub message_id: i64,
+    pub index: usize,
+    player: crate::audio::Player,
+    pub rate: f32,
+    /// Where it was when last seen playing: near the end, a stop is the end.
+    last_position: f64,
+    /// Redraws while it plays, and notices when it ends.
+    _poll: Task<()>,
+}
+
+impl AudioPlaying {
+    pub fn is_playing(&self) -> bool {
+        self.player.is_playing()
+    }
+
+    /// Where it is, and how long it is, in seconds.
+    pub fn progress(&self) -> (f64, f64) {
+        (self.player.position(), self.player.duration())
+    }
+}
+
+/// An audio file's waveform peaks (0 to 1) and its length in seconds.
+pub type Waveform = (std::rc::Rc<Vec<f32>>, f64);
+
+/// How often the audio player redraws its progress.
+const AUDIO_POLL: Duration = Duration::from_millis(50);
+/// Seen within this many seconds of the end, then stopped and rewound: it
+/// finished (rather than being paused at the start).
+const END_SLACK: f64 = 0.3;
+
 pub struct AppState {
     pub backend: Backend,
     pub screen: Screen,
@@ -114,6 +146,12 @@ pub struct AppState {
     pub has_giphy_key: bool,
     /// Decoded looping videos (GIFs), by file and width.
     loops: LoopCache<std::sync::Arc<gpui_kit::RenderImage>>,
+    /// The audio attachment or voice message playing (or paused), as
+    /// Desktop plays one at a time, whichever chat is open.
+    pub audio: Option<AudioPlaying>,
+    /// Audio files' waveforms and lengths (`None` while decoding, or if it
+    /// can't be).
+    waveforms: HashMap<std::path::PathBuf, Option<Waveform>>,
     /// Recently sent stickers, newest first: (pack id, sticker id).
     pub recent_stickers: Vec<(Vec<u8>, u32)>,
     /// How images are optimized before sending (our setting, not Signal's).
@@ -178,6 +216,8 @@ impl AppState {
             sticker_packs: Vec::new(),
             has_giphy_key: std::env::var_os("GIPHY_API_KEY").is_some(),
             loops: Default::default(),
+            audio: None,
+            waveforms: HashMap::new(),
             recent_stickers: Vec::new(),
             reload_task: None,
             reload_pending: false,
@@ -763,6 +803,109 @@ impl AppState {
             });
         })
         .detach();
+    }
+
+    /// Plays or pauses an audio attachment (`path`, downloaded); another
+    /// one playing stops, as in Desktop.
+    pub fn toggle_audio(&mut self, message_id: i64, index: usize, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        if let Some(audio) = self.audio.as_ref().filter(|a| a.message_id == message_id && a.index == index) {
+            if audio.player.is_playing() {
+                audio.player.pause();
+            } else {
+                audio.player.play();
+            }
+            cx.notify();
+            return;
+        }
+        self.start_audio(message_id, index, &path, 0., cx);
+    }
+
+    /// Plays from `fraction` of the way through (a click on the waveform).
+    pub fn seek_audio(&mut self, message_id: i64, index: usize, path: std::path::PathBuf, fraction: f64, cx: &mut Context<Self>) {
+        match self.audio.as_ref().filter(|a| a.message_id == message_id && a.index == index) {
+            Some(audio) => {
+                audio.player.seek(fraction * audio.player.duration());
+                cx.notify();
+            }
+            None => self.start_audio(message_id, index, &path, fraction, cx),
+        }
+    }
+
+    /// Desktop's rate button: 1×, 1.5×, 2×, 0.5×.
+    pub fn cycle_audio_rate(&mut self, cx: &mut Context<Self>) {
+        if let Some(audio) = &mut self.audio {
+            audio.rate = crate::audio::next_rate(audio.rate);
+            audio.player.set_rate(audio.rate);
+            cx.notify();
+        }
+    }
+
+    fn start_audio(&mut self, message_id: i64, index: usize, path: &std::path::Path, fraction: f64, cx: &mut Context<Self>) {
+        // The one playing stops first.
+        self.audio = None;
+        let player = match crate::audio::Player::open(path) {
+            Ok(player) => player,
+            Err(error) => return self.report_error(format!("Couldn't play it: {error:#}"), cx),
+        };
+        if fraction > 0. {
+            player.seek(fraction * player.duration());
+        }
+        player.play();
+        let poll = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(AUDIO_POLL).await;
+                let ended = this.update(cx, |this, cx| {
+                    let Some(audio) = &mut this.audio else { return true };
+                    if audio.player.is_playing() {
+                        audio.last_position = audio.player.position();
+                        cx.notify();
+                        return false;
+                    }
+                    // At the end it stops by itself (and rewinds): done.
+                    // Paused (anywhere, the start too), it waits.
+                    let ended = audio.player.position() <= 0.
+                        && audio.last_position >= audio.player.duration() - END_SLACK;
+                    if ended {
+                        this.audio = None;
+                        cx.notify();
+                    }
+                    ended
+                });
+                if ended.unwrap_or(true) {
+                    break;
+                }
+            }
+        });
+        self.audio = Some(AudioPlaying { message_id, index, player, rate: 1., last_position: 0., _poll: poll });
+        cx.notify();
+    }
+
+    /// A downloaded audio file's waveform and length, decoding it (once, in
+    /// the background) the first time it's asked for.
+    pub fn waveform(&mut self, path: &std::path::Path, cx: &mut Context<Self>) -> Option<Waveform> {
+        if let Some(known) = self.waveforms.get(path) {
+            return known.clone();
+        }
+        self.waveforms.insert(path.to_owned(), None);
+        let path = path.to_owned();
+        let decode = cx.background_executor().spawn({
+            let path = path.clone();
+            async move { crate::audio::waveform(&path) }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = decode.await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok((peaks, seconds)) => {
+                        this.waveforms.insert(path, Some((std::rc::Rc::new(peaks), seconds)));
+                    }
+                    Err(error) => tracing::warn!(error = %format!("{error:#}"), "couldn't read an audio file's waveform"),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        None
     }
 
     pub fn view_image(&self, image: crate::views::image_viewer::ViewedImage, cx: &mut Context<Self>) {
