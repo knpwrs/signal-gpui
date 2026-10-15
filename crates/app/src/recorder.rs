@@ -145,7 +145,9 @@ impl Recorder for Microphone {
     fn level(&mut self) -> f32 {
         unsafe {
             self.recorder.updateMeters();
-            decibels_to_level(self.recorder.peakPowerForChannel(0))
+            // The loudness since the last reading, as Desktop's encoder
+            // measures each 100 ms (a mean square, in decibels).
+            decibels_to_level(self.recorder.averagePowerForChannel(0))
         }
     }
 
@@ -157,10 +159,15 @@ impl Recorder for Microphone {
     }
 }
 
-/// A meter reading (decibels below full scale, -160 for silence) as a
-/// share of full scale.
+/// Below this, a bar is empty (Desktop's `NOISE_BED`).
+const NOISE_BED: f32 = -60.;
+
+/// A meter reading (decibels below full scale, -160 for silence) as a bar's
+/// height from 0 to 1: Desktop's `toPeak` (`ts/util/waveformBuilder`),
+/// linear in decibels from the noise bed to full scale, so speech fills
+/// half the bar or more rather than a few percent.
 pub fn decibels_to_level(decibels: f32) -> f32 {
-    if decibels.is_finite() { 10f32.powf(decibels / 20.).clamp(0., 1.) } else { 0. }
+    if decibels.is_finite() { ((decibels - NOISE_BED) / -NOISE_BED).clamp(0., 1.) } else { 0. }
 }
 
 #[cfg(test)]
@@ -233,8 +240,9 @@ mod tests {
     #[test]
     fn meter_readings_become_levels() {
         assert_eq!(decibels_to_level(0.), 1.);
-        assert!((decibels_to_level(-20.) - 0.1).abs() < 1e-6);
-        assert!(decibels_to_level(-160.) < 1e-7, "silence");
+        assert!((decibels_to_level(-20.) - 2. / 3.).abs() < 1e-6, "speech is most of the bar");
+        assert_eq!(decibels_to_level(-60.), 0., "Desktop's noise bed");
+        assert_eq!(decibels_to_level(-160.), 0., "silence");
         assert_eq!(decibels_to_level(f32::NEG_INFINITY), 0.);
     }
 }
