@@ -653,6 +653,10 @@ impl Composer {
             player.pause();
         } else {
             self.state.read(cx).pause_audio();
+            // Played to the end: again from the start.
+            if player.duration() > 0. && player.position() >= player.duration() - 0.05 {
+                player.seek(0.);
+            }
             player.play();
             draft._poll = Some(cx.spawn(async move |this, cx| {
                 loop {
