@@ -506,8 +506,7 @@ impl Sidebar {
             ConversationKind::NoteToSelf => "Note to Self".into(),
             _ => conversation.title.clone().into(),
         };
-        div().w_full().h(px(ROW_HEIGHT)).px_2().py(px(2.)).child(
-            div()
+        let row = div()
                 .id(SharedString::from(format!("conv-{}", conversation.id.0)))
                 .debug_selector({
                     let id = conversation.id.0.clone();
@@ -552,8 +551,14 @@ impl Sidebar {
                                     .when(unread > 0, |d| d.child(if unread > 99 { "99+".to_string() } else { unread.to_string() })),
                             )
                         }),
-                ),
-        )
+                );
+        // Right-click: the chat's menu, as in the full list.
+        let state = self.state.clone();
+        let menu_conversation = conversation.clone();
+        let row = row.context_menu(move |menu, window, cx| {
+            crate::views::chat_menu::build(menu, &menu_conversation, &state, Default::default(), window, cx)
+        });
+        div().w_full().h(px(ROW_HEIGHT)).px_2().py(px(2.)).child(row)
     }
 
     fn render_row(&self, conversation: &Conversation, selected: bool, typing: bool, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
