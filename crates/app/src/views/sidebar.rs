@@ -475,10 +475,20 @@ impl Sidebar {
                                 div()
                                     .flex_1()
                                     .min_w_0()
-                                    .truncate()
-                                    .line_height(px(20.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(title),
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .line_height(px(20.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(title),
+                                    )
+                                    .when(crate::views::common::is_official(conversation), |d| {
+                                        d.child(crate::views::common::official_badge(palette))
+                                    }),
                             )
                             .when(conversation.muted, |d| {
                                 d.child(Icon::new(IconName::BellOff).size_3().text_color(palette.text_secondary))

@@ -819,7 +819,17 @@ impl ConversationView {
                             .flex()
                             .flex_col()
                             .min_w_0()
-                            .child(div().font_weight(FontWeight::SEMIBOLD).truncate().child(title))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .min_w_0()
+                                    .child(div().font_weight(FontWeight::SEMIBOLD).truncate().child(title))
+                                    .when(conversation.is_some_and(crate::views::common::is_official), |d| {
+                                        d.child(crate::views::common::official_badge(palette))
+                                    }),
+                            )
                             .when_some(subtitle, |d, s| {
                                 d.child(div().text_xs().text_color(palette.text_secondary).child(s))
                             }),
@@ -1025,6 +1035,8 @@ impl ConversationView {
                 cx.notify();
             }))
             .when(outgoing, |d| d.justify_end())
+            // Desktop centers release notes.
+            .when(self.id.is_signal(), |d| d.justify_center())
             .when(!outgoing && is_group, |d| {
                 d.child(
                     div()
@@ -1102,7 +1114,10 @@ impl ConversationView {
                         .child("Loading…"),
                 )
             })
+            // The start of the Signal chat: Desktop's hero.
+            .when(ix == 0 && !self.has_more && self.id.is_signal(), |d| d.child(signal_hero(palette, cx)))
             .when(show_day, |d| {
+                let signal = self.id.is_signal().then(|| signal_colors(cx));
                 d.child(
                     div()
                         .pt_4()
@@ -1112,7 +1127,15 @@ impl ConversationView {
                         .text_xs()
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(palette.text_secondary)
-                        .child(day_label(message.sent_at)),
+                        .child(
+                            div()
+                                // Desktop's pill in the Signal chat
+                                // (TimelineDateHeader).
+                                .when_some(signal, |d, colors| {
+                                    d.px_2p5().py_1().rounded_full().border_1().border_color(palette.panel_border).bg(colors.background)
+                                })
+                                .child(day_label(message.sent_at)),
+                        ),
                 )
             })
             .child(row)
@@ -1136,6 +1159,10 @@ impl ConversationView {
         let corners = Corners::for_bubble(outgoing, first, last);
         let (bg, fg, meta_color) = if outgoing {
             (palette.bubble_out, palette.bubble_out_text, palette.bubble_out_meta)
+        } else if self.id.is_signal() {
+            // Desktop's own color for release notes, with white text.
+            let white = Hsla { h: 0., s: 0., l: 1., a: 1. };
+            (signal_colors(cx).message, white, Hsla { a: 0.8, ..white })
         } else {
             (palette.bubble_in, palette.bubble_in_text, palette.text_secondary)
         };
@@ -3020,6 +3047,78 @@ impl Render for ConversationView {
     }
 }
 
+/// Desktop's colors for the Signal chat (`--axo-color-legacy-signal-*` and
+/// `-official-chat-badge-*` in `ts/axo/_tailwind-theme/colors.css`).
+struct SignalColors {
+    background: Hsla,
+    message: Hsla,
+    badge_bg: Hsla,
+    badge_text: Hsla,
+}
+
+fn signal_colors(cx: &App) -> SignalColors {
+    let dark = gpui_kit::component::ActiveTheme::theme(cx).is_dark();
+    let rgb = |hex: u32| Hsla::from(gpui_kit::rgb(hex));
+    let alpha = |hex: u32, a: f32| Hsla { a, ..rgb(hex) };
+    if dark {
+        SignalColors { background: rgb(0x2f3240), message: rgb(0x444664), badge_bg: alpha(0x4952f8, 0.4), badge_text: rgb(0xc2c5fe) }
+    } else {
+        SignalColors { background: rgb(0xf6f7ff), message: rgb(0x8889b4), badge_bg: alpha(0x4655ff, 0.12), badge_text: rgb(0x030ffc) }
+    }
+}
+
+/// Desktop's hero at the top of the Signal chat (ConversationHero): its
+/// avatar and name, the "Official chat" pill, and what the chat is.
+fn signal_hero(palette: Palette, cx: &App) -> impl IntoElement {
+    let colors = signal_colors(cx);
+    div().debug_selector(|| "signal-hero".into()).pt_6().pb_2().px_6().flex().justify_center().child(
+        div()
+            .max_w(px(360.))
+            .px_6()
+            .py_5()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_2()
+            .rounded_xl()
+            .border_1()
+            .border_color(palette.panel_border)
+            .bg(colors.background)
+            .child(crate::views::common::signal_avatar(px(80.)))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_xl()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Signal")
+                    .child(crate::views::common::official_badge(palette)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2p5()
+                    .py_1()
+                    .rounded_full()
+                    .bg(colors.badge_bg)
+                    .text_color(colors.badge_text)
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(Icon::new(IconName::BadgeCheck).size_4())
+                    .child("Official chat"),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_center()
+                    .child("The only official chat from Signal. Keep up to date with news and release notes."),
+            ),
+    )
+}
+
 /// Where a release note's "Donate" goes.
 const DONATE_URL: &str = "https://signal.org/donate/";
 
@@ -3734,8 +3833,9 @@ mod tests {
         let notes = wait_for_messages(&backend, &signal, 1, |m| m.cta.is_some());
         let note = notes.iter().find(|m| m.cta.is_some()).unwrap().id;
         let (mut cx, _view) = open_view(cx, &backend, &signal);
-        // Desktop's donate button, under the note.
+        // Desktop's donate button, under the note, and its hero at the top.
         bounds(&mut cx, format!("cta-{note}"));
+        bounds(&mut cx, "signal-hero".into());
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
         assert!(cx.debug_bounds("emoji-button").is_none(), "no composer");

@@ -39,6 +39,17 @@ pub fn person_avatar(photo: Option<&std::path::Path>, name: &str, color: u8, siz
     }
 }
 
+/// Desktop's mark after the name of an official chat, the Signal chat or
+/// Note to Self (`OfficialChatInlineBadge`).
+pub fn official_badge(palette: crate::theme::Palette) -> AnyElement {
+    Icon::new(IconName::BadgeCheck).size_4().flex_none().text_color(palette.accent).into_any_element()
+}
+
+/// Whether a chat gets [`official_badge`].
+pub fn is_official(conversation: &Conversation) -> bool {
+    conversation.kind == ConversationKind::NoteToSelf || conversation.id.is_signal()
+}
+
 /// The Signal chat's avatar, as Desktop draws it (`module-Avatar--signal-
 /// official`): Signal's logo in white at 62% on its blue.
 pub fn signal_avatar(size: Pixels) -> AnyElement {

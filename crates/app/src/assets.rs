@@ -11,6 +11,7 @@ gpui_kit::assets::icon_assets!(
         AppWindow,
         Archive,
         ArchiveRestore,
+        BadgeCheck,
         ArrowDown,
         Ban,
         Bell,
