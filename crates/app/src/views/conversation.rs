@@ -611,7 +611,9 @@ impl ConversationView {
             let _ = this.update(cx, |this, cx| {
                 if let Some(ix) = this.messages.iter().position(|m| m.id == message.id) {
                     this.messages[ix] = message;
-                    this.list.remeasure_items(ix..ix + 1);
+                    // The next one too: reactions decide whether it starts a
+                    // group (its name and spacing).
+                    this.list.remeasure_items(ix..(ix + 2).min(this.messages.len()));
                 } else if this.has_newer
                     && this.messages.last().is_some_and(|last| (message.sent_at, message.id) > (last.sent_at, last.id))
                 {
@@ -882,16 +884,8 @@ impl ConversationView {
         if let Some(notice) = &message.notice {
             return self.render_notice(notice, show_day, message.sent_at, palette, cx);
         }
-        let continues = |a: &Message, b: &Message| {
-            a.notice.is_none()
-                && b.notice.is_none()
-                && a.direction == b.direction
-                && a.author == b.author
-                && (b.sent_at - a.sent_at).abs() < GROUP_WINDOW_MS
-                && same_day(a.sent_at, b.sent_at)
-        };
-        let first_in_group = show_day || prev.is_none_or(|p| !continues(p, &message));
-        let last_in_group = next.is_none_or(|n| !continues(&message, n));
+        let first_in_group = show_day || prev.is_none_or(|p| !same_group(p, &message));
+        let last_in_group = next.is_none_or(|n| !same_group(&message, n));
         let outgoing = message.direction == Direction::Outgoing;
         let author_name = message.author_name.clone().unwrap_or_else(|| "Unknown".into());
         let author_color = color_for(message.author.as_deref().unwrap_or(""));
@@ -2206,6 +2200,19 @@ fn meta_spacer(message: &Message, cx: &App) -> String {
     format!(" {}", "0".repeat(count))
 }
 
+/// Whether `newer` continues `older`'s group (one sender, a name and
+/// avatar for the run). As Desktop (`areMessagesInSameGroup`): reactions
+/// end a group, so the reacted message keeps its time and avatar.
+fn same_group(older: &Message, newer: &Message) -> bool {
+    older.notice.is_none()
+        && newer.notice.is_none()
+        && older.reactions.is_empty()
+        && older.direction == newer.direction
+        && older.author == newer.author
+        && (newer.sent_at - older.sent_at).abs() < GROUP_WINDOW_MS
+        && same_day(older.sent_at, newer.sent_at)
+}
+
 /// Body text size and line height in bubbles.
 const BODY_SIZE: f32 = 14.5;
 const BODY_LINE: f32 = 20.;
@@ -2955,6 +2962,38 @@ fn capitalize(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reactions_end_a_group_as_in_desktop() {
+        let message = |id: i64, at: i64| Message {
+            id,
+            conversation_id: signal_store::ConversationId("d:a".into()),
+            sent_at: at,
+            received_at: at,
+            direction: Direction::Incoming,
+            author: Some("a".into()),
+            author_name: None,
+            body: "hi".into(),
+            status: DeliveryStatus::Delivered,
+            reactions: Vec::new(),
+            quote: None,
+            attachments: Vec::new(),
+            link_preview: None,
+            deleted: false,
+            edited: false,
+            expires_in: 0,
+            expire_start: None,
+            edit_count: 0,
+            notice: None,
+            mentions: Vec::new(),
+            styles: Vec::new(),
+        };
+        let (older, newer) = (message(1, 1_000), message(2, 2_000));
+        assert!(super::same_group(&older, &newer));
+        let mut reacted = older.clone();
+        reacted.reactions.push(signal_store::Reaction { emoji: "😂".into(), author: None, sent_at: 1_500 });
+        assert!(!super::same_group(&reacted, &newer), "the reacted message ends its group");
+    }
+
     #[test]
     fn formatting_becomes_runs_and_spoilers_hide_until_shown() {
         use signal_store::{StyleSpan, TextStyle};
