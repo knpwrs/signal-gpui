@@ -1169,6 +1169,54 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
             }
             // Demo stories are here already, and replies go nowhere.
             Command::FetchStory { .. } | Command::ReplyToStory { .. } => {}
+            // A posted story is ours here at once; nothing is sent.
+            Command::PostStory { story, targets } => {
+                let now = now();
+                for (ix, target) in targets.iter().enumerate() {
+                    let content = match &story {
+                        crate::OutgoingStory::Text(text) => signal_store::StoryContent::Text((**text).clone()),
+                        crate::OutgoingStory::Media { bytes, content_type, caption } => {
+                            let path = data_dir.join("attachments").join(format!("story-sent-{now}-{ix}"));
+                            if std::fs::write(&path, bytes.as_slice()).is_err() {
+                                continue;
+                            }
+                            signal_store::StoryContent::Media {
+                                attachment: AttachmentMeta {
+                                    content_type: content_type.clone(),
+                                    file_name: None,
+                                    size: bytes.len() as u64,
+                                    width: None,
+                                    height: None,
+                                    local_path: path.to_str().map(Into::into),
+                                    sticker: false,
+                                    gif: false,
+                                    voice: false,
+                                    remote: None,
+                                },
+                                caption: caption.clone(),
+                                styles: Vec::new(),
+                            }
+                        }
+                    };
+                    let group = match target {
+                        crate::StoryTarget::MyStory => None,
+                        crate::StoryTarget::Group(group) => Some(group.clone()),
+                    };
+                    let story = signal_store::NewStory {
+                        author: None,
+                        author_name: None,
+                        sent_at: now + ix as i64,
+                        received_at: now,
+                        group,
+                        content,
+                        pointer: None,
+                        allows_replies: true,
+                        read: true,
+                    };
+                    let _ = db.insert_story(&story, now).await;
+                }
+                emit(Event::StoriesChanged);
+            }
             Command::PressMegaphone { id, .. } => {
                 if megaphone.as_ref().is_some_and(|m| m.id == id) {
                     megaphone = None;

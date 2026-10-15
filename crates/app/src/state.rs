@@ -123,6 +123,9 @@ pub enum AppEvent {
     ViewVideo(crate::views::video_viewer::ViewedVideo),
     /// Open the story viewer at these stories (a chat's; `None`: ours).
     ViewStories(Option<ConversationId>),
+    /// Open the story creator: a text story, or this photo or video
+    /// (its bytes, type and file).
+    CreateStory(Option<(std::sync::Arc<Vec<u8>>, String, std::path::PathBuf)>),
     /// A link preview the composer asked for (`None`: nothing to show).
     LinkPreview { url: String, preview: Option<std::rc::Rc<signal_backend::LinkPreviewDraft>> },
     /// How the sticker pack creator's upload is going.
@@ -898,6 +901,29 @@ impl AppState {
     pub fn view_stories(&mut self, chat: Option<ConversationId>, cx: &mut Context<Self>) {
         self.pause_audio();
         cx.emit(AppEvent::ViewStories(chat));
+    }
+
+    /// Desktop's "Text story".
+    pub fn create_text_story(&mut self, cx: &mut Context<Self>) {
+        cx.emit(AppEvent::CreateStory(None));
+    }
+
+    /// Desktop's "Photo or video": a picked file, checked as Desktop checks
+    /// it, opens the creator.
+    pub fn create_media_story(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let content_type = signal_backend::media::content_type_for_file(&name).to_owned();
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => return self.report_error(format!("Couldn't read {name}: {error}"), cx),
+        };
+        if !content_type.starts_with("image/") && !content_type.starts_with("video/") {
+            return self.report_error("A story can be a photo or a video.", cx);
+        }
+        if let Some(problem) = crate::views::story_creator::story_file_problem(&bytes, &content_type) {
+            return self.report_error(problem, cx);
+        }
+        cx.emit(AppEvent::CreateStory(Some((std::sync::Arc::new(bytes), content_type, path))));
     }
 
     /// Desktop's Stories tab badge (`getStoriesNotificationCount`): chats

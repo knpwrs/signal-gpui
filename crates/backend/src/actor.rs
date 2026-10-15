@@ -158,6 +158,8 @@ enum Outbound {
     },
     /// Sync message to our other devices.
     Sync { body: SyncMessage },
+    /// A story (or group story reply) to one recipient, part of `job`.
+    Story { recipient: String, body: ContentBody, timestamp: u64, job: u64 },
 }
 
 struct Actor {
@@ -180,6 +182,9 @@ struct Actor {
     /// Shows megaphones; notified when they change.
     megaphones: RefCell<Option<tokio::task::JoinHandle<()>>>,
     megaphone_check: tokio::sync::Notify,
+    /// Stories being sent, recipient by recipient.
+    story_jobs: RefCell<HashMap<u64, stories::StoryJob>>,
+    next_story_job: std::cell::Cell<u64>,
     /// Lets stories go after a day; notified when one arrives.
     story_expiry_task: RefCell<Option<tokio::task::JoinHandle<()>>>,
     story_expiry: tokio::sync::Notify,
@@ -262,6 +267,8 @@ pub(crate) async fn run(
         megaphones: RefCell::new(None),
         megaphone_check: tokio::sync::Notify::new(),
         story_expiry_task: RefCell::new(None),
+        story_jobs: RefCell::new(HashMap::new()),
+        next_story_job: std::cell::Cell::new(0),
         story_expiry: tokio::sync::Notify::new(),
         early_reads: RefCell::default(),
         identities_seen: RefCell::default(),
@@ -564,6 +571,10 @@ impl Actor {
                 Command::ViewStory { id } => self.view_story(id).await,
                 Command::FetchStory { id } => self.fetch_story(id).await,
                 Command::ReplyToStory { id, body, emoji } => self.reply_to_story(id, body, emoji).await,
+                Command::PostStory { story, targets } => {
+                    let this = self.clone();
+                    tokio::task::spawn_local(async move { this.post_story(story, targets).await });
+                }
                 Command::StartCall { conversation, video } => self.start_call(conversation, video),
                 Command::AcceptCall { video } => self.accept_call(video),
                 Command::DeclineCall | Command::HangUp => self.hang_up(),
@@ -3186,6 +3197,7 @@ impl Actor {
                     | Outbound::SendGif { conversation, message: id, timestamp, .. } => {
                         self.finish_send(&conversation, id, timestamp, DeliveryStatus::Failed).await;
                     }
+                    Outbound::Story { recipient, job, .. } => self.story_part_done(job, recipient, Err("not connected".into())),
                     _ => {}
                 }
                 continue;
@@ -3247,6 +3259,9 @@ impl Actor {
                         }
                     };
                     self.finish_send(&conversation, message, timestamp, status).await;
+                }
+                Outbound::Story { recipient, body, timestamp, job } => {
+                    self.send_story_part(&mut manager, recipient, body, timestamp, job).await;
                 }
                 Outbound::Sync { body } => {
                     let me = self.self_aci();

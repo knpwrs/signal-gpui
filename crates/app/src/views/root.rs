@@ -32,6 +32,7 @@ pub struct RootView {
     stories: Entity<crate::views::stories::StoriesPane>,
     calls: Entity<crate::views::calls::CallsPane>,
     story_viewer: Option<(Entity<crate::views::story_viewer::StoryViewer>, Subscription)>,
+    story_creator: Option<(Entity<crate::views::story_creator::StoryCreator>, Subscription)>,
     /// The chat list's width as dragged (see `crate::sidebar_width`).
     sidebar_preferred: f32,
     /// The account (its ACI) when last seen.
@@ -95,6 +96,21 @@ impl RootView {
                     this.story_viewer = Some((viewer, closed));
                     cx.notify();
                 }
+                if let AppEvent::CreateStory(media) = event {
+                    let creator = cx.new(|cx| match media.clone() {
+                        None => crate::views::story_creator::StoryCreator::text(state.clone(), window, cx),
+                        Some((bytes, content_type, path)) => {
+                            crate::views::story_creator::StoryCreator::media(state.clone(), bytes, content_type, path, window, cx)
+                        }
+                    });
+                    window.focus(&creator.focus_handle(cx), cx);
+                    let closed = cx.subscribe_in(&creator, window, |this, _, _: &ViewerEvent, _, cx| {
+                        this.story_creator = None;
+                        cx.notify();
+                    });
+                    this.story_creator = Some((creator, closed));
+                    cx.notify();
+                }
                 if let AppEvent::Error(message) = event {
                     use gpui_kit::component::WindowExt as _;
                     window.push_notification(gpui_kit::component::notification::Notification::error(message.clone()), cx);
@@ -137,6 +153,7 @@ impl RootView {
             stories,
             calls,
             story_viewer: None,
+            story_creator: None,
             sidebar_preferred: crate::sidebar_width::DEFAULT_WIDTH,
             account: None,
             account_generation: 0,
@@ -306,6 +323,7 @@ impl Render for RootView {
         let viewer = self.viewer.as_ref().map(|(viewer, _)| viewer.clone());
         let video_viewer = self.video_viewer.as_ref().map(|(viewer, _)| viewer.clone());
         let story_viewer = self.story_viewer.as_ref().map(|(viewer, _)| viewer.clone());
+        let story_creator = self.story_creator.as_ref().map(|(creator, _)| creator.clone());
         div()
             .key_context("Signal")
             .relative()
@@ -359,6 +377,7 @@ impl Render for RootView {
             .when_some(viewer, |d, viewer| d.child(viewer))
             .when_some(video_viewer, |d, viewer| d.child(viewer))
             .when_some(story_viewer, |d, viewer| d.child(viewer))
+            .when_some(story_creator, |d, creator| d.child(creator))
     }
 }
 
@@ -491,6 +510,66 @@ mod tests {
         cx.update(|window, cx| window.dispatch_keystroke(gpui_kit::Keystroke::parse("escape").unwrap(), cx));
         wait(&mut cx, "the viewer to close", &|cx| cx.debug_bounds("story-viewer").is_none());
         let _ = root;
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn a_text_story_is_written_and_posted(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config { data_dir: dir.path().to_owned(), db_key: [7; 32], device_name: "test".into(), demo: true };
+        let (backend, mut events) = Backend::start(config).unwrap();
+        let state = cx.update(|cx| crate::state::new_state(backend.clone(), cx));
+        cx.update(|cx| {
+            use futures::StreamExt as _;
+            let state = state.clone();
+            cx.spawn(async move |cx| {
+                while let Some(event) = events.next().await {
+                    state.update(cx, |state, cx| state.handle(event, cx));
+                }
+            })
+            .detach();
+        });
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(gpui_kit::Bounds { origin: Default::default(), size: size(px(1000.), px(900.)) })),
+            ..Default::default()
+        };
+        let (window, root) = cx.update(|cx| {
+            let state = state.clone();
+            gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| RootView::new(state, window, cx))).unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window, cx);
+        let wait = |cx: &mut VisualTestContext, what: &str, done: &dyn Fn(&mut VisualTestContext) -> bool| {
+            for _ in 0..300 {
+                cx.update(|window, _| window.refresh());
+                cx.run_until_parked();
+                if done(cx) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("timed out waiting for {what}");
+        };
+        wait(&mut cx, "the demo", &|cx| state.read_with(cx, |s, _| !s.my_stories().is_empty()));
+        let before = state.read_with(&cx, |s, _| s.my_stories().len());
+        state.update(&mut cx, |s, cx| s.create_text_story(cx));
+        wait(&mut cx, "the creator", &|cx| cx.debug_bounds("story-creator").is_some());
+        let creator = root.read_with(&cx, |r, _| r.story_creator.as_ref().map(|(c, _)| c.clone())).unwrap();
+        cx.update(|window, cx| {
+            creator.update(cx, |c, cx| {
+                c.text.update(cx, |input, cx| input.set_value("Out on the trail", window, cx));
+                c.choosing = true;
+                cx.notify();
+            })
+        });
+        // My Story is chosen to start with.
+        wait(&mut cx, "the targets", &|cx| cx.debug_bounds("story-target-my-story").is_some());
+        creator.update(&mut cx, |c, cx| c.send(cx));
+        wait(&mut cx, "the story to post", &|cx| state.read_with(cx, |s, _| s.my_stories().len() == before + 1));
+        let posted = state.read_with(&cx, |s, _| s.my_stories().last().cloned().unwrap());
+        assert!(matches!(posted.content, signal_store::StoryContent::Text(ref t) if t.text == "Out on the trail"));
+        assert!(cx.debug_bounds("story-creator").is_none(), "closed once sent");
         backend.shutdown();
     }
 }

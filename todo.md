@@ -175,19 +175,22 @@ seen in the demo.
 
 ## Stories
 
-Receiving, viewing, viewed receipts, 1:1 replies and reactions, hiding,
-and Desktop's tabs work (see the README). Not done yet:
+Receiving, viewing, posting (text, photo, video), replies and reactions,
+hiding, and Desktop's tabs work (see the README). Not done yet:
 
-- **Posting stories:** the creator (text with Desktop's styles and
-  backgrounds, photo or video), choosing My Story or a group, and sending.
-  libsignal-service-rs can't send with the story flag (`?story=true`,
-  sealed sender without an access key) or sync a story to our other
-  devices; that needs a change there, vendored like presage.
-- **Replies to group stories:** they go to the group with the story flag,
-  so they wait on the same change.
-- **Storage Service:** My Story's privacy (`StoryDistributionListRecord`),
-  hidden stories (`hideStory`), `storiesDisabled` and
-  `storyViewReceiptsEnabled` are kept on this device only.
+- **Sender keys:** a story goes to each recipient in turn through the
+  outbound queue, where Desktop sends to a list at once with sender keys.
+  Posting to hundreds of connections takes a while.
+- **Story privacy editing:** My Story's privacy and custom story lists are
+  read from Storage Service but not edited here; the first post doesn't
+  ask, as Desktop does, who My Story should go to.
+- **Writing account settings back:** turning stories off and view
+  receipts are kept on this device; Desktop writes them to the account
+  record (`storiesDisabled`, `storyViewReceiptsEnabled`).
+- **Creator extras:** Desktop's text color slider, links in text stories,
+  the image editor, and captions' formatting.
+- **Our stories' views and replies:** counted, but there's no Desktop
+  Views/Replies list to see who.
 - **Desktop's fonts** for text stories (Inter, EB Garamond, Parisienne,
   Barlow Condensed); macOS fonts stand in.
 - **Who we take stories from:** Desktop shows a person's story when it

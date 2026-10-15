@@ -176,6 +176,7 @@ impl StoriesPane {
     fn render_mine(&self, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let mine = self.state.read(cx).my_stories();
         let latest = mine.last().cloned();
+        let has_any = latest.is_some();
         let views: usize = mine.iter().map(|s| s.views.len()).sum();
         let state = self.state.clone();
         let me = self.state.read(cx).account.as_ref().map(|a| a.aci.clone()).unwrap_or_default();
@@ -192,7 +193,10 @@ impl StoriesPane {
             .rounded(px(10.))
             .cursor_pointer()
             .hover(|d| d.bg(palette.row_hover))
-            .when(latest.is_some(), |d| d.on_click(move |_, _, cx| state.update(cx, |s, cx| s.view_stories(None, cx))))
+            // Desktop: with none up, it adds a text story.
+            .on_click(move |_, _, cx| {
+                state.update(cx, |s, cx| if has_any { s.view_stories(None, cx) } else { s.create_text_story(cx) })
+            })
             .child(crate::views::common::person_avatar(photo.as_deref(), "Me", crate::theme::color_for(&me), px(48.)))
             .child(
                 div()
@@ -206,6 +210,43 @@ impl StoriesPane {
                     })),
             )
             .children(latest.map(|s| thumbnail(&s, palette)))
+    }
+
+    /// Desktop's add-story button: "Text story" or "Photo or video".
+    fn render_add_story(&self) -> impl IntoElement {
+        use gpui_kit::component::Sizable as _;
+        use gpui_kit::component::button::{Button, ButtonVariants as _};
+        use gpui_kit::component::menu::DropdownMenu as _;
+        let state = self.state.clone();
+        Button::new("add-story")
+            .ghost()
+            .small()
+            .icon(gpui_kit::assets::IconName::Plus)
+            .tooltip("Add a story")
+            .dropdown_menu(move |menu, _, _| {
+                let (text_state, media_state) = (state.clone(), state.clone());
+                menu.item(PopupMenuItem::new("Text story").on_click(move |_, _, cx| {
+                    text_state.update(cx, |s, cx| s.create_text_story(cx));
+                }))
+                .item(PopupMenuItem::new("Photo or video").on_click(move |_, window, cx| {
+                    let state = media_state.clone();
+                    let picked = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
+                        files: true,
+                        directories: false,
+                        multiple: false,
+                        prompt: Some("Add to story".into()),
+                    });
+                    window
+                        .spawn(cx, async move |cx| {
+                            if let Ok(Ok(Some(paths))) = picked.await
+                                && let Some(path) = paths.into_iter().next()
+                            {
+                                state.update(cx, |s, cx| s.create_media_story(path, cx));
+                            }
+                        })
+                        .detach();
+                }))
+            })
     }
 
     fn render_group(&self, group: &StoryGroup, palette: Palette, cx: &mut Context<Self>) -> AnyElement {
@@ -296,7 +337,8 @@ impl Render for StoriesPane {
                     // Clear the macOS traffic lights while the tabs are hidden.
                     .pl(px(if collapsed { 92. } else { 16. }))
                     .when(collapsed, |d| d.child(crate::views::nav::show_tabs_button(&self.state, palette, cx)))
-                    .child(div().flex_1().text_lg().font_weight(FontWeight::SEMIBOLD).child("Stories")),
+                    .child(div().flex_1().text_lg().font_weight(FontWeight::SEMIBOLD).child("Stories"))
+                    .child(self.render_add_story()),
             )
             .child(
                 div()

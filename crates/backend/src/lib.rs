@@ -203,9 +203,11 @@ pub enum Command {
     ViewStory { id: i64 },
     /// Downloads a story's photo or video.
     FetchStory { id: i64 },
-    /// Replies to someone's story (or reacts, with `emoji`), in your chat
-    /// with them.
+    /// Replies to someone's story (or reacts, with `emoji`): one to one in
+    /// your chat with them; a group's, with the story.
     ReplyToStory { id: i64, body: String, emoji: Option<String> },
+    /// Posts a story to each of `targets`.
+    PostStory { story: OutgoingStory, targets: Vec<StoryTarget> },
     /// Calls a 1:1 chat (Desktop's call buttons, after the lobby).
     StartCall { conversation: ConversationId, video: bool },
     /// Answers the ringing call, with our camera on or off.
@@ -344,6 +346,23 @@ pub struct StickerView {
     pub id: u32,
     pub emoji: Option<String>,
     pub path: std::path::PathBuf,
+}
+
+/// A story to post.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OutgoingStory {
+    Text(Box<signal_store::TextStory>),
+    /// A photo, or an MP4 video of up to 30 seconds, with a caption.
+    Media { bytes: std::sync::Arc<Vec<u8>>, content_type: String, caption: String },
+}
+
+/// Where a story goes (Desktop's `SendStoryModal`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum StoryTarget {
+    /// My Story: whoever its privacy says.
+    MyStory,
+    /// A group's story, to its members.
+    Group(ConversationId),
 }
 
 /// An image picked, pasted or dropped in the composer.

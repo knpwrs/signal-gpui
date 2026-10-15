@@ -148,7 +148,7 @@ Settings → Calls picks the microphone, speaker and camera. macOS asks for came
 
 ## Stories
 
-Desktop's tabs (Chats, Calls, Stories, and Settings at the bottom) run down the left; Hide Tabs moves their button into the chat list's header. The Stories tab lists your stories and then each person's or group's, unviewed first, with Hide story in a row's menu. A story opens over the window: Desktop's progress bars and times (5 seconds, more for longer text, a video's length up to 30), arrows to move, Space to pause, Esc to close. Text stories are drawn on their colors and gradients (in macOS's nearest fonts to Desktop's); photos and videos download as Desktop decides. Viewing one tells your other devices and, with view receipts on, its author; your own show their views. You can reply or react to someone's story, which goes to your chat with them; replies to group stories show with the story. Stories last a day. Settings → Stories turns them off.
+Desktop's tabs (Chats, Calls, Stories, and Settings at the bottom) run down the left; Hide Tabs moves their button into the chat list's header. The Stories tab lists your stories and then each person's or group's, unviewed first, with Hide story in a row's menu. A story opens over the window: Desktop's progress bars and times (5 seconds, more for longer text, a video's length up to 30), arrows to move, Space to pause, Esc to close. Text stories are drawn on their colors and gradients (in macOS's nearest fonts to Desktop's); photos and videos download as Desktop decides. Viewing one tells your other devices and, with view receipts on, its author; your own show their views. You can reply or react to someone's story: one to one it goes to your chat with them; a group's goes to the group's members and shows with the story. To post, the add button offers Desktop's text story (its styles, text backgrounds and eight backgrounds) or a photo or video (an MP4 of up to 30 seconds), with a caption; then pick My Story and any groups. My Story goes to whoever its privacy (from your phone, through Storage Service) says, else all your Signal connections, sent to each in turn, and your other devices get the story too. Stories last a day. Settings → Stories turns them off; hidden stories sync with your other devices.
 
 ## Message history when linking
 
@@ -184,7 +184,7 @@ cargo bench -p signal-emoji
 
 ## Not yet implemented
 
-Call links, posting stories (and replying to group stories), adding and removing group members, and most settings. New identity keys are trusted automatically: a key change shows Desktop's "Your safety number with … has changed" notice (in the 1:1 chat and shared groups) and clears a verification, but sending isn't held for confirmation. Attachments in transferred history that are only in the backup (media) tier, which needs a backup subscription, aren't downloaded. See `todo.md` for more.
+Call links, adding and removing group members, and most settings. New identity keys are trusted automatically: a key change shows Desktop's "Your safety number with … has changed" notice (in the 1:1 chat and shared groups) and clears a verification, but sending isn't held for confirmation. Attachments in transferred history that are only in the backup (media) tier, which needs a backup subscription, aren't downloaded. See `todo.md` for more.
 
 ## License
 

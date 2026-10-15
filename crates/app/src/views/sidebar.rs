@@ -155,6 +155,7 @@ impl Sidebar {
                 | AppEvent::ViewImage(_)
                 | AppEvent::ViewVideo(_)
                 | AppEvent::ViewStories(_)
+                | AppEvent::CreateStory(_)
                 | AppEvent::Gifs { .. } => {}
             }),
         ];
