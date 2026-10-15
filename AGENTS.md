@@ -39,6 +39,7 @@ presage stores the first profile, profile photo and group photo it downloads and
 ## Reviews and commits
 
 - Before committing, run `coderabbit review --uncommitted --include-untracked --agent` and repeat until it finds nothing. If it reports no fresh review, add `--fresh`. Fix valid findings; skip the rest with a stated reason.
+- **Budget CodeRabbit reviews.** The free plan allows 3 CLI reviews per developer per hour over a rolling window: each review becomes available again an hour after it ran ([plans](https://docs.coderabbit.ai/management/plans.md), [rate limits](https://docs.coderabbit.ai/management/rate-limits.md)). A rate-limited attempt doesn't use one; its JSON error gives the wait (`metadata.waitTime`), so retry after that, in the background, rather than in a loop. Review a whole change once it's done and its tests pass, not each small step, and split it into atomic commits afterwards by staging hunks. Each round of fixes costs another review, so fix every finding of a round before re-running.
 - Findings that came up again and again:
   - Don't consume queued state (an early read sync, a pending download) until the work it stands for succeeded.
   - Don't record side data for an update that didn't apply, such as an edit timestamp for an edit to a deleted message.
