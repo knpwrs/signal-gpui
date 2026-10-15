@@ -804,7 +804,7 @@ impl ConversationView {
                     .items_center()
                     .gap_3()
                     .min_w_0()
-                    .when_some(conversation.cloned().filter(|c| c.kind != ConversationKind::NoteToSelf), |d, chat| {
+                    .when_some(conversation.cloned().filter(|c| c.kind != ConversationKind::NoteToSelf && !c.id.is_signal()), |d, chat| {
                         let state = self.state.clone();
                         d.cursor_pointer().on_click(move |_, window, cx| {
                             crate::views::chat_settings::open(state.clone(), chat.clone(), window, cx);
@@ -839,7 +839,7 @@ impl ConversationView {
                 )
             })
             // Desktop's call buttons: a 1:1 chat's two.
-            .when(conversation.is_some_and(|c| c.kind == ConversationKind::Direct && !c.blocked), |d| {
+            .when(conversation.is_some_and(|c| c.kind == ConversationKind::Direct && !c.blocked && !c.id.is_signal()), |d| {
                 use gpui_kit::component::button::ButtonVariants as _;
                 let call = |id: &'static str, icon: IconName, tooltip: &'static str, video: bool| {
                     gpui_kit::component::button::Button::new(id).ghost().icon(icon).tooltip(tooltip).on_click(cx.listener(
@@ -963,13 +963,16 @@ impl ConversationView {
         let author_photo = message.author.as_deref().and_then(|a| self.state.read(cx).photo_of(a)).map(|p| p.to_path_buf());
 
         let bubble = self.render_bubble(&message, is_group && first_in_group, first_in_group, last_in_group, palette, cx);
+        let cta = self.render_cta(&message, palette);
 
         // The actions stay while the reaction bar they opened is up, as in Desktop.
         let hovered = self.hovered == Some(message.id)
             || self.menu_open_for == Some(message.id)
             || self.reaction_bar_for == Some(message.id);
         let selecting = self.selecting.as_ref().map(|s| s.contains(&message.id));
-        let actions = if hovered && !message.deleted && selecting.is_none() {
+        // None on release notes: Desktop gives the Signal chat no menu
+        // (TimelineMessage's renderMenu), so no reacting or replying.
+        let actions = if hovered && !message.deleted && selecting.is_none() && !self.id.is_signal() {
             Some(self.render_hover_actions(&message, palette, cx).into_any_element())
         } else {
             None
@@ -1055,6 +1058,7 @@ impl ConversationView {
                             .min_w_0()
                             .when(outgoing, |d| d.items_end())
                             .child(bubble)
+                            .when_some(cta, |d, cta| d.child(cta))
                             .when_some(reactions, |d, r| d.child(r)),
                     )
                     // Positioned outside the bubble so showing them doesn't
@@ -1385,6 +1389,34 @@ impl ConversationView {
             })
             .when_some(meta, |d, m| d.child(place_meta(m, inline_meta)))
             .into_any_element()
+    }
+
+    /// A release note's button (Desktop's `MessageCta`), under it. Desktop's
+    /// "donate" opens its donation screen, which this app doesn't have, so
+    /// it opens Signal's donation page instead. Other buttons aren't shown,
+    /// as in Desktop (`isReleaseNoteCtaId`).
+    fn render_cta(&self, message: &Message, palette: Palette) -> Option<AnyElement> {
+        let cta = message.cta.as_ref().filter(|c| c.id == "donate" && self.id.is_signal())?;
+        let id = message.id;
+        Some(
+            div()
+                .id(("cta", id as u64))
+                .debug_selector(move || format!("cta-{id}"))
+                .mt_1()
+                .px_4()
+                .py_1p5()
+                .flex()
+                .justify_center()
+                .rounded_full()
+                .cursor_pointer()
+                .bg(palette.accent)
+                .text_color(palette.on_accent)
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .on_click(|_, _, cx| cx.open_url(DONATE_URL))
+                .child(cta.text.clone().unwrap_or_else(|| "Donate".into()))
+                .into_any_element(),
+        )
     }
 
     fn render_hover_actions(&self, message: &Message, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2963,6 +2995,10 @@ impl Render for ConversationView {
                 if let Some(selected) = &self.selecting {
                     return d.child(self.render_select_bar(selected, palette, cx));
                 }
+                // Release notes are read-only: no composer, as Desktop's.
+                if self.id.is_signal() {
+                    return d;
+                }
                 match self.state.read(cx).conversation(&self.id).filter(|c| c.blocked || c.left) {
                     Some(conversation) if conversation.blocked => d.child(self.render_blocked(conversation, palette)),
                     // Desktop: "You are no longer a member of the group."
@@ -2983,6 +3019,9 @@ impl Render for ConversationView {
             })
     }
 }
+
+/// Where a release note's "Donate" goes.
+const DONATE_URL: &str = "https://signal.org/donate/";
 
 fn now_millis() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
@@ -3026,7 +3065,7 @@ fn message_menu(
         }));
     }
     let (pinned, can_pin, pin_count) = this.read_with(cx, |this, cx| {
-        let can = this.state.read(cx).conversation(&this.id).is_some_and(|c| c.can_edit_info);
+        let can = !this.id.is_signal() && this.state.read(cx).conversation(&this.id).is_some_and(|c| c.can_edit_info);
         (this.pins.iter().any(|p| p.id == id), can, this.pins.len())
     });
     if can_pin && !message.deleted {
@@ -3292,6 +3331,7 @@ mod tests {
             notice: None,
             mentions: Vec::new(),
             styles: Vec::new(),
+            cta: None,
         };
         let (older, newer) = (message(1, 1_000), message(2, 2_000));
         assert!(super::same_group(&older, &newer));
@@ -3685,6 +3725,20 @@ mod tests {
         let bubble = bounds(&mut cx, format!("bubble-{}", view_photo.id));
         assert_eq!(avatar.bottom(), bubble.bottom(), "avatar {avatar:?} vs bubble {bubble:?}");
         backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn the_signal_chat_is_read_only_with_its_button(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        let signal = ConversationId::signal().0;
+        let notes = wait_for_messages(&backend, &signal, 1, |m| m.cta.is_some());
+        let note = notes.iter().find(|m| m.cta.is_some()).unwrap().id;
+        let (mut cx, _view) = open_view(cx, &backend, &signal);
+        // Desktop's donate button, under the note.
+        bounds(&mut cx, format!("cta-{note}"));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("emoji-button").is_none(), "no composer");
     }
 
     #[gpui_kit::test]

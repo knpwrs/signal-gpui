@@ -39,9 +39,32 @@ pub fn person_avatar(photo: Option<&std::path::Path>, name: &str, color: u8, siz
     }
 }
 
+/// The Signal chat's avatar, as Desktop draws it (`module-Avatar--signal-
+/// official`): Signal's logo in white at 62% on its blue.
+pub fn signal_avatar(size: Pixels) -> AnyElement {
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(size)
+        .rounded_full()
+        .bg(gpui_kit::rgb(0x3640fd))
+        .child(
+            gpui_kit::svg()
+                .path("icons/signal/profile-avatar.svg")
+                .size(size * 0.62)
+                .text_color(gpui_kit::rgb(0xffffff)),
+        )
+        .into_any_element()
+}
+
 /// A conversation's avatar: its downloaded photo, else (like Signal Desktop)
 /// a people icon for groups, a note icon for Note to Self, or initials.
 pub fn conversation_avatar(conversation: &Conversation, size: Pixels) -> AnyElement {
+    if conversation.id.is_signal() {
+        return signal_avatar(size);
+    }
     if let Some(path) = &conversation.avatar_path {
         return img(std::path::PathBuf::from(path))
             .flex_none()

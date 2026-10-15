@@ -67,13 +67,14 @@ gpui_kit::assets::icon_assets!(
 );
 
 /// Signal Desktop's own icons (AGPL-3.0-only, like this app), where Lucide
-/// has no match: the message status circles.
+/// has no match: the message status circles, and the Signal chat's logo.
 const SIGNAL_ICONS: &[(&str, &[u8])] = &[
     ("icons/signal/messagestatus-sending.svg", include_bytes!("../assets/icons/signal/messagestatus-sending.svg")),
     ("icons/signal/messagestatus-sent.svg", include_bytes!("../assets/icons/signal/messagestatus-sent.svg")),
     ("icons/signal/messagestatus-delivered.svg", include_bytes!("../assets/icons/signal/messagestatus-delivered.svg")),
     ("icons/signal/messagestatus-read.svg", include_bytes!("../assets/icons/signal/messagestatus-read.svg")),
     ("icons/signal/error-circle.svg", include_bytes!("../assets/icons/signal/error-circle.svg")),
+    ("icons/signal/profile-avatar.svg", include_bytes!("../assets/icons/signal/profile-avatar.svg")),
 ];
 
 pub struct Assets;

@@ -125,12 +125,16 @@ fn pinned_id(pin: &PinnedConversation) -> Option<ConversationId> {
             Some(ConversationId::direct(&sid.service_id_string()))
         }
         PinnedId::GroupMasterKey(key) if key.len() == 32 => Some(ConversationId::group(key)),
+        // The Signal chat (Desktop pins it as `releaseNotes`).
+        PinnedId::ReleaseNotes(_) => Some(ConversationId::signal()),
         _ => None,
     }
 }
 
 fn pin_for(id: &ConversationId) -> Option<PinnedConversation> {
-    let identifier = if let Some(key) = id.as_group() {
+    let identifier = if id.is_signal() {
+        PinnedId::ReleaseNotes(Default::default())
+    } else if let Some(key) = id.as_group() {
         PinnedId::GroupMasterKey(key)
     } else {
         let sid = ServiceId::parse_from_service_id_string(id.as_direct()?)?;
@@ -197,7 +201,7 @@ fn edit_account_pins(account: &[u8], edit: &PinEdit) -> anyhow::Result<Option<Ve
 
     let mut out = Vec::with_capacity(account.len() + 64);
     for field in &fields {
-        // Entries we can't map (legacy groups, release notes) are kept as-is.
+        // Entries we can't map (legacy groups) are kept as-is.
         if pinning || pin_of(field).as_ref() != Some(target) {
             out.extend_from_slice(field.raw);
         }
@@ -324,6 +328,11 @@ fn new_chat_record(conversation: &ConversationId) -> Option<(IdentifierType, Vec
 
 /// Changes one flag on a chat for the whole account.
 pub(crate) async fn write_chat(manager: &SignalManager, conversation: &ConversationId, edit: ChatEdit) -> anyhow::Result<()> {
+    // The Signal chat has no record of its own (only its pin, in the
+    // account record): its state stays on this device.
+    if conversation.is_signal() {
+        return Ok(());
+    }
     let session = Session::new(manager).await?;
     let kind = if conversation.as_group().is_some() { IdentifierType::Groupv2 } else { IdentifierType::Contact };
     for _ in 0..3 {
@@ -683,6 +692,13 @@ mod tests {
         let account = decode_account(&unpinned);
         assert_eq!(account.pinned_conversations, [legacy, pin_for(&jon).unwrap()]);
         assert!(contains(&unpinned, b"future account field"));
+    }
+
+    #[test]
+    fn the_signal_chat_pins_as_release_notes() {
+        let pin = pin_for(&ConversationId::signal()).unwrap();
+        assert!(matches!(pin.identifier, Some(PinnedId::ReleaseNotes(_))), "as Desktop pins it");
+        assert_eq!(pinned_id(&pin), Some(ConversationId::signal()));
     }
 
     #[test]

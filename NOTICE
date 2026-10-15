@@ -31,7 +31,8 @@ Bundled data and assets:
     Miles Johnson. See crates/emoji/data/LICENSE-emojibase.
   - Icons from Lucide (ISC), Copyright (c) Lucide Icons and Contributors,
     bundled through gpui-kit.
-  - Message status and error icons from Signal Desktop (AGPL-3.0-only),
+  - Message status and error icons, and the Signal chat's logo
+    (images/profile-avatar.svg), from Signal Desktop (AGPL-3.0-only),
     Copyright Signal Messenger, LLC. See crates/app/assets/icons/signal.
   - The ringtone from Signal Desktop (sounds/ringtone_minimal.ogg,
     AGPL-3.0-only), Copyright Signal Messenger, LLC, converted to AAC. See

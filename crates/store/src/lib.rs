@@ -281,7 +281,23 @@ pub struct Message {
     pub mentions: Vec<MentionSpan>,
     /// Its formatting (bold, spoilers…), in `body`'s bytes.
     pub styles: Vec<StyleSpan>,
+    /// A release note's button (the Signal chat's only).
+    pub cta: Option<CallToAction>,
 }
+
+/// A release note's button: what it does (Desktop's `callToActionId`,
+/// "donate") and what it says.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CallToAction {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// The Signal chat's made-up account (Desktop's `SIGNAL_ACI`,
+/// `ts/types/SignalConversation.std.ts`): release notes appear from it, and
+/// nothing is ever sent to it.
+pub const SIGNAL_ACI: &str = "11111111-1111-4111-8111-111111111111";
 
 /// A group member's label: a short text with an optional emoji.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -505,6 +521,15 @@ impl ConversationId {
         Self(s)
     }
 
+    /// The Signal chat, where release notes appear.
+    pub fn signal() -> Self {
+        Self::direct(SIGNAL_ACI)
+    }
+
+    pub fn is_signal(&self) -> bool {
+        self.as_direct() == Some(SIGNAL_ACI)
+    }
+
     /// Service id string for direct conversations.
     pub fn as_direct(&self) -> Option<&str> {
         self.0.strip_prefix("d:")
@@ -637,7 +662,7 @@ const CONVERSATION_COLUMNS: &str = "id, kind, title, phone, color, members, last
       AS last_outgoing_status";
 
 const MESSAGE_COLUMNS: &str = "id, conversation_id, sent_at, received_at, direction, author, \
-     author_name, body, status, reactions, quote, attachments, link_preview, deleted, edited, expires_in, expire_start, edit_count, notice, mentions, styles";
+     author_name, body, status, reactions, quote, attachments, link_preview, deleted, edited, expires_in, expire_start, edit_count, notice, mentions, styles, cta";
 
 /// SQL matching a message whose own timestamp, or one of its edits', is
 /// the bound parameter `{param}`.
@@ -826,6 +851,7 @@ fn message_from_row(row: &SqliteRow) -> Result<Message> {
             .map(|s| serde_json::from_str(&s))
             .transpose()?
             .unwrap_or_default(),
+        cta: row.try_get::<Option<String>, _>("cta")?.map(|c| serde_json::from_str(&c)).transpose()?,
     })
 }
 
@@ -1789,6 +1815,16 @@ impl AppDb {
         Ok(())
     }
 
+    /// Records a release note's button.
+    pub async fn set_cta(&self, message_id: i64, cta: &CallToAction) -> Result<()> {
+        sqlx::query("UPDATE messages SET cta = ? WHERE id = ?")
+            .bind(serde_json::to_string(cta)?)
+            .bind(message_id)
+            .execute(&self.writer)
+            .await?;
+        Ok(())
+    }
+
     /// Records a message's formatting. Its chat's preview follows, as it
     /// hides spoilers.
     pub async fn set_styles(&self, message_id: i64, styles: &[StyleSpan]) -> Result<()> {
@@ -2028,11 +2064,13 @@ impl AppDb {
     /// the people in your contacts, by name.
     pub async fn people(&self) -> Result<Vec<DirectoryEntry>> {
         let rows = sqlx::query(
-            "SELECT id, title, phone FROM conversations WHERE kind = 'direct' AND blocked = 0 AND title != '' \
+            "SELECT id, title, phone FROM conversations WHERE kind = 'direct' AND blocked = 0 AND title != '' AND id != ?1 \
              UNION SELECT id, title, phone FROM directory WHERE kind = 'direct' \
                 AND id NOT IN (SELECT id FROM conversations) \
              ORDER BY title COLLATE NOCASE",
         )
+        // The Signal chat isn't someone to add or message.
+        .bind(&ConversationId::signal().0)
         .fetch_all(&self.pool)
         .await?;
         rows.iter()

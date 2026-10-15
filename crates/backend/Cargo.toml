@@ -17,6 +17,11 @@ futures.workspace = true
 tokio = { workspace = true, features = ["net"] }
 tracing.workspace = true
 serde_json.workspace = true
+serde.workspace = true
+uuid.workspace = true
+# Release notes: Desktop versions, and the languages to fetch them in.
+semver = "1"
+sys-locale = "0.3"
 url = "2"
 rand = "0.9"
 # Storage Service writes: item crypto and wire-level record edits (versions

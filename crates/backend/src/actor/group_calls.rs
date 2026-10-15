@@ -82,7 +82,7 @@ fn http() -> Option<&'static reqwest::Client> {
     static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
-            let client = signal_tls().and_then(|tls| {
+            let client = crate::signal_tls().and_then(|tls| {
                 Ok(reqwest::Client::builder()
                     .use_preconfigured_tls(tls)
                     .timeout(std::time::Duration::from_secs(30))
@@ -91,21 +91,6 @@ fn http() -> Option<&'static reqwest::Client> {
             client.inspect_err(|error| warn!(error = %format!("{error:#}"), "no calling server client")).ok()
         })
         .as_ref()
-}
-
-fn signal_tls() -> anyhow::Result<rustls::ClientConfig> {
-    use rustls::pki_types::{CertificateDer, pem::PemObject as _};
-    let pem = presage::libsignal_service::configuration::ServiceConfiguration::from(SignalServers::Production)
-        .certificate_authority;
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in CertificateDer::pem_slice_iter(pem.as_bytes()) {
-        roots.add(cert?)?;
-    }
-    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
-    Ok(rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()?
-        .with_root_certificates(roots)
-        .with_no_client_auth())
 }
 
 impl Actor {
@@ -506,7 +491,7 @@ impl Actor {
 mod tests {
     #[test]
     fn the_calling_server_client_trusts_signals_root() {
-        assert!(super::signal_tls().is_ok());
+        assert!(crate::signal_tls().is_ok());
         assert!(super::http().is_some());
     }
 

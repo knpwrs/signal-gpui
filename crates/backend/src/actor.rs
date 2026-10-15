@@ -3,6 +3,7 @@
 
 mod calls;
 mod group_calls;
+mod release_notes;
 
 use std::{
     cell::RefCell,
@@ -144,6 +145,8 @@ struct Actor {
     group_ids: RefCell<HashMap<Vec<u8>, [u8; 32]>>,
     profile_fetches: RefCell<HashSet<String>>,
     receiver: RefCell<Option<tokio::task::JoinHandle<()>>>,
+    /// Fetches release notes into the Signal chat.
+    release_notes: RefCell<Option<tokio::task::JoinHandle<()>>>,
     /// Read syncs that arrived before their message, `(author, sent_at)`,
     /// applied when it does (as Desktop keeps them). Newest last.
     early_reads: RefCell<std::collections::VecDeque<(String, i64)>>,
@@ -219,6 +222,7 @@ pub(crate) async fn run(
         group_ids: RefCell::default(),
         profile_fetches: RefCell::default(),
         receiver: RefCell::new(None),
+        release_notes: RefCell::new(None),
         early_reads: RefCell::default(),
         identities_seen: RefCell::default(),
         calls: RefCell::new(None),
@@ -327,6 +331,7 @@ impl Actor {
         }
         self.titled.borrow_mut().insert(note);
 
+        let phone_for_notes = phone.clone();
         self.emit(Event::Ready { phone, aci });
         self.refresh_titles().await;
 
@@ -353,6 +358,11 @@ impl Actor {
 
         let task = tokio::task::spawn_local(self.clone().receive_loop(manager));
         if let Some(old) = self.receiver.borrow_mut().replace(task) {
+            old.abort();
+        }
+        // Release notes for the Signal chat, as Desktop fetches them.
+        let task = tokio::task::spawn_local(self.clone().release_notes_loop(phone_for_notes));
+        if let Some(old) = self.release_notes.borrow_mut().replace(task) {
             old.abort();
         }
     }
@@ -1910,6 +1920,8 @@ impl Actor {
             }
         }
         people.remove(&me);
+        // The Signal chat's account is made up: it has no profile.
+        people.remove(signal_store::SIGNAL_ACI);
         let now = now_millis();
         let mut due = Vec::new();
         for sid in people {
@@ -2098,6 +2110,13 @@ impl Actor {
             });
         }
         let sid = conversation.as_direct()?;
+        if conversation.is_signal() {
+            return Some(ConversationUpdate {
+                kind: Some(ConversationKind::Direct),
+                title: Some("Signal".into()),
+                ..Default::default()
+            });
+        }
         if sid == self.self_aci() {
             return Some(ConversationUpdate {
                 kind: Some(ConversationKind::NoteToSelf),
@@ -2941,10 +2960,13 @@ impl Actor {
                 }
             });
         }
-        let unread = match self.db.mark_read(&conversation).await {
+        let mut unread = match self.db.mark_read(&conversation).await {
             Ok(unread) => unread,
             Err(error) => return self.error("failed to mark read", error),
         };
+        // Release notes are only here: no receipts to the Signal chat's
+        // made-up account, and nothing for our other devices to sync.
+        unread.retain(|(author, _)| author != signal_store::SIGNAL_ACI);
         // Read messages start disappearing now.
         self.expiry.notify_one();
         self.emit(Event::ConversationsChanged);
@@ -3115,6 +3137,11 @@ impl Actor {
         body: ContentBody,
         timestamp: u64,
     ) -> DeliveryStatus {
+        // Its account is made up (as Desktop's): nothing goes to it.
+        if conversation.is_signal() {
+            warn!("not sending to the Signal chat");
+            return DeliveryStatus::Failed;
+        }
         let body = self.stamp_timer(conversation, body).await;
         let result = match (conversation.as_group(), mapping::service_id_of(conversation)) {
             (Some(key), _) => manager.send_message_to_group(&key, body, timestamp).await,

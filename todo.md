@@ -172,3 +172,18 @@ Recording works (see the README). Not done yet:
 - **Live testing:** the recorder (AVAudioRecorder) is only tested with a
   stand-in microphone; recording from a real one, and how other clients
   play the result, haven't been tried.
+
+## The Signal chat
+
+Release notes work (see the README). Not done yet:
+
+- **Megaphones:** the same manifest lists Desktop's megaphones (banners
+  with buttons, shown for some days); they aren't fetched or shown.
+- **Desktop's look:** its official-chat badge beside the name, the
+  chat's own message background, and the hero card at the top.
+- **Transferred history:** the phone's backup has a release notes chat of
+  its own; it isn't imported.
+- **Live testing:** the fetch was tested against updates2.signal.org (an
+  ignored test, `live_release_notes`), but a note hasn't yet arrived in
+  a real account's chat, since the first check starts from the current
+  version.

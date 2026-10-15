@@ -295,6 +295,22 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
     db.insert_message(&incoming(HOUSE, LEO, now - 4 * HOUR + 2 * MINUTE, "I'll grab some on the way home")).await?;
     db.set_muted(&ConversationId(HOUSE.into()), true).await?;
 
+    // The Signal chat: a release note (made up), with Desktop's donate button.
+    let signal = ConversationId::signal();
+    db.upsert_conversation(&signal, ConversationUpdate { kind: Some(ConversationKind::Direct), title: Some("Signal".into()), ..Default::default() })
+        .await?;
+    db.set_muted(&signal, true).await?;
+    let title = "Welcome to the demo";
+    let body = format!("{title}\n\nRelease notes from Signal show up in this chat. It's read-only, and muted to start with.");
+    let mut note = incoming(MAYA, MAYA, now - 9 * DAY, &body);
+    note.conversation_id = signal.clone();
+    note.author = Some(signal_store::SIGNAL_ACI.into());
+    note.author_name = Some("Signal".into());
+    let note = db.insert_message(&note).await?;
+    db.set_styles(note, &[signal_store::StyleSpan { start: 0, len: title.len(), style: signal_store::TextStyle::Bold }]).await?;
+    db.set_cta(note, &signal_store::CallToAction { id: "donate".into(), text: Some("Donate Now".into()) }).await?;
+    db.mark_read(&signal).await?;
+
     // Jordan: borrowing gear, with a draft waiting.
     db.insert_message(&incoming(JORDAN, JORDAN, now - 4 * DAY, "Can I borrow your tent for the 20th?")).await?;
     db.insert_message(&outgoing(JORDAN, now - 4 * DAY + 10 * MINUTE, "Of course. It's in the garage, I'll leave it out", DeliveryStatus::Read))

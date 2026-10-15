@@ -58,6 +58,7 @@ mod tests {
             notice: None,
             mentions: Vec::new(),
             styles: Vec::new(),
+            cta: None,
         }
     }
 

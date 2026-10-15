@@ -766,6 +766,7 @@ async fn drop_later_migrations(db: &AppDb) {
     sqlx::query("DROP INDEX messages_author").execute(&db.writer).await.unwrap();
     sqlx::query("DROP INDEX messages_quote_author").execute(&db.writer).await.unwrap();
     sqlx::query("ALTER TABLE messages DROP COLUMN styles").execute(&db.writer).await.unwrap();
+    sqlx::query("ALTER TABLE messages DROP COLUMN cta").execute(&db.writer).await.unwrap();
 }
 
 /// Rewrites the migration history to look like a pre-squash database that
@@ -1104,4 +1105,20 @@ fn quoted_attachments_say_what_they_are_as_desktop_does() {
     // Quotes stored before this knew nothing of the attachment.
     let old: Quote = serde_json::from_str(r#"{"author":null,"author_name":"You","sent_at":1,"text":""}"#).unwrap();
     assert_eq!(old.attachment, None);
+}
+
+#[tokio::test]
+async fn release_notes_keep_their_button() {
+    let db = test_db().await;
+    let id = db.insert_message(&incoming(&ConversationId::signal().0, SIGNAL_ACI, 1, "Hello\n\nNews")).await.unwrap();
+    assert_eq!(db.message(id).await.unwrap().unwrap().cta, None);
+    let cta = CallToAction { id: "donate".into(), text: Some("Donate Now".into()) };
+    db.set_cta(id, &cta).await.unwrap();
+    assert_eq!(db.message(id).await.unwrap().unwrap().cta, Some(cta));
+    assert!(ConversationId::signal().is_signal() && !conv("d:a").is_signal());
+    // The Signal chat isn't someone to message or add to a group.
+    db.upsert_conversation(&ConversationId::signal(), ConversationUpdate { title: Some("Signal".into()), ..Default::default() })
+        .await
+        .unwrap();
+    assert!(db.people().await.unwrap().iter().all(|p| !p.id.is_signal()));
 }

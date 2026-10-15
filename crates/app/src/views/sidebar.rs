@@ -569,6 +569,7 @@ impl Sidebar {
                     .child(Icon::new(IconName::Users).size_5().text_color(fg))
                     .into_any_element()
             }
+            _ if entry.id.is_signal() => crate::views::common::signal_avatar(px(48.)),
             _ => crate::views::common::person_avatar(
                 entry.id.as_direct().and_then(|sid| self.state.read(cx).photo_of(sid)),
                 &entry.title,

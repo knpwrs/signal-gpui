@@ -157,8 +157,10 @@ pub fn build(
         move |_: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut App| state.read(cx).set_chat(id.clone(), change)
     };
 
+    // The Signal chat (release notes) has no timer or settings, as Desktop's.
+    let signal = conversation.id.is_signal();
     // Groups: only people allowed to edit the group's details.
-    let timer_locked = conversation.blocked || conversation.left || (group && !conversation.can_edit_info);
+    let timer_locked = signal || conversation.blocked || conversation.left || (group && !conversation.can_edit_info);
     let menu = if timer_locked {
         menu
     } else {
@@ -203,7 +205,7 @@ pub fn build(
     };
 
     let mut menu = menu;
-    if !note_to_self {
+    if !note_to_self && !signal {
         let (state, chat) = (state.clone(), conversation.clone());
         menu = menu.item(
             PopupMenuItem::new(if group { "Group settings" } else { "Chat settings" })

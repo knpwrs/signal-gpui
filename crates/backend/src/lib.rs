@@ -28,6 +28,7 @@ pub mod giphy;
 pub mod sticker_upload;
 pub mod deletes;
 pub mod edits;
+pub mod release_notes;
 
 /// Most conversations an account can pin (Signal's limit).
 pub use storage::MAX_PINNED;
@@ -48,6 +49,24 @@ pub const SETTING_GIPHY_API_KEY: &str = "giphy_api_key";
 pub const SETTING_IMAGE_OPTIMIZATION: &str = "image_optimization";
 
 pub use link_preview::{LinkPreviewDraft, PreviewImage};
+
+/// TLS for Signal's own servers (the calling server, updates2.signal.org),
+/// whose certificates come from Signal's root CA: trusting only that, as
+/// Desktop does.
+pub(crate) fn signal_tls() -> anyhow::Result<rustls::ClientConfig> {
+    use rustls::pki_types::{CertificateDer, pem::PemObject as _};
+    let pem = presage::libsignal_service::configuration::ServiceConfiguration::from(presage::libsignal_service::configuration::SignalServers::Production)
+        .certificate_authority;
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_slice_iter(pem.as_bytes()) {
+        roots.add(cert?)?;
+    }
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    Ok(rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_no_client_auth())
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
