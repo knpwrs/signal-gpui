@@ -37,6 +37,17 @@ gpui_kit::actions!(composer, [FormatBold, FormatItalic, FormatStrikethrough, For
 // Desktop's shortcut for recording a voice message (cmd-shift-y).
 gpui_kit::actions!(composer, [RecordVoice]);
 
+/// A stopped recording to play back: its waveform (once decoded), and its
+/// player while it plays.
+struct VoiceDraft {
+    wave: Option<(Vec<f32>, f64)>,
+    player: Option<crate::audio::Player>,
+    _poll: Option<Task<()>>,
+}
+
+/// How often the draft's playback is redrawn.
+const DRAFT_POLL: Duration = Duration::from_millis(50);
+
 /// How often the recording's level and time are read.
 const RECORDING_POLL: Duration = Duration::from_millis(100);
 /// What a recorded voice message is called on disk here (it's sent without
@@ -159,6 +170,9 @@ pub struct Composer {
     /// A voice message being recorded; the composer shows it instead of
     /// the input.
     recording: Option<Recording>,
+    /// The recording stopped and kept to play back before sending
+    /// (Desktop's draft recording).
+    voice_draft: Option<VoiceDraft>,
     recording_focus: FocusHandle,
     _recording_poll: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -205,6 +219,13 @@ impl Composer {
             cx.subscribe(&state, |this, _, event: &crate::state::AppEvent, cx| {
                 if let crate::state::AppEvent::LinkPreview { url, preview } = event {
                     this.on_link_preview(url, preview.clone(), cx);
+                }
+            }),
+            // Desktop: leaving the app stops a recording and keeps it as a
+            // draft (`saveDraftRecordingIfNeeded` on blur).
+            cx.observe_window_activation(window, |this, window, cx| {
+                if !window.is_window_active() {
+                    this.save_draft_recording(cx);
                 }
             }),
             cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| match event {
@@ -259,6 +280,7 @@ impl Composer {
             typing_sent_at: None,
             draft_task: None,
             recording: None,
+            voice_draft: None,
             recording_focus: cx.focus_handle(),
             _recording_poll: None,
             _subscriptions: subscriptions,
@@ -525,6 +547,7 @@ impl Composer {
                 let alive = this.update_in(cx, |this, window, cx| {
                     let Some(recording) = &mut this.recording else { return false };
                     if recording.tick() {
+                        this.enter_draft(cx);
                         this.confirm_over_limit(window, cx);
                     }
                     cx.notify();
@@ -570,14 +593,93 @@ impl Composer {
         use gpui_kit::component::WindowExt as _;
         let mut recording = self.recording.take()?;
         // Stopped at the limit: its dialog is open, and is answered now.
-        if recording.stopped {
+        if recording.stopped && recording.elapsed() >= crate::recorder::MAX_SECONDS {
             window.close_all_dialogs(cx);
         }
+        // Stops a draft playing.
+        self.voice_draft = None;
         recording.stop();
         self._recording_poll = None;
         self.focus(window, cx);
         cx.notify();
         Some(recording)
+    }
+
+    /// Stops recording and keeps it as a draft, if it's still recording.
+    fn save_draft_recording(&mut self, cx: &mut Context<Self>) {
+        let Some(recording) = self.recording.as_mut().filter(|r| !r.stopped) else { return };
+        recording.stop();
+        self._recording_poll = None;
+        self.enter_draft(cx);
+    }
+
+    /// Shows the stopped recording as a draft, decoding its waveform.
+    fn enter_draft(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.recording.as_ref().map(|r| r.path.clone()) else { return };
+        self.voice_draft = Some(VoiceDraft { wave: None, player: None, _poll: None });
+        cx.spawn(async move |this, cx| {
+            let wave = cx.background_executor().spawn(async move { crate::audio::waveform(&path).ok() }).await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(draft) = &mut this.voice_draft {
+                    draft.wave = wave;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Plays or pauses the draft (one sound at a time).
+    fn toggle_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.recording.as_ref().map(|r| r.path.clone()) else { return };
+        let Some(draft) = &mut self.voice_draft else { return };
+        if draft.player.is_none() {
+            match crate::audio::Player::open(&path) {
+                Ok(player) => draft.player = Some(player),
+                Err(error) => {
+                    use gpui_kit::component::WindowExt as _;
+                    tracing::warn!(error = %format!("{error:#}"), "couldn't play the draft");
+                    window.push_notification(
+                        gpui_kit::component::notification::Notification::error("There was an error with the voice recorder."),
+                        cx,
+                    );
+                    return;
+                }
+            }
+        }
+        let Some(player) = &draft.player else { return };
+        if player.is_playing() {
+            player.pause();
+        } else {
+            self.state.read(cx).pause_audio();
+            player.play();
+            draft._poll = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(DRAFT_POLL).await;
+                    let playing = this.update(cx, |this, cx| {
+                        cx.notify();
+                        this.voice_draft.as_ref().and_then(|d| d.player.as_ref()).is_some_and(|p| p.is_playing())
+                    });
+                    if !matches!(playing, Ok(true)) {
+                        break;
+                    }
+                }
+            }));
+        }
+        cx.notify();
+    }
+
+    /// A click on the draft's waveform: plays from there.
+    fn seek_draft(&mut self, fraction: f64, window: &mut Window, cx: &mut Context<Self>) {
+        let playing = self.voice_draft.as_ref().and_then(|d| d.player.as_ref()).is_some_and(|p| p.is_playing());
+        if !playing {
+            self.toggle_draft(window, cx);
+        }
+        if let Some(player) = self.voice_draft.as_ref().and_then(|d| d.player.as_ref()) {
+            player.seek(fraction * player.duration());
+        }
+        cx.notify();
     }
 
     fn cancel_recording(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1337,7 +1439,10 @@ impl Render for Composer {
             .when_some(self.render_link_preview(palette, cx), |d, card| d.child(card))
             .when(!self.images.is_empty(), |d| d.child(self.render_images(palette, cx)))
             .when(!self.files.is_empty(), |d| d.child(self.render_files(palette, cx)))
-            .when_some(self.recording.as_ref(), |d, recording| d.child(self.render_recording(recording, palette, cx)))
+            .when_some(self.recording.as_ref().filter(|_| self.voice_draft.is_none()), |d, recording| {
+                d.child(self.render_recording(recording, palette, cx))
+            })
+            .when(self.voice_draft.is_some(), |d| d.child(self.render_draft(palette, cx)))
             .when(self.recording.is_none(), |d| d.child(
                 div()
                     .flex()
@@ -1436,6 +1541,90 @@ impl Render for Composer {
 }
 
 impl Composer {
+    /// Desktop's `CompositionRecordingDraft`: play or pause, the waveform
+    /// (click to play from there), the time, then Cancel and Send.
+    fn render_draft(&self, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        use gpui_kit::component::button::{Button, ButtonVariants as _};
+        let draft = self.voice_draft.as_ref();
+        let player = draft.and_then(|d| d.player.as_ref());
+        let playing = player.is_some_and(|p| p.is_playing());
+        let length = draft.and_then(|d| d.wave.as_ref()).map_or(0., |(_, seconds)| *seconds);
+        let position = player.map_or(0., |p| p.position());
+        let played = if length > 0. { (position / length).clamp(0., 1.) } else { 0. };
+        let peaks = draft.and_then(|d| d.wave.as_ref()).map(|(peaks, _)| peaks.clone());
+        let bars = (0..crate::audio::BARS).map(|bar| {
+            let peak = peaks.as_ref().and_then(|p| p.get(bar).copied()).unwrap_or(0.);
+            let done = (bar as f64 + 0.5) / crate::audio::BARS as f64 <= played;
+            div()
+                .id(("voice-draft-bar", bar))
+                .flex_1()
+                .h_full()
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.seek_draft(bar as f64 / crate::audio::BARS as f64, window, cx);
+                }))
+                .child(
+                    div()
+                        .w(px(2.))
+                        .h(px(2. + peak * 18.))
+                        .rounded(px(1.))
+                        .bg(if done { palette.text } else { palette.text_secondary }),
+                )
+        });
+        div()
+            .id("voice-draft")
+            .debug_selector(|| "voice-draft".into())
+            .track_focus(&self.recording_focus)
+            .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" {
+                    this.cancel_recording(window, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .flex()
+            .items_center()
+            .gap_3()
+            .px_3()
+            .py_2()
+            .child(
+                div()
+                    .id("voice-draft-play")
+                    .flex_none()
+                    .size(px(32.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .cursor_pointer()
+                    .bg(palette.input_bg)
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_draft(window, cx)))
+                    .child(Icon::new(if playing { IconName::Pause } else { IconName::Play }).size_4().text_color(palette.text)),
+            )
+            .child(div().flex_1().min_w_0().h(px(32.)).flex().items_center().children(bars))
+            .child(
+                div()
+                    .flex_none()
+                    .min_w(px(36.))
+                    .text_sm()
+                    .text_color(palette.text_secondary)
+                    .child(crate::audio::clock(if playing { position } else { length })),
+            )
+            .child(
+                Button::new("voice-draft-cancel")
+                    .label("Cancel")
+                    .ghost()
+                    .on_click(cx.listener(|this, _, window, cx| this.cancel_recording(window, cx))),
+            )
+            .child(
+                Button::new("voice-draft-send")
+                    .label("Send")
+                    .primary()
+                    .on_click(cx.listener(|this, _, window, cx| this.send_recording(window, cx))),
+            )
+    }
+
     /// Desktop's `CompositionRecording`: a red dot, the time, the level as
     /// bars scrolling in from the right, then Cancel and Send.
     fn render_recording(&self, recording: &Recording, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1783,6 +1972,27 @@ mod tests {
         // As phones send them: AAC, without a name.
         assert_eq!((attachment.content_type.as_str(), attachment.file_name.as_deref()), ("audio/aac", None));
         assert_eq!(std::fs::read(attachment.local_path.as_ref().unwrap()).unwrap(), b"not really AAC");
+    }
+
+    #[gpui_kit::test]
+    fn leaving_the_app_keeps_the_recording_as_a_draft(cx: &mut TestAppContext) {
+        let f = mount(cx);
+        let mut cx = gpui_kit::VisualTestContext::from_window(f.window, cx);
+        let mic = start_fake_recording(&f, &mut cx);
+        mic.seconds.set(2.);
+        // What the window losing focus does (no audio is played here).
+        f.composer.update(&mut cx, |c, cx| c.save_draft_recording(cx));
+        cx.run_until_parked();
+        assert!(mic.stopped.get(), "recording stops");
+        assert!(cx.update(|_, cx| f.composer.read(cx).voice_draft.is_some()));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("voice-draft").is_some(), "the draft, to play back");
+        // Sent from the draft, as a voice message.
+        cx.update(|window, cx| f.composer.update(cx, |c, cx| c.send_recording(window, cx)));
+        assert!(cx.update(|_, cx| f.composer.read(cx).voice_draft.is_none()));
+        let messages = sent(&f, |m| m.attachments.iter().any(|a| a.voice));
+        assert!(messages.iter().any(|m| m.attachments.iter().any(|a| a.voice)));
     }
 
     #[gpui_kit::test]
