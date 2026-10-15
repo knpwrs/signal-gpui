@@ -233,8 +233,9 @@ impl ConversationView {
         .detach();
     }
 
-    /// Shows the message `author` sent at `sent_at` (from a notice).
-    fn go_to(&mut self, author: Option<String>, sent_at: i64, cx: &mut Context<Self>) {
+    /// Shows the message `author` sent at `sent_at` (from a pin notice or a
+    /// quote), saying `missing` if we don't have it.
+    fn go_to(&mut self, author: Option<String>, sent_at: i64, missing: &'static str, cx: &mut Context<Self>) {
         let backend = self.state.read(cx).backend.clone();
         let db = backend.db().clone();
         let id = self.id.clone();
@@ -243,7 +244,7 @@ impl ConversationView {
             let found = query.await.ok().flatten();
             let _ = this.update(cx, |this, cx| match found {
                 Some(message) => this.load_around(message.id, cx),
-                None => this.state.update(cx, |state, cx| state.report_error("Pinned message not found".to_owned(), cx)),
+                None => this.state.update(cx, |state, cx| state.report_error(missing.to_owned(), cx)),
             });
         })
         .detach();
@@ -304,7 +305,7 @@ impl ConversationView {
                             Button::new(SharedString::from(format!("notice-go-{at}")))
                                 .label("Go to message")
                                 .ghost()
-                                .on_click(cx.listener(move |this, _, _, cx| this.go_to(author.clone(), at, cx))),
+                                .on_click(cx.listener(move |this, _, _, cx| this.go_to(author.clone(), at, "Pinned message not found", cx))),
                         )
                     })
                     .when_some(call_back, |d, (incoming, video)| {
@@ -1252,7 +1253,7 @@ impl ConversationView {
                             .when(show_author && !outgoing, |d| {
                                 d.child(author_line(author_name, author_color, author_label))
                             })
-                            .when_some(message.quote.clone(), |d, quote| d.child(render_quote(quote, fg, palette))),
+                            .when_some(message.quote.clone(), |d, quote| d.child(self.render_quote(message.id, quote, fg, palette, cx))),
                     )
                 })
                 .child(
@@ -1332,7 +1333,7 @@ impl ConversationView {
                             .when(show_author && !outgoing, |d| {
                                 d.child(author_line(author_name, author_color, author_label))
                             })
-                            .when_some(message.quote.clone(), |d, quote| d.child(render_quote(quote, fg, palette))),
+                            .when_some(message.quote.clone(), |d, quote| d.child(self.render_quote(message.id, quote, fg, palette, cx))),
                     )
                 })
                 .child(render_preview_card(message.id, preview, full, (!header).then_some(corners), meta_color))
@@ -1367,7 +1368,7 @@ impl ConversationView {
             .when(show_author && !outgoing, |d| {
                 d.child(author_line(author_name, author_color, author_label))
             })
-            .when_some(message.quote.clone(), |d, quote| d.child(render_quote(quote, fg, palette)))
+            .when_some(message.quote.clone(), |d, quote| d.child(self.render_quote(message.id, quote, fg, palette, cx)))
             .children(message.attachments.iter().enumerate().map(|(ix, a)| render_attachment(message.id, ix, a, &title, fg, palette, &self.state, cx)))
             .map(|d| {
                 if message.deleted {
@@ -2489,6 +2490,23 @@ fn media_size(width: Option<u32>, height: Option<u32>) -> (f32, f32) {
 
 /// Side of the image beside a quote (the quoted photo or preview image).
 const QUOTE_THUMBNAIL: f32 = 54.;
+
+impl ConversationView {
+    /// A reply's quote; clicking it shows the quoted message, as in Desktop.
+    fn render_quote(&self, message_id: i64, quote: signal_store::Quote, fg: Hsla, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let (author, sent_at) = (quote.author.clone(), quote.sent_at);
+        div()
+            .id(("quote", message_id as u64))
+            .debug_selector(move || format!("quote-{message_id}"))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                // Desktop's toast when it's gone (`icu:originalMessageNotFound`).
+                this.go_to(author.clone(), sent_at, "Original message not found", cx);
+            }))
+            .child(render_quote(quote, fg, palette))
+    }
+}
 
 fn render_quote(quote: signal_store::Quote, fg: Hsla, palette: Palette) -> impl IntoElement {
     // A column with a left border, not a row with a bar beside the text: in a
@@ -3667,6 +3685,63 @@ mod tests {
         let bubble = bounds(&mut cx, format!("bubble-{}", view_photo.id));
         assert_eq!(avatar.bottom(), bubble.bottom(), "avatar {avatar:?} vs bubble {bubble:?}");
         backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn clicking_a_quote_shows_the_quoted_message(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        wait_for_messages(&backend, MAYA, 3, |_| true);
+        // An old message far up the chat, and today's reply to it.
+        let db = backend.db().clone();
+        let (quoted, reply) = futures::executor::block_on(backend.spawn(async move {
+            let message = |n: i64, body: String| signal_store::NewMessage {
+                conversation_id: ConversationId(MAYA.into()),
+                sent_at: 1_000_000 + n * 60_000,
+                received_at: 1_000_000 + n * 60_000,
+                direction: Direction::Incoming,
+                author: Some(MAYA.trim_start_matches("d:").into()),
+                author_name: Some("Maya Chen".into()),
+                body,
+                status: DeliveryStatus::Read,
+                quote: None,
+                attachments: vec![],
+                link_preview: None,
+                expires_in: 0,
+            };
+            let mut quoted = 0;
+            for n in 0..100i64 {
+                let id = db.insert_message(&message(n, format!("old {n}"))).await?;
+                if n == 5 {
+                    quoted = id;
+                }
+            }
+            let mut reply = message(0, "about that".into());
+            reply.sent_at = chrono::Utc::now().timestamp_millis();
+            reply.received_at = reply.sent_at;
+            reply.quote = Some(signal_store::Quote {
+                author: reply.author.clone(),
+                author_name: "Maya Chen".into(),
+                sent_at: 1_000_000 + 5 * 60_000,
+                text: "old 5".into(),
+                thumbnail: None,
+                attachment: None,
+            });
+            Ok::<_, signal_store::Error>((quoted, db.insert_message(&reply).await?))
+        }))
+        .unwrap();
+        let (mut cx, view) = open_view_sized(cx, &backend, MAYA, 600.);
+        let quote = bounds(&mut cx, format!("quote-{reply}"));
+        cx.simulate_click(quote.center(), gpui_kit::Modifiers::none());
+        for _ in 0..300 {
+            cx.run_until_parked();
+            if view.read_with(&cx, |v, _| v.highlight == Some(quoted)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(view.read_with(&cx, |v, _| v.highlight), Some(quoted));
+        let row = bounds(&mut cx, format!("row-{quoted}"));
+        assert!(row.top() >= px(0.) && row.top() < px(600.), "on screen: {row:?}");
     }
 
     #[gpui_kit::test]
