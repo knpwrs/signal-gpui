@@ -19,6 +19,7 @@ use signal_backend::{Command, LinkPreviewDraft, OutgoingFile, OutgoingImage};
 use signal_emoji::{Emoji, SearchOptions};
 use signal_store::{ConversationId, ConversationKind, Message};
 
+use crate::recorder::Recording;
 use crate::state::AppState;
 use crate::theme::Palette;
 use crate::views::common::ClosedByClick;
@@ -33,6 +34,14 @@ const DRAFT_DEBOUNCE: Duration = Duration::from_millis(400);
 // Desktop's formatting shortcuts (bound in main.rs): each wraps the
 // selection in its marker (see `crate::formatting`).
 gpui_kit::actions!(composer, [FormatBold, FormatItalic, FormatStrikethrough, FormatMonospace, FormatSpoiler]);
+// Desktop's shortcut for recording a voice message (cmd-shift-y).
+gpui_kit::actions!(composer, [RecordVoice]);
+
+/// How often the recording's level and time are read.
+const RECORDING_POLL: Duration = Duration::from_millis(100);
+/// What a recorded voice message is called on disk here (it's sent without
+/// a name).
+const VOICE_FILE_NAME: &str = "Voice message.m4a";
 
 pub enum ComposerEvent {
     Sent,
@@ -147,6 +156,11 @@ pub struct Composer {
     preview_task: Option<Task<()>>,
     typing_sent_at: Option<Instant>,
     draft_task: Option<Task<()>>,
+    /// A voice message being recorded; the composer shows it instead of
+    /// the input.
+    recording: Option<Recording>,
+    recording_focus: FocusHandle,
+    _recording_poll: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -179,6 +193,13 @@ impl Composer {
                 }
                 if let Some(preview) = &this.link_preview {
                     preview.release(cx);
+                }
+                // A recording left unsent when the chat closes is dropped.
+                if let Some(recording) = this.recording.take() {
+                    drop(this._recording_poll.take());
+                    let path = recording.path.clone();
+                    drop(recording);
+                    let _ = std::fs::remove_file(path);
                 }
             }),
             cx.subscribe(&state, |this, _, event: &crate::state::AppEvent, cx| {
@@ -237,6 +258,9 @@ impl Composer {
             preview_task: None,
             typing_sent_at: None,
             draft_task: None,
+            recording: None,
+            recording_focus: cx.focus_handle(),
+            _recording_poll: None,
             _subscriptions: subscriptions,
         };
         this.load_members(cx);
@@ -244,6 +268,9 @@ impl Composer {
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
+        if self.recording.is_some() {
+            return window.focus(&self.recording_focus, cx);
+        }
         let input = self.input.clone();
         input.update(cx, |input, cx| input.focus(window, cx));
     }
@@ -461,6 +488,130 @@ impl Composer {
                 started: false,
             });
         }
+    }
+
+    /// Desktop's microphone button: records until Send or Cancel (or Esc).
+    /// A voice message goes alone, so not with images or files staged.
+    fn start_recording(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_kit::component::WindowExt as _;
+        use gpui_kit::component::notification::Notification;
+        if self.recording.is_some() || self.editing.is_some() {
+            return;
+        }
+        if !self.images.is_empty() || !self.files.is_empty() {
+            window.push_notification(Notification::new().message("A voice message must have only one attachment."), cx);
+            return;
+        }
+        let path = crate::recorder::new_path();
+        let start = self.state.read(cx).start_recorder;
+        let recorder = match start(&path) {
+            Ok(recorder) => recorder,
+            Err(error) => {
+                tracing::warn!(%error, "couldn't start recording");
+                let _ = std::fs::remove_file(&path);
+                window.push_notification(Notification::error("There was an error with the voice recorder."), cx);
+                return;
+            }
+        };
+        // One sound at a time.
+        self.state.read(cx).pause_audio();
+        self.stop_typing(cx);
+        self.recording = Some(Recording::new(path, recorder));
+        window.push_notification(Notification::new().message("Voice messages are limited to one hour."), cx);
+        window.focus(&self.recording_focus, cx);
+        self._recording_poll = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(RECORDING_POLL).await;
+                let alive = this.update_in(cx, |this, window, cx| {
+                    let Some(recording) = &mut this.recording else { return false };
+                    if recording.tick() {
+                        this.confirm_over_limit(window, cx);
+                    }
+                    cx.notify();
+                    true
+                });
+                if !matches!(alive, Ok(true)) {
+                    break;
+                }
+            }
+        }));
+        cx.notify();
+    }
+
+    /// Desktop's dialog when an hour is up: the recording has stopped; send
+    /// it or not.
+    fn confirm_over_limit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_kit::component::WindowExt as _;
+        use gpui_kit::component::button::{Button, ButtonVariants as _};
+        use gpui_kit::component::dialog::DialogFooter;
+        let this = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (discard, send) = (this.clone(), this.clone());
+            dialog
+                .w(px(420.))
+                .child(div().text_sm().child("Voice message recording stopped because the maximum time limit was reached."))
+                .footer(
+                    DialogFooter::new()
+                        .child(Button::new("voice-discard").label("Discard").outline().on_click(move |_, window, cx| {
+                            window.close_all_dialogs(cx);
+                            let _ = discard.update(cx, |this, cx| this.cancel_recording(window, cx));
+                        }))
+                        .child(Button::new("voice-send-anyway").label("Send anyway").primary().on_click(
+                            move |_, window, cx| {
+                                window.close_all_dialogs(cx);
+                                let _ = send.update(cx, |this, cx| this.send_recording(window, cx));
+                            },
+                        )),
+                )
+        });
+    }
+
+    fn end_recording(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<Recording> {
+        use gpui_kit::component::WindowExt as _;
+        let mut recording = self.recording.take()?;
+        // Stopped at the limit: its dialog is open, and is answered now.
+        if recording.stopped {
+            window.close_all_dialogs(cx);
+        }
+        recording.stop();
+        self._recording_poll = None;
+        self.focus(window, cx);
+        cx.notify();
+        Some(recording)
+    }
+
+    fn cancel_recording(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(recording) = self.end_recording(window, cx) {
+            let _ = std::fs::remove_file(&recording.path);
+        }
+    }
+
+    /// Sends the recording as a voice message (replying, if a reply was
+    /// staged).
+    fn send_recording(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_kit::component::WindowExt as _;
+        use gpui_kit::component::notification::Notification;
+        let Some(recording) = self.end_recording(window, cx) else { return };
+        let bytes = std::fs::read(&recording.path);
+        let _ = std::fs::remove_file(&recording.path);
+        let bytes = match bytes {
+            Ok(bytes) if !bytes.is_empty() => bytes,
+            result => {
+                tracing::warn!(error = ?result.err(), "the recording is empty or unreadable");
+                window.push_notification(Notification::error("There was an error with the voice recorder."), cx);
+                return;
+            }
+        };
+        let quote = self.reply_to.take().map(|m| m.id);
+        self.state.read(cx).send(Command::SendFile {
+            conversation: self.conversation.clone(),
+            file: OutgoingFile { bytes: Arc::new(bytes), file_name: VOICE_FILE_NAME.into(), voice: true },
+            caption: String::new(),
+            quote,
+            mentions: Vec::new(),
+            styles: Vec::new(),
+        });
+        cx.emit(ComposerEvent::Sent);
     }
 
     fn save_draft_later(&mut self, text: String, cx: &mut Context<Self>) {
@@ -1038,6 +1189,9 @@ fn encode_mentions(
 
 impl Focusable for Composer {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
+        if self.recording.is_some() {
+            return self.recording_focus.clone();
+        }
         self.input.read(cx).focus_handle(cx)
     }
 }
@@ -1057,6 +1211,7 @@ impl Render for Composer {
             .on_action(cx.listener(|this, _: &FormatStrikethrough, window, cx| this.format(TextStyle::Strikethrough, window, cx)))
             .on_action(cx.listener(|this, _: &FormatMonospace, window, cx| this.format(TextStyle::Monospace, window, cx)))
             .on_action(cx.listener(|this, _: &FormatSpoiler, window, cx| this.format(TextStyle::Spoiler, window, cx)))
+            .on_action(cx.listener(|this, _: &RecordVoice, window, cx| this.start_recording(window, cx)))
             .relative()
             .flex()
             .flex_col()
@@ -1156,7 +1311,8 @@ impl Render for Composer {
             .when_some(self.render_link_preview(palette, cx), |d, card| d.child(card))
             .when(!self.images.is_empty(), |d| d.child(self.render_images(palette, cx)))
             .when(!self.files.is_empty(), |d| d.child(self.render_files(palette, cx)))
-            .child(
+            .when_some(self.recording.as_ref(), |d, recording| d.child(self.render_recording(recording, palette, cx)))
+            .when(self.recording.is_none(), |d| d.child(
                 div()
                     .flex()
                     .items_end()
@@ -1229,7 +1385,98 @@ impl Render for Composer {
                                 .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
                                 .child(Icon::new(IconName::Send).size_4().text_color(palette.on_accent)),
                         )
+                    })
+                    // Desktop's microphone, where Send goes once there's
+                    // something to send.
+                    .when(!can_send && self.editing.is_none(), |d| {
+                        d.child(
+                            div()
+                                .id("mic-button")
+                                .debug_selector(|| "mic-button".into())
+                                .flex_none()
+                                .size(px(32.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_full()
+                                .cursor_pointer()
+                                .hover(|d| d.bg(palette.row_hover))
+                                .on_click(cx.listener(|this, _, window, cx| this.start_recording(window, cx)))
+                                .child(Icon::new(IconName::Mic).size_5().text_color(palette.text_secondary)),
+                        )
                     }),
+            ))
+    }
+}
+
+impl Composer {
+    /// Desktop's `CompositionRecording`: a red dot, the time, the level as
+    /// bars scrolling in from the right, then Cancel and Send.
+    fn render_recording(&self, recording: &Recording, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        use gpui_kit::component::button::{Button, ButtonVariants as _};
+        let red = gpui_kit::Hsla { h: 0., s: 0.75, l: 0.5, a: 1. };
+        // Newest first: the row runs right to left.
+        let bars = recording.levels.iter().rev().enumerate().map(|(ix, level)| {
+            div()
+                .id(("voice-level", ix))
+                .flex_none()
+                .w(px(2.))
+                .min_h(px(2.))
+                .h(gpui_kit::relative(level.clamp(0., 1.)))
+                .rounded(px(1.))
+                .bg(palette.text_secondary)
+        });
+        div()
+            .id("voice-recording")
+            .track_focus(&self.recording_focus)
+            .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
+                // Desktop's: Esc cancels (`useEscapeHandling`).
+                if event.keystroke.key == "escape" {
+                    this.cancel_recording(window, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .flex()
+            .items_center()
+            .gap_3()
+            .px_3()
+            .py_2()
+            .child(div().flex_none().size(px(10.)).rounded_full().bg(red))
+            .child(
+                div()
+                    .flex_none()
+                    .min_w(px(36.))
+                    .text_sm()
+                    .text_color(palette.text)
+                    .child(crate::audio::clock(recording.elapsed().floor())),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h(px(32.))
+                    .px_2()
+                    .py_1()
+                    .overflow_hidden()
+                    .rounded(px(6.))
+                    .bg(palette.input_bg)
+                    .flex()
+                    .flex_row_reverse()
+                    .items_center()
+                    .gap(px(2.))
+                    .children(bars),
+            )
+            .child(
+                Button::new("voice-cancel")
+                    .label("Cancel")
+                    .ghost()
+                    .on_click(cx.listener(|this, _, window, cx| this.cancel_recording(window, cx))),
+            )
+            .child(
+                Button::new("voice-send")
+                    .label("Send")
+                    .primary()
+                    .on_click(cx.listener(|this, _, window, cx| this.send_recording(window, cx))),
             )
     }
 }
@@ -1462,6 +1709,104 @@ mod tests {
         assert_eq!((csv.body.as_str(), csv.attachments[0].content_type.as_str()), ("", "text/csv"));
         let saved = std::fs::read(pdf.attachments[0].local_path.as_ref().unwrap()).unwrap();
         assert_eq!(saved, b"%PDF-1.7");
+    }
+
+    thread_local! {
+        /// The stand-in microphone the next recording gets.
+        static MIC: std::cell::RefCell<crate::recorder::fake::FakeMic> = Default::default();
+    }
+
+    fn fake_microphone(path: &std::path::Path) -> anyhow::Result<Box<dyn crate::recorder::Recorder>> {
+        std::fs::write(path, b"not really AAC")?;
+        Ok(Box::new(MIC.with(|m| m.borrow().clone())))
+    }
+
+    fn start_fake_recording(f: &Fixture, cx: &mut gpui_kit::VisualTestContext) -> crate::recorder::fake::FakeMic {
+        let mic = crate::recorder::fake::FakeMic::default();
+        MIC.with(|m| *m.borrow_mut() = mic.clone());
+        cx.update(|_, cx| {
+            let state = f.composer.read(cx).state.clone();
+            state.update(cx, |s, _| s.start_recorder = fake_microphone);
+        });
+        cx.run_until_parked();
+        let button = cx.debug_bounds("mic-button").expect("the microphone shows in an empty composer").center();
+        cx.simulate_click(button, gpui_kit::Modifiers::none());
+        cx.run_until_parked();
+        mic
+    }
+
+    #[gpui_kit::test]
+    fn a_recording_sends_as_a_voice_message(cx: &mut TestAppContext) {
+        let f = mount(cx);
+        let mut cx = gpui_kit::VisualTestContext::from_window(f.window, cx);
+        let mic = start_fake_recording(&f, &mut cx);
+        let path = cx.update(|_, cx| f.composer.read(cx).recording.as_ref().map(|r| r.path.clone())).expect("recording");
+        mic.level.set(0.5);
+        mic.seconds.set(3.);
+        cx.executor().advance_clock(RECORDING_POLL * 3);
+        cx.run_until_parked();
+        let levels = cx.update(|_, cx| f.composer.read(cx).recording.as_ref().unwrap().levels.len());
+        assert!(levels >= 2, "levels are read as it records ({levels})");
+
+        cx.update(|window, cx| f.composer.update(cx, |c, cx| c.send_recording(window, cx)));
+        assert!(mic.stopped.get() && !path.exists(), "stopped, and the recording handed over");
+        assert!(cx.update(|_, cx| f.composer.read(cx).recording.is_none()));
+        let messages = sent(&f, |m| m.attachments.iter().any(|a| a.voice));
+        let voice = messages.iter().find(|m| m.attachments.iter().any(|a| a.voice)).unwrap();
+        let attachment = &voice.attachments[0];
+        // As phones send them: AAC, without a name.
+        assert_eq!((attachment.content_type.as_str(), attachment.file_name.as_deref()), ("audio/aac", None));
+        assert_eq!(std::fs::read(attachment.local_path.as_ref().unwrap()).unwrap(), b"not really AAC");
+    }
+
+    #[gpui_kit::test]
+    fn escape_cancels_a_recording(cx: &mut TestAppContext) {
+        let f = mount(cx);
+        let mut cx = gpui_kit::VisualTestContext::from_window(f.window, cx);
+        let mic = start_fake_recording(&f, &mut cx);
+        let path = cx.update(|_, cx| f.composer.read(cx).recording.as_ref().map(|r| r.path.clone())).expect("recording");
+        cx.update(|window, cx| window.press("escape", cx));
+        cx.run_until_parked();
+        assert!(cx.update(|_, cx| f.composer.read(cx).recording.is_none()));
+        assert!(mic.stopped.get() && !path.exists(), "stopped and thrown away");
+    }
+
+    #[gpui_kit::test]
+    fn an_hour_stops_the_recording_and_asks(cx: &mut TestAppContext) {
+        use gpui_kit::component::WindowExt as _;
+        let f = mount(cx);
+        let mut cx = gpui_kit::VisualTestContext::from_window(f.window, cx);
+        let mic = start_fake_recording(&f, &mut cx);
+        mic.seconds.set(crate::recorder::MAX_SECONDS);
+        cx.executor().advance_clock(RECORDING_POLL * 2);
+        cx.run_until_parked();
+        assert!(mic.stopped.get(), "the microphone stops at the limit");
+        assert!(cx.update(|window, cx| window.has_active_dialog(cx)), "Desktop's Discard / Send anyway");
+        // Still there to send until one is picked.
+        assert!(cx.update(|_, cx| f.composer.read(cx).recording.as_ref().is_some_and(|r| r.stopped)));
+        // Cancelled behind the dialog: the dialog goes with it.
+        cx.update(|window, cx| f.composer.update(cx, |c, cx| c.cancel_recording(window, cx)));
+        cx.run_until_parked();
+        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+    }
+
+    #[gpui_kit::test]
+    fn the_microphone_gives_way_to_send(cx: &mut TestAppContext) {
+        let f = mount(cx);
+        let target = input_id(&f, cx);
+        let mut cx = gpui_kit::VisualTestContext::from_window(f.window, cx);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("mic-button").is_some());
+        cx.update(|window, cx| {
+            window.click(target, cx);
+            window.input("hello", cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("mic-button").is_none(), "Send takes its place");
+        // A voice message goes alone: not with a file staged.
+        f.composer.update(&mut cx, |c, cx| assert!(c.add_file(b"x".to_vec(), Some("a.txt".into()), cx)));
+        cx.update(|window, cx| f.composer.update(cx, |c, cx| c.start_recording(window, cx)));
+        assert!(cx.update(|_, cx| f.composer.read(cx).recording.is_none()));
     }
 
     #[gpui_kit::test]

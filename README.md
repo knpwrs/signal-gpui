@@ -47,6 +47,12 @@ Images are optimized losslessly before upload (at the level chosen in Settings �
 - WebP: the EXIF and XMP chunks (which can hold location) are removed; the image itself is unchanged.
 - TIFF and BMP become PNG first (losslessly); GIF is sent as it is.
 
+## Audio, video and voice messages
+
+- **Audio and voice messages** play in the message, as in Desktop: a waveform of 47 bars (click one to seek), the time left, and a speed button that steps through 1×, 1.5×, 2× and 0.5×. One plays at a time. Voice messages download as they arrive; other audio shows a download button first. AVFoundation decodes them, so AAC (what the phones send), MP3 (what Desktop sends) and anything else macOS plays will work.
+- **Videos** show their first frame (made with `ffmpeg`, when it's installed) with a play button. Clicking opens a player over the window with sound, play and pause (space), a seek bar and the time; Esc closes it.
+- **Recording**: in an empty composer, the microphone (or ⌘⇧Y, Desktop's shortcut) records a voice message. The composer shows the time and the level while it records; Send sends it; Cancel or Esc throws it away. As in Desktop, recording stops at one hour and asks whether to send it, and a voice message can't go with other attachments. It's recorded as AAC in an M4A file and sent as `audio/aac` with Signal's voice message flag, as the phones send theirs (Desktop sends MP3). Unlike Desktop, switching to another app doesn't stop the recording, and there's no draft to play back before sending. macOS asks for microphone access the first time.
+
 ## Stickers and GIFs
 
 From the composer, the emoji button opens Signal Desktop's picker with Emoji, Stickers and GIFs tabs (reactions stay emoji-only).

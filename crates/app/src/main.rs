@@ -9,6 +9,7 @@ mod keys;
 mod loop_cache;
 mod notifications;
 mod platform;
+mod recorder;
 mod ringtone;
 mod state;
 mod sticker_image;
@@ -126,6 +127,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-x", views::composer::FormatStrikethrough, Some("Composer")),
         KeyBinding::new("cmd-e", views::composer::FormatMonospace, Some("Composer")),
         KeyBinding::new("cmd-shift-b", views::composer::FormatSpoiler, Some("Composer")),
+        KeyBinding::new("cmd-shift-y", views::composer::RecordVoice, Some("Composer")),
     ]);
 
     cx.set_menus(vec![Menu {

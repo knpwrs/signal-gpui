@@ -150,6 +150,9 @@ pub struct AppState {
     /// The audio attachment or voice message playing (or paused), as
     /// Desktop plays one at a time, whichever chat is open.
     pub audio: Option<AudioPlaying>,
+    /// Starts recording a voice message (the microphone; a stand-in in
+    /// tests).
+    pub start_recorder: crate::recorder::StartRecorder,
     /// Audio files' waveforms and lengths (`None` while decoding, or if it
     /// can't be).
     waveforms: HashMap<std::path::PathBuf, Option<Waveform>>,
@@ -221,6 +224,7 @@ impl AppState {
             has_giphy_key: std::env::var_os("GIPHY_API_KEY").is_some(),
             loops: Default::default(),
             audio: None,
+            start_recorder: crate::recorder::start_microphone,
             waveforms: HashMap::new(),
             posters: HashMap::new(),
             recent_stickers: Vec::new(),
@@ -943,10 +947,15 @@ impl AppState {
 
     /// Plays a video in the viewer; any audio playing pauses, as in Desktop.
     pub fn view_video(&mut self, video: crate::views::video_viewer::ViewedVideo, cx: &mut Context<Self>) {
+        self.pause_audio();
+        cx.emit(AppEvent::ViewVideo(video));
+    }
+
+    /// Pauses the audio playing, if any (for another sound, or recording).
+    pub fn pause_audio(&self) {
         if let Some(audio) = &self.audio {
             audio.player.pause();
         }
-        cx.emit(AppEvent::ViewVideo(video));
     }
 
     pub fn view_image(&self, image: crate::views::image_viewer::ViewedImage, cx: &mut Context<Self>) {

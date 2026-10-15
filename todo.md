@@ -159,3 +159,16 @@ with a membership proof from `GET /v1/groups/token`. Not done yet:
   presage uses v0.99.0; both build side by side. Keep RingRTC's pin in step
   when presage moves.
 
+## Voice messages
+
+Recording works (see the README). Not done yet:
+
+- **Draft playback:** Desktop stops a recording when the window loses
+  focus and shows it as a draft to play back before sending
+  (`CompositionRecordingDraft`). Here it keeps recording.
+- **Waveform and duration sent with it:** Desktop keeps the waveform it
+  drew while recording; here the waveform is decoded from the file when
+  it's shown.
+- **Live testing:** the recorder (AVAudioRecorder) is only tested with a
+  stand-in microphone; recording from a real one, and how other clients
+  play the result, haven't been tried.
