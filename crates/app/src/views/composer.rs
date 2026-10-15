@@ -542,7 +542,7 @@ impl Composer {
             let (caption, quote, mentions, styles) = caption.take().unwrap_or_default();
             commands.push(Command::SendFile {
                 conversation: self.conversation.clone(),
-                file: OutgoingFile { bytes: file.bytes, file_name: file.file_name },
+                file: OutgoingFile { bytes: file.bytes, file_name: file.file_name, voice: false },
                 caption,
                 quote,
                 mentions,

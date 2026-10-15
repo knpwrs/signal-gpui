@@ -43,7 +43,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     Command, Config, ConnectionState, Event, SETTING_LINK_PREVIEWS, SETTING_READ_RECEIPTS, SETTING_TYPING_INDICATORS,
-    mapping::{self, Action, MapContext},
+    VOICE_CONTENT_TYPE, mapping::{self, Action, MapContext},
     media, storage,
 };
 use anyhow::Context as _;
@@ -83,6 +83,8 @@ struct Upload {
     /// A file to send unchanged, with this MIME type; `None` for an image,
     /// which is optimized first.
     file_type: Option<String>,
+    /// Sent with the voice message flag.
+    voice: bool,
 }
 
 /// Outbound work, processed one at a time so sessions are never ratcheted concurrently.
@@ -2416,6 +2418,7 @@ impl Actor {
                     // sent as a file stays as it is).
                     file_type: (!matches!(a.content_type.as_str(), "image/png" | "image/jpeg" | "image/webp" | "image/gif"))
                         .then(|| a.content_type.clone()),
+                    voice: a.voice,
                 })
             })
             .collect();
@@ -2655,7 +2658,7 @@ impl Actor {
                 voice: false,
                 remote: None,
             });
-            files.push(Upload { path, file_name: image.file_name, file_type: None });
+            files.push(Upload { path, file_name: image.file_name, file_type: None, voice: false });
         }
         if files.is_empty() {
             return;
@@ -2701,17 +2704,20 @@ impl Actor {
         if let Err(error) = written.await {
             return self.error("failed to save file", error);
         }
-        let meta_type = media::content_type_for_file(&name).to_owned();
+        // A voice message goes as the phones send theirs: AAC, unnamed.
+        let meta_type =
+            if file.voice { VOICE_CONTENT_TYPE.to_owned() } else { media::content_type_for_file(&name).to_owned() };
+        let wire_name = (!file.voice).then(|| name.clone());
         let meta = AttachmentMeta {
             content_type: meta_type.clone(),
-            file_name: Some(name.clone()),
+            file_name: wire_name.clone(),
             size: file.bytes.len() as u64,
             width: None,
             height: None,
             local_path: Some(path.to_string_lossy().into_owned()),
             sticker: false,
             gif: false,
-            voice: false,
+            voice: file.voice,
             remote: None,
         };
         let wire_caption = caption.trim_end().to_owned();
@@ -2726,7 +2732,7 @@ impl Actor {
             body: data,
             timestamp,
             message: id,
-            images: vec![Upload { path, file_name: Some(name), file_type: Some(meta_type) }],
+            images: vec![Upload { path, file_name: wire_name, file_type: Some(meta_type), voice: file.voice }],
             preview_image: None,
         });
     }
@@ -3145,7 +3151,7 @@ impl Actor {
         images: Vec<Upload>,
     ) -> anyhow::Result<Vec<AttachmentPointer>> {
         let mut uploads = Vec::with_capacity(images.len());
-        for Upload { path, file_name, file_type } in images {
+        for Upload { path, file_name, file_type, voice } in images {
             let original = tokio::fs::read(&path).await.with_context(|| format!("reading {}", path.display()))?;
             if let Some(content_type) = file_type {
                 let spec = AttachmentSpec {
@@ -3153,7 +3159,7 @@ impl Actor {
                     length: original.len(),
                     file_name,
                     preview: None,
-                    voice_note: None,
+                    voice_note: voice.then_some(true),
                     borderless: None,
                     width: None,
                     height: None,

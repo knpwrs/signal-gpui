@@ -397,7 +397,13 @@ pub struct SafetyNumber {
 pub struct OutgoingFile {
     pub bytes: std::sync::Arc<Vec<u8>>,
     pub file_name: String,
+    /// A recorded voice message (AAC in an M4A file), sent as one.
+    pub voice: bool,
 }
+
+/// What a voice message is sent as: AAC (in an M4A file), as Signal's
+/// phones send theirs.
+pub const VOICE_CONTENT_TYPE: &str = "audio/aac";
 
 /// Signal's attachment size limit.
 pub const MAX_ATTACHMENT_BYTES: usize = 100 * 1024 * 1024;

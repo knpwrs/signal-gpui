@@ -1035,15 +1035,19 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     status: DeliveryStatus::Sent,
                     quote: demo_quote(&db, quote).await,
                     attachments: vec![AttachmentMeta {
-                        content_type: crate::media::content_type_for_file(&name).into(),
-                        file_name: Some(name),
+                        content_type: if file.voice {
+                            crate::VOICE_CONTENT_TYPE.into()
+                        } else {
+                            crate::media::content_type_for_file(&name).into()
+                        },
+                        file_name: (!file.voice).then_some(name),
                         size: file.bytes.len() as u64,
                         width: None,
                         height: None,
                         local_path: path.to_str().map(Into::into),
                         sticker: false,
                         gif: false,
-                        voice: false,
+                        voice: file.voice,
                         remote: None,
                     }],
                     link_preview: None,
