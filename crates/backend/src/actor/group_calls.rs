@@ -75,9 +75,37 @@ fn aci_of(bytes: &[u8]) -> Option<String> {
     Some(Aci::from_uuid_bytes(bytes).service_id_string())
 }
 
-fn http() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
+/// For the calling server, which (as Signal's other servers) has a
+/// certificate from Signal's own root CA: trusting only that, as Desktop
+/// does. (reqwest here has no TLS of its own.)
+fn http() -> Option<&'static reqwest::Client> {
+    static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            let client = signal_tls().and_then(|tls| {
+                Ok(reqwest::Client::builder()
+                    .use_preconfigured_tls(tls)
+                    .timeout(std::time::Duration::from_secs(30))
+                    .build()?)
+            });
+            client.inspect_err(|error| warn!(error = %format!("{error:#}"), "no calling server client")).ok()
+        })
+        .as_ref()
+}
+
+fn signal_tls() -> anyhow::Result<rustls::ClientConfig> {
+    use rustls::pki_types::{CertificateDer, pem::PemObject as _};
+    let pem = presage::libsignal_service::configuration::ServiceConfiguration::from(SignalServers::Production)
+        .certificate_authority;
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_slice_iter(pem.as_bytes()) {
+        roots.add(cert?)?;
+    }
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    Ok(rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_no_client_auth())
 }
 
 impl Actor {
@@ -402,7 +430,10 @@ impl Actor {
                 signal_calls::HttpMethod::Post => reqwest::Method::POST,
                 signal_calls::HttpMethod::Delete => reqwest::Method::DELETE,
             };
-            let mut builder = http().request(method, &request.url);
+            let Some(client) = http() else {
+                return this.with_calls(|calls| calls.received_http_response(request_id, None));
+            };
+            let mut builder = client.request(method, &request.url);
             for (name, value) in &request.headers {
                 builder = builder.header(name, value);
             }
@@ -418,7 +449,7 @@ impl Actor {
                     }
                 }
                 Err(error) => {
-                    warn!(%error, "calling server request failed");
+                    warn!(error = %format!("{:#}", anyhow::Error::from(error)), "calling server request failed");
                     None
                 }
             };
@@ -468,5 +499,23 @@ impl Actor {
                 call.camera_before_sharing = camera;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_calling_server_client_trusts_signals_root() {
+        assert!(super::signal_tls().is_ok());
+        assert!(super::http().is_some());
+    }
+
+    /// Reaches the real calling server (run with --ignored).
+    #[tokio::test]
+    #[ignore]
+    async fn the_calling_server_answers_over_tls() {
+        let response = super::http().unwrap().get("https://sfu.voip.signal.org/v2/conference/participants").send().await;
+        // Unauthorized without a membership proof, but it answered.
+        assert!(response.unwrap().status().is_client_error());
     }
 }
