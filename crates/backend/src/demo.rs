@@ -605,8 +605,8 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     let _ = events.unbounded_send(Event::LinkPreview { url, preview });
                 });
             }
-            Command::SendText { conversation, body, quote, preview, mentions } => {
-                let (body, spans) = demo_mentions(&db, &body, &mentions).await;
+            Command::SendText { conversation, body, quote, preview, mentions, styles } => {
+                let (body, spans, styles) = demo_mentions(&db, &body, &mentions, &styles).await;
                 let quote = match quote {
                     Some(id) => db.message(id).await.ok().flatten().map(|m| Quote {
                         author: m.author.clone(),
@@ -653,6 +653,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 };
                 let Ok(id) = db.insert_message(&msg).await else { continue };
                 let _ = db.set_mentions(id, &spans).await;
+                let _ = db.set_styles(id, &styles).await;
                 emit(Event::MessageChanged { conversation: conversation.clone(), message_id: id });
                 // Walk the status forward like a real send would.
                 // Receipts trickle in on their own, without holding up commands.
@@ -715,10 +716,11 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     emit(Event::PinsChanged(m.conversation_id));
                 }
             }
-            Command::EditMessage { message_id, body, mentions } => {
-                let (body, spans) = demo_mentions(&db, body.trim_end(), &mentions).await;
+            Command::EditMessage { message_id, body, mentions, styles } => {
+                let (body, spans, styles) = demo_mentions(&db, body.trim_end(), &mentions, &styles).await;
                 if db.edit_message(message_id, &body, next_sent_at()).await.is_ok()
                     && db.set_mentions(message_id, &spans).await.is_ok()
+                    && db.set_styles(message_id, &styles).await.is_ok()
                     && let Ok(Some(m)) = db.message(message_id).await
                 {
                     emit(Event::MessageChanged { conversation: m.conversation_id, message_id });
@@ -927,7 +929,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
             Command::FindRecipient { query } => {
                 emit(Event::RecipientFound { query, result: Err("Looking people up isn't available in the demo".into()) });
             }
-            Command::SendImages { conversation, images, caption, quote, mentions } => {
+            Command::SendImages { conversation, images, caption, quote, mentions, styles } => {
                 let mut attachments = Vec::new();
                 for (ix, image) in images.into_iter().enumerate() {
                     let bytes = image.bytes.as_ref().clone();
@@ -981,14 +983,15 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     link_preview: None,
                     expires_in: 0,
                 };
-                let (caption, spans) = demo_mentions(&db, caption.trim_end(), &mentions).await;
+                let (caption, spans, styles) = demo_mentions(&db, caption.trim_end(), &mentions, &styles).await;
                 let msg = NewMessage { body: caption, ..msg };
                 if let Ok(id) = db.insert_message(&msg).await {
                     let _ = db.set_mentions(id, &spans).await;
+                    let _ = db.set_styles(id, &styles).await;
                     emit(Event::MessageChanged { conversation, message_id: id });
                 }
             }
-            Command::SendFile { conversation, file, caption, quote, mentions } => {
+            Command::SendFile { conversation, file, caption, quote, mentions, styles } => {
                 let name = crate::media::safe_file_name(&file.file_name);
                 let dir = data_dir.join("attachments").join(format!("sent-{}", now()));
                 let path = dir.join(&name);
@@ -996,7 +999,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     continue;
                 }
                 let sent_at = next_sent_at();
-                let (body, spans) = demo_mentions(&db, caption.trim_end(), &mentions).await;
+                let (body, spans, styles) = demo_mentions(&db, caption.trim_end(), &mentions, &styles).await;
                 let msg = NewMessage {
                     conversation_id: conversation.clone(),
                     sent_at,
@@ -1023,6 +1026,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 };
                 if let Ok(id) = db.insert_message(&msg).await {
                     let _ = db.set_mentions(id, &spans).await;
+                    let _ = db.set_styles(id, &styles).await;
                     emit(Event::MessageChanged { conversation, message_id: id });
                 }
             }
@@ -1048,13 +1052,20 @@ fn demo_safety_number(conversation: &ConversationId, verified: bool) -> crate::S
 }
 
 /// "@Name" for each mention placeholder, names from the demo's chats.
-async fn demo_mentions(db: &AppDb, body: &str, mentions: &[String]) -> (String, Vec<signal_store::MentionSpan>) {
+/// "@Name" for each mention placeholder, and where each mention and style
+/// (spans over `body`) lands, as the real backend renders them.
+async fn demo_mentions(
+    db: &AppDb,
+    body: &str,
+    mentions: &[String],
+    styles: &[signal_store::StyleSpan],
+) -> (String, Vec<signal_store::MentionSpan>, Vec<signal_store::StyleSpan>) {
     let mut names = Vec::new();
     for aci in mentions {
         let chat = db.conversation(&ConversationId::direct(aci)).await.ok().flatten();
         names.push(chat.map_or_else(|| "Unknown".to_owned(), |c| c.title));
     }
-    crate::mapping::render_mention_spans(body, mentions, &names)
+    crate::mapping::render_body(body, mentions, &names, &crate::mapping::wire_styles(body, styles))
 }
 
 /// The quote for a reply to `quote`, as the real backend stores it.

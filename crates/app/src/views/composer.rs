@@ -30,6 +30,10 @@ const TYPEAHEAD_LIMIT: usize = 8;
 const TYPING_REFRESH: Duration = Duration::from_secs(10);
 const DRAFT_DEBOUNCE: Duration = Duration::from_millis(400);
 
+// Desktop's formatting shortcuts (bound in main.rs): each wraps the
+// selection in its marker (see `crate::formatting`).
+gpui_kit::actions!(composer, [FormatBold, FormatItalic, FormatStrikethrough, FormatMonospace, FormatSpoiler]);
+
 pub enum ComposerEvent {
     Sent,
     /// ↑ in an empty composer: edit your last message (as Desktop).
@@ -265,16 +269,34 @@ impl Composer {
 
     /// Desktop's "Edit": the message's text in the input, sent as an edit.
     pub fn start_edit(&mut self, message: Message, window: &mut Window, cx: &mut Context<Self>) {
-        let body = message.body.clone();
         self.mentions = message
             .mentions
             .iter()
-            .filter_map(|m| Some((body.get(m.start..m.start + m.len)?.to_owned(), m.aci.clone())))
+            .filter_map(|m| Some((message.body.get(m.start..m.start + m.len)?.to_owned(), m.aci.clone())))
             .collect();
+        // Its formatting, as markers to edit.
+        let body = crate::formatting::to_markers(&message.body, &message.styles);
         self.reply_to = None;
         self.editing = Some(message);
         self.input.update(cx, |input, cx| input.set_value(body, window, cx));
         self.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Wraps (or unwraps) the selection in `style`'s marker.
+    fn format(&mut self, style: signal_store::TextStyle, window: &mut Window, cx: &mut Context<Self>) {
+        let (text, selection) = {
+            let input = self.input.read(cx);
+            (input.value().to_string(), input.selected_range())
+        };
+        let (text, selection) = crate::formatting::toggle(&text, selection, style);
+        self.input.update(cx, |input, cx| {
+            input.set_value(text, window, cx);
+            input.set_selected_range(selection, cx);
+        });
+        // `set_value` reports no change: the draft, typing and send button
+        // follow by hand.
+        self.on_change(window, cx);
         cx.notify();
     }
 
@@ -463,15 +485,17 @@ impl Composer {
             return;
         }
         let text = self.input.read(cx).value().trim().to_string();
-        let (body, mentions) = encode_mentions(&text, &std::mem::take(&mut self.mentions));
+        let (plain, styles) = crate::formatting::parse(&text);
+        let (body, mentions, styles) = encode_mentions(&plain, &std::mem::take(&mut self.mentions), &styles);
         if let Some(original) = self.editing.take() {
             // Who's mentioned can change without the text changing (two people
             // with one name), so compare both.
             let mut before: Vec<&signal_store::MentionSpan> = original.mentions.iter().collect();
             before.sort_by_key(|m| m.start);
             let same_people = before.iter().map(|m| m.aci.as_str()).eq(mentions.iter().map(String::as_str));
-            if !text.is_empty() && (text != original.body || !same_people) {
-                self.state.read(cx).send(Command::EditMessage { message_id: original.id, body, mentions });
+            let original_text = crate::formatting::to_markers(&original.body, &original.styles);
+            if !text.is_empty() && (text != original_text || !same_people) {
+                self.state.read(cx).send(Command::EditMessage { message_id: original.id, body, mentions, styles });
             }
             self.input.update(cx, |input, cx| input.set_value("", window, cx));
             self.save_draft_later(String::new(), cx);
@@ -498,11 +522,11 @@ impl Composer {
         // is a message of its own, as in Desktop).
         let files = std::mem::take(&mut self.files);
         let mut commands = Vec::new();
-        let mut caption = Some((body, quote, mentions));
+        let mut caption = Some((body, quote, mentions, styles));
         if !self.images.is_empty() || files.is_empty() {
-            let (body, quote, mentions) = caption.take().unwrap_or_default();
+            let (body, quote, mentions, styles) = caption.take().unwrap_or_default();
             commands.push(if self.images.is_empty() {
-                Command::SendText { conversation: self.conversation.clone(), body, quote, preview, mentions }
+                Command::SendText { conversation: self.conversation.clone(), body, quote, preview, mentions, styles }
             } else {
                 let images = std::mem::take(&mut self.images)
                     .into_iter()
@@ -511,17 +535,18 @@ impl Composer {
                         OutgoingImage { bytes: i.bytes, file_name: i.file_name }
                     })
                     .collect();
-                Command::SendImages { conversation: self.conversation.clone(), images, caption: body, quote, mentions }
+                Command::SendImages { conversation: self.conversation.clone(), images, caption: body, quote, mentions, styles }
             });
         }
         for file in files {
-            let (caption, quote, mentions) = caption.take().unwrap_or_default();
+            let (caption, quote, mentions, styles) = caption.take().unwrap_or_default();
             commands.push(Command::SendFile {
                 conversation: self.conversation.clone(),
                 file: OutgoingFile { bytes: file.bytes, file_name: file.file_name },
                 caption,
                 quote,
                 mentions,
+                styles,
             });
         }
         for command in commands {
@@ -956,9 +981,13 @@ fn mention_query(text: &str, cursor: usize) -> Option<(Range<usize>, String)> {
 }
 
 /// Turns the picked "@Name"s still in `text` into Signal's placeholders,
-/// with who each one mentions, in order. A mention you've since edited
-/// stays as plain text.
-fn encode_mentions(text: &str, picked: &[(String, String)]) -> (String, Vec<String>) {
+/// with who each one mentions, in order, and moves `styles` (spans over
+/// `text`) to match. A mention you've since edited stays as plain text.
+fn encode_mentions(
+    text: &str,
+    picked: &[(String, String)],
+    styles: &[signal_store::StyleSpan],
+) -> (String, Vec<String>, Vec<signal_store::StyleSpan>) {
     let mut hits: Vec<(usize, usize, &str)> = Vec::new();
     for (display, aci) in picked {
         let mut from = 0;
@@ -981,7 +1010,30 @@ fn encode_mentions(text: &str, picked: &[(String, String)]) -> (String, Vec<Stri
         last = start + len;
     }
     body.push_str(&text[last..]);
-    (body, hits.into_iter().map(|(_, _, aci)| aci.to_owned()).collect())
+    // Where a position in `text` lands in `body`: each mention before it
+    // shrinks to a placeholder; one inside a mention moves to its edge.
+    let placeholder = signal_backend::mapping::MENTION_PLACEHOLDER.len_utf8();
+    let moved = |at: usize, end: bool| {
+        let mut shift = 0usize;
+        let mut at = at;
+        for (start, len, _) in &hits {
+            if *start < at && at < start + len {
+                at = if end { start + len } else { *start };
+            }
+            if start + len <= at {
+                shift += len - placeholder;
+            }
+        }
+        at - shift
+    };
+    let styles = styles
+        .iter()
+        .filter_map(|s| {
+            let (start, end) = (moved(s.start, false), moved(s.start + s.len, true));
+            (end > start).then_some(signal_store::StyleSpan { start, len: end - start, style: s.style })
+        })
+        .collect();
+    (body, hits.into_iter().map(|(_, _, aci)| aci.to_owned()).collect(), styles)
 }
 
 impl Focusable for Composer {
@@ -997,7 +1049,14 @@ impl Render for Composer {
         let can_send =
             !self.input.read(cx).value().trim().is_empty() || !self.images.is_empty() || !self.files.is_empty();
 
+        use signal_store::TextStyle;
         div()
+            .key_context("Composer")
+            .on_action(cx.listener(|this, _: &FormatBold, window, cx| this.format(TextStyle::Bold, window, cx)))
+            .on_action(cx.listener(|this, _: &FormatItalic, window, cx| this.format(TextStyle::Italic, window, cx)))
+            .on_action(cx.listener(|this, _: &FormatStrikethrough, window, cx| this.format(TextStyle::Strikethrough, window, cx)))
+            .on_action(cx.listener(|this, _: &FormatMonospace, window, cx| this.format(TextStyle::Monospace, window, cx)))
+            .on_action(cx.listener(|this, _: &FormatSpoiler, window, cx| this.format(TextStyle::Spoiler, window, cx)))
             .relative()
             .flex()
             .flex_col()
@@ -1196,11 +1255,11 @@ mod tests {
     fn picked_mentions_become_placeholders_in_order() {
         let alice = ("@Alice Liddell".to_owned(), "a".to_owned());
         let bob = ("@Bob".to_owned(), "b".to_owned());
-        let (body, acis) = encode_mentions("@Bob and @Alice Liddell, @Bob", &[alice.clone(), bob.clone(), bob.clone()]);
+        let (body, acis, _) = encode_mentions("@Bob and @Alice Liddell, @Bob", &[alice.clone(), bob.clone(), bob.clone()], &[]);
         assert_eq!(body, "\u{FFFC} and \u{FFFC}, \u{FFFC}");
         assert_eq!(acis, ["b", "a", "b"]);
         // Edited away: plain text.
-        let (body, acis) = encode_mentions("@Ali", &[alice]);
+        let (body, acis, _) = encode_mentions("@Ali", &[alice], &[]);
         assert_eq!((body.as_str(), acis.len()), ("@Ali", 0));
     }
 

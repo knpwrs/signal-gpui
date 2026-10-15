@@ -3607,6 +3607,73 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn formatting_markers_are_sent_as_styles_beside_a_mention(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        wait_for_messages(&backend, GROUP, 1, |_| true);
+        let state = cx.update(|cx| crate::state::new_state(backend.clone(), cx));
+        state.update(cx, |state, cx| state.handle(signal_backend::Event::ConversationsChanged, cx));
+        for _ in 0..300 {
+            cx.run_until_parked();
+            if state.read_with(cx, |s, _| s.conversation(&ConversationId(GROUP.into())).is_some_and(|c| !c.members.is_empty())) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let (window, view) = cx.update(|cx| {
+            gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                let picker = cx.new(|cx| EmojiPicker::new(state.clone(), window, cx));
+                cx.new(|cx| ConversationView::new(state.clone(), picker, ConversationId(GROUP.into()), window, cx))
+            })
+            .unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window, cx);
+        cx.update(|window, cx| {
+            let composer = view.read(cx).composer.clone();
+            composer.update(cx, |c, cx| c.focus(window, cx));
+        });
+        for _ in 0..100 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        cx.simulate_input("hi @May");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("*bring* ||snacks||");
+        cx.simulate_keystrokes("enter");
+        let sent = wait_for_messages(&backend, GROUP, 1, |m| m.body.ends_with("snacks") && !m.styles.is_empty()).remove(0);
+        assert_eq!(sent.body, "hi @Maya Chen bring snacks");
+        let part = |s: &signal_store::StyleSpan| sent.body[s.start..s.start + s.len].to_owned();
+        assert_eq!(sent.styles.iter().map(|s| (part(s), s.style)).collect::<Vec<_>>(), [
+            ("bring".to_owned(), signal_store::TextStyle::Bold),
+            ("snacks".to_owned(), signal_store::TextStyle::Spoiler),
+        ]);
+        assert_eq!(&sent.body[sent.mentions[0].start..sent.mentions[0].start + sent.mentions[0].len], "@Maya Chen");
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn the_bold_shortcut_wraps_the_selection(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        wait_for_messages(&backend, MAYA, 1, |_| true);
+        let (mut cx, view) = open_view(cx, &backend, MAYA);
+        cx.update(|_, cx| {
+            cx.bind_keys([gpui_kit::KeyBinding::new("cmd-b", crate::views::composer::FormatBold, Some("Composer"))]);
+        });
+        cx.update(|window, cx| {
+            let composer = view.read(cx).composer.clone();
+            composer.update(cx, |c, cx| c.focus(window, cx));
+        });
+        cx.simulate_input("loud");
+        // Enter right after: the word stays selected, and is sent, not
+        // replaced with a line break.
+        cx.simulate_keystrokes("cmd-a cmd-b enter");
+        // (Its formatting is saved just after it.)
+        let sent = wait_for_messages(&backend, MAYA, 1, |m| m.body == "loud" && !m.styles.is_empty()).remove(0);
+        assert_eq!(sent.styles, [signal_store::StyleSpan { start: 0, len: 4, style: signal_store::TextStyle::Bold }]);
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
     fn member_labels_show_beside_names(cx: &mut TestAppContext) {
         let (backend, _dir) = demo_backend(cx);
         wait_for_messages(&backend, GROUP, 1, |m| m.direction == Direction::Incoming);

@@ -75,6 +75,8 @@ pub enum Command {
         preview: Option<LinkPreviewDraft>,
         /// Who each placeholder in `body` mentions, in order.
         mentions: Vec<String>,
+        /// Its formatting: spans over `body` (placeholders and all).
+        styles: Vec<signal_store::StyleSpan>,
     },
     /// GIF search (trending when `query` is empty); answered with `Event::Gifs`.
     SearchGifs { query: String, offset: u32 },
@@ -105,6 +107,8 @@ pub enum Command {
         quote: Option<i64>,
         /// Who each placeholder in `caption` mentions, in order.
         mentions: Vec<String>,
+        /// Its formatting: spans over `caption` (placeholders and all).
+        styles: Vec<signal_store::StyleSpan>,
     },
     /// Sends any file as it is (not optimized), with `caption` as the
     /// message text.
@@ -115,6 +119,8 @@ pub enum Command {
         quote: Option<i64>,
         /// Who each placeholder in `caption` mentions, in order.
         mentions: Vec<String>,
+        /// Its formatting: spans over `caption` (placeholders and all).
+        styles: Vec<signal_store::StyleSpan>,
     },
     /// Reacts to message `message_id`; `remove` retracts our reaction.
     React { message_id: i64, emoji: String, remove: bool },
@@ -129,7 +135,7 @@ pub enum Command {
     PinMessage { message_id: i64, duration: Option<u32> },
     UnpinMessage { message_id: i64 },
     /// Changes the text of one of our sent messages (Signal's edit).
-    EditMessage { message_id: i64, body: String, mentions: Vec<String> },
+    EditMessage { message_id: i64, body: String, mentions: Vec<String>, styles: Vec<signal_store::StyleSpan> },
     /// Sends a failed message again, with its original timestamp.
     RetrySend { message_id: i64 },
     /// Sends copies of messages (text, photos, GIFs, link previews) to

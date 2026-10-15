@@ -231,12 +231,15 @@ impl AppState {
                 self.select(Some(conversation), cx);
             }
             NotificationAction::Reply(conversation, text) => {
+                // Formatting markers work here as in the composer.
+                let (body, styles) = crate::formatting::parse(&text);
                 self.send(Command::SendText {
                     conversation: conversation.clone(),
-                    body: text,
+                    body,
                     quote: None,
                     preview: None,
                     mentions: Vec::new(),
+                    styles,
                 });
                 self.send(Command::MarkRead { conversation });
             }

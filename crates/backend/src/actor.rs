@@ -433,8 +433,8 @@ impl Actor {
         tokio::task::spawn_local(async move {
             match command {
                 Command::Link => self.link().await,
-                Command::SendText { conversation, body, quote, preview, mentions } => {
-                    self.send_text(conversation, body, quote, preview, mentions).await
+                Command::SendText { conversation, body, quote, preview, mentions, styles } => {
+                    self.send_text(conversation, body, quote, preview, mentions, styles).await
                 }
                 Command::SearchGifs { query, offset } => {
                     let cache = self.config.data_dir.join("gif-cache");
@@ -463,11 +463,11 @@ impl Actor {
                     };
                     self.emit(Event::LinkPreview { url, preview });
                 }
-                Command::SendImages { conversation, images, caption, quote, mentions } => {
-                    self.send_images(conversation, images, caption, quote, mentions).await
+                Command::SendImages { conversation, images, caption, quote, mentions, styles } => {
+                    self.send_images(conversation, images, caption, quote, mentions, styles).await
                 }
-                Command::SendFile { conversation, file, caption, quote, mentions } => {
-                    self.send_file(conversation, file, caption, quote, mentions).await
+                Command::SendFile { conversation, file, caption, quote, mentions, styles } => {
+                    self.send_file(conversation, file, caption, quote, mentions, styles).await
                 }
                 Command::React { message_id, emoji, remove } => {
                     self.react(message_id, emoji, remove).await
@@ -476,7 +476,9 @@ impl Actor {
                 Command::Typing { conversation, started } => self.typing(conversation, started).await,
                 Command::DeleteForMe { message_ids } => self.delete_for_me(message_ids).await,
                 Command::RetrySend { message_id } => self.retry_send(message_id).await,
-                Command::EditMessage { message_id, body, mentions } => self.edit_message(message_id, body, mentions).await,
+                Command::EditMessage { message_id, body, mentions, styles } => {
+                    self.edit_message(message_id, body, mentions, styles).await
+                }
                 Command::PinMessage { message_id, duration } => self.set_pin(message_id, true, duration).await,
                 Command::UnpinMessage { message_id } => self.set_pin(message_id, false, None).await,
                 Command::Forward { message_ids, conversations } => self.forward(message_ids, conversations).await,
@@ -1384,11 +1386,6 @@ impl Actor {
         mapping::render_body(body, mentions, &names, styles)
     }
 
-    /// "@Name" for each mention placeholder, and where each one is.
-    async fn render_mentions(self: &Rc<Self>, body: &str, mentions: &[String]) -> (String, Vec<signal_store::MentionSpan>) {
-        let (body, spans, _) = self.render_body(body, mentions, &[]).await;
-        (body, spans)
-    }
 
     // ------------------------------------------------------------------ names
 
@@ -2299,12 +2296,19 @@ impl Actor {
 
     /// Signal's edit: the new text replaces the old everywhere, aimed at the
     /// original's timestamp (every edit is). Attachments can't change.
-    async fn edit_message(self: Rc<Self>, message_id: i64, body: String, mentions: Vec<String>) {
+    async fn edit_message(
+        self: Rc<Self>,
+        message_id: i64,
+        body: String,
+        mentions: Vec<String>,
+        styles: Vec<signal_store::StyleSpan>,
+    ) {
         let wire_body = body.trim_end().to_owned();
-        let (body, spans) = self.render_mentions(&wire_body, &mentions).await;
+        let wire_styles = mapping::wire_styles(&wire_body, &styles);
+        let (body, spans, style_spans) = self.render_body(&wire_body, &mentions, &wire_styles).await;
         let Some(message) = self.db.message(message_id).await.ok().flatten() else { return };
         let conversation = message.conversation_id.clone();
-        if body.is_empty() || (body == message.body && spans == message.mentions) {
+        if body.is_empty() || (body == message.body && spans == message.mentions && style_spans == message.styles) {
             return;
         }
         if !crate::edits::can_edit(&message, self.is_note_to_self(&conversation), now_millis()) {
@@ -2315,11 +2319,14 @@ impl Actor {
             return self.error("failed to edit message", error);
         }
         let _ = self.db.set_mentions(message_id, &spans).await;
+        let _ = self.db.set_styles(message_id, &style_spans).await;
         self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id });
         self.emit(Event::ConversationsChanged);
         let self_aci = self.self_aci();
+        let mut body_ranges = mapping::mention_ranges(&wire_body, &mentions);
+        body_ranges.extend(mapping::style_ranges(&wire_styles));
         let data = DataMessage {
-            body_ranges: mapping::mention_ranges(&wire_body, &mentions),
+            body_ranges,
             body: Some(wire_body),
             timestamp: Some(timestamp),
             quote: message.quote.as_ref().map(|q| data_message::Quote {
@@ -2522,13 +2529,15 @@ impl Actor {
         quote: Option<i64>,
         preview: Option<crate::LinkPreviewDraft>,
         mentions: Vec<String>,
+        styles: Vec<signal_store::StyleSpan>,
     ) {
         let wire_body = body.trim_end().to_owned();
         if wire_body.is_empty() {
             return;
         }
         // We see "@Name"; the message carries placeholders and ranges.
-        let (body, spans) = self.render_mentions(&wire_body, &mentions).await;
+        let wire_styles = mapping::wire_styles(&wire_body, &styles);
+        let (body, spans, style_spans) = self.render_body(&wire_body, &mentions, &wire_styles).await;
         // Only for a link that's still in the message.
         let preview = preview.filter(|p| crate::link_preview::is_valid(&body, &p.url));
         let mut preview_image = None;
@@ -2573,7 +2582,7 @@ impl Actor {
         else {
             return;
         };
-        self.add_mentions(id, &mut data, wire_body, &mentions, &spans).await;
+        self.add_ranges(id, &mut data, wire_body, &mentions, &spans, &wire_styles, &style_spans).await;
         match link_preview {
             Some(preview) => {
                 data.preview = vec![presage::proto::Preview {
@@ -2605,6 +2614,7 @@ impl Actor {
         caption: String,
         quote: Option<i64>,
         mentions: Vec<String>,
+        styles: Vec<signal_store::StyleSpan>,
     ) {
         let stamp = now_millis();
         let dir = self.config.data_dir.join("attachments");
@@ -2644,11 +2654,12 @@ impl Actor {
             return;
         }
         let wire_caption = caption.trim_end().to_owned();
-        let (caption, spans) = self.render_mentions(&wire_caption, &mentions).await;
+        let wire_styles = mapping::wire_styles(&wire_caption, &styles);
+        let (caption, spans, style_spans) = self.render_body(&wire_caption, &mentions, &wire_styles).await;
         let Some((id, mut data, timestamp)) = self.store_outgoing(&conversation, caption, quote, metas, None).await else {
             return;
         };
-        self.add_mentions(id, &mut data, wire_caption, &mentions, &spans).await;
+        self.add_ranges(id, &mut data, wire_caption, &mentions, &spans, &wire_styles, &style_spans).await;
         self.enqueue(Outbound::SendImages {
             conversation,
             body: data,
@@ -2668,6 +2679,7 @@ impl Actor {
         caption: String,
         quote: Option<i64>,
         mentions: Vec<String>,
+        styles: Vec<signal_store::StyleSpan>,
     ) {
         if file.bytes.len() > crate::MAX_ATTACHMENT_BYTES {
             return self.error("can't send file", "larger than Signal's 100 MB limit");
@@ -2695,11 +2707,12 @@ impl Actor {
             remote: None,
         };
         let wire_caption = caption.trim_end().to_owned();
-        let (caption, spans) = self.render_mentions(&wire_caption, &mentions).await;
+        let wire_styles = mapping::wire_styles(&wire_caption, &styles);
+        let (caption, spans, style_spans) = self.render_body(&wire_caption, &mentions, &wire_styles).await;
         let Some((id, mut data, timestamp)) = self.store_outgoing(&conversation, caption, quote, vec![meta], None).await else {
             return;
         };
-        self.add_mentions(id, &mut data, wire_caption, &mentions, &spans).await;
+        self.add_ranges(id, &mut data, wire_caption, &mentions, &spans, &wire_styles, &style_spans).await;
         self.enqueue(Outbound::SendImages {
             conversation,
             body: data,
@@ -2710,26 +2723,33 @@ impl Actor {
         });
     }
 
-    /// Mentions in a message we're sending: stored where they render, sent
-    /// as placeholders with ranges.
-    async fn add_mentions(
+    /// Mentions and formatting in a message we're sending: stored where they
+    /// render, sent as placeholders with ranges.
+    #[allow(clippy::too_many_arguments)]
+    async fn add_ranges(
         &self,
         id: i64,
         data: &mut DataMessage,
         wire_body: String,
         mentions: &[String],
         spans: &[signal_store::MentionSpan],
+        wire_styles: &[mapping::WireStyle],
+        style_spans: &[signal_store::StyleSpan],
     ) {
-        if mentions.is_empty() {
+        if mentions.is_empty() && style_spans.is_empty() {
             return;
         }
-        if self.db.set_mentions(id, spans).await.is_ok()
+        let mentions_saved = mentions.is_empty() || self.db.set_mentions(id, spans).await.is_ok();
+        let styles_saved = style_spans.is_empty() || self.db.set_styles(id, style_spans).await.is_ok();
+        if (mentions_saved || styles_saved)
             && let Ok(Some(message)) = self.db.message(id).await
         {
             // Shown before the spans were saved: show it again, highlighted.
             self.emit(Event::MessageChanged { conversation: message.conversation_id, message_id: id });
+            self.emit(Event::ConversationsChanged);
         }
         data.body_ranges = mapping::mention_ranges(&wire_body, mentions);
+        data.body_ranges.extend(mapping::style_ranges(wire_styles));
         data.body = Some(wire_body).filter(|b| !b.is_empty());
     }
 

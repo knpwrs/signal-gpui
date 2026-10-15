@@ -2,6 +2,7 @@
 
 mod assets;
 mod emoji_usage;
+mod formatting;
 mod image_cache;
 mod keys;
 mod loop_cache;
@@ -117,6 +118,12 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("alt-up", PreviousConversation, Some("Signal")),
         KeyBinding::new("ctrl-tab", NextConversation, Some("Signal")),
         KeyBinding::new("ctrl-shift-tab", PreviousConversation, Some("Signal")),
+        // Desktop's formatting shortcuts.
+        KeyBinding::new("cmd-b", views::composer::FormatBold, Some("Composer")),
+        KeyBinding::new("cmd-i", views::composer::FormatItalic, Some("Composer")),
+        KeyBinding::new("cmd-shift-x", views::composer::FormatStrikethrough, Some("Composer")),
+        KeyBinding::new("cmd-e", views::composer::FormatMonospace, Some("Composer")),
+        KeyBinding::new("cmd-shift-b", views::composer::FormatSpoiler, Some("Composer")),
     ]);
 
     cx.set_menus(vec![Menu {

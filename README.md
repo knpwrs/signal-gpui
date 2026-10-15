@@ -112,6 +112,7 @@ Hover a message for React, Download (saves its attachments), Reply and a ⋯ men
 - **Edit** your text messages for 24 hours (any time in Note to Self), up to 10 times. ↑ in an empty composer edits your last message.
 - **Pin** for 24 hours, 7 days, 30 days or forever; a chat keeps three pins, and a fourth replaces the oldest. Pins show in a bar under the header; clicking it goes to each in turn. In groups, pinning follows who may edit the group's details.
 - **@mentions** in groups: type @ for a list of members. A mention is sent as Signal's placeholder and range, and mentions show highlighted.
+- **Formatting**: received bold, italic, strikethrough, monospace and spoilers show as Desktop shows them; a spoiler is a block until you click it, and stays `■■■■` in the chat list, notifications and quotes. To send formatting, write `*bold*`, `_italic_`, `~strikethrough~`, `` `monospace` `` or `||spoiler||`, or select text and use Desktop's shortcuts (⌘B, ⌘I, ⌘⇧X, ⌘E, ⌘⇧B), which add those markers. They're sent as Signal's formatting, so other clients show the styles, not the markers. Desktop styles the text in its composer as you type; the composer here can't show styles, which is why it uses markers. A marker only counts at a word's edge, so `snake_case` stays as typed, and so does formatting that starts mid-word.
 
 Timer changes and pins leave a notice in the timeline ("Alice pinned a message", with Go to message).
 
