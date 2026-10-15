@@ -468,6 +468,9 @@ pub enum Event {
     Unlinked,
 }
 
+/// The backend thread's stack (see `Backend::start`).
+const BACKEND_STACK: usize = 16 * 1024 * 1024;
+
 /// Handle to the running backend. Cheap to clone.
 #[derive(Clone)]
 pub struct Backend {
@@ -525,6 +528,10 @@ impl Backend {
 
         std::thread::Builder::new()
             .name("signal-backend".into())
+            // Decrypting a message runs deep, generic futures (presage's and
+            // libsignal-service's, built in this crate); unoptimized in debug
+            // builds, they overflowed the default 2 MB stack.
+            .stack_size(BACKEND_STACK)
             .spawn(move || {
                 // presage's futures are !Send, so the actor lives on a LocalSet
                 // pinned to this thread; `Backend::spawn` work goes to the workers.
