@@ -1130,3 +1130,36 @@ async fn knows_when_it_was_made() {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
     assert!((now - made).abs() < 60_000, "{made} vs {now}");
 }
+
+#[tokio::test]
+async fn attachments_are_named_as_desktop_names_them() {
+    let meta = |content_type: &str| AttachmentMeta {
+        content_type: content_type.into(),
+        file_name: None,
+        size: 1,
+        width: None,
+        height: None,
+        local_path: None,
+        sticker: false,
+        gif: false,
+        voice: false,
+        remote: None,
+    };
+    let gif = AttachmentMeta { gif: true, ..meta("video/mp4") };
+    assert_eq!(attachment_preview(&gif), "🎡 GIF", "a GIF is an MP4 with the GIF flag");
+    assert_eq!(attachment_preview(&meta("video/mp4")), "🎥 Video");
+    assert_eq!(attachment_preview(&meta("image/gif")), "🎡 GIF");
+    assert_eq!(attachment_preview(&meta("image/jpeg")), "📷 Photo");
+    assert_eq!(attachment_preview(&AttachmentMeta { voice: true, ..meta("audio/aac") }), "🎤 Voice Message");
+    assert_eq!(attachment_preview(&meta("audio/mpeg")), "🔈 Audio Message");
+    assert_eq!(attachment_preview(&AttachmentMeta { sticker: true, ..meta("image/webp") }), "Sticker message");
+    assert_eq!(attachment_preview(&meta("application/pdf")), "📎 File");
+
+    // The chat list says so too.
+    let db = test_db().await;
+    let mut m = incoming("d:a", "a", 1, "");
+    m.attachments = vec![gif];
+    db.insert_message(&m).await.unwrap();
+    let chat = db.conversation(&conv("d:a")).await.unwrap().unwrap();
+    assert_eq!(chat.last_message_preview.as_deref(), Some("🎡 GIF"));
+}

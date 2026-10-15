@@ -1269,12 +1269,7 @@ fn notification_preview(message: &signal_store::Message) -> String {
         return text.chars().take(300).collect();
     }
     match message.attachments.first() {
-        Some(a) if a.sticker => "Sticker".into(),
-        Some(a) if a.gif => "GIF".into(),
-        Some(a) if a.content_type.starts_with("image/") => "📷 Photo".into(),
-        Some(a) if a.content_type.starts_with("video/") => "🎥 Video".into(),
-        Some(a) if a.content_type.starts_with("audio/") => "🎤 Voice message".into(),
-        Some(_) => "📎 File".into(),
+        Some(a) => signal_store::attachment_preview(a).into(),
         None => "New Message".into(),
     }
 }

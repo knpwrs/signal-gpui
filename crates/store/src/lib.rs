@@ -294,6 +294,30 @@ pub struct CallToAction {
     pub text: Option<String>,
 }
 
+/// What a message with only an attachment says in the chat list and
+/// notifications, in Desktop's words and order
+/// (`getNotificationDataForMessage`): a GIF before a video, a voice message
+/// before other audio. (Desktop puts a sticker's emoji before "Sticker
+/// message"; it isn't kept here.)
+pub fn attachment_preview(attachment: &AttachmentMeta) -> &'static str {
+    let kind = attachment.content_type.as_str();
+    if attachment.sticker {
+        "Sticker message"
+    } else if attachment.gif || kind == "image/gif" {
+        "🎡 GIF"
+    } else if kind.starts_with("image/") {
+        "📷 Photo"
+    } else if kind.starts_with("video/") {
+        "🎥 Video"
+    } else if kind.starts_with("audio/") && attachment.voice {
+        "🎤 Voice Message"
+    } else if kind.starts_with("audio/") {
+        "🔈 Audio Message"
+    } else {
+        "📎 File"
+    }
+}
+
 /// The Signal chat's made-up account (Desktop's `SIGNAL_ACI`,
 /// `ts/types/SignalConversation.std.ts`): release notes appear from it, and
 /// nothing is ever sent to it.
@@ -974,7 +998,9 @@ impl AppDb {
     }
 
     pub async fn upgrade_previews(&self) -> Result<()> {
-        const PREVIEW_FORMAT: &str = "2"; // "You:" in groups, whole text
+        // 2: "You:" in groups, whole text. 3: GIFs, stickers and audio
+        // named as Desktop names them.
+        const PREVIEW_FORMAT: &str = "3";
         if self.setting("preview_format").await?.as_deref() == Some(PREVIEW_FORMAT) {
             return Ok(());
         }
@@ -2319,13 +2345,7 @@ async fn refresh_preview(conn: &mut sqlx::SqliteConnection, id: &ConversationId)
                 body.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(300).collect()
             } else {
                 let atts: Vec<AttachmentMeta> = serde_json::from_str(row.try_get("attachments")?)?;
-                match atts.first() {
-                    Some(a) if a.content_type.starts_with("image/") => "📷 Photo".to_owned(),
-                    Some(a) if a.content_type.starts_with("video/") => "🎥 Video".to_owned(),
-                    Some(a) if a.content_type.starts_with("audio/") => "🎤 Voice message".to_owned(),
-                    Some(_) => "📎 File".to_owned(),
-                    None => String::new(),
-                }
+                atts.first().map(|a| attachment_preview(a).to_owned()).unwrap_or_default()
             };
             let group = row.try_get::<&str, _>("kind")? == "group";
             let incoming = row.try_get::<i64, _>("direction")? == 0;
