@@ -12,6 +12,7 @@ A native Signal Desktop client built on [GPUI](https://gpui-kit.com) (via `gpui-
 | `crates/backend` | Signal networking on a dedicated Tokio thread, via [presage](https://github.com/whisperfish/presage) → libsignal-service-rs → [libsignal](https://github.com/signalapp/libsignal) v0.99. The UI talks to it with `Command`s / `Event`s |
 | `crates/store` | Encrypted app database (SQLCipher through sqlx): conversations, messages, FTS5 search, emoji usage, settings |
 | `crates/emoji` | Emoji table and FST search / type-ahead, generated at build time from vendored emojibase data |
+| `vendor/presage` | presage with the changes this app needs (see `vendor/README.md`) |
 
 ## Beyond Signal Desktop
 
@@ -139,10 +140,15 @@ Voice and video calls, 1:1 and in groups, work as in Signal Desktop, through Rin
 - **The call screen** shows their video (or their photo, name and "Ringing…", "Connecting…" or how long the call has run), your camera in the corner, and camera, microphone, Present and End controls. A group call shows everyone in a grid, named, with their video or photo and a muted mark; whoever presents fills the screen. Minimize shrinks it to a small window in the corner; clicking that brings it back.
 - **Presenting** shares a screen or a window (picked from a list) in place of your camera, which comes back after. macOS asks for screen recording access the first time.
 - **Incoming calls** show Desktop's bar across the top (Decline, Answer, and for video calls Answer without video), play Desktop's ringtone, and post a notification. A group ring says who's calling.
+- **The Calls tab** lists the calls in every chat, newest first; a row opens its chat, and its button calls again.
 - **Call history:** each 1:1 call leaves a notice in the chat ("Missed voice call", "Outgoing video call", …) with Call back or Call again, synced with your other devices' call lists. Starting a group call tells the group ("Alice started a group call", with Join).
 - Calls with someone you have no chat with go entirely through Signal's relays, as in Desktop, so they don't learn your IP address.
 
 Settings → Calls picks the microphone, speaker and camera. macOS asks for camera and microphone access the first time (this needs the app bundle; see Running). Call links aren't done yet.
+
+## Stories
+
+Desktop's tabs (Chats, Calls, Stories, and Settings at the bottom) run down the left; Hide Tabs moves their button into the chat list's header. The Stories tab lists your stories and then each person's or group's, unviewed first, with Hide story in a row's menu. A story opens over the window: Desktop's progress bars and times (5 seconds, more for longer text, a video's length up to 30), arrows to move, Space to pause, Esc to close. Text stories are drawn on their colors and gradients (in macOS's nearest fonts to Desktop's); photos and videos download as Desktop decides. Viewing one tells your other devices and, with view receipts on, its author; your own show their views. You can reply or react to someone's story, which goes to your chat with them; replies to group stories show with the story. Stories last a day. Settings → Stories turns them off.
 
 ## Message history when linking
 
@@ -178,7 +184,7 @@ cargo bench -p signal-emoji
 
 ## Not yet implemented
 
-Call links, stories, adding and removing group members, and most settings. New identity keys are trusted automatically: a key change shows Desktop's "Your safety number with … has changed" notice (in the 1:1 chat and shared groups) and clears a verification, but sending isn't held for confirmation. Attachments in transferred history that are only in the backup (media) tier, which needs a backup subscription, aren't downloaded. See `todo.md` for more.
+Call links, posting stories (and replying to group stories), adding and removing group members, and most settings. New identity keys are trusted automatically: a key change shows Desktop's "Your safety number with … has changed" notice (in the 1:1 chat and shared groups) and clears a verification, but sending isn't held for confirmation. Attachments in transferred history that are only in the backup (media) tier, which needs a backup subscription, aren't downloaded. See `todo.md` for more.
 
 ## License
 

@@ -214,7 +214,7 @@ async fn delete_edit_attachments_and_search() {
         voice: false,
         remote: None,
     }];
-    m.quote = Some(Quote { author: None, author_name: "You".into(), sent_at: 0, text: "q".into(), thumbnail: None, attachment: None });
+    m.quote = Some(Quote { author: None, author_name: "You".into(), sent_at: 0, text: "q".into(), thumbnail: None, attachment: None, story: false });
     let id = db.insert_message(&m).await.unwrap();
     let id2 = db.insert_message(&incoming("d:b", "b", 2, "Crème brûlée foxes")).await.unwrap();
 
@@ -388,7 +388,7 @@ async fn rename_authors_updates_messages_and_quotes() {
     first.author_name = None;
     let first = db.insert_message(&first).await.unwrap();
     let mut reply = incoming("g:01", "amy", 2, "re");
-    reply.quote = Some(Quote { author: Some("jon".into()), author_name: "jon".into(), sent_at: 1, text: "hi".into(), thumbnail: None, attachment: None });
+    reply.quote = Some(Quote { author: Some("jon".into()), author_name: "jon".into(), sent_at: 1, text: "hi".into(), thumbnail: None, attachment: None, story: false });
     let reply = db.insert_message(&reply).await.unwrap();
 
     let mut authors = db.message_authors().await.unwrap();
@@ -767,6 +767,7 @@ async fn drop_later_migrations(db: &AppDb) {
     sqlx::query("DROP INDEX messages_quote_author").execute(&db.writer).await.unwrap();
     sqlx::query("ALTER TABLE messages DROP COLUMN styles").execute(&db.writer).await.unwrap();
     sqlx::query("ALTER TABLE messages DROP COLUMN cta").execute(&db.writer).await.unwrap();
+    sqlx::query("DROP TABLE stories").execute(&db.writer).await.unwrap();
 }
 
 /// Rewrites the migration history to look like a pre-squash database that
@@ -1162,4 +1163,66 @@ async fn attachments_are_named_as_desktop_names_them() {
     db.insert_message(&m).await.unwrap();
     let chat = db.conversation(&conv("d:a")).await.unwrap().unwrap();
     assert_eq!(chat.last_message_preview.as_deref(), Some("🎡 GIF"));
+}
+
+#[tokio::test]
+async fn stories_last_a_day_and_keep_views_and_replies() {
+    let db = test_db().await;
+    let now = 10 * STORY_LIFETIME_MS;
+    let text = |text: &str| StoryContent::Text(TextStory { text: text.into(), ..Default::default() });
+    let story = |author: Option<&str>, sent_at: i64, content: StoryContent| NewStory {
+        author: author.map(Into::into),
+        author_name: author.map(|_| "Alice".into()),
+        sent_at,
+        received_at: sent_at,
+        group: None,
+        content,
+        pointer: None,
+        allows_replies: true,
+        read: false,
+    };
+    let theirs = db.insert_story(&story(Some("a"), now - 1_000, text("hi")), now).await.unwrap().unwrap();
+    assert_eq!(db.insert_story(&story(Some("a"), now - 1_000, text("hi")), now).await.unwrap(), None, "once");
+    assert_eq!(db.insert_story(&story(Some("a"), now - STORY_LIFETIME_MS, text("old")), now).await.unwrap(), None, "already gone");
+    let photo = StoryContent::Media {
+        attachment: AttachmentMeta {
+            content_type: "image/jpeg".into(),
+            file_name: None,
+            size: 1,
+            width: None,
+            height: None,
+            local_path: None,
+            sticker: false,
+            gif: false,
+            voice: false,
+            remote: None,
+        },
+        caption: String::new(),
+        styles: Vec::new(),
+    };
+    let ours = db.insert_story(&story(None, now - 500, photo), now).await.unwrap().unwrap();
+    db.set_story_file(ours, "/tmp/x.jpg").await.unwrap();
+
+    let stories = db.stories(now).await.unwrap();
+    assert_eq!(stories.iter().map(|s| s.id).collect::<Vec<_>>(), [ours, theirs], "newest first");
+    assert!(matches!(&stories[0].content, StoryContent::Media { attachment, .. } if attachment.local_path.as_deref() == Some("/tmp/x.jpg")));
+
+    assert!(db.mark_story_read(Some("a"), now - 1_000).await.unwrap());
+    assert!(!db.mark_story_read(Some("a"), now - 1_000).await.unwrap(), "once");
+    assert!(db.add_story_view(now - 500, "b").await.unwrap());
+    assert!(db.add_story_view(now - 500, "b").await.unwrap());
+    assert!(!db.add_story_view(now - 1_000, "b").await.unwrap(), "not ours");
+    let reply = StoryReply { author: Some("b".into()), author_name: None, sent_at: now, body: "nice".into(), emoji: None };
+    assert_eq!(db.add_story_reply(Some("a"), now - 1_000, &reply).await.unwrap(), Some(theirs));
+    assert_eq!(db.add_story_reply(Some("a"), 1, &reply).await.unwrap(), None, "no such story");
+    let theirs_now = db.story(theirs).await.unwrap().unwrap();
+    assert!(theirs_now.read);
+    assert_eq!(theirs_now.replies, [reply]);
+    assert_eq!(db.story(ours).await.unwrap().unwrap().views, ["b"]);
+
+    // A day after: gone, with the photo's file to delete.
+    let later = now - 500 + STORY_LIFETIME_MS;
+    assert_eq!(db.next_story_expiry().await.unwrap(), Some(now - 1_000 + STORY_LIFETIME_MS));
+    assert_eq!(db.remove_expired_stories(later).await.unwrap(), ["/tmp/x.jpg"]);
+    assert!(db.stories(later).await.unwrap().is_empty());
 }

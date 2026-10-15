@@ -44,6 +44,8 @@ pub fn open(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
                     .child(notifications(&state, cx))
                     .child(section("Calls", palette))
                     .child(call_devices(&state, cx))
+                    .child(section("Stories", palette))
+                    .child(stories(&state, cx))
                     .child(section("Images", palette))
                     .child(image_optimization(&state, cx))
                     .child(section("Linked device", palette))
@@ -126,6 +128,62 @@ fn notifications(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
         .child(choice("notify-name", "Name only", NotificationSetting::NameOnly))
         .child(choice("notify-none", "No name or content", NotificationSetting::NoNameOrMessage))
         .child(choice("notify-off", "Off", NotificationSetting::Off))
+}
+
+/// Desktop's "Share & View Stories" (Privacy) and its story view receipts
+/// (Story privacy).
+fn stories(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
+    let palette = Palette::get(cx);
+    let (disabled, receipts) = {
+        let s = state.read(cx);
+        (s.stories_disabled, s.story_view_receipts.unwrap_or(true))
+    };
+    let (toggle_state, receipts_state) = (state.clone(), state.clone());
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(div().text_sm().text_color(palette.text_secondary).child(
+            "If you opt out of stories you will no longer be able to share or view stories.",
+        ))
+        .child(
+            div().child(
+                Button::new("stories-toggle")
+                    .label(if disabled { "Turn on stories" } else { "Turn off stories" })
+                    .small()
+                    .outline()
+                    .on_click(move |_, window, cx| {
+                        toggle_state.update(cx, |s, cx| s.set_stories_disabled(!disabled, cx));
+                        window.refresh();
+                    }),
+            ),
+        )
+        .when(!disabled, |d| {
+            d.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .text_color(palette.text_secondary)
+                            .child("View receipts: see and share when stories are viewed. If disabled, you won't see when others view your story."),
+                    )
+                    .child(
+                        Button::new("story-view-receipts")
+                            .label(if receipts { "On" } else { "Off" })
+                            .small()
+                            .when(receipts, |b| b.primary())
+                            .when(!receipts, |b| b.outline())
+                            .on_click(move |_, window, cx| {
+                                receipts_state.update(cx, |s, cx| s.set_story_view_receipts(!receipts, cx));
+                                window.refresh();
+                            }),
+                    ),
+            )
+        })
 }
 
 /// Desktop's call device choices: microphone, speaker and camera.

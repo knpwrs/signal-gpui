@@ -4,7 +4,7 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::prelude::*;
 use gpui_kit::{Context, Entity, Focusable as _, FontWeight, Subscription, Window, div, px};
 
-use crate::state::{AppEvent, AppState, Screen};
+use crate::state::{AppEvent, AppState, NavTab, Screen};
 use crate::theme::Palette;
 use crate::views::conversation::ConversationView;
 use crate::views::emoji_picker::EmojiPicker;
@@ -28,6 +28,10 @@ pub struct RootView {
     video_viewer: Option<(Entity<crate::views::video_viewer::VideoViewer>, Subscription)>,
     /// The lobby or call, while there is one.
     call: Option<Entity<crate::views::call::CallView>>,
+    /// The Stories and Calls tabs' lists.
+    stories: Entity<crate::views::stories::StoriesPane>,
+    calls: Entity<crate::views::calls::CallsPane>,
+    story_viewer: Option<(Entity<crate::views::story_viewer::StoryViewer>, Subscription)>,
     /// The chat list's width as dragged (see `crate::sidebar_width`).
     sidebar_preferred: f32,
     /// The account (its ACI) when last seen.
@@ -80,6 +84,17 @@ impl RootView {
                     this.video_viewer = Some((viewer, closed));
                     cx.notify();
                 }
+                if let AppEvent::ViewStories(chat) = event {
+                    let viewer = cx.new(|cx| crate::views::story_viewer::StoryViewer::new(state.clone(), chat.clone(), window, cx));
+                    window.focus(&viewer.focus_handle(cx), cx);
+                    let closed = cx.subscribe_in(&viewer, window, |this, _, _: &ViewerEvent, _, cx| {
+                        // Dropping it stops a video.
+                        this.story_viewer = None;
+                        cx.notify();
+                    });
+                    this.story_viewer = Some((viewer, closed));
+                    cx.notify();
+                }
                 if let AppEvent::Error(message) = event {
                     use gpui_kit::component::WindowExt as _;
                     window.push_notification(gpui_kit::component::notification::Notification::error(message.clone()), cx);
@@ -109,6 +124,8 @@ impl RootView {
                 cx.notify()
             }),
         ];
+        let stories = cx.new(|cx| crate::views::stories::StoriesPane::new(state.clone(), cx));
+        let calls = cx.new(|cx| crate::views::calls::CallsPane::new(state.clone(), cx));
         let mut this = Self {
             state,
             sidebar,
@@ -117,6 +134,9 @@ impl RootView {
             viewer: None,
             video_viewer: None,
             call: None,
+            stories,
+            calls,
+            story_viewer: None,
             sidebar_preferred: crate::sidebar_width::DEFAULT_WIDTH,
             account: None,
             account_generation: 0,
@@ -191,8 +211,14 @@ impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::get(cx);
         let screen = self.state.read(cx).screen.clone();
-        // Desktop's left pane width: narrow (avatars) below the snap.
-        let requires_full = self.sidebar.read(cx).requires_full_width();
+        let (tab, nav_collapsed) = {
+            let s = self.state.read(cx);
+            (s.tab, s.nav_collapsed)
+        };
+        let rail = if nav_collapsed { 0. } else { crate::views::nav::NAV_WIDTH };
+        // Desktop's left pane width: narrow (avatars) below the snap; the
+        // Stories and Calls lists always need their names.
+        let requires_full = self.sidebar.read(cx).requires_full_width() || tab != NavTab::Chats;
         let sidebar_width = crate::sidebar_width::width(self.sidebar_preferred, requires_full);
         let narrow = crate::sidebar_width::is_narrow(sidebar_width);
         if self.sidebar.read(cx).narrow != narrow {
@@ -224,9 +250,11 @@ impl Render for RootView {
             Screen::Main => div()
                 .size_full()
                 .flex()
+                // Desktop's tabs, unless hidden.
+                .when(!nav_collapsed, |d| d.child(crate::views::nav::render(&self.state, palette, cx)))
                 // Dragging the chat list's edge (Desktop's drag handle).
-                .on_drag_move(cx.listener(|this, event: &gpui_kit::DragMoveEvent<SidebarResize>, _, cx| {
-                    this.sidebar_preferred = f32::from(event.event.position.x);
+                .on_drag_move(cx.listener(move |this, event: &gpui_kit::DragMoveEvent<SidebarResize>, _, cx| {
+                    this.sidebar_preferred = f32::from(event.event.position.x) - rail;
                     cx.notify();
                 }))
                 .on_drop(cx.listener(|this, _: &SidebarResize, _, cx| this.save_sidebar_width(cx)))
@@ -238,7 +266,11 @@ impl Render for RootView {
                         .h_full()
                         .border_r_1()
                         .border_color(palette.panel_border)
-                        .child(self.sidebar.clone())
+                        .child(match tab {
+                            NavTab::Chats => self.sidebar.clone().into_any_element(),
+                            NavTab::Stories => self.stories.clone().into_any_element(),
+                            NavTab::Calls => self.calls.clone().into_any_element(),
+                        })
                         .child(
                             div()
                                 .id("sidebar-resize")
@@ -252,9 +284,10 @@ impl Render for RootView {
                                 .on_drag(SidebarResize, |_, _, _, cx| cx.new(|_| gpui_kit::EmptyView)),
                         ),
                 )
-                .child(div().flex_1().min_w_0().h_full().child(match &self.conversation {
-                    Some(view) => view.clone().into_any_element(),
-                    None => div()
+                .child(div().flex_1().min_w_0().h_full().child(match (tab, &self.conversation) {
+                    (NavTab::Stories, _) => crate::views::stories::render_placeholder(palette).into_any_element(),
+                    (_, Some(view)) if tab == NavTab::Chats => view.clone().into_any_element(),
+                    (_, _) => div()
                         .size_full()
                         .flex()
                         .flex_col()
@@ -272,6 +305,7 @@ impl Render for RootView {
 
         let viewer = self.viewer.as_ref().map(|(viewer, _)| viewer.clone());
         let video_viewer = self.video_viewer.as_ref().map(|(viewer, _)| viewer.clone());
+        let story_viewer = self.story_viewer.as_ref().map(|(viewer, _)| viewer.clone());
         div()
             .key_context("Signal")
             .relative()
@@ -324,6 +358,7 @@ impl Render for RootView {
             .when_some(self.call.clone().filter(|_| call_shown), |d, call| d.child(call))
             .when_some(viewer, |d, viewer| d.child(viewer))
             .when_some(video_viewer, |d, viewer| d.child(viewer))
+            .when_some(story_viewer, |d, viewer| d.child(viewer))
     }
 }
 
@@ -395,6 +430,67 @@ mod tests {
             assert!(!r.sidebar.read(cx).narrow);
             assert_eq!(r.sidebar_preferred, crate::sidebar_width::MIN_FULL_WIDTH);
         });
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn the_stories_tab_lists_stories_and_opens_them(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config { data_dir: dir.path().to_owned(), db_key: [7; 32], device_name: "test".into(), demo: true };
+        let (backend, mut events) = Backend::start(config).unwrap();
+        let state = cx.update(|cx| crate::state::new_state(backend.clone(), cx));
+        cx.update(|cx| {
+            use futures::StreamExt as _;
+            let state = state.clone();
+            cx.spawn(async move |cx| {
+                while let Some(event) = events.next().await {
+                    state.update(cx, |state, cx| state.handle(event, cx));
+                }
+            })
+            .detach();
+        });
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(gpui_kit::Bounds { origin: Default::default(), size: size(px(1000.), px(900.)) })),
+            ..Default::default()
+        };
+        let (window, root) = cx.update(|cx| {
+            let state = state.clone();
+            gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| RootView::new(state, window, cx))).unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window, cx);
+        let wait = |cx: &mut VisualTestContext, what: &str, done: &dyn Fn(&mut VisualTestContext) -> bool| {
+            for _ in 0..300 {
+                cx.update(|window, _| window.refresh());
+                cx.run_until_parked();
+                if done(cx) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("timed out waiting for {what}");
+        };
+        wait(&mut cx, "the tabs and the demo's stories", &|cx| {
+            cx.debug_bounds("nav-stories").is_some() && state.read_with(cx, |s, _| s.story_groups().len() >= 3)
+        });
+        // Its badge counts the people and groups with something new.
+        assert_eq!(state.read_with(&cx, |s, _| s.unread_story_chats()), 3);
+        let tab = cx.debug_bounds("nav-stories").unwrap().center();
+        cx.simulate_click(tab, Modifiers::none());
+        wait(&mut cx, "the stories list", &|cx| cx.debug_bounds("my-stories").is_some());
+
+        // The first row opens the viewer, which marks the story viewed.
+        let first = state.read_with(&cx, |s, _| s.story_groups()[0].chat.clone());
+        let row = cx.debug_bounds(Box::leak(format!("story-row-{}", first.0).into_boxed_str())).expect("its row").center();
+        cx.simulate_click(row, Modifiers::none());
+        wait(&mut cx, "the viewer", &|cx| cx.debug_bounds("story-viewer").is_some());
+        wait(&mut cx, "the story to be viewed", &|cx| {
+            state.read_with(cx, |s, _| s.story_groups().iter().any(|g| g.chat == first && !g.unread()))
+        });
+        cx.update(|window, cx| window.dispatch_keystroke(gpui_kit::Keystroke::parse("escape").unwrap(), cx));
+        wait(&mut cx, "the viewer to close", &|cx| cx.debug_bounds("story-viewer").is_none());
+        let _ = root;
         backend.shutdown();
     }
 }

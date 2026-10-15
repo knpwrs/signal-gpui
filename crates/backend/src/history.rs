@@ -451,6 +451,7 @@ async fn import_item(
                             gif: flag == Some(Flag::GIF),
                         }
                     }),
+                    story: false,
                 })
             });
             let message = NewMessage {

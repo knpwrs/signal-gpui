@@ -655,3 +655,114 @@ fn quoted_spoilers_stay_hidden() {
     let Some(Action::Insert { message, .. }) = actions.first() else { panic!("{actions:?}") };
     assert_eq!(message.quote.as_ref().unwrap().text, "it was ■■■■");
 }
+
+fn text_story(text: &str) -> presage::proto::StoryMessage {
+    use presage::proto::{StoryMessage, TextAttachment, story_message, text_attachment};
+    StoryMessage {
+        attachment: Some(story_message::Attachment::TextAttachment(TextAttachment {
+            text: Some(text.into()),
+            text_style: Some(text_attachment::Style::Serif.into()),
+            text_foreground_color: Some(0xff00_0000),
+            background: Some(text_attachment::Background::Gradient(text_attachment::Gradient {
+                colors: vec![0xff11_2233, 0xff44_5566],
+                positions: vec![0., 1.],
+                angle: Some(180),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })),
+        allows_replies: Some(true),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn stories_arrive_as_stories_not_messages() {
+    use signal_store::{StoryBackground, StoryContent, StoryFont};
+    let actions = map_content(&content(ALICE, ContentBody::StoryMessage(text_story("Hello"))), &ctx());
+    let [Action::Story { story, pointer: None }] = actions.as_slice() else { panic!("{actions:?}") };
+    assert_eq!((story.author.as_deref(), story.sent_at, story.group.as_ref(), story.allows_replies), (Some(ALICE), 500, None, true));
+    let StoryContent::Text(text) = &story.content else { panic!() };
+    assert_eq!((text.text.as_str(), text.font, text.foreground), ("Hello", StoryFont::Serif, Some(0xff00_0000)));
+    assert_eq!(text.background, StoryBackground::Gradient { colors: vec![0xff11_2233, 0xff44_5566], positions: vec![0., 1.], angle: 180 });
+
+    // Empty, with no link: dropped, as Desktop does.
+    assert!(map_content(&content(ALICE, ContentBody::StoryMessage(text_story(" "))), &ctx()).is_empty());
+
+    // A photo story to a group.
+    let mut photo = presage::proto::StoryMessage {
+        attachment: Some(presage::proto::story_message::Attachment::FileAttachment(AttachmentPointer {
+            content_type: Some("image/jpeg".into()),
+            caption: Some("Look".into()),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    photo.group = Some(GroupContextV2 { master_key: Some(group_key()), ..Default::default() });
+    let actions = map_content(&content(ALICE, ContentBody::StoryMessage(photo)), &ctx());
+    let [Action::Story { story, pointer: Some(_) }] = actions.as_slice() else { panic!("{actions:?}") };
+    assert_eq!(story.group, Some(ConversationId::group(&group_key())));
+    assert!(matches!(&story.content, StoryContent::Media { caption, .. } if caption == "Look"));
+}
+
+#[test]
+fn our_stories_from_another_device_are_ours() {
+    let sync = SyncMessage {
+        content: Some(sync_message::Content::Sent(sync_message::Sent {
+            timestamp: Some(700),
+            story_message: Some(text_story("Mine")),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let actions = map_content(&content(ME, sync), &ctx());
+    let [Action::Story { story, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+    assert_eq!((story.author.as_deref(), story.sent_at, story.read), (None, 700, true));
+}
+
+#[test]
+fn story_replies_go_with_the_story_in_groups_and_to_the_chat_one_to_one() {
+    let context = data_message::StoryContext { author_aci: Some(BOB.into()), sent_timestamp: Some(400), ..Default::default() };
+    // In a group: kept with Bob's story, not in the group's timeline.
+    let mut reply = text("nice!", 600);
+    reply.story_context = Some(context.clone());
+    reply.group_v2 = Some(GroupContextV2 { master_key: Some(group_key()), ..Default::default() });
+    let actions = map_content(&content(ALICE, reply), &ctx());
+    let [Action::StoryReply { story_author, story_sent_at, reply, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+    assert_eq!((story_author.as_deref(), *story_sent_at, reply.body.as_str(), reply.emoji.as_ref()), (Some(BOB), 400, "nice!", None));
+
+    // One to one, to our story: a message quoting it.
+    let mut reply = text("love it", 610);
+    reply.story_context = Some(data_message::StoryContext { author_aci: Some(ME.into()), sent_timestamp: Some(300), ..Default::default() });
+    let actions = map_content(&content(ALICE, reply), &ctx());
+    let [Action::Insert { message, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+    let quote = message.quote.as_ref().unwrap();
+    assert_eq!((message.body.as_str(), quote.story, quote.author.as_ref(), quote.sent_at, quote.text.as_str()), ("love it", true, None, 300, "Story"));
+
+    // A reaction to it: the emoji, "Reacted to your story" (not a lost
+    // reaction to a message).
+    let mut reaction = DataMessage { timestamp: Some(620), ..Default::default() };
+    reaction.story_context = Some(data_message::StoryContext { author_aci: Some(ME.into()), sent_timestamp: Some(300), ..Default::default() });
+    reaction.reaction = Some(data_message::Reaction {
+        emoji: Some("🔥".into()),
+        target_author_aci: Some(ME.into()),
+        target_sent_timestamp: Some(300),
+        ..Default::default()
+    });
+    let actions = map_content(&content(ALICE, reaction), &ctx());
+    let [Action::Insert { message, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+    assert_eq!((message.body.as_str(), message.quote.as_ref().unwrap().text.as_str()), ("🔥", "Reacted to your story"));
+}
+
+#[test]
+fn viewed_receipts_count_story_views() {
+    let receipt = ReceiptMessage { r#type: Some(receipt_message::Type::Viewed.into()), timestamp: vec![300] };
+    let actions = map_content(&content(ALICE, receipt), &ctx());
+    assert!(actions.iter().any(|a| matches!(a, Action::StoryViewed { viewer, sent_at } if viewer == ALICE && sent_at == &[300])));
+    let sync = SyncMessage {
+        viewed: vec![sync_message::Viewed { sender_aci: Some(ALICE.into()), timestamp: Some(400), ..Default::default() }],
+        ..Default::default()
+    };
+    let actions = map_content(&content(ME, sync), &ctx());
+    assert!(actions.iter().any(|a| matches!(a, Action::ViewedSync(v) if v == &[(Some(ALICE.into()), 400)])));
+}

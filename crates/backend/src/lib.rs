@@ -45,6 +45,13 @@ pub const SETTING_LINK_PREVIEWS: &str = "link_previews";
 /// works). Not a Signal setting.
 pub const SETTING_GIPHY_API_KEY: &str = "giphy_api_key";
 
+/// Settings key: when `"true"`, stories are turned off (Desktop's
+/// `hasStoriesDisabled`): none are kept or shown.
+pub const SETTING_STORIES_DISABLED: &str = "stories_disabled";
+/// Settings key: `"false"` to not tell people we viewed their stories
+/// (Desktop's `storyViewReceiptsEnabled`; unset follows read receipts).
+pub const SETTING_STORY_VIEW_RECEIPTS: &str = "story_view_receipts";
+
 /// Settings key: lossless optimization of images we send (`max`, `fast` or
 /// `off`; see [`media::Optimization`]). Not a Signal setting.
 pub const SETTING_IMAGE_OPTIMIZATION: &str = "image_optimization";
@@ -191,6 +198,14 @@ pub enum Command {
     /// A megaphone's button: done with it (donate, finish) or put off
     /// (snooze). Answered with `Event::Megaphones`.
     PressMegaphone { id: String, cta: megaphones::MegaphoneCta },
+    /// A story was shown: viewed here, on our other devices, and (with
+    /// view receipts on) to its author.
+    ViewStory { id: i64 },
+    /// Downloads a story's photo or video.
+    FetchStory { id: i64 },
+    /// Replies to someone's story (or reacts, with `emoji`), in your chat
+    /// with them.
+    ReplyToStory { id: i64, body: String, emoji: Option<String> },
     /// Calls a 1:1 chat (Desktop's call buttons, after the lobby).
     StartCall { conversation: ConversationId, video: bool },
     /// Answers the ringing call, with our camera on or off.
@@ -454,6 +469,8 @@ pub enum Event {
     ConversationsChanged,
     /// Signal's megaphones to show now, highest priority first.
     Megaphones(Vec<megaphones::MegaphoneView>),
+    /// Stories came, went, were viewed or replied to.
+    StoriesChanged,
     /// A message was inserted or updated (status, reaction, edit, delete, attachment).
     MessageChanged { conversation: ConversationId, message_id: i64 },
     Typing { conversation: ConversationId, author: String, started: bool },

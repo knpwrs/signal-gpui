@@ -68,7 +68,8 @@ gpui_kit::assets::icon_assets!(
 );
 
 /// Signal Desktop's own icons (AGPL-3.0-only, like this app), where Lucide
-/// has no match: the message status circles, and the Signal chat's logo.
+/// has no match: the message status circles, the Signal chat's logo, and
+/// the navigation tabs' icons.
 const SIGNAL_ICONS: &[(&str, &[u8])] = &[
     ("icons/signal/messagestatus-sending.svg", include_bytes!("../assets/icons/signal/messagestatus-sending.svg")),
     ("icons/signal/messagestatus-sent.svg", include_bytes!("../assets/icons/signal/messagestatus-sent.svg")),
@@ -76,6 +77,15 @@ const SIGNAL_ICONS: &[(&str, &[u8])] = &[
     ("icons/signal/messagestatus-read.svg", include_bytes!("../assets/icons/signal/messagestatus-read.svg")),
     ("icons/signal/error-circle.svg", include_bytes!("../assets/icons/signal/error-circle.svg")),
     ("icons/signal/profile-avatar.svg", include_bytes!("../assets/icons/signal/profile-avatar.svg")),
+    ("icons/signal/nav-chat.svg", include_bytes!("../assets/icons/signal/nav-chat.svg")),
+    ("icons/signal/nav-chat-fill.svg", include_bytes!("../assets/icons/signal/nav-chat-fill.svg")),
+    ("icons/signal/nav-phone.svg", include_bytes!("../assets/icons/signal/nav-phone.svg")),
+    ("icons/signal/nav-phone-fill.svg", include_bytes!("../assets/icons/signal/nav-phone-fill.svg")),
+    ("icons/signal/nav-stories.svg", include_bytes!("../assets/icons/signal/nav-stories.svg")),
+    ("icons/signal/nav-stories-fill.svg", include_bytes!("../assets/icons/signal/nav-stories-fill.svg")),
+    ("icons/signal/nav-settings.svg", include_bytes!("../assets/icons/signal/nav-settings.svg")),
+    ("icons/signal/nav-settings-fill.svg", include_bytes!("../assets/icons/signal/nav-settings-fill.svg")),
+    ("icons/signal/nav-menu.svg", include_bytes!("../assets/icons/signal/nav-menu.svg")),
 ];
 
 pub struct Assets;

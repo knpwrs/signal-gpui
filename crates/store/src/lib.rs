@@ -12,6 +12,9 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous},
 };
 
+mod stories;
+pub use stories::*;
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, thiserror::Error)]
@@ -123,6 +126,9 @@ pub struct Quote {
     /// when it has no text ("Voice Message", "Photo").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachment: Option<QuotedAttachment>,
+    /// It quotes a story (a reply to one, one to one).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub story: bool,
 }
 
 /// What a quote knows of the quoted attachment (Signal's
@@ -1889,6 +1895,18 @@ impl AppDb {
         .await?;
         tx.commit().await?;
         Ok(id)
+    }
+
+    /// Calls in every chat, newest first (Desktop's Calls tab).
+    pub async fn call_history(&self, limit: u32) -> Result<Vec<Message>> {
+        let rows = sqlx::query(AssertSqlSafe(format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE author_key = 'notice' \
+               AND json_extract(notice, '$.type') IN ('call', 'group_call') ORDER BY sent_at DESC LIMIT ?"
+        )))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(message_from_row).collect()
     }
 
     /// Records a call's notice, or updates the one for the same call (seen

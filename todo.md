@@ -172,3 +172,25 @@ with a real account yet: the fetch was run against updates2.signal.org
 real chat, since the first check starts from the current Desktop
 version, and the manifest lists no megaphones now, so they've only been
 seen in the demo.
+
+## Stories
+
+Receiving, viewing, viewed receipts, 1:1 replies and reactions, hiding,
+and Desktop's tabs work (see the README). Not done yet:
+
+- **Posting stories:** the creator (text with Desktop's styles and
+  backgrounds, photo or video), choosing My Story or a group, and sending.
+  libsignal-service-rs can't send with the story flag (`?story=true`,
+  sealed sender without an access key) or sync a story to our other
+  devices; that needs a change there, vendored like presage.
+- **Replies to group stories:** they go to the group with the story flag,
+  so they wait on the same change.
+- **Storage Service:** My Story's privacy (`StoryDistributionListRecord`),
+  hidden stories (`hideStory`), `storiesDisabled` and
+  `storyViewReceiptsEnabled` are kept on this device only.
+- **Desktop's fonts** for text stories (Inter, EB Garamond, Parisienne,
+  Barlow Condensed); macOS fonts stand in.
+- **Who we take stories from:** Desktop shows a person's story when it
+  shares its profile with them; here, when we have a chat with them or
+  they're in our contacts.
+- **Calls tab:** call details, links and new calls from it.

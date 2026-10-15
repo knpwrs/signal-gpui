@@ -27,7 +27,12 @@ impl Actor {
     /// Stops fetching release notes and showing megaphones (the account is
     /// going).
     pub(super) fn stop_release_notes(&self) {
-        for task in [self.release_notes.borrow_mut().take(), self.megaphones.borrow_mut().take()].into_iter().flatten() {
+        let tasks = [
+            self.release_notes.borrow_mut().take(),
+            self.megaphones.borrow_mut().take(),
+            self.story_expiry_task.borrow_mut().take(),
+        ];
+        for task in tasks.into_iter().flatten() {
             task.abort();
         }
     }

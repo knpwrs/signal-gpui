@@ -3879,6 +3879,7 @@ mod tests {
                 text: "old 5".into(),
                 thumbnail: None,
                 attachment: None,
+                story: false,
             });
             Ok::<_, signal_store::Error>((quoted, db.insert_message(&reply).await?))
         }))

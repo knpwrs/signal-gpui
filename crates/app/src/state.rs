@@ -10,6 +10,40 @@ use signal_store::{Conversation, ConversationId};
 use crate::emoji_usage::EmojiUsageCache;
 use crate::loop_cache::{LoopCache, LoopState};
 
+/// Desktop's navigation tabs (`NavTab`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NavTab {
+    #[default]
+    Chats,
+    Calls,
+    Stories,
+}
+
+/// Settings key: the tabs are hidden (Desktop's `navTabsCollapsed`).
+const NAV_COLLAPSED_SETTING: &str = "nav_tabs_collapsed";
+/// Settings key: chats whose stories are hidden (JSON conversation ids).
+const HIDDEN_STORIES_SETTING: &str = "stories_hidden";
+
+/// A person's or group's stories, for the list and the viewer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoryGroup {
+    pub chat: ConversationId,
+    pub title: String,
+    /// Oldest first.
+    pub stories: Vec<signal_store::Story>,
+    pub hidden: bool,
+}
+
+impl StoryGroup {
+    pub fn unread(&self) -> bool {
+        self.stories.iter().any(|s| !s.read)
+    }
+
+    pub fn latest(&self) -> i64 {
+        self.stories.last().map_or(0, |s| s.sent_at)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Screen {
     /// Opening databases / checking registration.
@@ -87,6 +121,8 @@ pub enum AppEvent {
     /// Show an image full-window.
     ViewImage(crate::views::image_viewer::ViewedImage),
     ViewVideo(crate::views::video_viewer::ViewedVideo),
+    /// Open the story viewer at these stories (a chat's; `None`: ours).
+    ViewStories(Option<ConversationId>),
     /// A link preview the composer asked for (`None`: nothing to show).
     LinkPreview { url: String, preview: Option<std::rc::Rc<signal_backend::LinkPreviewDraft>> },
     /// How the sticker pack creator's upload is going.
@@ -154,6 +190,18 @@ pub struct AppState {
     pub audio: Option<AudioPlaying>,
     /// Signal's megaphones to show, highest priority first.
     pub megaphones: Vec<signal_backend::megaphones::MegaphoneView>,
+    /// The navigation tab showing.
+    pub tab: NavTab,
+    /// The tabs are hidden.
+    pub nav_collapsed: bool,
+    /// The stories up now, newest first.
+    pub stories: Vec<signal_store::Story>,
+    /// Chats (people or groups) whose stories are hidden.
+    pub hidden_stories: std::collections::HashSet<ConversationId>,
+    /// Stories are turned off.
+    pub stories_disabled: bool,
+    /// Story view receipts, if set (unset follows read receipts).
+    pub story_view_receipts: Option<bool>,
     /// Starts recording a voice message (the microphone; a stand-in in
     /// tests).
     pub start_recorder: crate::recorder::StartRecorder,
@@ -230,6 +278,12 @@ impl AppState {
             audio: None,
             start_recorder: crate::recorder::start_microphone,
             megaphones: Vec::new(),
+            tab: NavTab::default(),
+            nav_collapsed: false,
+            stories: Vec::new(),
+            hidden_stories: Default::default(),
+            stories_disabled: false,
+            story_view_receipts: None,
             waveforms: HashMap::new(),
             posters: HashMap::new(),
             recent_stickers: Vec::new(),
@@ -463,6 +517,7 @@ impl AppState {
                 self.load_settings(cx);
                 self.screen = Screen::Main;
                 self.reload_conversations(cx);
+                self.reload_stories(cx);
                 self.start_catch_up(cx);
             }
             Event::Connection(state) => {
@@ -480,6 +535,7 @@ impl AppState {
                 }
             }
             Event::ConversationsChanged => self.reload_conversations(cx),
+            Event::StoriesChanged => self.reload_stories(cx),
             Event::Megaphones(megaphones) => {
                 self.megaphones = megaphones;
                 cx.notify();
@@ -683,11 +739,25 @@ impl AppState {
                 db.setting(RECENT_STICKERS_SETTING).await?,
                 db.setting(signal_backend::SETTING_GIPHY_API_KEY).await?,
                 db.setting(crate::notifications::NotificationSetting::KEY).await?,
+                db.setting(NAV_COLLAPSED_SETTING).await?,
+                db.setting(HIDDEN_STORIES_SETTING).await?,
+                db.setting(signal_backend::SETTING_STORIES_DISABLED).await?,
+                db.setting(signal_backend::SETTING_STORY_VIEW_RECEIPTS).await?,
             ))
         });
         cx.spawn(async move |this, cx| {
-            let (optimization, recents, giphy, notifications) = read.await.unwrap_or_default();
+            let (optimization, recents, giphy, notifications, collapsed, hidden, stories_off, view_receipts) =
+                read.await.unwrap_or_default();
             let _ = this.update(cx, |this, cx| {
+                this.nav_collapsed = collapsed.as_deref() == Some("true");
+                this.hidden_stories = hidden
+                    .and_then(|h| serde_json::from_str::<Vec<String>>(&h).ok())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(ConversationId)
+                    .collect();
+                this.stories_disabled = stories_off.as_deref() == Some("true");
+                this.story_view_receipts = view_receipts.map(|v| v != "false");
                 this.notification_setting = crate::notifications::NotificationSetting::from_setting(notifications.as_deref());
                 this.has_giphy_key |= giphy.is_some_and(|k| !k.trim().is_empty());
                 this.image_optimization = signal_backend::media::Optimization::from_setting(optimization.as_deref());
@@ -696,6 +766,158 @@ impl AppState {
             });
         })
         .detach();
+    }
+
+    /// The stories still up, from the store.
+    pub fn reload_stories(&mut self, cx: &mut Context<Self>) {
+        let db = self.backend.db().clone();
+        let now = chrono::Utc::now().timestamp_millis();
+        let query = self.backend.spawn(async move { db.stories(now).await });
+        cx.spawn(async move |this, cx| {
+            if let Ok(stories) = query.await {
+                let _ = this.update(cx, |this, cx| {
+                    this.stories = stories;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub fn set_tab(&mut self, tab: NavTab, cx: &mut Context<Self>) {
+        if self.tab != tab {
+            self.tab = tab;
+            cx.notify();
+        }
+    }
+
+    /// Desktop's "Hide Tabs" / "Show Tabs".
+    pub fn toggle_nav(&mut self, cx: &mut Context<Self>) {
+        self.nav_collapsed = !self.nav_collapsed;
+        self.save_setting(NAV_COLLAPSED_SETTING, if self.nav_collapsed { "true" } else { "false" }.into(), cx);
+        cx.notify();
+    }
+
+    /// Hides (or shows again) a person's or group's stories.
+    pub fn set_story_hidden(&mut self, chat: ConversationId, hidden: bool, cx: &mut Context<Self>) {
+        let changed = if hidden { self.hidden_stories.insert(chat) } else { self.hidden_stories.remove(&chat) };
+        if changed {
+            let mut ids: Vec<&str> = self.hidden_stories.iter().map(|c| c.0.as_str()).collect();
+            ids.sort();
+            self.save_setting(HIDDEN_STORIES_SETTING, serde_json::to_string(&ids).unwrap_or_default(), cx);
+            cx.notify();
+        }
+    }
+
+    /// Desktop's "Turn off stories" / "Turn on stories": off, none are kept
+    /// or shown, and the tab goes.
+    pub fn set_stories_disabled(&mut self, disabled: bool, cx: &mut Context<Self>) {
+        self.stories_disabled = disabled;
+        if disabled && self.tab == NavTab::Stories {
+            self.tab = NavTab::Chats;
+        }
+        self.save_setting(signal_backend::SETTING_STORIES_DISABLED, disabled.to_string(), cx);
+        if disabled {
+            self.stories.clear();
+            let db = self.backend.db().clone();
+            let remove = self.backend.spawn(async move { db.remove_all_stories().await });
+            cx.background_spawn(async move {
+                if let Ok(files) = remove.await {
+                    for file in files {
+                        let _ = std::fs::remove_file(file);
+                    }
+                }
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    /// Whether we tell people we viewed their stories (and see who viewed
+    /// ours); unset follows read receipts, as in Desktop.
+    pub fn set_story_view_receipts(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.story_view_receipts = Some(on);
+        self.save_setting(signal_backend::SETTING_STORY_VIEW_RECEIPTS, on.to_string(), cx);
+        cx.notify();
+    }
+
+    fn save_setting(&self, key: &'static str, value: String, cx: &mut Context<Self>) {
+        let db = self.backend.db().clone();
+        let save = self.backend.spawn(async move { db.set_setting(key, &value).await });
+        cx.background_spawn(async move {
+            let _ = save.await;
+        })
+        .detach();
+    }
+
+    /// The chat a story belongs to in the list: its group, else its author
+    /// (`None` for ours).
+    pub fn story_chat(story: &signal_store::Story) -> Option<ConversationId> {
+        story.group.clone().or_else(|| story.author.as_deref().map(ConversationId::direct))
+    }
+
+    /// The stories by who posted them (Desktop's `getStories`): one entry
+    /// per person or group, its stories oldest first; unviewed first, then
+    /// newest. Ours aren't included.
+    pub fn story_groups(&self) -> Vec<StoryGroup> {
+        let mut groups: Vec<StoryGroup> = Vec::new();
+        for story in self.stories.iter().filter(|s| s.author.is_some()) {
+            let Some(chat) = Self::story_chat(story) else { continue };
+            match groups.iter_mut().find(|g| g.chat == chat) {
+                Some(group) => group.stories.push(story.clone()),
+                None => {
+                    let title = match &story.group {
+                        Some(group) => self.conversation(group).map(|c| c.title.clone()).unwrap_or_default(),
+                        None => self
+                            .conversation(&chat)
+                            .map(|c| c.title.clone())
+                            .or_else(|| story.author_name.clone())
+                            .unwrap_or_default(),
+                    };
+                    groups.push(StoryGroup { hidden: self.hidden_stories.contains(&chat), chat, title, stories: vec![story.clone()] });
+                }
+            }
+        }
+        for group in &mut groups {
+            group.stories.sort_by_key(|s| s.sent_at);
+        }
+        groups.sort_by_key(|g| (!g.unread(), std::cmp::Reverse(g.latest())));
+        groups
+    }
+
+    /// Our own stories still up, oldest first.
+    pub fn my_stories(&self) -> Vec<signal_store::Story> {
+        let mut mine: Vec<_> = self.stories.iter().filter(|s| s.author.is_none()).cloned().collect();
+        mine.sort_by_key(|s| s.sent_at);
+        mine
+    }
+
+    /// Opens the story viewer at a person's or group's stories (`None`:
+    /// ours).
+    pub fn view_stories(&mut self, chat: Option<ConversationId>, cx: &mut Context<Self>) {
+        self.pause_audio();
+        cx.emit(AppEvent::ViewStories(chat));
+    }
+
+    /// Desktop's Stories tab badge (`getStoriesNotificationCount`): chats
+    /// with an unviewed story, not hidden.
+    pub fn unread_story_chats(&self) -> usize {
+        let mut chats = std::collections::HashSet::new();
+        for story in self.stories.iter().filter(|s| !s.read && s.author.is_some()) {
+            if let Some(chat) = Self::story_chat(story).filter(|c| !self.hidden_stories.contains(c)) {
+                chats.insert(chat);
+            }
+        }
+        chats.len()
+    }
+
+    /// Desktop's Chats tab badge: unread messages, and chats marked unread.
+    pub fn unread_chats_badge(&self) -> u32 {
+        self.conversations
+            .iter()
+            .filter(|c| !c.muted)
+            .map(|c| if c.unread_count > 0 { c.unread_count } else { u32::from(c.marked_unread) })
+            .sum()
     }
 
     /// Saves your Giphy API key.

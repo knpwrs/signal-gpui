@@ -74,6 +74,24 @@ pub enum Action {
     },
     /// Our other device read these incoming messages: `(author, sent_at)`.
     ReadSync(Vec<(String, i64)>),
+    /// A story, someone's or ours (posted from another device).
+    Story {
+        story: signal_store::NewStory,
+        /// Its photo or video, to download.
+        pointer: Option<AttachmentPointer>,
+    },
+    /// A reply or reaction to a group story, kept with the story.
+    StoryReply {
+        group: ConversationId,
+        /// The story's author; `None` = ours.
+        story_author: Option<String>,
+        story_sent_at: i64,
+        reply: signal_store::StoryReply,
+    },
+    /// `viewer` viewed our stories sent at these times (a VIEWED receipt).
+    StoryViewed { viewer: String, sent_at: Vec<i64> },
+    /// We viewed these on another device: `(author, sent_at)`.
+    ViewedSync(Vec<(Option<String>, i64)>),
     /// Someone (`None`: us, on another device) started a group call.
     GroupCallStarted { conversation: ConversationId, by: Option<String>, era: Option<String>, at: i64 },
     /// Another of our devices' record of a 1:1 call.
@@ -300,7 +318,15 @@ pub fn map_content(content: &Content, ctx: &MapContext) -> Vec<Action> {
             map_edit(edit, Origin::Incoming { sender }, envelope_ts, ctx).into_iter().collect()
         }
         ContentBody::SynchronizeMessage(sync) => map_sync(sync, envelope_ts, ctx),
-        ContentBody::ReceiptMessage(receipt) => map_receipt(receipt).into_iter().collect(),
+        ContentBody::ReceiptMessage(receipt) => {
+            let mut out: Vec<Action> = map_receipt(receipt).into_iter().collect();
+            // A VIEWED receipt is also how a story's views are counted.
+            if receipt.r#type() == receipt_message::Type::Viewed && !receipt.timestamp.is_empty() {
+                out.push(Action::StoryViewed { viewer: sender, sent_at: receipt.timestamp.iter().map(|t| *t as i64).collect() });
+            }
+            out
+        }
+        ContentBody::StoryMessage(story) => map_story(story, Some(sender), envelope_ts, ctx).into_iter().collect(),
         ContentBody::TypingMessage(typing) => vec![map_typing(typing, sender)],
         _ => Vec::new(),
     }
@@ -534,6 +560,10 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
         return vec![Action::Unpin { conversation, target_author: target, target_sent_at: sent_at as i64 }];
     }
 
+    if let Some(context) = &dm.story_context {
+        return map_story_reply(dm, context, conversation, author, ts, ctx);
+    }
+
     if let Some(reaction) = &dm.reaction {
         let (Some(emoji), Some(target)) = (reaction.emoji.clone(), reaction.target_sent_timestamp)
         else {
@@ -585,6 +615,7 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
                 file_name: a.file_name.clone(),
                 ..Default::default()
             }),
+            story: false,
         })
     });
 
@@ -632,6 +663,170 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
     }]
 }
 
+/// A story (Desktop's `#handleStoryMessage`): the first attachment or a
+/// text story, which must have text or a link. `author` is `None` for ours.
+fn map_story(story: &presage::proto::StoryMessage, author: Option<String>, sent_at: i64, ctx: &MapContext) -> Option<Action> {
+    use presage::proto::story_message::Attachment;
+    use signal_store::{StoryContent, TextStory};
+    let author = other(author, ctx);
+    let group = story
+        .group
+        .as_ref()
+        .and_then(|g| g.master_key.as_deref())
+        .filter(|k| k.len() == 32)
+        .map(ConversationId::group);
+    let (content, pointer) = match story.attachment.as_ref()? {
+        Attachment::FileAttachment(pointer) => {
+            let caption = pointer.caption.clone().unwrap_or_default();
+            let styles = byte_spans(&caption, &styles(&story.body_ranges));
+            (StoryContent::Media { attachment: attachment_meta(pointer), caption, styles }, Some(pointer.clone()))
+        }
+        Attachment::TextAttachment(text) => {
+            let preview = text.preview.as_ref().filter(|p| p.url.as_deref().is_some_and(|u| !u.is_empty())).map(|p| LinkPreview {
+                url: p.url.clone().unwrap_or_default(),
+                title: p.title.clone().filter(|t| !t.trim().is_empty()),
+                description: p.description.clone().filter(|d| !d.trim().is_empty()),
+                date: p.date.filter(|d| *d > 0).map(|d| d as i64),
+                image: None,
+            });
+            let body = text.text.clone().unwrap_or_default();
+            if body.trim().is_empty() && preview.is_none() {
+                return None;
+            }
+            (
+                StoryContent::Text(TextStory {
+                    text: body,
+                    font: story_font(text.text_style()),
+                    foreground: text.text_foreground_color,
+                    text_background: text.text_background_color,
+                    background: story_background(text.background.as_ref()),
+                    preview,
+                }),
+                None,
+            )
+        }
+    };
+    Some(Action::Story {
+        story: signal_store::NewStory {
+            read: author.is_none(),
+            author,
+            author_name: None,
+            sent_at,
+            received_at: ctx.now,
+            group,
+            content,
+            pointer: None,
+            allows_replies: story.allows_replies.unwrap_or(false),
+        },
+        pointer,
+    })
+}
+
+fn story_font(style: presage::proto::text_attachment::Style) -> signal_store::StoryFont {
+    use presage::proto::text_attachment::Style;
+    use signal_store::StoryFont;
+    match style {
+        Style::Default => StoryFont::Default,
+        Style::Regular => StoryFont::Regular,
+        Style::Bold => StoryFont::Bold,
+        Style::Serif => StoryFont::Serif,
+        Style::Script => StoryFont::Script,
+        Style::Condensed => StoryFont::Condensed,
+    }
+}
+
+/// Desktop's `getBackgroundColor`: a gradient's colors at their positions,
+/// else its start and end (when the lists don't match), else the color,
+/// else white.
+fn story_background(background: Option<&presage::proto::text_attachment::Background>) -> signal_store::StoryBackground {
+    use presage::proto::text_attachment::Background;
+    use signal_store::StoryBackground;
+    match background {
+        Some(Background::Color(color)) => StoryBackground::Color(*color),
+        Some(Background::Gradient(gradient)) => {
+            let angle = gradient.angle.unwrap_or(0);
+            if !gradient.colors.is_empty() && gradient.colors.len() == gradient.positions.len() {
+                StoryBackground::Gradient { colors: gradient.colors.clone(), positions: gradient.positions.clone(), angle }
+            } else {
+                let start = gradient.start_color.unwrap_or(0xffff_ffff);
+                let end = gradient.end_color.unwrap_or(start);
+                StoryBackground::Gradient { colors: vec![start, end], positions: vec![0., 1.], angle }
+            }
+        }
+        None => StoryBackground::default(),
+    }
+}
+
+/// A reply or reaction to a story (`DataMessage.storyContext`). In a group
+/// it stays with the story; one to one, it's a message in the chat, quoting
+/// the story (Desktop's "Story" quote, and "Reacted to …" for a reaction).
+fn map_story_reply(
+    dm: &DataMessage,
+    context: &data_message::StoryContext,
+    conversation: ConversationId,
+    author: Option<String>,
+    ts: i64,
+    ctx: &MapContext,
+) -> Vec<Action> {
+    let story_author = other(
+        parse_aci_with_fallback(context.author_aci_binary.as_deref(), context.author_aci.as_deref()).map(|a| a.service_id_string()),
+        ctx,
+    );
+    let Some(story_sent_at) = context.sent_timestamp.map(|t| t as i64) else { return Vec::new() };
+    let emoji = dm.reaction.as_ref().filter(|r| !r.remove.unwrap_or(false)).and_then(|r| r.emoji.clone());
+    if dm.reaction.is_some() && emoji.is_none() {
+        // A reaction taken back: nothing to show.
+        return Vec::new();
+    }
+    let body = match &emoji {
+        Some(emoji) => emoji.clone(),
+        None => body_text(dm),
+    };
+    if conversation.as_group().is_some() {
+        return vec![Action::StoryReply {
+            group: conversation,
+            story_author,
+            story_sent_at,
+            reply: signal_store::StoryReply { author, author_name: None, sent_at: ts, body, emoji },
+        }];
+    }
+    let outgoing = author.is_none();
+    let text = match (&emoji, story_author.is_none()) {
+        (None, _) => "Story".to_owned(),
+        (Some(_), true) => "Reacted to your story".to_owned(),
+        (Some(_), false) => "Reacted to a story".to_owned(),
+    };
+    vec![Action::Insert {
+        message: NewMessage {
+            conversation_id: conversation,
+            sent_at: ts,
+            received_at: ctx.now,
+            direction: if outgoing { Direction::Outgoing } else { Direction::Incoming },
+            author,
+            author_name: None,
+            body,
+            status: if outgoing { DeliveryStatus::Sent } else { DeliveryStatus::Delivered },
+            quote: Some(Quote {
+                author: story_author,
+                author_name: String::new(),
+                sent_at: story_sent_at,
+                text,
+                thumbnail: None,
+                attachment: None,
+                story: true,
+            }),
+            attachments: Vec::new(),
+            link_preview: None,
+            expires_in: dm.expire_timer.unwrap_or(0),
+        },
+        mentions: if emoji.is_some() { Vec::new() } else { mentions(&dm.body_ranges) },
+        styles: if emoji.is_some() { Vec::new() } else { styles(&dm.body_ranges) },
+        pointers: Vec::new(),
+        preview_image: None,
+        timer_version: dm.expire_timer_version,
+    }]
+}
+
 /// `envelope_ts` dates the edit when its message carries no timestamp.
 fn map_edit(edit: &EditMessage, origin: Origin, envelope_ts: i64, ctx: &MapContext) -> Option<Action> {
     let target = edit.target_sent_timestamp? as i64;
@@ -664,6 +859,21 @@ fn map_sync(sync: &SyncMessage, envelope_ts: i64, ctx: &MapContext) -> Vec<Actio
         if let Some(edit) = &sent.edit_message {
             out.extend(map_edit(edit, Origin::Outgoing { destination }, ts, ctx));
         }
+        // A story we posted from another device.
+        if let Some(story) = &sent.story_message {
+            out.extend(map_story(story, None, ts, ctx));
+        }
+    }
+    let viewed: Vec<(Option<String>, i64)> = sync
+        .viewed
+        .iter()
+        .filter_map(|v| {
+            let aci = parse_aci_with_fallback(v.sender_aci_binary.as_deref(), v.sender_aci.as_deref())?;
+            Some((other(Some(aci.service_id_string()), ctx), v.timestamp? as i64))
+        })
+        .collect();
+    if !viewed.is_empty() {
+        out.push(Action::ViewedSync(viewed));
     }
     let reads: Vec<(String, i64)> = sync
         .read

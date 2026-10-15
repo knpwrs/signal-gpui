@@ -154,6 +154,7 @@ impl Sidebar {
                 | AppEvent::StickerUpload(_)
                 | AppEvent::ViewImage(_)
                 | AppEvent::ViewVideo(_)
+                | AppEvent::ViewStories(_)
                 | AppEvent::Gifs { .. } => {}
             }),
         ];
@@ -464,11 +465,13 @@ impl Sidebar {
     /// The narrow sidebar's top (Desktop's narrow NavSidebar): room for the
     /// window's buttons, then new group, settings and search, stacked.
     fn render_narrow_header(&self, palette: Palette, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
-        let _ = palette;
+        let collapsed = self.state.read(cx).nav_collapsed;
         div()
             .flex_none()
-            .pt(px(44.)) // under the macOS traffic lights
+            // Under the macOS traffic lights when the tabs aren't there.
+            .pt(px(if collapsed { 44. } else { 12. }))
             .pb_2()
+            .when(collapsed, |d| d.child(crate::views::nav::show_tabs_button(&self.state, palette, cx)))
             .flex()
             .flex_col()
             .items_center()
@@ -480,13 +483,16 @@ impl Sidebar {
                     .tooltip("New group")
                     .on_click(cx.listener(|this, _, window, cx| crate::views::new_group::open(this.state.clone(), window, cx))),
             )
-            .child(
-                Button::new("settings-button")
-                    .ghost()
-                    .icon(IconName::Settings)
-                    .tooltip("Settings (⌘,)")
-                    .on_click(cx.listener(|this, _, window, cx| crate::views::settings::open(this.state.clone(), window, cx))),
-            )
+            // Settings is on the tabs while they show.
+            .when(collapsed, |d| {
+                d.child(
+                    Button::new("settings-button")
+                        .ghost()
+                        .icon(IconName::Settings)
+                        .tooltip("Settings (⌘,)")
+                        .on_click(cx.listener(|this, _, window, cx| crate::views::settings::open(this.state.clone(), window, cx))),
+                )
+            })
             .child(
                 Button::new("narrow-search")
                     .ghost()
@@ -880,6 +886,8 @@ impl Render for Sidebar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::get(cx);
         let narrow_header = self.narrow.then(|| self.render_narrow_header(palette, cx));
+        let collapsed = self.state.read(cx).nav_collapsed;
+        let show_tabs = collapsed.then(|| crate::views::nav::show_tabs_button(&self.state, palette, cx));
         let state = self.state.read(cx);
         let connection = state.connection.clone();
         self.rebuild_items(cx);
@@ -915,8 +923,11 @@ impl Render for Sidebar {
                     .flex()
                     .items_center()
                     .h(px(52.))
-                    .pl(px(92.)) // clear the macOS traffic lights
+                    // Clear the macOS traffic lights while the tabs (under
+                    // them otherwise) are hidden.
+                    .pl(px(if collapsed { 92. } else { 16. }))
                     .pr_4()
+                    .when_some(show_tabs, |d, button| d.child(button))
                     .when(self.archive_open, |d| {
                         d.gap_1().child(
                             Button::new("archive-back")
@@ -945,16 +956,19 @@ impl Render for Sidebar {
                                     crate::views::new_group::open(this.state.clone(), window, cx);
                                 })),
                         )
-                        .child(
-                            Button::new("settings-button")
-                                .ghost()
-                                .small()
-                                .icon(IconName::Settings)
-                                .tooltip("Settings (⌘,)")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    crate::views::settings::open(this.state.clone(), window, cx);
-                                })),
-                        )
+                        // Settings is on the tabs while they show.
+                        .when(collapsed, |d| {
+                            d.child(
+                                Button::new("settings-button")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::Settings)
+                                    .tooltip("Settings (⌘,)")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        crate::views::settings::open(this.state.clone(), window, cx);
+                                    })),
+                            )
+                        })
                     }),
             )
             .child(
@@ -1536,6 +1550,9 @@ mod tests {
         .unwrap();
         let (window, _sidebar) = cx.update(|cx| {
             let state = crate::state::new_state(backend.clone(), cx);
+            // The gear is in the header while the tabs are hidden (on the
+            // tabs otherwise).
+            state.update(cx, |s, _| s.nav_collapsed = true);
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(gpui_kit::Bounds {
                     origin: Default::default(),

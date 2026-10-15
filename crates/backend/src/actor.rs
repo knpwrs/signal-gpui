@@ -3,6 +3,7 @@
 
 mod calls;
 mod group_calls;
+mod stories;
 mod release_notes;
 
 use std::{
@@ -179,6 +180,9 @@ struct Actor {
     /// Shows megaphones; notified when they change.
     megaphones: RefCell<Option<tokio::task::JoinHandle<()>>>,
     megaphone_check: tokio::sync::Notify,
+    /// Lets stories go after a day; notified when one arrives.
+    story_expiry_task: RefCell<Option<tokio::task::JoinHandle<()>>>,
+    story_expiry: tokio::sync::Notify,
     /// Read syncs that arrived before their message, `(author, sent_at)`,
     /// applied when it does (as Desktop keeps them). Newest last.
     early_reads: RefCell<std::collections::VecDeque<(String, i64)>>,
@@ -257,6 +261,8 @@ pub(crate) async fn run(
         release_notes: RefCell::new(None),
         megaphones: RefCell::new(None),
         megaphone_check: tokio::sync::Notify::new(),
+        story_expiry_task: RefCell::new(None),
+        story_expiry: tokio::sync::Notify::new(),
         early_reads: RefCell::default(),
         identities_seen: RefCell::default(),
         calls: RefCell::new(None),
@@ -405,6 +411,10 @@ impl Actor {
         if let Some(old) = self.megaphones.borrow_mut().replace(task) {
             old.abort();
         }
+        let task = tokio::task::spawn_local(self.clone().story_expiry_loop());
+        if let Some(old) = self.story_expiry_task.borrow_mut().replace(task) {
+            old.abort();
+        }
     }
 
     /// Link and sync: waits for the phone's upload, then imports it.
@@ -551,6 +561,9 @@ impl Actor {
                 Command::LoadSafetyNumber { conversation } => self.emit_safety_number(conversation).await,
                 Command::SetVerified { conversation, verified } => self.set_verified(conversation, verified).await,
                 Command::PressMegaphone { id, cta } => self.press_megaphone(id, cta).await,
+                Command::ViewStory { id } => self.view_story(id).await,
+                Command::FetchStory { id } => self.fetch_story(id).await,
+                Command::ReplyToStory { id, body, emoji } => self.reply_to_story(id, body, emoji).await,
                 Command::StartCall { conversation, video } => self.start_call(conversation, video),
                 Command::AcceptCall { video } => self.accept_call(video),
                 Command::DeclineCall | Command::HangUp => self.hang_up(),
@@ -807,6 +820,16 @@ impl Actor {
                         None => "You".into(),
                         Some(a) => self.name_of(a).await.unwrap_or_else(|| short_id(a)),
                     };
+                    // A story reply shows the story's photo (Desktop's "Story"
+                    // quote).
+                    if quote.story {
+                        if let Ok(Some(story)) = self.db.find_story(quote.author.as_deref(), quote.sent_at).await
+                            && let signal_store::StoryContent::Media { attachment, .. } = &story.content
+                            && attachment.content_type.starts_with("image/")
+                        {
+                            quote.thumbnail = attachment.local_path.clone();
+                        }
+                    } else
                     // Like Desktop, show the quoted message's photo or link
                     // preview image beside the quote when we have it.
                     if let Ok(Some(quoted)) = self.db.find_message_any(quote.author.as_deref(), quote.sent_at).await {
@@ -988,6 +1011,12 @@ impl Actor {
                     self.emit_safety_number(conversation).await;
                 }
             }
+            Action::Story { story, pointer } => self.apply_story(manager, story, pointer).await,
+            Action::StoryReply { group, story_author, story_sent_at, reply } => {
+                self.apply_story_reply(group, story_author, story_sent_at, reply).await
+            }
+            Action::StoryViewed { viewer, sent_at } => self.apply_story_viewed(viewer, sent_at).await,
+            Action::ViewedSync(viewed) => self.apply_viewed_sync(viewed).await,
             Action::ReadSync(entries) => {
                 let mut changed = false;
                 for (author, sent_at) in entries {
@@ -2906,6 +2935,7 @@ impl Actor {
             text: signal_store::hide_spoilers(&m.body, &m.styles),
             thumbnail: m.thumbnail(),
             attachment: m.attachments.first().map(signal_store::QuotedAttachment::of),
+            story: false,
         });
 
         let expire_timer = self

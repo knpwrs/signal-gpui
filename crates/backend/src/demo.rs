@@ -154,6 +154,7 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
         text: message.body.clone(),
         thumbnail,
         attachment: message.attachments.first().map(signal_store::QuotedAttachment::of),
+        story: false,
     };
     let react = |emoji: &str, from: Option<&str>| Reaction { emoji: emoji.into(), author: from.map(|f| aci(f).into()), sent_at: now };
 
@@ -462,6 +463,63 @@ const PHOTO_HEIGHT: u32 = 800;
 
 /// An abstract "sunset" (gradient sky, sun, hills) so the demo shows photo
 /// bubbles without shipping anyone's pictures.
+/// Made-up stories, posted in the last day (they last one, so they're
+/// posted again whenever none are left): a text story on a gradient, a
+/// drawn photo, a group story with replies, and one of ours.
+async fn seed_stories(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
+    use signal_store::{NewStory, StoryBackground, StoryContent, StoryFont, StoryReply, TextStory};
+    let now = now();
+    if !db.stories(now).await?.is_empty() {
+        return Ok(());
+    }
+    let story = |author: Option<&str>, name: Option<&str>, ago: i64, group: Option<&str>, content: StoryContent| NewStory {
+        author: author.map(|a| aci(a).into()),
+        author_name: name.map(Into::into),
+        sent_at: now - ago,
+        received_at: now - ago,
+        group: group.map(|g| ConversationId(g.into())),
+        content,
+        pointer: None,
+        allows_replies: true,
+        read: author.is_none(),
+    };
+    let text = |text: &str, font, background| {
+        StoryContent::Text(TextStory { text: text.into(), font, foreground: None, text_background: None, background, preview: None })
+    };
+    // Desktop's BG6 gradient.
+    let sunrise = StoryBackground::Gradient {
+        colors: vec![0xff19a9fa, 0xff7097d7, 0xffd1998d, 0xffffc369],
+        positions: vec![0., 0.33, 0.66, 1.],
+        angle: 180,
+    };
+    db.insert_story(&story(Some(MAYA), Some("Maya Chen"), 2 * HOUR, None, text("Trail's clear all the way to the lake 🏞️", StoryFont::Bold, sunrise)), now)
+        .await?;
+    let path = data_dir.join("attachments").join("demo-story.png");
+    if write_demo_photo(&path, 540, 960).is_ok() {
+        let photo = AttachmentMeta {
+            content_type: "image/png".into(),
+            file_name: None,
+            size: std::fs::metadata(&path).map_or(0, |m| m.len()),
+            width: Some(540),
+            height: Some(960),
+            local_path: path.to_str().map(Into::into),
+            sticker: false,
+            gif: false,
+            voice: false,
+            remote: None,
+        };
+        let content = StoryContent::Media { attachment: photo, caption: "Golden hour".into(), styles: Vec::new() };
+        db.insert_story(&story(Some(JORDAN), Some("Jordan Reyes"), 5 * HOUR, None, content), now).await?;
+    }
+    let group = story(Some(PRIYA), Some("Priya Natarajan"), 3 * HOUR, Some(GROUP), text("Who's in for Saturday?", StoryFont::Serif, StoryBackground::Color(0xff2c5f45)));
+    db.insert_story(&group, now).await?;
+    let reply = StoryReply { author: Some(aci(SAM).into()), author_name: Some("Sam Okafor".into()), sent_at: now - 2 * HOUR, body: "Me!".into(), emoji: None };
+    db.add_story_reply(Some(aci(PRIYA)), group.sent_at, &reply).await?;
+    db.insert_story(&story(None, None, HOUR, None, text("Packing for the weekend", StoryFont::Script, StoryBackground::Color(0xff4437d8))), now)
+        .await?;
+    Ok(())
+}
+
 fn write_demo_photo(path: &Path, width: u32, height: u32) -> std::io::Result<()> {
     let (w, h) = (width as usize, height as usize);
     // Drawn at 600×800 and scaled to the requested size.
@@ -506,6 +564,9 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
     };
     if let Err(e) = seed(&db, &data_dir).await {
         emit(Event::Error(format!("seeding demo data: {e}")));
+    }
+    if let Err(e) = seed_stories(&db, &data_dir).await {
+        emit(Event::Error(format!("seeding demo stories: {e}")));
     }
     emit(Event::Ready {
         phone: Some("+1 555 0123 (demo)".into()),
@@ -663,6 +724,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                         text: m.body.clone(),
                         thumbnail: m.thumbnail(),
                         attachment: m.attachments.first().map(signal_store::QuotedAttachment::of),
+                        story: false,
                     }),
                     None => None,
                 };
@@ -1093,6 +1155,15 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 let verified = db.setting(&format!("demo.verified.{}", conversation.0)).await.ok().flatten().is_some_and(|v| v == "1");
                 emit(Event::SafetyNumber { conversation: conversation.clone(), result: Ok(demo_safety_number(&conversation, verified)) });
             }
+            Command::ViewStory { id } => {
+                if let Ok(Some(story)) = db.story(id).await
+                    && db.mark_story_read(story.author.as_deref(), story.sent_at).await.unwrap_or(false)
+                {
+                    emit(Event::StoriesChanged);
+                }
+            }
+            // Demo stories are here already, and replies go nowhere.
+            Command::FetchStory { .. } | Command::ReplyToStory { .. } => {}
             Command::PressMegaphone { id, .. } => {
                 if megaphone.as_ref().is_some_and(|m| m.id == id) {
                     megaphone = None;
@@ -1175,6 +1246,7 @@ async fn demo_quote(db: &AppDb, quote: Option<i64>) -> Option<Quote> {
         text: m.body.clone(),
         thumbnail: m.thumbnail(),
         attachment: m.attachments.first().map(signal_store::QuotedAttachment::of),
+        story: false,
     })
 }
 
