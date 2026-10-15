@@ -12,7 +12,9 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous},
 };
 
+mod poll;
 mod stories;
+pub use poll::*;
 pub use stories::*;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -294,6 +296,9 @@ pub struct Message {
     /// Its whole text, when that came as an attachment that hasn't
     /// replaced `body` (only its start) yet.
     pub long_text: Option<LongText>,
+    /// A poll, with its votes; `body` holds its question (so search finds
+    /// it, as Desktop's does).
+    pub poll: Option<Poll>,
 }
 
 /// The group admin who deleted a message for everyone (Desktop's
@@ -480,6 +485,9 @@ pub enum Notice {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         call_id: Option<i64>,
     },
+    /// Desktop's "You ended the poll: …" (`by`: the poll's creator, `None`
+    /// for us). `sent_at` names the poll ("View poll").
+    PollEnded { by: Option<String>, question: String, sent_at: i64 },
 }
 
 /// One change to a group, as a notice shows it. Service ids are `None`
@@ -747,7 +755,7 @@ const CONVERSATION_COLUMNS: &str = "id, kind, title, phone, color, members, last
       AS last_outgoing_status";
 
 const MESSAGE_COLUMNS: &str = "id, conversation_id, sent_at, received_at, direction, author, \
-     author_name, body, status, reactions, quote, attachments, link_preview, deleted, edited, expires_in, expire_start, edit_count, notice, mentions, styles, cta, deleted_by_admin, long_text";
+     author_name, body, status, reactions, quote, attachments, link_preview, deleted, edited, expires_in, expire_start, edit_count, notice, mentions, styles, cta, deleted_by_admin, long_text, poll";
 
 /// SQL matching a message whose own timestamp, or one of its edits', is
 /// the bound parameter `{param}`.
@@ -942,6 +950,7 @@ fn message_from_row(row: &SqliteRow) -> Result<Message> {
             .map(|d| serde_json::from_str(&d))
             .transpose()?,
         long_text: row.try_get::<Option<String>, _>("long_text")?.map(|l| serde_json::from_str(&l)).transpose()?,
+        poll: row.try_get::<Option<String>, _>("poll")?.map(|p| serde_json::from_str(&p)).transpose()?,
     })
 }
 
@@ -1746,7 +1755,7 @@ impl AppDb {
         self.update_and_refresh(
             message_id,
             "UPDATE messages SET deleted = 1, body = '', attachments = '[]', reactions = '[]', \
-             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL \
+             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL, poll = NULL \
              WHERE id = ? RETURNING conversation_id",
             None,
         )
@@ -1760,7 +1769,7 @@ impl AppDb {
         let mut tx = self.write().await?;
         let conversation: Option<String> = sqlx::query_scalar(
             "UPDATE messages SET deleted = 1, deleted_by_admin = ?2, body = '', attachments = '[]', reactions = '[]', \
-             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL WHERE id = ?1 AND deleted = 0 \
+             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL, poll = NULL WHERE id = ?1 AND deleted = 0 \
              RETURNING conversation_id",
         )
         .bind(message_id)
@@ -2511,7 +2520,7 @@ async fn current_long_text(conn: &mut sqlx::SqliteConnection, message_id: i64) -
 
 async fn refresh_preview(conn: &mut sqlx::SqliteConnection, id: &ConversationId) -> Result<()> {
     let row = sqlx::query(
-        "SELECT m.sent_at, m.body, m.styles, m.deleted, m.attachments, m.direction, m.author_name, c.kind \
+        "SELECT m.sent_at, m.body, m.styles, m.deleted, m.attachments, m.direction, m.author_name, m.poll, c.kind \
          FROM messages m JOIN conversations c ON c.id = m.conversation_id \
          WHERE m.conversation_id = ? AND m.notice IS NULL ORDER BY m.sent_at DESC, m.id DESC LIMIT 1",
     )
@@ -2524,8 +2533,11 @@ async fn refresh_preview(conn: &mut sqlx::SqliteConnection, id: &ConversationId)
             let styles: Vec<StyleSpan> =
                 row.try_get::<Option<String>, _>("styles")?.map(|s| serde_json::from_str(&s)).transpose()?.unwrap_or_default();
             let body = hide_spoilers(&row.try_get::<String, _>("body")?, &styles);
+            let poll: Option<Poll> = row.try_get::<Option<String>, _>("poll")?.map(|p| serde_json::from_str(&p)).transpose()?;
             let text = if row.try_get::<bool, _>("deleted")? {
                 "This message was deleted".to_owned()
+            } else if let Some(poll) = poll {
+                poll_preview(&poll.question)
             } else if !body.is_empty() {
                 // Line breaks collapse to spaces; the list clamps to two lines.
                 body.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(300).collect()

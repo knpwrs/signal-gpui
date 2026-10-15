@@ -22,6 +22,9 @@ pub fn notice_text(notice: &Notice, name: impl Fn(&str) -> String) -> String {
         Notice::Call { incoming, video, outcome, .. } => call_text(*incoming, *video, *outcome),
         Notice::GroupCall { by: None, .. } => "You started a group call".into(),
         Notice::GroupCall { by: Some(by), .. } => format!("{} started a group call", name(by)),
+        // Desktop's `icu:PollTerminate--you` / `--other`.
+        Notice::PollEnded { by: None, question, .. } => format!("You ended the poll: {question}"),
+        Notice::PollEnded { by: Some(by), question, .. } => format!("{} ended the poll: {question}", name(by)),
     }
 }
 

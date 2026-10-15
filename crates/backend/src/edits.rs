@@ -47,6 +47,7 @@ mod tests {
             cta: None,
             deleted_by_admin: None,
             long_text: None,
+            poll: None,
         }
     }
 

@@ -797,6 +797,7 @@ async fn drop_later_migrations(db: &AppDb) {
     sqlx::query("ALTER TABLE messages DROP COLUMN deleted_by_admin").execute(&db.writer).await.unwrap();
     sqlx::query("DROP INDEX messages_long_text").execute(&db.writer).await.unwrap();
     sqlx::query("ALTER TABLE messages DROP COLUMN long_text").execute(&db.writer).await.unwrap();
+    sqlx::query("ALTER TABLE messages DROP COLUMN poll").execute(&db.writer).await.unwrap();
 }
 
 /// Rewrites the migration history to look like a pre-squash database that
@@ -1353,4 +1354,118 @@ async fn a_long_text_replaces_the_start_of_the_body_once() {
     assert_eq!(db.message(gone).await.unwrap().unwrap().long_text, None);
     assert!(!db.apply_long_text(gone, &first, "whole", &[], &[]).await.unwrap());
     assert!(db.downloading_long_texts(10).await.unwrap().is_empty());
+}
+
+fn vote(author: Option<&str>, options: &[u32], vote_count: u32, sent_at: i64) -> PollVote {
+    PollVote { author: author.map(Into::into), options: options.to_vec(), vote_count, sent_at, pending: false }
+}
+
+fn lunch() -> Poll {
+    Poll::new("Lunch?".into(), vec!["Tacos".into(), "Pho".into(), "Salad".into()], false)
+}
+
+#[test]
+fn poll_votes_follow_desktops_rules() {
+    let mut poll = lunch();
+    // Not its options, the same one twice, or two in a single-choice poll.
+    assert!(!poll.apply_vote(vote(Some("a"), &[3], 1, 10), VoteSource::Other));
+    assert!(!poll.apply_vote(vote(Some("a"), &[0, 0], 1, 10), VoteSource::Other));
+    assert!(!poll.apply_vote(vote(Some("a"), &[0, 1], 1, 10), VoteSource::Other));
+    assert!(poll.apply_vote(vote(Some("a"), &[0], 2, 10), VoteSource::Other));
+    // A lower or equal count is older; from our other device a later one
+    // with the same count wins.
+    assert!(!poll.apply_vote(vote(Some("a"), &[1], 1, 20), VoteSource::Other));
+    assert!(!poll.apply_vote(vote(Some("a"), &[1], 2, 20), VoteSource::Other));
+    assert!(poll.apply_vote(vote(Some("a"), &[1], 3, 20), VoteSource::Other));
+    assert!(poll.apply_vote(vote(None, &[2], 1, 30), VoteSource::Sync));
+    assert!(poll.apply_vote(vote(None, &[1], 1, 40), VoteSource::Sync));
+    assert!(!poll.apply_vote(vote(None, &[0], 1, 35), VoteSource::Sync));
+    let tally = poll.tally();
+    assert_eq!(tally.voters, vec![vec![], vec![Some("a".into()), None], vec![]]);
+    assert_eq!((tally.total_votes, tally.unique_voters), (2, 2));
+    assert_eq!(tally.ours, [1].into());
+    // Taking a vote back: no options.
+    assert!(poll.apply_vote(vote(Some("a"), &[], 4, 50), VoteSource::Other));
+    assert_eq!(poll.tally().count(1), 1);
+    // Ended: no more votes.
+    assert!(poll.end());
+    assert!(!poll.end());
+    assert!(!poll.apply_vote(vote(Some("b"), &[0], 1, 60), VoteSource::Other));
+}
+
+#[test]
+fn our_votes_count_once_sent() {
+    let mut poll = Poll { allow_multiple: true, ..lunch() };
+    assert_eq!(poll.next_vote_count(), 1);
+    assert!(poll.apply_vote(vote(None, &[0, 2], 1, 10), VoteSource::ThisDevice));
+    let tally = poll.tally();
+    assert_eq!((tally.total_votes, tally.chosen().clone()), (0, [0, 2].into()), "pending: shown, not counted");
+    assert!(poll.finish_our_vote(1, true));
+    assert_eq!(poll.tally().ours, [0, 2].into());
+    assert_eq!(poll.next_vote_count(), 2);
+    // A second vote waits beside the first, replaces the pending one
+    // before it, and takes over once sent.
+    poll.apply_vote(vote(None, &[1], 2, 20), VoteSource::ThisDevice);
+    poll.apply_vote(vote(None, &[0], 3, 30), VoteSource::ThisDevice);
+    assert_eq!(poll.votes.len(), 2);
+    assert_eq!(poll.tally().ours, [0, 2].into());
+    assert_eq!(poll.tally().pending, Some([0].into()));
+    assert!(poll.finish_our_vote(3, true));
+    assert_eq!(poll.votes, vec![vote(None, &[0], 3, 30)]);
+    // One that fails never reached anyone: it goes.
+    poll.apply_vote(vote(None, &[1], 4, 40), VoteSource::ThisDevice);
+    assert!(poll.finish_our_vote(4, false));
+    assert_eq!(poll.votes, vec![vote(None, &[0], 3, 30)]);
+}
+
+#[test]
+fn poll_limits_follow_desktop() {
+    let options = |n: usize| (0..n).map(|i| format!("Option {i}")).collect::<Vec<_>>();
+    assert!(valid_poll("Q", &options(2)));
+    assert!(!valid_poll("", &options(2)));
+    assert!(!valid_poll("Q", &options(1)));
+    assert!(!valid_poll("Q", &options(11)));
+    assert!(!valid_poll("Q", &[String::new(), "B".into()]));
+    // Graphemes, not chars or bytes: 200 accented letters (two chars each)
+    // are fine, 201 aren't.
+    assert!(valid_poll(&"e\u{301}".repeat(200), &options(2)));
+    assert!(!valid_poll(&"e\u{301}".repeat(201), &options(2)));
+    // And at most 2 KiB: 100 family emoji are 100 characters, 2,500 bytes.
+    assert!(!valid_poll(&"👩‍👩‍👧‍👦".repeat(100), &options(2)));
+
+    assert_eq!(poll_send_error("  ", &options(2)), Some("Poll question is required"));
+    assert_eq!(poll_send_error(&"a".repeat(101), &options(2)), Some("Question is too long"));
+    assert_eq!(poll_send_error("Q", &["A".into(), "  ".into()]), Some("Poll requires at least 2 options"));
+    assert_eq!(poll_send_error("Q", &["A".into(), "a".repeat(101)]), Some("Option is too long"));
+    assert_eq!(poll_send_error(" Q ", &["A".into(), "".into(), "B".into()]), None);
+
+    assert_eq!(vote_options(&[2, 2, 0]), Some(vec![2, 0]));
+    assert_eq!(vote_options(&[10]), None);
+    assert_eq!(vote_options(&[]), Some(vec![]));
+}
+
+#[tokio::test]
+async fn polls_are_stored_with_their_votes() {
+    let db = test_db().await;
+    let id = db.insert_message(&incoming("g:aa", "bob", 10, "Lunch?")).await.unwrap();
+    db.set_poll(id, &lunch()).await.unwrap();
+    let c = db.conversation(&conv("g:aa")).await.unwrap().unwrap();
+    assert_eq!(c.last_message_preview.as_deref(), Some("bob: 📊 Poll: Lunch?"));
+    // Delivered again: the stored one (with its votes) stays.
+    assert!(db.update_poll(id, |p| p.apply_vote(vote(Some("carol"), &[1], 1, 20), VoteSource::Other)).await.unwrap());
+    db.set_poll(id, &lunch()).await.unwrap();
+    let found = db.find_poll(Some("bob"), 10).await.unwrap().unwrap();
+    assert_eq!(found.id, id);
+    assert_eq!(found.poll.unwrap().tally().count(1), 1);
+    assert!(db.find_poll(Some("carol"), 10).await.unwrap().is_none(), "by its author");
+    assert!(!db.update_poll(id, |_| false).await.unwrap());
+    // Search finds its question.
+    assert_eq!(db.search_messages("lunch", 10).await.unwrap().len(), 1);
+    // Deleted: no longer a poll.
+    db.mark_deleted(id).await.unwrap();
+    assert!(db.find_poll(Some("bob"), 10).await.unwrap().is_none());
+    assert!(!db.update_poll(id, |p| p.end()).await.unwrap());
+    // A plain message isn't one.
+    let plain = db.insert_message(&incoming("g:aa", "bob", 30, "hi")).await.unwrap();
+    assert!(!db.update_poll(plain, |p| p.end()).await.unwrap());
 }

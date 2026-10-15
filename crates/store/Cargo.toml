@@ -15,6 +15,8 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# Poll limits count characters as Desktop does: graphemes.
+unicode-segmentation = "1"
 
 [dev-dependencies]
 tokio.workspace = true
