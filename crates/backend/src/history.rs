@@ -361,7 +361,7 @@ pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: imp
 }
 
 /// One chat item; `Ok(false)` for kinds that aren't imported (group
-/// updates, calls, payments, polls, …) or that have already disappeared.
+/// updates, calls, payments, …) or that have already disappeared.
 async fn import_item(
     db: &AppDb,
     item: &proto::ChatItem,
@@ -385,6 +385,19 @@ async fn import_item(
             _ => (None, None),
         }
     };
+    // A poll's end: Desktop's "… ended the poll" notice (an update, with
+    // no direction).
+    if let Some(Item::UpdateMessage(update)) = &item.item
+        && let Some(proto::chat_update_message::Update::PollTerminate(end)) = &update.update
+    {
+        let by = match people.get(&item.authorId) {
+            Some(Who::Me) => None,
+            Some(Who::Contact { sid, .. }) => Some(sid.clone()),
+            _ => return Ok(false),
+        };
+        let notice = signal_store::Notice::PollEnded { by, question: end.question.clone(), sent_at: end.targetSentTimestamp as i64 };
+        return Ok(db.insert_notice(conversation, item.dateSent as i64, &notice).await?.is_some());
+    }
     let (author, author_name) = person(item.authorId);
     let (direction, received_at, status, read) = match &item.directionalDetails {
         Some(DirectionalDetails::Incoming(details)) => {
@@ -402,6 +415,7 @@ async fn import_item(
         Direction::Incoming => return Ok(false),
     };
 
+    let mut poll = None;
     let (mut message, reactions, mentions, deleted) = match &item.item {
         Some(Item::StandardMessage(standard)) => {
             let text = standard.text.as_ref();
@@ -491,6 +505,56 @@ async fn import_item(
             };
             (message, sticker.reactions.clone(), Vec::new(), false)
         }
+        Some(Item::Poll(exported)) => {
+            let options: Vec<String> = exported.options.iter().map(|o| o.option.clone()).collect();
+            if !signal_store::valid_poll(&exported.question, &options) {
+                return Ok(false);
+            }
+            // The backup lists voters per option; we keep each voter's
+            // choices together. When they voted isn't kept.
+            let mut votes: Vec<signal_store::PollVote> = Vec::new();
+            for (index, option) in exported.options.iter().enumerate() {
+                for voter in &option.votes {
+                    let author = match people.get(&voter.voterId) {
+                        Some(Who::Me) => None,
+                        Some(Who::Contact { sid, .. }) => Some(sid.clone()),
+                        _ => continue,
+                    };
+                    match votes.iter_mut().find(|v| v.author == author) {
+                        Some(vote) => {
+                            vote.options.push(index as u32);
+                            vote.vote_count = vote.vote_count.max(voter.voteCount);
+                        }
+                        None => votes.push(signal_store::PollVote {
+                            author,
+                            options: vec![index as u32],
+                            vote_count: voter.voteCount,
+                            sent_at: 0,
+                            pending: false,
+                        }),
+                    }
+                }
+            }
+            let mut imported = signal_store::Poll::new(exported.question.clone(), options, exported.allowMultiple);
+            imported.votes = votes;
+            imported.ended = exported.hasEnded;
+            poll = Some(imported);
+            let message = NewMessage {
+                conversation_id: conversation.clone(),
+                sent_at: item.dateSent as i64,
+                received_at,
+                direction,
+                author: author.clone(),
+                author_name: author_name.clone(),
+                body: exported.question.clone(),
+                status,
+                quote: None,
+                attachments: Vec::new(),
+                link_preview: None,
+                expires_in,
+            };
+            (message, exported.reactions.clone(), Vec::new(), false)
+        }
         Some(Item::RemoteDeletedMessage(_)) => {
             let message = NewMessage {
                 conversation_id: conversation.clone(),
@@ -572,6 +636,9 @@ async fn import_item(
     }
     if !style_spans.is_empty() {
         db.set_styles(id, &style_spans).await?;
+    }
+    if let Some(poll) = &poll {
+        db.set_poll(id, poll).await?;
     }
     if deleted {
         db.mark_deleted(id).await?;
@@ -861,6 +928,32 @@ mod tests {
         gone.expiresInMs = Some(1_000);
         gone.expireStartDate = Some(4_000);
         push(proto::Frame { item: Some(proto::frame::Item::ChatItem(gone)), ..Default::default() });
+        // Our poll in the group: Alice chose both options, we the second;
+        // then we ended it.
+        let mut poll = proto::Poll::new();
+        poll.question = "Trail?".into();
+        poll.allowMultiple = true;
+        for (name, voters) in [("Ridge", vec![(2, 1)]), ("Lake", vec![(2, 1), (1, 2)])] {
+            let mut option = proto::poll::PollOption::new();
+            option.option = name.into();
+            for (voter, count) in voters {
+                let mut vote = proto::poll::poll_option::PollVote::new();
+                vote.voterId = voter;
+                vote.voteCount = count;
+                option.votes.push(vote);
+            }
+            poll.options.push(option);
+        }
+        poll.hasEnded = true;
+        push(proto::Frame { item: Some(proto::frame::Item::ChatItem(item(30, 1, 5_000, false, Item::Poll(poll)))), ..Default::default() });
+        let mut end = proto::PollTerminateUpdate::new();
+        end.targetSentTimestamp = 5_000;
+        end.question = "Trail?".into();
+        let mut update = proto::ChatUpdateMessage::new();
+        update.update = Some(proto::chat_update_message::Update::PollTerminate(end));
+        let mut ended = item(30, 1, 6_000, false, Item::UpdateMessage(update));
+        ended.directionalDetails = Some(DirectionalDetails::Directionless(Default::default()));
+        push(proto::Frame { item: Some(proto::frame::Item::ChatItem(ended)), ..Default::default() });
         out
     }
 
@@ -874,7 +967,7 @@ mod tests {
         // Progress only moves forward and ends at the whole backup.
         assert!(seen.windows(2).all(|w| w[0] < w[1]));
         assert_eq!(seen.last(), Some(&(plain.len() as u64)));
-        assert_eq!((imported.chats, imported.messages), (4, 4));
+        assert_eq!((imported.chats, imported.messages), (4, 6));
         assert_eq!(imported.sticker_packs, vec![(vec![0xab; 16], vec![0xcd; 32])]);
 
         let alice_sid = Aci::from_uuid_bytes([0xa1; 16]).service_id_string();
@@ -900,6 +993,16 @@ mod tests {
         assert_eq!((long_text.size, long_text.remote.cdn_key.as_str()), (3_000, "text"));
         assert_eq!(long_text.mentions, vec![me.clone()]);
         assert_eq!(imported.long_texts, [in_group[0].id]);
+        // The poll, with each voter's choices, ended, and its notice.
+        let poll = in_group[1].poll.clone().unwrap();
+        assert_eq!((in_group[1].body.as_str(), poll.options.len(), poll.allow_multiple, poll.ended), ("Trail?", 2, true, true));
+        let tally = poll.tally();
+        assert_eq!(tally.voters, vec![vec![Some(alice_sid.clone())], vec![Some(alice_sid.clone()), None]]);
+        assert_eq!(poll.next_vote_count(), 3, "we had voted twice");
+        assert_eq!(
+            in_group[2].notice,
+            Some(signal_store::Notice::PollEnded { by: None, question: "Trail?".into(), sent_at: 5_000 })
+        );
 
         let with_alice = db.messages(&alice.id, None, 10).await.unwrap();
         let reply = &with_alice[0];

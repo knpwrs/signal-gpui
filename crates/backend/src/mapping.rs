@@ -37,6 +37,8 @@ pub enum Action {
         /// The sender's disappearing-timer version (1:1 chats), with
         /// `message.expires_in` as the timer.
         timer_version: Option<u32>,
+        /// A poll (`message.body` is its question).
+        poll: Option<signal_store::Poll>,
     },
     React {
         conversation: ConversationId,
@@ -146,6 +148,26 @@ pub enum Action {
         conversation: ConversationId,
         target_author: Option<String>,
         target_sent_at: i64,
+    },
+    /// A vote in a poll (Desktop's `PollVote`): every option the voter
+    /// chooses now, none to take their vote back.
+    PollVote {
+        conversation: ConversationId,
+        /// `None`: us, on another device.
+        voter: Option<String>,
+        /// The poll's author (`None`: ours) and timestamp.
+        target_author: Option<String>,
+        target_sent_at: i64,
+        options: Vec<u32>,
+        vote_count: u32,
+        sent_at: i64,
+    },
+    /// A poll's creator ended it (`by`: `None` for us, on another device).
+    PollEnd {
+        conversation: ConversationId,
+        by: Option<String>,
+        target_sent_at: i64,
+        sent_at: i64,
     },
 }
 
@@ -559,7 +581,7 @@ fn body_text(dm: &DataMessage) -> String {
         return sticker.emoji.clone().filter(|e| !e.is_empty()).unwrap_or_else(|| "Sticker".into());
     }
     if let Some(poll) = &dm.poll_create {
-        return format!("📊 Poll: {}", poll.question.as_deref().unwrap_or_default());
+        return poll.question.clone().unwrap_or_default();
     }
     if dm.payment.is_some() {
         return "💸 Payment".into();
@@ -629,6 +651,31 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
         return vec![Action::Unpin { conversation, target_author: target, target_sent_at: sent_at as i64 }];
     }
 
+    // Polls (Desktop's `background.preload.ts` and `PollVoteSchema` /
+    // `PollTerminateSchema`): a vote names its poll's author and a
+    // positive timestamp, and options 0 to 9; anything else is dropped.
+    if let Some(vote) = &dm.poll_vote {
+        let (Some(target), Some(sent_at)) =
+            (target_author(&vote.target_author_aci_binary), vote.target_sent_timestamp.filter(|t| *t > 0))
+        else {
+            return Vec::new();
+        };
+        let Some(options) = signal_store::vote_options(&vote.option_indexes) else { return Vec::new() };
+        return vec![Action::PollVote {
+            conversation,
+            voter: author,
+            target_author: target,
+            target_sent_at: sent_at as i64,
+            options,
+            vote_count: vote.vote_count.unwrap_or(0),
+            sent_at: ts,
+        }];
+    }
+    if let Some(end) = &dm.poll_terminate {
+        let Some(target) = end.target_sent_timestamp.filter(|t| *t > 0) else { return Vec::new() };
+        return vec![Action::PollEnd { conversation, by: author, target_sent_at: target as i64, sent_at: ts }];
+    }
+
     if let Some(context) = &dm.story_context {
         return map_story_reply(dm, context, conversation, author, ts, ctx);
     }
@@ -673,11 +720,27 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
         }];
     }
 
-    let body = body_text(dm);
+    // A poll Desktop wouldn't accept (`PollCreateSchema`) drops the whole
+    // message, as Desktop's `handleDataMessage` does.
+    let poll = match &dm.poll_create {
+        Some(create) => {
+            let question = create.question.clone().unwrap_or_default();
+            if !signal_store::valid_poll(&question, &create.options) {
+                return Vec::new();
+            }
+            Some(signal_store::Poll::new(question, create.options.clone(), create.allow_multiple.unwrap_or(false)))
+        }
+        None => None,
+    };
+    let body = match &poll {
+        Some(poll) => poll.question.clone(),
+        None => body_text(dm),
+    };
     let sticker = dm.sticker.as_ref().and_then(|s| s.data.clone()).filter(|_| dm.body.is_none());
     let is_sticker = sticker.is_some();
     let pointers: Vec<AttachmentPointer> = normal_attachments(dm).cloned().chain(sticker).collect();
-    let long_text = long_text_of(dm);
+    // A poll's body is its question, never a long text.
+    let long_text = if poll.is_some() { None } else { long_text_of(dm) };
     if body.is_empty() && pointers.is_empty() && long_text.is_none() {
         // Profile key updates, group changes, call updates, etc.
         return Vec::new();
@@ -740,12 +803,13 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
             link_preview,
             expires_in: dm.expire_timer.unwrap_or(0),
         },
-        mentions: mentions(&dm.body_ranges),
-        styles: styles(&dm.body_ranges),
+        mentions: if poll.is_some() { Vec::new() } else { mentions(&dm.body_ranges) },
+        styles: if poll.is_some() { Vec::new() } else { styles(&dm.body_ranges) },
         pointers,
         long_text,
         preview_image,
         timer_version: dm.expire_timer_version,
+        poll,
     }]
 }
 
@@ -923,6 +987,7 @@ fn map_story_reply(
         long_text: if emoji.is_some() { None } else { long_text_of(dm) },
         preview_image: None,
         timer_version: dm.expire_timer_version,
+        poll: None,
     });
     out
 }

@@ -12,6 +12,8 @@ pub fn can_edit(message: &Message, note_to_self: bool, now: i64) -> bool {
     message.direction == Direction::Outgoing
         && !message.deleted
         && !message.body.is_empty()
+        // A poll's body is its question; polls can't be edited.
+        && message.poll.is_none()
         && (note_to_self || (now - message.sent_at).abs() <= DAY_MS)
         && (note_to_self || message.edit_count < MAX_EDITS)
 }
@@ -58,6 +60,8 @@ mod tests {
         assert!(!can_edit(&ours(now - DAY_MS - 1, "hi"), false, now));
         assert!(can_edit(&ours(now - 30 * DAY_MS, "hi"), true, now), "Note to Self: any time");
         assert!(!can_edit(&ours(now, ""), false, now), "a photo without a caption");
+        let poll = Message { poll: Some(signal_store::Poll::new("Q".into(), vec!["A".into(), "B".into()], false)), ..ours(now, "Q") };
+        assert!(!can_edit(&poll, false, now), "a poll");
         assert!(!can_edit(&Message { edit_count: MAX_EDITS, ..ours(now, "hi") }, false, now));
         assert!(!can_edit(&Message { direction: Direction::Incoming, ..ours(now, "hi") }, false, now));
         assert!(!can_edit(&Message { deleted: true, ..ours(now, "hi") }, false, now));

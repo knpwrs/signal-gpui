@@ -417,6 +417,50 @@ impl AppState {
         .detach();
     }
 
+    /// Desktop's poll notifications (`maybeNotify`): someone voted in our
+    /// poll ("Alice voted in the poll "📊 Poll: …""), or ended theirs.
+    /// They follow the same rules as messages' (setting, muted chats, the
+    /// chat in front), except while catching up, when they're dropped.
+    /// They aren't taken down when the chat is read, since neither counts
+    /// as unread here.
+    fn notify_poll(&mut self, conversation: ConversationId, message_id: i64, sender: String, ended: bool, cx: &mut Context<Self>) {
+        let setting = self.notification_setting;
+        if self.catching_up.is_some() || self.notifier.is_none() || setting == crate::notifications::NotificationSetting::Off {
+            return;
+        }
+        if self.window_active && self.selected.as_ref() == Some(&conversation) {
+            return;
+        }
+        let db = self.backend.db().clone();
+        let id = conversation.clone();
+        let query = self.backend.spawn(async move {
+            Ok::<_, signal_store::Error>((db.conversation(&id).await?, db.message(message_id).await?))
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok((Some(chat), Some(message))) = query.await else { return };
+            let Some(poll) = message.poll.as_ref() else { return };
+            if chat.blocked || chat.muted {
+                return;
+            }
+            let _ = this.update(cx, |this, _| {
+                let Some(notifier) = this.notifier.clone() else { return };
+                let group = (chat.kind == signal_store::ConversationKind::Group).then_some(chat.title.as_str());
+                let sender = if group.is_some() { sender.clone() } else { chat.title.clone() };
+                let preview = poll_activity_text(&sender, group, &poll.question, ended);
+                let (title, body) = setting.text(&sender, group, &preview);
+                let id = format!("{}:{message_id}:poll-{}", chat.id.0, if ended { "ended" } else { "vote" });
+                notifier.post(&crate::notifications::Notification {
+                    id: &id,
+                    conversation: &chat.id,
+                    title: &title,
+                    subtitle: None,
+                    body: &body,
+                });
+            });
+        })
+        .detach();
+    }
+
     /// Takes down notifications for chats that have been read (here or on
     /// another device) and updates the Dock's unread count.
     fn sync_notifications(&mut self) {
@@ -598,6 +642,9 @@ impl AppState {
             }
             Event::Incoming { conversation, message_id, mentions_me } => {
                 self.maybe_notify(conversation, message_id, mentions_me, cx)
+            }
+            Event::PollActivity { conversation, message_id, sender, ended } => {
+                self.notify_poll(conversation, message_id, sender, ended, cx)
             }
             Event::ConversationCleared(conversation) => {
                 cx.emit(AppEvent::ConversationCleared(conversation));
@@ -1575,7 +1622,27 @@ impl AppState {
 }
 
 /// A notification's text for a message: its text, or what it holds.
+/// What a poll notification says, in Desktop's words: a vote names the
+/// sender as the title does ("Alice in Hikers") and quotes the poll's
+/// preview (`icu:notificationPollVoteMessage`); an end is the notice's
+/// text after 📊 (`icu:PollTerminate--other`).
+fn poll_activity_text(sender: &str, group: Option<&str>, question: &str, ended: bool) -> String {
+    let question_line: String = question.split_whitespace().collect::<Vec<_>>().join(" ");
+    if ended {
+        return format!("📊 {sender} ended the poll: {question_line}");
+    }
+    let title = match group {
+        Some(group) => format!("{sender} in {group}"),
+        None => sender.to_owned(),
+    };
+    format!("{title} voted in the poll \"{}\"", signal_store::poll_preview(question))
+}
+
 fn notification_preview(message: &signal_store::Message) -> String {
+    // Desktop's "📊 Poll: …" (`getNotificationDataForMessage`).
+    if let Some(poll) = &message.poll {
+        return signal_store::poll_preview(&poll.question);
+    }
     if !message.body.is_empty() {
         // Spoilers stay hidden (Desktop shows "■■■■").
         let body = signal_store::hide_spoilers(&message.body, &message.styles);

@@ -3,6 +3,7 @@
 
 mod calls;
 mod group_calls;
+mod polls;
 mod stories;
 mod release_notes;
 
@@ -39,7 +40,7 @@ use presage::{
 use presage_store_sqlite::{SqliteConnectOptions, SqliteStore};
 use signal_store::{
     AppDb, AttachmentMeta, ConversationId, ConversationKind, LinkPreview, ConversationUpdate, DeliveryStatus, Direction,
-    NewMessage, Quote, Reaction,
+    Message, NewMessage, Quote, Reaction,
 };
 use tracing::{debug, info, warn};
 
@@ -156,6 +157,9 @@ enum Outbound {
         message: i64,
         path: std::path::PathBuf,
     },
+    /// Our vote in a poll; once sent (or not) the vote numbered
+    /// `vote_count` counts (or goes).
+    PollVote { conversation: ConversationId, body: ContentBody, timestamp: u64, message: i64, vote_count: u32 },
     /// Sync message to our other devices.
     Sync { body: SyncMessage },
     /// A story (or group story reply) to one recipient, part of `job`.
@@ -194,6 +198,8 @@ struct Actor {
     /// Read syncs that arrived before their message, `(author, sent_at)`,
     /// applied when it does (as Desktop keeps them). Newest last.
     early_reads: RefCell<std::collections::VecDeque<(String, i64)>>,
+    /// Poll votes and ends that arrived before their poll (`polls.rs`).
+    early_polls: RefCell<std::collections::VecDeque<Action>>,
     /// RingRTC, once a call needs it.
     calls: RefCell<Option<signal_calls::Calls>>,
     /// The call in progress.
@@ -280,6 +286,7 @@ pub(crate) async fn run(
         next_story_job: std::cell::Cell::new(0),
         story_expiry: tokio::sync::Notify::new(),
         early_reads: RefCell::default(),
+        early_polls: RefCell::default(),
         identities_seen: RefCell::default(),
         calls: RefCell::new(None),
         call: RefCell::new(None),
@@ -564,6 +571,11 @@ impl Actor {
                 Command::React { message_id, emoji, remove } => {
                     self.react(message_id, emoji, remove).await
                 }
+                Command::SendPoll { conversation, question, options, allow_multiple } => {
+                    self.send_poll(conversation, question, options, allow_multiple).await
+                }
+                Command::VotePoll { message_id, options } => self.vote_in_poll(message_id, options).await,
+                Command::EndPoll { message_id } => self.end_poll(message_id).await,
                 Command::MarkRead { conversation } => self.mark_read(conversation).await,
                 Command::Typing { conversation, started } => self.typing(conversation, started).await,
                 Command::DeleteForMe { message_ids } => self.delete_for_me(message_ids).await,
@@ -850,7 +862,7 @@ impl Actor {
 
     async fn apply(self: &Rc<Self>, manager: &SignalManager, action: Action) {
         match action {
-            Action::Insert { mut message, mentions, styles, pointers, long_text, preview_image, timer_version } => {
+            Action::Insert { mut message, mentions, styles, pointers, long_text, preview_image, timer_version, poll } => {
                 let mut spans = Vec::new();
                 let mut style_spans = Vec::new();
                 // Every 1:1 message carries the sender's timer (groups take
@@ -932,6 +944,13 @@ impl Actor {
                         // (a re-delivery is already on its way).
                         if !repeat && let Some(pointer) = &long_text {
                             self.expect_long_text(manager, id, pointer, mentions.clone(), styles.clone()).await;
+                        }
+                        if let Some(poll) = &poll {
+                            if let Err(error) = self.db.set_poll(id, poll).await {
+                                self.error("failed to store poll", error);
+                            }
+                            // Votes and its end can come before it.
+                            self.apply_early_poll_events(&message.conversation_id, message.author.as_deref(), message.sent_at).await;
                         }
                         // Already read on another device, before it got here.
                         let read_early = !repeat
@@ -1159,6 +1178,8 @@ impl Actor {
                     self.emit(Event::PinsChanged(conversation));
                 }
             }
+            Action::PollVote { .. } => self.apply_poll_vote(action).await,
+            Action::PollEnd { .. } => self.apply_poll_end(action).await,
         }
     }
 
@@ -2679,6 +2700,8 @@ impl Actor {
             group_v2: self.group_context(&conversation).await,
             ..Default::default()
         };
+        let mut data = data;
+        polls::poll_data(&mut data, &message);
         self.enqueue_with_media(conversation, message_id, data, timestamp, &message.attachments, message.link_preview.as_ref());
     }
 
@@ -2740,7 +2763,9 @@ impl Actor {
                 let Some(message) = self.db.message(*message_id).await.ok().flatten() else { continue };
                 let attachments: Vec<AttachmentMeta> =
                     message.attachments.iter().filter(|a| a.local_path.is_some() && !a.sticker).cloned().collect();
+                // Desktop doesn't forward polls (`canForward`).
                 if message.deleted
+                    || message.poll.is_some()
                     || attachments.len() < message.attachments.len()
                     || (message.body.is_empty() && attachments.is_empty())
                 {
@@ -2758,7 +2783,7 @@ impl Actor {
         }
         if skipped > 0 {
             self.emit(Event::Error(
-                "Some messages couldn't be forwarded: stickers, and attachments that haven't downloaded, can't be yet".into(),
+                "Some messages couldn't be forwarded: polls and stickers can't be, nor attachments that haven't downloaded yet".into(),
             ));
         }
     }
@@ -3133,7 +3158,10 @@ impl Actor {
                 attachments: mapping::quoted_attachments(
                     m.attachments.first().map(signal_store::QuotedAttachment::of).as_ref(),
                 ),
-                r#type: Some(data_message::quote::Type::Normal.into()),
+                // Desktop's `makeQuote` marks a quoted poll (`isPoll`).
+                r#type: Some(
+                    if m.poll.is_some() { data_message::quote::Type::Poll } else { data_message::quote::Type::Normal }.into(),
+                ),
                 ..Default::default()
             }),
             group_v2: self.group_context(&conversation).await,
@@ -3360,6 +3388,9 @@ impl Actor {
                         self.finish_send(&conversation, id, timestamp, DeliveryStatus::Failed).await;
                     }
                     Outbound::Story { recipient, job, .. } => self.story_part_done(job, recipient, Err("not connected".into())),
+                    Outbound::PollVote { conversation, message, vote_count, .. } => {
+                        self.finish_poll_vote(&conversation, message, vote_count, false).await;
+                    }
                     _ => {}
                 }
                 continue;
@@ -3424,6 +3455,10 @@ impl Actor {
                 }
                 Outbound::Story { recipient, body, timestamp, job } => {
                     self.send_story_part(&mut manager, recipient, body, timestamp, job).await;
+                }
+                Outbound::PollVote { conversation, body, timestamp, message, vote_count } => {
+                    let status = self.deliver(&mut manager, &conversation, body, timestamp).await;
+                    self.finish_poll_vote(&conversation, message, vote_count, status == DeliveryStatus::Sent).await;
                 }
                 Outbound::Sync { body } => {
                     let me = self.self_aci();

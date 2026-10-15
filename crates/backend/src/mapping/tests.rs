@@ -965,3 +965,74 @@ fn admin_deletes_name_the_author_and_the_admin() {
     bare.admin_delete.as_mut().unwrap().target_author_aci_binary = None;
     assert!(map_content(&content(BOB, bare), &ctx()).is_empty());
 }
+
+#[test]
+fn polls_votes_and_ends_follow_desktop() {
+    use data_message::{PollCreate, PollTerminate, PollVote};
+    let group = || Some(GroupContextV2 { master_key: Some(group_key()), revision: Some(1), ..Default::default() });
+    let create = |question: &str, options: &[&str]| DataMessage {
+        timestamp: Some(100),
+        group_v2: group(),
+        poll_create: Some(PollCreate {
+            question: Some(question.into()),
+            allow_multiple: Some(true),
+            options: options.iter().map(|o| o.to_string()).collect(),
+        }),
+        ..Default::default()
+    };
+    let actions = map_content(&content(ALICE, create("Lunch?", &["Tacos", "Pho"])), &ctx());
+    let [Action::Insert { message, poll: Some(poll), .. }] = actions.as_slice() else { panic!("{actions:?}") };
+    assert_eq!(message.body, "Lunch?", "the question is the body, for search");
+    assert_eq!((poll.options.len(), poll.allow_multiple, poll.ended), (2, true, false));
+    // One option, or an empty question: Desktop drops the message.
+    assert!(map_content(&content(ALICE, create("Lunch?", &["Tacos"])), &ctx()).is_empty());
+    assert!(map_content(&content(ALICE, create("", &["Tacos", "Pho"])), &ctx()).is_empty());
+
+    let alice = ServiceId::parse_from_service_id_string(ALICE).unwrap().service_id_binary();
+    let vote = |indexes: Vec<u32>| DataMessage {
+        timestamp: Some(200),
+        group_v2: group(),
+        poll_vote: Some(PollVote {
+            target_author_aci_binary: Some(alice.clone()),
+            target_sent_timestamp: Some(100),
+            option_indexes: indexes,
+            vote_count: Some(2),
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        map_content(&content(BOB, vote(vec![1, 1, 0])), &ctx()),
+        vec![Action::PollVote {
+            conversation: ConversationId::group(&group_key()),
+            voter: Some(BOB.into()),
+            target_author: Some(ALICE.into()),
+            target_sent_at: 100,
+            options: vec![1, 0],
+            vote_count: 2,
+            sent_at: 200,
+        }]
+    );
+    assert!(map_content(&content(BOB, vote(vec![10])), &ctx()).is_empty(), "options are 0 to 9");
+    // Ours from another device: the voter is us.
+    let sync = SyncMessage {
+        content: Some(sync_message::Content::Sent(sync_message::Sent {
+            timestamp: Some(200),
+            message: Some(vote(vec![])),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let actions = map_content(&content(ME, sync), &ctx());
+    assert!(matches!(actions.as_slice(), [Action::PollVote { voter: None, options, .. }] if options.is_empty()));
+
+    let end = DataMessage {
+        timestamp: Some(300),
+        group_v2: group(),
+        poll_terminate: Some(PollTerminate { target_sent_timestamp: Some(100) }),
+        ..Default::default()
+    };
+    assert_eq!(
+        map_content(&content(ALICE, end), &ctx()),
+        vec![Action::PollEnd { conversation: ConversationId::group(&group_key()), by: Some(ALICE.into()), target_sent_at: 100, sent_at: 300 }]
+    );
+}

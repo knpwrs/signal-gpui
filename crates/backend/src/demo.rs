@@ -299,6 +299,15 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
     db.insert_message(&incoming(HOUSE, LEO, now - 5 * HOUR, "Rent's due Friday, I sent my half")).await?;
     db.insert_message(&incoming(HOUSE, ANA, now - 4 * HOUR, "Same. Also we're out of dish soap again")).await?;
     db.insert_message(&incoming(HOUSE, LEO, now - 4 * HOUR + 2 * MINUTE, "I'll grab some on the way home")).await?;
+    // A poll: Ana asks, Leo has voted for two evenings, Ana for one.
+    let chores = "Which night works for a deep clean?";
+    let poll_id = db.insert_message(&incoming(HOUSE, ANA, now - 3 * HOUR, chores)).await?;
+    let mut poll = signal_store::Poll::new(chores.into(), vec!["Tuesday".into(), "Wednesday".into(), "Sunday".into()], true);
+    for (from, options) in [(LEO, vec![0, 2]), (ANA, vec![2])] {
+        let vote = signal_store::PollVote { author: Some(aci(from).into()), options, vote_count: 1, sent_at: now - 3 * HOUR, pending: false };
+        poll.apply_vote(vote, signal_store::VoteSource::Other);
+    }
+    db.set_poll(poll_id, &poll).await?;
     db.set_muted(&ConversationId(HOUSE.into()), true).await?;
 
     // The Signal chat: a release note (made up), with Desktop's donate button.
@@ -837,6 +846,61 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
             Command::MarkRead { conversation } => {
                 let _ = db.mark_read(&conversation).await;
                 emit(Event::ConversationsChanged);
+            }
+            Command::SendPoll { conversation, question, options, allow_multiple } => {
+                if signal_store::poll_send_error(&question, &options).is_some() {
+                    continue;
+                }
+                let options: Vec<String> = options.iter().map(|o| o.trim().to_owned()).filter(|o| !o.is_empty()).collect();
+                let sent_at = next_sent_at();
+                let question = question.trim().to_owned();
+                let msg = NewMessage {
+                    conversation_id: conversation.clone(),
+                    sent_at,
+                    received_at: sent_at,
+                    direction: Direction::Outgoing,
+                    author: None,
+                    author_name: None,
+                    body: question.clone(),
+                    status: DeliveryStatus::Sent,
+                    quote: None,
+                    attachments: vec![],
+                    link_preview: None,
+                    expires_in: 0,
+                };
+                let Ok(id) = db.insert_message(&msg).await else { continue };
+                let _ = db.set_poll(id, &signal_store::Poll::new(question, options, allow_multiple)).await;
+                emit(Event::MessageChanged { conversation, message_id: id });
+                emit(Event::ConversationsChanged);
+            }
+            // A vote sends at once.
+            Command::VotePoll { message_id, options } => {
+                let mut count = 0;
+                let voted = db
+                    .update_poll(message_id, |poll| {
+                        count = poll.next_vote_count();
+                        let vote = signal_store::PollVote { author: None, options, vote_count: count, sent_at: now(), pending: true };
+                        poll.apply_vote(vote, signal_store::VoteSource::ThisDevice)
+                    })
+                    .await;
+                if let Ok(true) = voted {
+                    let _ = db.update_poll(message_id, |poll| poll.finish_our_vote(count, true)).await;
+                }
+                if let Ok(Some(m)) = db.message(message_id).await {
+                    emit(Event::MessageChanged { conversation: m.conversation_id, message_id });
+                }
+            }
+            Command::EndPoll { message_id } => {
+                let Ok(Some(m)) = db.message(message_id).await else { continue };
+                if m.direction != Direction::Outgoing || !matches!(db.update_poll(message_id, signal_store::Poll::end).await, Ok(true)) {
+                    continue;
+                }
+                let question = m.poll.map(|p| p.question).unwrap_or_default();
+                let notice = signal_store::Notice::PollEnded { by: None, question, sent_at: m.sent_at };
+                if let Ok(Some(id)) = db.insert_notice(&m.conversation_id, next_sent_at(), &notice).await {
+                    emit(Event::MessageChanged { conversation: m.conversation_id.clone(), message_id: id });
+                }
+                emit(Event::MessageChanged { conversation: m.conversation_id, message_id });
             }
             Command::DeleteForEveryone { message_id } => {
                 // Someone else's message can only be ours to delete as a

@@ -154,6 +154,13 @@ pub enum Command {
     },
     /// Reacts to message `message_id`; `remove` retracts our reaction.
     React { message_id: i64, emoji: String, remove: bool },
+    /// Sends a poll (Desktop's "New poll"); empty options are left out.
+    SendPoll { conversation: ConversationId, question: String, options: Vec<String>, allow_multiple: bool },
+    /// Votes in poll `message_id` for these options (none takes our vote
+    /// back).
+    VotePoll { message_id: i64, options: Vec<u32> },
+    /// Ends our poll `message_id` for everyone.
+    EndPoll { message_id: i64 },
     /// Marks a conversation read locally and sends read receipts / sync.
     MarkRead { conversation: ConversationId },
     /// Sends a typing indicator.
@@ -309,6 +316,17 @@ pub const SETTING_HIDDEN_STORIES: &str = signal_store::HIDDEN_STORIES;
 
 /// Pinned messages per chat (Desktop's `global.pinnedMessageLimit` default).
 pub const MAX_PINNED_MESSAGES: usize = 3;
+
+/// Whether polls can be made in 1:1 chats (Desktop's `pollSend1to1` remote
+/// config flag, `isPollSend1to1Enabled`). Off, as Desktop is while the flag
+/// isn't set: polls are made in groups only. Received ones show anywhere.
+pub const POLLS_IN_DIRECT_CHATS: bool = false;
+
+/// Whether the composer offers "Poll" in this chat (Desktop's
+/// `CompositionArea`: groups, and 1:1 chats behind the flag above).
+pub fn can_create_poll(kind: signal_store::ConversationKind) -> bool {
+    kind == signal_store::ConversationKind::Group || POLLS_IN_DIRECT_CHATS
+}
 
 /// The history transfer after linking, as shown while it runs.
 #[derive(Debug, Clone, PartialEq)]
@@ -592,6 +610,9 @@ pub enum Event {
     History(HistoryProgress),
     /// A new message from someone else arrived (for notifications).
     Incoming { conversation: ConversationId, message_id: i64, mentions_me: bool },
+    /// Someone voted in our poll (`ended`: they ended theirs), for
+    /// Desktop's notifications. `message_id` is the poll; `sender` their name.
+    PollActivity { conversation: ConversationId, message_id: i64, sender: String, ended: bool },
     /// GIF search results with their previews downloaded (`Err`: why not).
     Gifs { query: String, offset: u32, result: Result<GifResults, String> },
     /// Installed sticker packs (answer to `Command::LoadStickers`).
