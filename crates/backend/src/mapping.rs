@@ -580,6 +580,11 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
             ),
             // Filled in from the quoted message once it's found locally.
             thumbnail: None,
+            attachment: q.attachments.first().map(|a| signal_store::QuotedAttachment {
+                content_type: a.content_type.clone().unwrap_or_default(),
+                file_name: a.file_name.clone(),
+                ..Default::default()
+            }),
         })
     });
 
@@ -842,6 +847,22 @@ pub fn mention_ranges(body: &str, acis: &[String]) -> Vec<presage::proto::BodyRa
 /// Parses a direct conversation's service id.
 pub fn service_id_of(conversation: &ConversationId) -> Option<ServiceId> {
     ServiceId::parse_from_service_id_string(conversation.as_direct()?)
+}
+
+/// A quote's attachment as sent (`Quote.QuotedAttachment`): its type and
+/// name, so their client can say what was quoted. Desktop also sends a
+/// thumbnail of a quoted photo; that's not sent here.
+pub fn quoted_attachments(
+    attachment: Option<&signal_store::QuotedAttachment>,
+) -> Vec<presage::proto::data_message::quote::QuotedAttachment> {
+    attachment
+        .map(|a| presage::proto::data_message::quote::QuotedAttachment {
+            content_type: Some(a.content_type.clone()).filter(|t| !t.is_empty()),
+            file_name: a.file_name.clone(),
+            thumbnail: None,
+        })
+        .into_iter()
+        .collect()
 }
 
 #[cfg(test)]

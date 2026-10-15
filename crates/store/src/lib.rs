@@ -119,6 +119,53 @@ pub struct Quote {
     /// link preview image, when we have it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumbnail: Option<String>,
+    /// The quoted message's first attachment: what the quote says it is
+    /// when it has no text ("Voice Message", "Photo").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<QuotedAttachment>,
+}
+
+/// What a quote knows of the quoted attachment (Signal's
+/// `Quote.QuotedAttachment`, with the flags we can learn locally).
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct QuotedAttachment {
+    pub content_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    #[serde(default)]
+    pub voice: bool,
+    #[serde(default)]
+    pub gif: bool,
+}
+
+impl QuotedAttachment {
+    pub fn of(attachment: &AttachmentMeta) -> Self {
+        Self {
+            content_type: attachment.content_type.clone(),
+            file_name: attachment.file_name.clone(),
+            voice: attachment.voice,
+            gif: attachment.gif,
+        }
+    }
+
+    /// What a quote of it says when there's no text, in Desktop's words
+    /// (`Quote`'s `getTypeLabel`; any other file shows its name).
+    pub fn label(&self) -> String {
+        let kind = self.content_type.as_str();
+        if self.gif || kind == "image/gif" {
+            "GIF".into()
+        } else if kind.starts_with("video/") {
+            "Video".into()
+        } else if kind.starts_with("image/") {
+            "Photo".into()
+        } else if kind.starts_with("audio/") && self.voice {
+            "Voice Message".into()
+        } else if kind.starts_with("audio/") {
+            "Audio".into()
+        } else {
+            self.file_name.clone().unwrap_or_else(|| "File".into())
+        }
+    }
 }
 
 /// A link preview, as sent with the message (Signal's `Preview`).

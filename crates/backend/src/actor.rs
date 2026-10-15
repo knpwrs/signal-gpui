@@ -757,6 +757,10 @@ impl Actor {
                     // preview image beside the quote when we have it.
                     if let Ok(Some(quoted)) = self.db.find_message_any(quote.author.as_deref(), quote.sent_at).await {
                         quote.thumbnail = quoted.thumbnail();
+                        // Ours knows what the wire doesn't: a voice message.
+                        if let Some(attachment) = quoted.attachments.first() {
+                            quote.attachment = Some(signal_store::QuotedAttachment::of(attachment));
+                        }
                     }
                 }
                 let conversation = message.conversation_id.clone();
@@ -2340,6 +2344,7 @@ impl Actor {
                 id: Some(q.sent_at as u64),
                 author_aci: Some(q.author.clone().unwrap_or_else(|| self_aci.clone())),
                 text: Some(q.text.clone()),
+                attachments: mapping::quoted_attachments(q.attachment.as_ref()),
                 r#type: Some(data_message::quote::Type::Normal.into()),
                 ..Default::default()
             }),
@@ -2381,6 +2386,7 @@ impl Actor {
                 id: Some(q.sent_at as u64),
                 author_aci: Some(q.author.clone().unwrap_or_else(|| self_aci.clone())),
                 text: Some(q.text.clone()),
+                attachments: mapping::quoted_attachments(q.attachment.as_ref()),
                 r#type: Some(data_message::quote::Type::Normal.into()),
                 ..Default::default()
             }),
@@ -2793,6 +2799,7 @@ impl Actor {
             // A quoted spoiler stays hidden, here and for them.
             text: signal_store::hide_spoilers(&m.body, &m.styles),
             thumbnail: m.thumbnail(),
+            attachment: m.attachments.first().map(signal_store::QuotedAttachment::of),
         });
 
         let expire_timer = self
@@ -2836,6 +2843,9 @@ impl Actor {
                 id: Some(m.sent_at as u64),
                 author_aci: Some(m.author.unwrap_or_else(|| self_aci.clone())),
                 text: Some(signal_store::hide_spoilers(&m.body, &m.styles)),
+                attachments: mapping::quoted_attachments(
+                    m.attachments.first().map(signal_store::QuotedAttachment::of).as_ref(),
+                ),
                 r#type: Some(data_message::quote::Type::Normal.into()),
                 ..Default::default()
             }),

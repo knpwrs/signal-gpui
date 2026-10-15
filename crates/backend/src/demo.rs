@@ -153,6 +153,7 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
         sent_at: message.sent_at,
         text: message.body.clone(),
         thumbnail,
+        attachment: message.attachments.first().map(signal_store::QuotedAttachment::of),
     };
     let react = |emoji: &str, from: Option<&str>| Reaction { emoji: emoji.into(), author: from.map(|f| aci(f).into()), sent_at: now };
 
@@ -634,6 +635,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                         sent_at: m.sent_at,
                         text: m.body.clone(),
                         thumbnail: m.thumbnail(),
+                        attachment: m.attachments.first().map(signal_store::QuotedAttachment::of),
                     }),
                     None => None,
                 };
@@ -1139,6 +1141,7 @@ async fn demo_quote(db: &AppDb, quote: Option<i64>) -> Option<Quote> {
         sent_at: m.sent_at,
         text: m.body.clone(),
         thumbnail: m.thumbnail(),
+        attachment: m.attachments.first().map(signal_store::QuotedAttachment::of),
     })
 }
 

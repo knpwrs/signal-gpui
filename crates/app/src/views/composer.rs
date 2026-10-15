@@ -1085,6 +1085,13 @@ impl Composer {
             Some(name) if message.author.is_some() => name.clone().into(),
             _ => "You".into(),
         };
+        // As the quote will show: its text, else what it holds ("Voice
+        // Message"), with a photo or Desktop's microphone beside it.
+        let text = signal_store::hide_spoilers(&message.body, &message.styles);
+        let attachment = message.attachments.first();
+        let label = attachment.map(|a| signal_store::QuotedAttachment::of(a).label()).filter(|_| text.trim().is_empty());
+        let thumbnail = message.thumbnail();
+        let audio = thumbnail.is_none() && attachment.is_some_and(|a| a.content_type.starts_with("audio/"));
         div()
             .mx_3()
             .mt_2()
@@ -1100,8 +1107,27 @@ impl Composer {
                     .min_w_0()
                     .py_2()
                     .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(author))
-                    .child(div().text_sm().truncate().text_color(palette.text_secondary).child(signal_store::hide_spoilers(&message.body, &message.styles))),
+                    .map(|d| match label {
+                        Some(label) => d.child(div().text_sm().italic().truncate().text_color(palette.text_secondary).child(label)),
+                        None => d.child(div().text_sm().truncate().text_color(palette.text_secondary).child(text)),
+                    }),
             )
+            .when_some(thumbnail, |d, path| {
+                d.child(img(PathBuf::from(path)).flex_none().size(px(40.)).rounded_md().object_fit(ObjectFit::Cover))
+            })
+            .when(audio, |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .size(px(32.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .bg(palette.background)
+                        .child(Icon::new(IconName::Mic).size_4().text_color(palette.accent)),
+                )
+            })
             .child(
                 div()
                     .id("cancel-reply")

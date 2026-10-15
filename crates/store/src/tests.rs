@@ -214,7 +214,7 @@ async fn delete_edit_attachments_and_search() {
         voice: false,
         remote: None,
     }];
-    m.quote = Some(Quote { author: None, author_name: "You".into(), sent_at: 0, text: "q".into(), thumbnail: None });
+    m.quote = Some(Quote { author: None, author_name: "You".into(), sent_at: 0, text: "q".into(), thumbnail: None, attachment: None });
     let id = db.insert_message(&m).await.unwrap();
     let id2 = db.insert_message(&incoming("d:b", "b", 2, "Crème brûlée foxes")).await.unwrap();
 
@@ -388,7 +388,7 @@ async fn rename_authors_updates_messages_and_quotes() {
     first.author_name = None;
     let first = db.insert_message(&first).await.unwrap();
     let mut reply = incoming("g:01", "amy", 2, "re");
-    reply.quote = Some(Quote { author: Some("jon".into()), author_name: "jon".into(), sent_at: 1, text: "hi".into(), thumbnail: None });
+    reply.quote = Some(Quote { author: Some("jon".into()), author_name: "jon".into(), sent_at: 1, text: "hi".into(), thumbnail: None, attachment: None });
     let reply = db.insert_message(&reply).await.unwrap();
 
     let mut authors = db.message_authors().await.unwrap();
@@ -1088,4 +1088,20 @@ fn spoilers_hide_whole_and_overlapping() {
     assert_eq!(hide_spoilers("abc", &[spoiler(1, 9)]), "abc", "out of range: left alone");
     let bold = StyleSpan { start: 0, len: 3, style: TextStyle::Bold };
     assert_eq!(hide_spoilers("abc", &[bold]), "abc");
+}
+
+#[test]
+fn quoted_attachments_say_what_they_are_as_desktop_does() {
+    let quoted = |content_type: &str, voice: bool, gif: bool, file_name: Option<&str>| {
+        QuotedAttachment { content_type: content_type.into(), file_name: file_name.map(Into::into), voice, gif }.label()
+    };
+    assert_eq!(quoted("audio/aac", true, false, None), "Voice Message");
+    assert_eq!(quoted("audio/mpeg", false, false, Some("song.mp3")), "Audio");
+    assert_eq!(quoted("image/jpeg", false, false, None), "Photo");
+    assert_eq!(quoted("video/mp4", false, true, None), "GIF");
+    assert_eq!(quoted("video/mp4", false, false, None), "Video");
+    assert_eq!(quoted("application/pdf", false, false, Some("notes.pdf")), "notes.pdf");
+    // Quotes stored before this knew nothing of the attachment.
+    let old: Quote = serde_json::from_str(r#"{"author":null,"author_name":"You","sent_at":1,"text":""}"#).unwrap();
+    assert_eq!(old.attachment, None);
 }

@@ -2424,13 +2424,30 @@ fn render_quote(quote: signal_store::Quote, fg: Hsla, palette: Palette) -> impl 
     // its maximum. A thumbnail is placed over reserved padding for the same
     // reason.
     let thumbnail = quote.thumbnail.clone();
+    // Audio has Desktop's microphone where a photo would go.
+    let audio = thumbnail.is_none() && quote.attachment.as_ref().is_some_and(|a| a.content_type.starts_with("audio/"));
+    let label = quote.attachment.as_ref().map(|a| a.label()).filter(|_| quote.text.trim().is_empty());
     div()
         .relative()
         .flex()
         .flex_col()
         .px_2()
         .py_1()
-        .when(thumbnail.is_some(), |d| d.pr(px(QUOTE_THUMBNAIL + 8.)).min_h(px(QUOTE_THUMBNAIL)))
+        .when(thumbnail.is_some() || audio, |d| d.pr(px(QUOTE_THUMBNAIL + 8.)).min_h(px(QUOTE_THUMBNAIL)))
+        .when(audio, |d| {
+            d.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .bottom_0()
+                    .w(px(QUOTE_THUMBNAIL))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(Icon::new(IconName::Mic).size_5().text_color(fg)),
+            )
+        })
         .when_some(thumbnail, |d, path| {
             d.child(
                 img(std::path::PathBuf::from(path))
@@ -2454,7 +2471,10 @@ fn render_quote(quote: signal_store::Quote, fg: Hsla, palette: Palette) -> impl 
                 .font_weight(FontWeight::SEMIBOLD)
                 .child(if quote.author.is_none() { "You".to_string() } else { quote.author_name }),
         )
-        .child(div().text_sm().line_clamp(3).text_ellipsis().child(collapse_whitespace(&quote.text)))
+        .map(|d| match label {
+            Some(label) => d.child(div().text_sm().italic().truncate().child(label)),
+            None => d.child(div().text_sm().line_clamp(3).text_ellipsis().child(collapse_whitespace(&quote.text))),
+        })
 }
 
 /// What the image viewer needs to show a downloaded image.
