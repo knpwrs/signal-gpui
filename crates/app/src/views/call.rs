@@ -44,6 +44,10 @@ fn dim_text() -> Hsla {
 pub struct VideoTile {
     /// Show the whole frame (a shared screen) rather than fill the tile.
     pub fit_whole: bool,
+    /// Show a portrait frame (a phone held upright) whole too: filling a
+    /// landscape window, it showed only the top of their head.
+    pub portrait_whole: bool,
+    portrait: bool,
     slot: FrameSlot,
     seq: u64,
     image: Option<Arc<RenderImage>>,
@@ -66,7 +70,7 @@ impl VideoTile {
             }
         })
         .detach();
-        Self { fit_whole: false, slot, seq: 0, image: None, _poll: poll }
+        Self { fit_whole: false, portrait_whole: false, portrait: false, slot, seq: 0, image: None, _poll: poll }
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -81,6 +85,7 @@ impl VideoTile {
             return;
         }
         self.seq = frame.seq;
+        self.portrait = frame.height > frame.width;
         // GPUI's images are BGRA, which is what the slot holds.
         let Some(buffer) = image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra.to_vec()) else { return };
         let image = Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]));
@@ -100,7 +105,11 @@ impl Render for VideoTile {
         match &self.image {
             Some(image) => img(image.clone())
                 .size_full()
-                .object_fit(if self.fit_whole { ObjectFit::Contain } else { ObjectFit::Cover })
+                .object_fit(if self.fit_whole || (self.portrait_whole && self.portrait) {
+                    ObjectFit::Contain
+                } else {
+                    ObjectFit::Cover
+                })
                 .into_any_element(),
             None => div().size_full().into_any_element(),
         }
@@ -124,7 +133,7 @@ pub struct CallView {
 impl CallView {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let video = state.read(cx).backend.call_video().clone();
-        let remote = cx.new(|cx| VideoTile::new(video.remote.clone(), cx));
+        let remote = cx.new(|cx| VideoTile { portrait_whole: true, ..VideoTile::new(video.remote.clone(), cx) });
         let local = cx.new(|cx| VideoTile::new(video.local.clone(), cx));
         let clock = cx.spawn(async move |this, cx| {
             loop {
@@ -176,7 +185,9 @@ impl CallView {
         let frames = self.state.read(cx).backend.call_video().group.clone();
         self.tiles.retain(|id, _| participants.iter().any(|p| p.demux_id == *id));
         for p in participants {
-            self.tiles.entry(p.demux_id).or_insert_with(|| cx.new(|cx| VideoTile::new(frames.slot(p.demux_id), cx)));
+            self.tiles.entry(p.demux_id).or_insert_with(|| {
+                cx.new(|cx| VideoTile { portrait_whole: true, ..VideoTile::new(frames.slot(p.demux_id), cx) })
+            });
         }
     }
 
