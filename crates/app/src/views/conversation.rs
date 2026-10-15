@@ -839,15 +839,13 @@ impl ConversationView {
 
         let bubble = self.render_bubble(&message, is_group && first_in_group, first_in_group, last_in_group, palette, cx);
 
-        let hovered = self.hovered == Some(message.id) || self.menu_open_for == Some(message.id);
+        // The actions stay while the reaction bar they opened is up, as in Desktop.
+        let hovered = self.hovered == Some(message.id)
+            || self.menu_open_for == Some(message.id)
+            || self.reaction_bar_for == Some(message.id);
         let selecting = self.selecting.as_ref().map(|s| s.contains(&message.id));
         let actions = if hovered && !message.deleted && selecting.is_none() {
             Some(self.render_hover_actions(&message, palette, cx).into_any_element())
-        } else {
-            None
-        };
-        let reaction_bar = if self.reaction_bar_for == Some(message.id) {
-            Some(self.render_reaction_bar(&message, palette, cx).into_any_element())
         } else {
             None
         };
@@ -948,8 +946,7 @@ impl ConversationView {
                                 .when(!outgoing, |d| d.left_full().pl_2())
                                 .child(a),
                         )
-                    })
-                    .when_some(reaction_bar, |d, bar| d.child(deferred(bar).with_priority(1))),
+                    }),
             );
 
         // Right-click: the same menu as "⋯" (not in select mode).
@@ -1284,13 +1281,34 @@ impl ConversationView {
             .flex()
             .flex_none()
             .items_center()
-            .child(button("react", IconName::FaceSlightlySmilingPlus).on_click(cx.listener(move |this, click, _, cx| {
-                if this.reaction_bar_closed_by.take(click) {
-                    return;
-                }
-                this.reaction_bar_for = if this.reaction_bar_for == Some(id) { None } else { Some(id) };
-                cx.notify();
-            })))
+            .child(
+                div()
+                    .relative()
+                    .debug_selector(move || format!("react-{id}"))
+                    .child(button("react", IconName::FaceSlightlySmilingPlus).on_click(cx.listener(
+                        move |this, click, _, cx| {
+                            if this.reaction_bar_closed_by.take(click) {
+                                return;
+                            }
+                            this.reaction_bar_for = if this.reaction_bar_for == Some(id) { None } else { Some(id) };
+                            cx.notify();
+                        },
+                    )))
+                    .when(self.reaction_bar_for == Some(id), |d| {
+                        // Desktop (TimelineMessage): a popper centered above
+                        // the react button, 4px off it, kept inside the window.
+                        d.child(div().absolute().top_0().left(px(14.)).child(
+                            deferred(
+                                anchored()
+                                    .anchor(Anchor::BottomCenter)
+                                    .offset(gpui_kit::point(px(0.), px(-4.)))
+                                    .snap_to_window_with_margin(px(8.))
+                                    .child(self.render_reaction_bar(message, palette, cx)),
+                            )
+                            .with_priority(1),
+                        ))
+                    }),
+            )
             .when(!downloadable.is_empty(), |d| {
                 d.child(button("download", IconName::Download).on_click(move |_, _, cx: &mut App| {
                     download_attachments(downloadable.clone(), cx);
@@ -1426,13 +1444,7 @@ impl ConversationView {
         };
         let mine = message.reactions.iter().find(|r| r.author.is_none()).map(|r| r.emoji.clone());
         let tone = self.picker.read(cx).skin_tone();
-        let outgoing = message.direction == Direction::Outgoing;
         div()
-            .absolute()
-            .bottom_full()
-            .when(outgoing, |d| d.right_0())
-            .when(!outgoing, |d| d.left_0())
-            .mb_1()
             .flex()
             .items_center()
             .gap_1()
@@ -1443,6 +1455,7 @@ impl ConversationView {
             .border_color(palette.panel_border)
             .shadow_lg()
             .occlude()
+            .debug_selector(move || format!("reaction-bar-{id}"))
             .on_mouse_down_out(cx.listener(|this, event, _, cx| {
                 this.reaction_bar_closed_by.record(event);
                 this.reaction_bar_for = None;
@@ -3082,6 +3095,23 @@ mod tests {
         assert!(reaction_appear(61. / 460., 6) > 0.);
         assert!((reaction_appear(1., 6) - 1.).abs() < 1e-4);
         assert!(reaction_appear(0.1, 0) > reaction_appear(0.1, 3));
+    }
+
+    #[gpui_kit::test]
+    fn reaction_bar_sits_over_the_react_button(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        let message = wait_for_messages(&backend, GROUP, 1, |m| m.direction == Direction::Outgoing).remove(0);
+        let (mut cx, view) = open_view(cx, &backend, GROUP);
+        view.update(&mut cx, |v, cx| {
+            v.reaction_bar_for = Some(message.id);
+            cx.notify();
+        });
+        // The actions stay up with it, and it is centered 4px above "react".
+        let button = bounds(&mut cx, format!("react-{}", message.id));
+        let bar = bounds(&mut cx, format!("reaction-bar-{}", message.id));
+        assert!((bar.center().x - button.center().x).abs() < px(0.5), "{bar:?} vs {button:?}");
+        assert_eq!(bar.bottom(), button.top() - px(4.), "{bar:?} vs {button:?}");
+        backend.shutdown();
     }
 
     #[test]
