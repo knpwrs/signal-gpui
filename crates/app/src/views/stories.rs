@@ -178,6 +178,7 @@ impl StoriesPane {
         let latest = mine.last().cloned();
         let has_any = latest.is_some();
         let views: usize = mine.iter().map(|s| s.views.len()).sum();
+        let views_off = !self.state.read(cx).story_view_receipts_on();
         let state = self.state.clone();
         let me = self.state.read(cx).account.as_ref().map(|a| a.aci.clone()).unwrap_or_default();
         let photo = self.state.read(cx).photo_of(&me).map(std::path::Path::to_path_buf);
@@ -205,7 +206,9 @@ impl StoriesPane {
                     .child(div().font_weight(FontWeight::SEMIBOLD).child(if mine.is_empty() { "My Story" } else { "My Stories" }))
                     .child(div().text_sm().text_color(palette.text_secondary).child(match &latest {
                         None => "Add a story".to_owned(),
-                        Some(story) if views > 0 => format!("{} · {views} views", short_timestamp(story.sent_at)),
+                        // Desktop's `MyStories__views-off`.
+                        Some(story) if views_off => format!("{} · Views off", short_timestamp(story.sent_at)),
+                        Some(story) if views > 0 => format!("{} · {}", short_timestamp(story.sent_at), crate::views::story_viewer::views_text(views)),
                         Some(story) => short_timestamp(story.sent_at),
                     })),
             )
@@ -247,6 +250,22 @@ impl StoriesPane {
                         .detach();
                 }))
             })
+    }
+
+    /// Desktop's Stories menu: "Story privacy".
+    fn render_menu(&self) -> impl IntoElement {
+        use gpui_kit::component::Sizable as _;
+        use gpui_kit::component::button::{Button, ButtonVariants as _};
+        use gpui_kit::component::menu::DropdownMenu as _;
+        let state = self.state.clone();
+        Button::new("stories-menu").ghost().small().icon(gpui_kit::assets::IconName::Ellipsis).tooltip("More").dropdown_menu(
+            move |menu, _, _| {
+                let state = state.clone();
+                menu.item(PopupMenuItem::new("Story privacy").on_click(move |_, window, cx| {
+                    crate::views::story_privacy::open(state.clone(), window, cx);
+                }))
+            },
+        )
     }
 
     fn render_group(&self, group: &StoryGroup, palette: Palette, cx: &mut Context<Self>) -> AnyElement {
@@ -339,7 +358,8 @@ impl Render for StoriesPane {
                     .pl(px(16.))
                     .when(collapsed, |d| d.child(crate::views::nav::show_tabs_button(&self.state, palette, cx)))
                     .child(div().flex_1().text_lg().font_weight(FontWeight::SEMIBOLD).child("Stories"))
-                    .child(self.render_add_story()),
+                    .child(self.render_add_story())
+                    .child(self.render_menu()),
             )
             .child(
                 div()

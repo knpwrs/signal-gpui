@@ -110,6 +110,11 @@ pub fn story_file_problem(bytes: &[u8], content_type: &str) -> Option<&'static s
     }
 }
 
+/// Desktop's `StoriesSettings__viewers`.
+fn viewers(count: usize) -> String {
+    if count == 1 { "1 viewer".into() } else { format!("{count} viewers") }
+}
+
 /// What's being made.
 enum Draft {
     Text,
@@ -126,14 +131,16 @@ pub struct StoryCreator {
     font: usize,
     text_background: TextBackground,
     background: usize,
-    targets: BTreeSet<Target>,
+    pub(crate) targets: BTreeSet<Target>,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum Target {
+pub(crate) enum Target {
     MyStory,
+    /// A custom story, by id.
+    List(String),
     Group(String),
 }
 
@@ -170,8 +177,7 @@ impl StoryCreator {
             cx.subscribe(&text, |_, _, _: &InputEvent, cx| cx.notify()),
             cx.subscribe(&caption, |_, _, _: &InputEvent, cx| cx.notify()),
         ];
-        let mut targets = BTreeSet::new();
-        targets.insert(Target::MyStory);
+        // Desktop's `SendStoryModal` starts with nothing chosen.
         Self {
             state,
             draft,
@@ -181,7 +187,7 @@ impl StoryCreator {
             font: 0,
             text_background: TextBackground::None,
             background: 0,
-            targets,
+            targets: BTreeSet::new(),
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
         }
@@ -226,6 +232,7 @@ impl StoryCreator {
             .iter()
             .map(|t| match t {
                 Target::MyStory => StoryTarget::MyStory,
+                Target::List(id) => StoryTarget::List(id.clone()),
                 Target::Group(id) => StoryTarget::Group(ConversationId(id.clone())),
             })
             .collect();
@@ -323,22 +330,46 @@ impl StoryCreator {
             .into_any_element()
     }
 
+    /// Picks or unpicks a target. The first time My Story is picked,
+    /// Desktop asks who it goes to (`hasFirstStoryPostExperience`); once
+    /// that's saved, My Story is picked.
+    pub(crate) fn toggle_target(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
+        if self.targets.remove(&target) {
+            return cx.notify();
+        }
+        if target == Target::MyStory && !self.state.read(cx).my_story_privacy_set {
+            let creator = cx.entity().downgrade();
+            let on_saved: crate::views::story_privacy::OnSaved = std::rc::Rc::new(move |_, cx| {
+                let _ = creator.update(cx, |c, cx| {
+                    c.targets.insert(Target::MyStory);
+                    cx.notify();
+                });
+            });
+            crate::views::story_privacy::first_post(self.state.clone(), on_saved, window, cx);
+            return;
+        }
+        self.targets.insert(target);
+        cx.notify();
+    }
+
     fn render_targets(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
-        let groups: Vec<(String, String)> = {
+        let (groups, lists, my_story, privacy_set) = {
             let state = self.state.read(cx);
-            state
+            let groups: Vec<(String, String)> = state
                 .conversations
                 .iter()
                 .chain(state.archived.iter())
                 .filter(|c| c.kind == ConversationKind::Group && !c.left && !c.blocked)
                 .map(|c| (c.id.0.clone(), c.title.clone()))
-                .collect()
+                .collect();
+            (groups, state.custom_story_lists(), state.my_story(), state.my_story_privacy_set)
         };
         let white = Hsla { h: 0., s: 0., l: 1., a: 1. };
-        let row = |target: Target, label: String, cx: &mut Context<Self>| {
+        let row = |target: Target, label: String, detail: String, cx: &mut Context<Self>| {
             let on = self.targets.contains(&target);
             let key = match &target {
                 Target::MyStory => "story-target-my-story".to_owned(),
+                Target::List(id) => format!("story-target-list-{id}"),
                 Target::Group(id) => format!("story-target-{id}"),
             };
             div()
@@ -352,12 +383,7 @@ impl StoryCreator {
                 .rounded(px(8.))
                 .cursor_pointer()
                 .hover(|d| d.bg(Hsla { a: 0.1, ..white }))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if !this.targets.remove(&target) {
-                        this.targets.insert(target.clone());
-                    }
-                    cx.notify();
-                }))
+                .on_click(cx.listener(move |this, _, window, cx| this.toggle_target(target.clone(), window, cx)))
                 .child(
                     div()
                         .size(px(18.))
@@ -367,12 +393,41 @@ impl StoryCreator {
                         .border_color(white)
                         .when(on, |d| d.bg(white)),
                 )
-                .child(div().flex_1().truncate().child(label))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().truncate().child(label))
+                        .child(div().text_xs().opacity(0.7).truncate().child(detail)),
+                )
         };
-        let mut rows = vec![row(Target::MyStory, "My Story".into(), cx).into_any_element()];
-        for (id, title) in groups {
-            rows.push(row(Target::Group(id), title, cx).into_any_element());
+        // Desktop's descriptions (`SendStoryModal`).
+        let my_detail = if !privacy_set {
+            "Choose who can view your story".to_owned()
+        } else if my_story.block_list && !my_story.members.is_empty() {
+            format!("All Signal connections · {} excluded", my_story.members.len())
+        } else if my_story.members.is_empty() || my_story.block_list {
+            "All Signal connections".to_owned()
+        } else {
+            format!("Only share with · {}", viewers(my_story.members.len()))
+        };
+        let mut rows = vec![row(Target::MyStory, "My Story".into(), my_detail, cx).into_any_element()];
+        for list in lists {
+            let detail = format!("Custom story · {}", viewers(list.members.len()));
+            rows.push(row(Target::List(list.id), list.name, detail, cx).into_any_element());
         }
+        for (id, title) in groups {
+            rows.push(row(Target::Group(id), title, "Group story".into(), cx).into_any_element());
+        }
+        let state = self.state.clone();
+        rows.push(
+            div()
+                .pt_2()
+                .child(Button::new("story-privacy").label("Story privacy").small().ghost().on_click(move |_, window, cx| {
+                    crate::views::story_privacy::open(state.clone(), window, cx);
+                }))
+                .into_any_element(),
+        );
         div()
             .w(px(360.))
             .max_h(px(480.))

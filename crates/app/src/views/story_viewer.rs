@@ -31,6 +31,38 @@ const CAPTION_LENGTH: usize = 200;
 /// Quick reactions (Desktop's default reaction set).
 const REACTIONS: [&str; 6] = ["❤️", "👍", "👎", "😂", "😮", "😢"];
 
+/// Desktop's `MyStories__views`.
+pub fn views_text(count: usize) -> String {
+    if count == 1 { "1 view".into() } else { format!("{count} views") }
+}
+
+/// Desktop's `MyStories__replies`.
+fn replies_text(count: usize) -> String {
+    if count == 1 { "1 reply".into() } else { format!("{count} replies") }
+}
+
+/// The button under our story (Desktop's `StoryViewer`): its views, or
+/// "Views off" with view receipts off, and its replies.
+pub fn views_button_text(views: usize, replies: usize, receipts: bool) -> String {
+    let mut parts = Vec::new();
+    if receipts {
+        parts.push(views_text(views));
+    } else if replies == 0 {
+        parts.push("Views off".to_owned());
+    }
+    if replies > 0 {
+        parts.push(replies_text(replies));
+    }
+    parts.join(" ")
+}
+
+/// The tabs of Desktop's `StoryViewsNRepliesModal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewsTab {
+    Views,
+    Replies,
+}
+
 /// Desktop's `getStoryDuration` for text: 5 seconds, a second more for
 /// each 15 characters after the first 15, and 2 for a link.
 pub fn text_seconds(text: &str, link: bool) -> f64 {
@@ -68,6 +100,8 @@ pub struct StoryViewer {
     /// What the reply box says; set on it when drawn.
     reply_placeholder: SharedString,
     placeholder_shown: SharedString,
+    /// Our story's views and replies, open at this tab (the story waits).
+    pub(crate) views_open: Option<ViewsTab>,
     focus: FocusHandle,
     _tick: Task<()>,
     _subscriptions: Vec<Subscription>,
@@ -145,6 +179,7 @@ impl StoryViewer {
             reply,
             reply_placeholder: "Reply".into(),
             placeholder_shown: "Reply".into(),
+            views_open: None,
             focus: cx.focus_handle(),
             _tick: tick,
             _subscriptions: subscriptions,
@@ -159,6 +194,9 @@ impl StoryViewer {
 
     /// The story now showing: viewed, downloaded, its video started.
     fn show(&mut self, cx: &mut Context<Self>) {
+        if self.views_open.take().is_some() {
+            self.set_paused(false, cx);
+        }
         self.started = Instant::now();
         self.shown_before = Duration::ZERO;
         self.video = None;
@@ -299,8 +337,17 @@ impl StoryViewer {
         self.state.read(cx).send(Command::ReplyToStory { id: story.id, body: text, emoji });
     }
 
+    /// Opens (or with `None`, closes) our story's views and replies; the
+    /// story waits while they're open.
+    pub(crate) fn open_views(&mut self, tab: Option<ViewsTab>, cx: &mut Context<Self>) {
+        self.views_open = tab;
+        self.set_paused(tab.is_some(), cx);
+        cx.notify();
+    }
+
     fn on_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         match event.keystroke.key.as_str() {
+            "escape" if self.views_open.is_some() => self.open_views(None, cx),
             "escape" => cx.emit(ViewerEvent::Close),
             "right" => self.next(cx),
             "left" => self.previous(cx),
@@ -357,6 +404,150 @@ impl StoryViewer {
                     .into_any_element()
             }
         }
+    }
+
+    /// Desktop's `StoryViewsNRepliesModal` for our story: who viewed it
+    /// (newest first) and its replies, in tabs when there are both.
+    fn render_views(&self, story: &Story, tab: ViewsTab, cx: &mut Context<Self>) -> AnyElement {
+        let white = Hsla { h: 0., s: 0., l: 1., a: 1. };
+        let dim = Hsla { a: 0.7, ..white };
+        let state = self.state.read(cx);
+        let receipts = state.story_view_receipts_on();
+        let name_of = |sid: &str| {
+            state.conversation(&ConversationId::direct(sid)).map(|c| c.title.clone()).filter(|t| !t.is_empty()).unwrap_or_else(|| "Unknown".into())
+        };
+        let empty = |text: &'static str| div().py_8().text_center().text_color(dim).child(text).into_any_element();
+        let views = if !receipts {
+            Some(
+                div()
+                    .py_8()
+                    .text_center()
+                    .text_color(dim)
+                    .child("Enable view receipts to see who’s viewed your stories. Open the Signal app on your mobile device and navigate to Settings > Stories.")
+                    .into_any_element(),
+            )
+        } else if story.views.is_empty() {
+            Some(empty("No views yet"))
+        } else {
+            let mut views = story.views.clone();
+            views.sort_by_key(|v| std::cmp::Reverse(v.at));
+            Some(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .children(views.into_iter().map(|view| {
+                        let name = name_of(&view.viewer);
+                        let photo = state.photo_of(&view.viewer).map(std::path::Path::to_path_buf);
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(crate::views::common::person_avatar(
+                                photo.as_deref(),
+                                &name,
+                                crate::theme::color_for(&ConversationId::direct(&view.viewer).0),
+                                px(28.),
+                            ))
+                            .child(div().flex_1().truncate().child(name))
+                            .children(view.at.map(|at| div().text_xs().text_color(dim).child(crate::views::common::short_timestamp(at))))
+                    }))
+                    .into_any_element(),
+            )
+        };
+        let replies = if !story.replies.is_empty() {
+            Some(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .children(story.replies.iter().map(|reply| {
+                        let who = match &reply.author {
+                            None => "You".to_owned(),
+                            Some(sid) => reply.author_name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| name_of(sid)),
+                        };
+                        let body = match &reply.emoji {
+                            Some(emoji) => format!("Reacted to the story {emoji}"),
+                            None => reply.body.clone(),
+                        };
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(div().flex_1().font_weight(FontWeight::SEMIBOLD).truncate().child(who))
+                                    .child(div().text_xs().text_color(dim).child(crate::views::common::short_timestamp(reply.sent_at))),
+                            )
+                            .child(div().text_sm().child(body))
+                    }))
+                    .into_any_element(),
+            )
+        } else if story.group.is_some() {
+            // Desktop says so for a group's story only.
+            Some(empty("No replies yet"))
+        } else {
+            None
+        };
+        let tabs = views.is_some() && replies.is_some();
+        let tab = if replies.is_none() { ViewsTab::Views } else if views.is_none() { ViewsTab::Replies } else { tab };
+        let tab_button = |id: &'static str, label: &'static str, this: ViewsTab, cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .flex_1()
+                .py_1()
+                .text_center()
+                .cursor_pointer()
+                .border_b_2()
+                .border_color(if tab == this { white } else { Hsla { a: 0., ..white } })
+                .on_click(cx.listener(move |v, _, _, cx| {
+                    v.views_open = Some(this);
+                    cx.notify();
+                }))
+                .child(label)
+        };
+        let body = match tab {
+            ViewsTab::Views => views,
+            ViewsTab::Replies => replies,
+        };
+        div()
+            .id("story-views-panel")
+            .debug_selector(|| "story-views-panel".into())
+            .absolute()
+            .inset_0()
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(Hsla { h: 0., s: 0., l: 0., a: 0.5 })
+            .on_click(cx.listener(|this, _, _, cx| this.open_views(None, cx)))
+            .child(
+                div()
+                    .id("story-views-sheet")
+                    .w(px(360.))
+                    .max_h(px(480.))
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .rounded(px(12.))
+                    .bg(gpui_kit::rgb(0x2e2e2e))
+                    .text_color(white)
+                    // Clicks inside stay inside.
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .when(tabs, |d| {
+                        d.child(
+                            div()
+                                .flex()
+                                .child(tab_button("story-views-tab", "Views", ViewsTab::Views, cx))
+                                .child(tab_button("story-replies-tab", "Replies", ViewsTab::Replies, cx)),
+                        )
+                    })
+                    .child(div().id("story-views-list").flex_1().min_h_0().overflow_y_scroll().children(body)),
+            )
+            .into_any_element()
     }
 }
 
@@ -467,10 +658,26 @@ impl gpui_kit::Render for StoryViewer {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    // Ours: who's seen it (Desktop's "n views").
+                    // Ours: Desktop's "n views" / "n replies", opening
+                    // who viewed and replied.
                     .when(!theirs, |d| {
-                        let views = story.views.len();
-                        d.child(div().text_sm().text_center().child(if views == 1 { "1 view".to_owned() } else { format!("{views} views") }))
+                        let receipts = self.state.read(cx).story_view_receipts_on();
+                        let label = views_button_text(story.views.len(), story.replies.len(), receipts);
+                        let tab = if receipts || story.replies.is_empty() { ViewsTab::Views } else { ViewsTab::Replies };
+                        d.child(
+                            div()
+                                .id("story-views")
+                                .debug_selector(|| "story-views".into())
+                                .self_center()
+                                .px_3()
+                                .py_1()
+                                .rounded_full()
+                                .cursor_pointer()
+                                .text_sm()
+                                .hover(|d| d.bg(Hsla { a: 0.15, ..white }))
+                                .on_click(cx.listener(move |this, _, _, cx| this.open_views(Some(tab), cx)))
+                                .child(label),
+                        )
                     })
                     // A group's: its replies.
                     .when(theirs && story.group.is_some(), |d| {
@@ -500,6 +707,7 @@ impl gpui_kit::Render for StoryViewer {
                         )
                     }),
             )
+            .when_some(self.views_open, |d, tab| d.child(self.render_views(&story, tab, cx)))
             .into_any_element()
     }
 }
@@ -513,5 +721,14 @@ mod tests {
         assert_eq!(text_seconds(&"x".repeat(16), false), 6.);
         assert_eq!(text_seconds(&"x".repeat(45), false), 7.);
         assert_eq!(text_seconds("short", true), 7., "a link adds two");
+    }
+
+    #[test]
+    fn our_stories_say_views_and_replies_as_desktop_does() {
+        use super::views_button_text;
+        assert_eq!(views_button_text(0, 0, true), "0 views");
+        assert_eq!(views_button_text(1, 1, true), "1 view 1 reply");
+        assert_eq!(views_button_text(3, 0, false), "Views off");
+        assert_eq!(views_button_text(3, 2, false), "2 replies", "replies take the place of Views off");
     }
 }

@@ -23,6 +23,7 @@ pub mod sidebar;
 pub mod sticker_creator;
 pub mod stories;
 pub mod story_creator;
+pub mod story_privacy;
 pub mod story_viewer;
 pub mod syncing;
 pub mod video_viewer;

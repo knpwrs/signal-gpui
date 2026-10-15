@@ -513,8 +513,11 @@ mod tests {
         backend.shutdown();
     }
 
-    #[gpui_kit::test]
-    fn a_text_story_is_written_and_posted(cx: &mut TestAppContext) {
+    /// The demo in a window, with backend events pumped into the model as
+    /// `main.rs` does.
+    fn demo_window(
+        cx: &mut TestAppContext,
+    ) -> (VisualTestContext, Entity<AppState>, Entity<RootView>, Backend, tempfile::TempDir) {
         cx.update(gpui_kit::init);
         cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
@@ -539,18 +542,36 @@ mod tests {
             let state = state.clone();
             gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| RootView::new(state, window, cx))).unwrap()
         });
-        let mut cx = VisualTestContext::from_window(window, cx);
-        let wait = |cx: &mut VisualTestContext, what: &str, done: &dyn Fn(&mut VisualTestContext) -> bool| {
-            for _ in 0..300 {
-                cx.update(|window, _| window.refresh());
-                cx.run_until_parked();
-                if done(cx) {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+        (VisualTestContext::from_window(window, cx), state, root, backend, dir)
+    }
+
+    fn wait(cx: &mut VisualTestContext, what: &str, done: &dyn Fn(&mut VisualTestContext) -> bool) {
+        for _ in 0..300 {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            if done(cx) {
+                return;
             }
-            panic!("timed out waiting for {what}");
-        };
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    fn click(cx: &mut VisualTestContext, what: &'static str) {
+        wait(cx, what, &|cx| cx.debug_bounds(what).is_some());
+        let at = cx.debug_bounds(what).unwrap().center();
+        cx.simulate_click(at, Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    /// The demo's Jordan Reyes.
+    const JORDAN: &str = "00000000-0000-4000-8000-0000000000b0";
+    /// The demo's Maya Chen.
+    const MAYA: &str = "00000000-0000-4000-8000-00000000a11c";
+
+    #[gpui_kit::test]
+    fn a_text_story_is_written_and_posted(cx: &mut TestAppContext) {
+        let (mut cx, state, root, backend, _dir) = demo_window(cx);
         wait(&mut cx, "the demo", &|cx| state.read_with(cx, |s, _| !s.my_stories().is_empty()));
         let before = state.read_with(&cx, |s, _| s.my_stories().len());
         state.update(&mut cx, |s, cx| s.create_text_story(cx));
@@ -563,13 +584,108 @@ mod tests {
                 cx.notify();
             })
         });
-        // My Story is chosen to start with.
+        // Nothing is chosen to start with, as in Desktop.
         wait(&mut cx, "the targets", &|cx| cx.debug_bounds("story-target-my-story").is_some());
+        assert!(creator.read_with(&cx, |c, _| c.targets.is_empty()));
+
+        // The first time, My Story asks who it goes to: all but Jordan.
+        click(&mut cx, "story-target-my-story");
+        wait(&mut cx, "My Story privacy", &|cx| cx.debug_bounds("story-privacy").is_some());
+        assert!(creator.read_with(&cx, |c, _| c.targets.is_empty()), "not until it's saved");
+        click(&mut cx, "privacy-except");
+        click(&mut cx, Box::leak(format!("privacy-pick-{JORDAN}").into_boxed_str()));
+        click(&mut cx, "privacy-picked");
+        click(&mut cx, "privacy-save");
+        wait(&mut cx, "My Story chosen", &|cx| creator.read_with(cx, |c, _| c.targets.contains(&crate::views::story_creator::Target::MyStory)));
+        state.read_with(&cx, |s, _| {
+            assert!(s.my_story_privacy_set);
+            let my = s.my_story();
+            assert!(my.block_list && my.members == [JORDAN]);
+        });
+
         creator.update(&mut cx, |c, cx| c.send(cx));
         wait(&mut cx, "the story to post", &|cx| state.read_with(cx, |s, _| s.my_stories().len() == before + 1));
         let posted = state.read_with(&cx, |s, _| s.my_stories().last().cloned().unwrap());
         assert!(matches!(posted.content, signal_store::StoryContent::Text(ref t) if t.text == "Out on the trail"));
+        let to: Vec<&str> = posted.recipients.iter().map(|r| r.service_id.as_str()).collect();
+        assert!(to.contains(&MAYA) && !to.contains(&JORDAN), "{to:?}");
         assert!(cx.debug_bounds("story-creator").is_none(), "closed once sent");
+        // Saved for next time: the backend kept it.
+        let saved = backend.spawn({
+            let db = backend.db().clone();
+            async move { db.setting(signal_backend::SETTING_MY_STORY_PRIVACY_SET).await }
+        });
+        assert_eq!(futures::executor::block_on(saved).unwrap().as_deref(), Some("true"));
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn a_custom_story_is_made_posted_to_and_deleted(cx: &mut TestAppContext) {
+        let (mut cx, state, root, backend, _dir) = demo_window(cx);
+        wait(&mut cx, "the demo", &|cx| state.read_with(cx, |s, _| !s.my_stories().is_empty()));
+        let privacy = cx
+            .update(|window, cx| {
+                crate::views::story_privacy::show(state.clone(), crate::views::story_privacy::Page::Lists, None, None, window, cx)
+            })
+            .unwrap();
+        click(&mut cx, "privacy-new-story");
+        click(&mut cx, Box::leak(format!("privacy-pick-{MAYA}").into_boxed_str()));
+        click(&mut cx, "privacy-picked");
+        wait(&mut cx, "naming it", &|cx| privacy.read_with(cx, |p, _| p.page == crate::views::story_privacy::Page::Name));
+        cx.update(|window, cx| {
+            let name = privacy.read(cx).name.clone();
+            name.update(cx, |input, cx| input.set_value("Hikers", window, cx));
+        });
+        click(&mut cx, "privacy-create");
+        wait(&mut cx, "the new story", &|cx| state.read_with(cx, |s, _| !s.custom_story_lists().is_empty()));
+        let list = state.read_with(&cx, |s, _| s.custom_story_lists()[0].clone());
+        assert_eq!((list.name.as_str(), list.members.as_slice(), list.block_list, list.allows_replies), ("Hikers", [MAYA.to_owned()].as_slice(), false, true));
+        // It's listed with the others.
+        wait(&mut cx, "its row", &|cx| cx.debug_bounds(Box::leak(format!("privacy-list-{}", list.id).into_boxed_str())).is_some());
+        cx.update(gpui_kit::component::WindowExt::close_all_dialogs);
+
+        // Post to it.
+        let before = state.read_with(&cx, |s, _| s.my_stories().len());
+        state.update(&mut cx, |s, cx| s.create_text_story(cx));
+        wait(&mut cx, "the creator", &|cx| cx.debug_bounds("story-creator").is_some());
+        let creator = root.read_with(&cx, |r, _| r.story_creator.as_ref().map(|(c, _)| c.clone())).unwrap();
+        cx.update(|window, cx| {
+            creator.update(cx, |c, cx| {
+                c.text.update(cx, |input, cx| input.set_value("Trailhead at 8", window, cx));
+                c.choosing = true;
+                cx.notify();
+            })
+        });
+        click(&mut cx, Box::leak(format!("story-target-list-{}", list.id).into_boxed_str()));
+        creator.update(&mut cx, |c, cx| c.send(cx));
+        wait(&mut cx, "the story to post", &|cx| state.read_with(cx, |s, _| s.my_stories().len() == before + 1));
+        let posted = state.read_with(&cx, |s, _| s.my_stories().last().cloned().unwrap());
+        assert_eq!(posted.recipients.len(), 1);
+        assert_eq!((posted.recipients[0].service_id.as_str(), posted.recipients[0].list_ids.as_slice()), (MAYA, [list.id.clone()].as_slice()));
+
+        // Deleted: gone from the lists.
+        state.update(&mut cx, |s, cx| s.delete_story_list(list.id.clone(), cx));
+        wait(&mut cx, "the list to go", &|cx| state.read_with(cx, |s, _| s.custom_story_lists().is_empty()));
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn our_story_shows_who_viewed_and_replied(cx: &mut TestAppContext) {
+        let (mut cx, state, root, backend, _dir) = demo_window(cx);
+        wait(&mut cx, "the demo", &|cx| state.read_with(cx, |s, _| s.my_stories().iter().any(|s| !s.views.is_empty())));
+        state.update(&mut cx, |s, cx| s.view_stories(None, cx));
+        wait(&mut cx, "the viewer", &|cx| cx.debug_bounds("story-viewer").is_some());
+        let viewer = root.read_with(&cx, |r, _| r.story_viewer.as_ref().map(|(v, _)| v.clone())).unwrap();
+        click(&mut cx, "story-views");
+        wait(&mut cx, "the views", &|cx| cx.debug_bounds("story-views-panel").is_some());
+        // Two views and two replies: both tabs.
+        assert!(cx.debug_bounds("story-views-tab").is_some() && cx.debug_bounds("story-replies-tab").is_some());
+        click(&mut cx, "story-replies-tab");
+        assert_eq!(viewer.read_with(&cx, |v, _| v.views_open), Some(crate::views::story_viewer::ViewsTab::Replies));
+        // It waits while they're open, and Escape closes them first.
+        cx.simulate_keystrokes("escape");
+        wait(&mut cx, "the views to close", &|cx| cx.debug_bounds("story-views-panel").is_none());
+        assert!(cx.debug_bounds("story-viewer").is_some());
         backend.shutdown();
     }
 }

@@ -137,21 +137,28 @@ seen in the demo.
 ## Stories
 
 Receiving, viewing, posting (text, photo, video), replies and reactions,
-hiding, and Desktop's tabs work (see the README). Not done yet:
+hiding, story privacy (My Story, custom stories, the first post asking),
+stories off and view receipts for the whole account, who viewed and
+replied to ours, and Desktop's tabs work. Not done yet:
 
 - **Sender keys:** a story goes to each recipient in turn through the
   outbound queue, where Desktop sends to a list at once with sender keys.
   Posting to hundreds of connections takes a while.
-- **Story privacy editing:** My Story's privacy and custom story lists are
-  read from Storage Service but not edited here; the first post doesn't
-  ask, as Desktop does, who My Story should go to.
-- **Writing account settings back:** turning stories off and view
-  receipts are kept on this device; Desktop writes them to the account
-  record (`storiesDisabled`, `storyViewReceiptsEnabled`).
+- **Story privacy, account settings, views and replies** are written
+  against Desktop's code and checked with unit, store and demo-mode UI
+  tests; none of it has been tried with a real account yet (the Storage
+  Service writes for story lists and the account record above all).
+- **Story privacy leftovers:** Desktop's group story settings (a group's
+  viewers, "Remove group story") and "New group story" from the send
+  screen; renaming a custom story; deleting one story of ours ("Delete
+  story" in My Stories), though the backend can delete one for everyone.
+  Stories posted before story recipients were kept can't be deleted for
+  everyone, only here.
+- **Views and replies extras:** a view's time is when we got the receipt,
+  not the receipt's own time; replies can't be deleted from the list, and
+  a group story's replies can't be written from it.
 - **Creator extras:** Desktop's text color slider, links in text stories,
   the image editor, and captions' formatting.
-- **Our stories' views and replies:** counted, but there's no Desktop
-  Views/Replies list to see who.
 - **Desktop's fonts** for text stories (Inter, EB Garamond, Parisienne,
   Barlow Condensed); macOS fonts stand in.
 - **Who we take stories from:** Desktop shows a person's story when it

@@ -130,13 +130,33 @@ fn notifications(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
         .child(choice("notify-off", "Off", NotificationSetting::Off))
 }
 
+/// Desktop's "Turn off stories" confirmation (`Preferences`). It deletes
+/// the stories we sent, as its text says; Desktop's own code
+/// (`ts/state/smart/Preferences.preload.tsx`) calls `deleteAllMyStories`
+/// on turning stories back on instead, which looks like a slip.
+pub fn confirm_stories_off(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
+    window.open_alert_dialog(cx, move |alert, _, _| {
+        let state = state.clone();
+        alert
+            .description("You will no longer be able to share or view stories. Story updates you have recently shared will also be deleted.")
+            .confirm()
+            .ok_text("Turn off")
+            .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
+            .on_ok(move |_, window, cx| {
+                state.update(cx, |s, cx| s.set_stories_disabled(true, cx));
+                window.close_all_dialogs(cx);
+                true
+            })
+    });
+}
+
 /// Desktop's "Share & View Stories" (Privacy) and its story view receipts
-/// (Story privacy).
+/// (Story privacy), both kept in the account record.
 fn stories(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
     let palette = Palette::get(cx);
     let (disabled, receipts) = {
         let s = state.read(cx);
-        (s.stories_disabled, s.story_view_receipts.unwrap_or(true))
+        (s.stories_disabled, s.story_view_receipts_on())
     };
     let (toggle_state, receipts_state) = (state.clone(), state.clone());
     div()
@@ -153,8 +173,12 @@ fn stories(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                     .small()
                     .outline()
                     .on_click(move |_, window, cx| {
-                        toggle_state.update(cx, |s, cx| s.set_stories_disabled(!disabled, cx));
-                        window.refresh();
+                        if disabled {
+                            toggle_state.update(cx, |s, cx| s.set_stories_disabled(false, cx));
+                            window.refresh();
+                        } else {
+                            confirm_stories_off(toggle_state.clone(), window, cx);
+                        }
                     }),
             ),
         )

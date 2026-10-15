@@ -209,6 +209,13 @@ pub struct AppState {
     pub seen_admin_delete_education: bool,
     /// Story view receipts, if set (unset follows read receipts).
     pub story_view_receipts: Option<bool>,
+    /// Read receipts are on (what unset story view receipts follow).
+    pub read_receipts: bool,
+    /// The story lists: My Story's privacy and custom stories.
+    pub story_lists: Vec<signal_backend::StoryList>,
+    /// My Story's viewers were chosen (Desktop's `hasSetMyStoriesPrivacy`);
+    /// until then, choosing My Story asks.
+    pub my_story_privacy_set: bool,
     /// Starts recording a voice message (the microphone; a stand-in in
     /// tests).
     pub start_recorder: crate::recorder::StartRecorder,
@@ -292,6 +299,9 @@ impl AppState {
             stories_disabled: false,
             seen_admin_delete_education: false,
             story_view_receipts: None,
+            read_receipts: true,
+            story_lists: Vec::new(),
+            my_story_privacy_set: false,
             waveforms: HashMap::new(),
             posters: HashMap::new(),
             recent_stickers: Vec::new(),
@@ -753,13 +763,22 @@ impl AppState {
                 db.setting(HIDDEN_STORIES_SETTING).await?,
                 db.setting(signal_backend::SETTING_STORIES_DISABLED).await?,
                 db.setting(signal_backend::SETTING_STORY_VIEW_RECEIPTS).await?,
-                db.setting(ADMIN_DELETE_EDUCATION_SETTING).await?,
+                (
+                    db.setting(signal_backend::SETTING_READ_RECEIPTS).await?,
+                    db.setting(signal_backend::SETTING_STORY_LISTS).await?,
+                    db.setting(signal_backend::SETTING_MY_STORY_PRIVACY_SET).await?,
+                    db.setting(ADMIN_DELETE_EDUCATION_SETTING).await?,
+                ),
             ))
         });
         cx.spawn(async move |this, cx| {
-            let (optimization, recents, giphy, notifications, collapsed, hidden, stories_off, view_receipts, admin_delete_seen) =
+            let (optimization, recents, giphy, notifications, collapsed, hidden, stories_off, view_receipts, more) =
                 read.await.unwrap_or_default();
+            let (read_receipts, lists, privacy_set, admin_delete_seen) = more;
             let _ = this.update(cx, |this, cx| {
+                this.read_receipts = read_receipts.as_deref() != Some("false");
+                this.story_lists = lists.and_then(|l| serde_json::from_str(&l).ok()).unwrap_or_default();
+                this.my_story_privacy_set = privacy_set.as_deref() == Some("true");
                 this.nav_collapsed = collapsed.as_deref() == Some("true");
                 this.hidden_stories = hidden
                     .and_then(|h| serde_json::from_str::<Vec<String>>(&h).ok())
@@ -822,26 +841,17 @@ impl AppState {
     }
 
     /// Desktop's "Turn off stories" / "Turn on stories": off, none are kept
-    /// or shown, and the tab goes.
+    /// or shown (ours are deleted for everyone), and the tab goes; for the
+    /// whole account.
     pub fn set_stories_disabled(&mut self, disabled: bool, cx: &mut Context<Self>) {
         self.stories_disabled = disabled;
         if disabled && self.tab == NavTab::Stories {
             self.tab = NavTab::Chats;
         }
-        self.save_setting(signal_backend::SETTING_STORIES_DISABLED, disabled.to_string(), cx);
         if disabled {
             self.stories.clear();
-            let db = self.backend.db().clone();
-            let remove = self.backend.spawn(async move { db.remove_all_stories().await });
-            cx.background_spawn(async move {
-                if let Ok(files) = remove.await {
-                    for file in files {
-                        let _ = std::fs::remove_file(file);
-                    }
-                }
-            })
-            .detach();
         }
+        self.send(Command::SetStoriesDisabled(disabled));
         cx.notify();
     }
 
@@ -854,10 +864,47 @@ impl AppState {
     }
 
     /// Whether we tell people we viewed their stories (and see who viewed
-    /// ours); unset follows read receipts, as in Desktop.
+    /// ours), for the whole account.
     pub fn set_story_view_receipts(&mut self, on: bool, cx: &mut Context<Self>) {
         self.story_view_receipts = Some(on);
-        self.save_setting(signal_backend::SETTING_STORY_VIEW_RECEIPTS, on.to_string(), cx);
+        self.send(Command::SetStoryViewReceipts(on));
+        cx.notify();
+    }
+
+    /// Story view receipts are on: as set, else as read receipts are
+    /// (Desktop's `areStoryViewReceiptsEnabled`).
+    pub fn story_view_receipts_on(&self) -> bool {
+        self.story_view_receipts.unwrap_or(self.read_receipts)
+    }
+
+    /// My Story's privacy, or as Desktop starts it.
+    pub fn my_story(&self) -> signal_backend::StoryList {
+        self.story_lists.iter().find(|l| l.is_my_story()).cloned().unwrap_or_else(signal_backend::StoryList::my_story)
+    }
+
+    /// The custom stories, in Storage Service's order.
+    pub fn custom_story_lists(&self) -> Vec<signal_backend::StoryList> {
+        self.story_lists.iter().filter(|l| !l.is_my_story()).cloned().collect()
+    }
+
+    /// Saves a story list (a new one is added), here at once and for the
+    /// whole account.
+    pub fn save_story_list(&mut self, list: signal_backend::StoryList, cx: &mut Context<Self>) {
+        match self.story_lists.iter_mut().find(|l| l.id == list.id) {
+            Some(existing) => *existing = list.clone(),
+            None => self.story_lists.push(list.clone()),
+        }
+        if list.is_my_story() {
+            self.my_story_privacy_set = true;
+        }
+        self.send(Command::SaveStoryList(list));
+        cx.notify();
+    }
+
+    /// Deletes a custom story, and what was sent to it.
+    pub fn delete_story_list(&mut self, id: String, cx: &mut Context<Self>) {
+        self.story_lists.retain(|l| l.id != id || l.is_my_story());
+        self.send(Command::DeleteStoryList { id });
         cx.notify();
     }
 
