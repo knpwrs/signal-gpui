@@ -34,9 +34,9 @@ const REACTION_VIEWER_WIDTH: f32 = 320.;
 const REACTION_VIEWER_HEIGHT: f32 = 320.;
 
 pub struct ConversationView {
-    state: Entity<AppState>,
+    pub(crate) state: Entity<AppState>,
     pub id: ConversationId,
-    messages: Vec<Message>,
+    pub(crate) messages: Vec<Message>,
     list: ListState,
     composer: Entity<Composer>,
     picker: Entity<EmojiPicker>,
@@ -261,7 +261,9 @@ impl ConversationView {
         use signal_store::Notice;
         let text = crate::views::notices::notice_text(notice, |sid| self.reactor_name(Some(sid), cx));
         let go_to = match notice {
-            Notice::Pinned { author, sent_at, .. } => Some((author.clone(), *sent_at)),
+            Notice::Pinned { author, sent_at, .. } => Some((author.clone(), *sent_at, "Go to message", "Pinned message not found")),
+            // Desktop's "View poll" (`PollTerminateNotification`).
+            Notice::PollEnded { by, sent_at, .. } => Some((by.clone(), *sent_at, "View poll", "Poll not found")),
             _ => None,
         };
         // Desktop's "Call back" / "Call again".
@@ -304,12 +306,12 @@ impl ConversationView {
                     .text_sm()
                     .text_color(palette.text_secondary)
                     .child(div().text_center().child(text))
-                    .when_some(go_to, |d, (author, at)| {
+                    .when_some(go_to, |d, (author, at, label, missing)| {
                         d.child(
-                            Button::new(SharedString::from(format!("notice-go-{at}")))
-                                .label("Go to message")
+                            Button::new(SharedString::from(format!("notice-go-{sent_at}")))
+                                .label(label)
                                 .ghost()
-                                .on_click(cx.listener(move |this, _, _, cx| this.go_to(author.clone(), at, "Pinned message not found", cx))),
+                                .on_click(cx.listener(move |this, _, _, cx| this.go_to(author.clone(), at, missing, cx))),
                         )
                     })
                     .when_some(call_back, |d, (incoming, video)| {
@@ -1402,8 +1404,15 @@ impl ConversationView {
                 .into_any_element();
         }
 
+        // A poll shows in place of its text (its body is the question).
+        let poll = message.poll.as_ref().filter(|_| !message.deleted).map(|poll| {
+            let can_vote = !self.id.is_signal()
+                && self.state.read(cx).conversation(&self.id).is_none_or(|c| !c.left && !c.blocked);
+            let secondary = if outgoing { meta_color } else { palette.text_secondary };
+            crate::views::poll::render_poll(message, poll, outgoing, fg, secondary, can_vote, palette, cx.entity().downgrade(), self.state.clone())
+        });
         // The time shares the last line of text when it fits, as in Desktop.
-        let inline_meta = meta.is_some() && !message.deleted && !message.body.is_empty();
+        let inline_meta = meta.is_some() && !message.deleted && !message.body.is_empty() && poll.is_none();
         let spacer = inline_meta.then(|| meta_spacer(message, cx));
         corners
             .apply(div())
@@ -1432,6 +1441,8 @@ impl ConversationView {
             .map(|d| {
                 if message.deleted {
                     d.child(div().italic().child(self.deleted_text(message, cx)))
+                } else if let Some(poll) = poll {
+                    d.child(poll)
                 } else if !message.body.is_empty() {
                     d.child(message_text(message, fg, self.revealed_spoilers.contains(&message.id), spacer.as_deref().map(|s| (s, bg)), cx))
                 } else {
@@ -1970,7 +1981,7 @@ impl ConversationView {
 
     /// A reactor's name from what this view already knows: their direct
     /// conversation's title, or a name they posted under here.
-    fn reactor_name(&self, author: Option<&str>, cx: &App) -> String {
+    pub(crate) fn reactor_name(&self, author: Option<&str>, cx: &App) -> String {
         let Some(author) = author else { return "You".into() };
         let state = self.state.read(cx);
         state
@@ -3239,7 +3250,8 @@ fn message_menu(
         }
     };
     let mut menu = menu;
-    if !message.deleted {
+    // Desktop doesn't forward polls (`canForward`).
+    if !message.deleted && message.poll.is_none() {
         let state = state.clone();
         menu = menu.item(
             PopupMenuItem::new("Forward")
@@ -3279,7 +3291,17 @@ fn message_menu(
             .icon(IconName::SquareCheck)
             .on_click(with_view(|this, id, _, cx| this.start_selecting(Some(id), cx))),
     );
-    if !message.body.is_empty() && !message.deleted {
+    // Desktop's "End poll", on our own poll until it's ended.
+    if message.direction == Direction::Outgoing && message.poll.as_ref().is_some_and(|p| !p.ended) && !message.deleted {
+        let state = state.clone();
+        menu = menu.item(
+            PopupMenuItem::new("End poll")
+                .icon(IconName::ChartBar)
+                .on_click(move |_, _, cx| state.read(cx).send(Command::EndPoll { message_id: id })),
+        );
+    }
+    // A poll has no text to copy (its body is the question).
+    if !message.body.is_empty() && !message.deleted && message.poll.is_none() {
         let body = message.body.clone();
         menu = menu.item(
             PopupMenuItem::new("Copy text")
@@ -4686,6 +4708,88 @@ mod tests {
                 assert!(pills.right() < bubble.right() && pills.right() > bubble.right() - px(20.), "{pills:?} vs {bubble:?}");
             }
         }
+        backend.shutdown();
+    }
+
+    const HOUSE: &str = "g:0000000000000000000000000000000000000000000000000000000000000003";
+
+    /// Waits for the demo to have changed a message as `done` says, then
+    /// tells the view, as `main.rs` would.
+    fn changed(cx: &mut VisualTestContext, view: &Entity<ConversationView>, backend: &Backend, chat: &str, done: impl Fn(&Message) -> bool) -> Message {
+        let message = wait_for_messages(backend, chat, 1, done).remove(0);
+        let state = view.read_with(cx, |v, _| v.state.clone());
+        let event = signal_backend::Event::MessageChanged { conversation: ConversationId(chat.into()), message_id: message.id };
+        state.update(cx, |state, cx| state.handle(event, cx));
+        cx.run_until_parked();
+        message
+    }
+
+    #[gpui_kit::test]
+    fn voting_in_a_poll_counts_and_changes_our_vote(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        let poll = wait_for_messages(&backend, HOUSE, 1, |m| m.poll.is_some()).remove(0);
+        let id = poll.id;
+        let (mut cx, view) = open_view(cx, &backend, HOUSE);
+        // The demo's: Leo chose Tuesday and Sunday, Ana Sunday.
+        bounds(&mut cx, format!("poll-{id}"));
+        assert_eq!(poll.poll.as_ref().unwrap().tally().count(2), 2);
+        bounds(&mut cx, format!("poll-{id}-count-2"));
+
+        let tuesday = bounds(&mut cx, format!("poll-{id}-option-0"));
+        cx.simulate_click(tuesday.center(), gpui_kit::Modifiers::none());
+        let voted = changed(&mut cx, &view, &backend, HOUSE, |m| m.poll.as_ref().is_some_and(|p| !p.tally().ours.is_empty()));
+        let tally = voted.poll.unwrap().tally();
+        assert_eq!(tally.ours, [0].into());
+        assert_eq!((tally.count(0), tally.unique_voters), (2, 3));
+
+        // Multiple choice: Sunday too; then Tuesday off again.
+        let sunday = bounds(&mut cx, format!("poll-{id}-option-2"));
+        cx.simulate_click(sunday.center(), gpui_kit::Modifiers::none());
+        changed(&mut cx, &view, &backend, HOUSE, |m| m.poll.as_ref().is_some_and(|p| p.tally().ours.len() == 2));
+        let tuesday = bounds(&mut cx, format!("poll-{id}-option-0"));
+        cx.simulate_click(tuesday.center(), gpui_kit::Modifiers::none());
+        let last = changed(&mut cx, &view, &backend, HOUSE, |m| m.poll.as_ref().is_some_and(|p| p.tally().ours == [2].into()));
+        let poll = last.poll.unwrap();
+        let ours: Vec<u32> = poll.votes.iter().filter(|v| v.author.is_none()).map(|v| v.vote_count).collect();
+        assert_eq!(ours, [3], "one vote of ours, the third");
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn our_poll_can_be_ended_and_says_so(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        wait_for_messages(&backend, GROUP, 1, |_| true);
+        let (mut cx, view) = open_view(cx, &backend, GROUP);
+        backend.send(Command::SendPoll {
+            conversation: ConversationId(GROUP.into()),
+            question: " Start time? ".into(),
+            options: vec!["7:30".into(), " ".into(), "8:30".into(), String::new()],
+            allow_multiple: false,
+        });
+        let sent = changed(&mut cx, &view, &backend, GROUP, |m| m.poll.is_some());
+        let poll = sent.poll.clone().unwrap();
+        assert_eq!(sent.body, "Start time?");
+        assert_eq!((poll.options.clone(), poll.allow_multiple), (vec!["7:30".to_owned(), "8:30".to_owned()], false));
+        let id = sent.id;
+        bounds(&mut cx, format!("poll-{id}"));
+        // Single choice: picking 8:30 after 7:30 moves the vote.
+        let first = bounds(&mut cx, format!("poll-{id}-option-0"));
+        cx.simulate_click(first.center(), gpui_kit::Modifiers::none());
+        changed(&mut cx, &view, &backend, GROUP, |m| m.poll.as_ref().is_some_and(|p| p.tally().ours == [0].into()));
+        let second = bounds(&mut cx, format!("poll-{id}-option-1"));
+        cx.simulate_click(second.center(), gpui_kit::Modifiers::none());
+        changed(&mut cx, &view, &backend, GROUP, |m| m.poll.as_ref().is_some_and(|p| p.tally().ours == [1].into()));
+
+        backend.send(Command::EndPoll { message_id: id });
+        let ended = changed(&mut cx, &view, &backend, GROUP, |m| m.poll.as_ref().is_some_and(|p| p.ended));
+        assert_eq!(crate::views::poll::status_text(ended.poll.as_ref().unwrap()), "Poll · Final results");
+        let notice = changed(&mut cx, &view, &backend, GROUP, |m| matches!(m.notice, Some(signal_store::Notice::PollEnded { .. })));
+        let text = crate::views::notices::notice_text(notice.notice.as_ref().unwrap(), |_| "?".into());
+        assert_eq!(text, "You ended the poll: Start time?");
+        // Ended: no more voting.
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds(Box::leak(format!("poll-{id}-option-0").into_boxed_str())).is_none());
         backend.shutdown();
     }
 }

@@ -17,6 +17,7 @@ gpui_kit::assets::icon_assets!(
         Bell,
         BellOff,
         ChevronLeft,
+        ChartBar,
         CheckCheck,
         CircleAlert,
         Clock,

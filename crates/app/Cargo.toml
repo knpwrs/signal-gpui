@@ -35,6 +35,8 @@ qrcode = { version = "0.14", default-features = false }
 # (libwebp), as Desktop's creator encodes them.
 webp = { version = "0.3", default-features = false }
 rand = "0.9"
+# Poll limits count characters as Desktop does: graphemes.
+unicode-segmentation = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"

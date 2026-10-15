@@ -1117,6 +1117,47 @@ impl Composer {
         cx.notify();
     }
 
+    /// The paperclip picks files. Where polls can be made it opens Desktop's
+    /// attach menu instead (`CompositionArea`): File, and Poll.
+    fn render_attach_button(&self, palette: Palette, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        use gpui_kit::component::button::{Button, ButtonVariants as _};
+        use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+        let polls = !self.conversation.is_signal()
+            && self.state.read(cx).conversation(&self.conversation).is_some_and(|c| signal_backend::can_create_poll(c.kind));
+        if !polls {
+            return div()
+                .id("attach-button")
+                .flex_none()
+                .size(px(32.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .cursor_pointer()
+                .hover(|d| d.bg(palette.row_hover))
+                .on_click(cx.listener(|this, _, window, cx| this.pick_files(window, cx)))
+                .child(Icon::new(IconName::Paperclip).size_5().text_color(palette.text_secondary))
+                .into_any_element();
+        }
+        let this = cx.entity().downgrade();
+        let (state, conversation) = (self.state.clone(), self.conversation.clone());
+        Button::new("attach-button")
+            .ghost()
+            .rounded_full()
+            .icon(Icon::new(IconName::Paperclip).size_5().text_color(palette.text_secondary))
+            .tooltip("Add attachment or poll")
+            .dropdown_menu(move |menu, _, _| {
+                let (this, state, conversation) = (this.clone(), state.clone(), conversation.clone());
+                menu.item(PopupMenuItem::new("File").icon(IconName::File).on_click(move |_, window, cx| {
+                    let _ = this.update(cx, |this, cx| this.pick_files(window, cx));
+                }))
+                .item(PopupMenuItem::new("Poll").icon(IconName::ChartBar).on_click(move |_, window, cx| {
+                    crate::views::poll::open_create(state.clone(), conversation.clone(), window, cx)
+                }))
+            })
+            .into_any_element()
+    }
+
     fn render_typeahead(&self, typeahead: &Typeahead, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let tone = self.skin_tone(cx);
         div()
@@ -1489,20 +1530,7 @@ impl Render for Composer {
                             }))
                             .child(Icon::new(IconName::FaceSlightlySmiling).size_5().text_color(palette.text_secondary)),
                     )
-                    .child(
-                        div()
-                            .id("attach-button")
-                            .flex_none()
-                            .size(px(32.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_full()
-                            .cursor_pointer()
-                            .hover(|d| d.bg(palette.row_hover))
-                            .on_click(cx.listener(|this, _, window, cx| this.pick_files(window, cx)))
-                            .child(Icon::new(IconName::Paperclip).size_5().text_color(palette.text_secondary)),
-                    )
+                    .child(self.render_attach_button(palette, cx))
                     .child(
                         // One line tall when empty, like Signal Desktop: the
                         // pill supplies the padding, the textarea none.

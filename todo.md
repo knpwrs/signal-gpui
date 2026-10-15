@@ -23,7 +23,7 @@ flag as on whenever it's set.
 |---|---|---|
 | `adminDelete.receive` / `.send` | Group admins deleting anyone's message for everyone. Desktop turns receiving and sending on separately (`isAdminDeleteReceiveEnabled` / `isAdminDeleteSendEnabled`). | Done, both always on. People whose clients don't know `adminDelete` yet still see the message. |
 | `stickerReply.send` | Sending a sticker as a reply (with a quote). | Done, always on. GIFs sent while replying still drop the reply. |
-| `pollSend1to1` | Creating polls in 1:1 chats (groups already have polls). | Polls aren't supported: received ones show only as "📊 Poll: question". |
+| `pollSend1to1` | Creating polls in 1:1 chats (groups already have polls). | Off (`signal_backend::POLLS_IN_DIRECT_CHATS`), as Desktop is while the flag isn't set: polls are made in groups only. Received 1:1 polls show and can be voted in. |
 | `groupMemberLabels.edit` | Editing your own member label in a group. | Done (Group settings), always on: whether you may set one follows the group's label access, as Desktop's `getCanAddLabel`. |
 | `groupTerminate.send` | Admins ending a group for everyone. | Not done. We also don't know when a group was ended, so we'd still let you send to it. Desktop blocks sends and delete-for-everyone in ended groups. |
 | `binaryServiceId` | Sending service ids in the binary proto fields (`*Binary`) instead of strings. | We accept both and send strings, which is still valid. |
@@ -63,6 +63,26 @@ Desktop keeps a delete for everyone (the author's or an admin's) whose
 message hasn't arrived yet and applies it when the message does
 (`ts/messageModifiers/Deletes.preload.ts`, `forMessage`). We drop it, so
 the message shows when it comes.
+
+## Polls
+
+Receiving, voting, making (in groups) and ending polls work, following
+Desktop's `messageModifiers/Polls.preload.ts` and `PollCreateModal`.
+Tested with store, mapping and history import unit tests and demo-mode
+UI tests; not yet tried with a real account or against phones. Not done:
+
+- **Who may vote:** Desktop counts a vote on our poll only from someone
+  it was sent to (per-recipient send states). We don't keep those, so
+  any member of the chat counts.
+- **Unread:** Desktop counts votes on our polls (`hasUnreadPollVotes`)
+  and someone else's "ended the poll" as unread, and the end notice
+  becomes the chat's preview. Here both notify but don't count as
+  unread, so their notifications stay until dismissed.
+- **Sending votes:** a vote that fails is taken back rather than retried
+  (Desktop's job queue retries), and a group send that reaches only some
+  members counts as failed. There's no pending spinner, only a fainter
+  checkbox.
+- **New poll dialog:** Desktop's emoji picker beside each option.
 
 ## Sticker pack creator
 
