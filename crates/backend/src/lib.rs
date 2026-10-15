@@ -214,6 +214,18 @@ pub enum Command {
     ReplyToStory { id: i64, body: String, emoji: Option<String> },
     /// Posts a story to each of `targets`.
     PostStory { story: OutgoingStory, targets: Vec<StoryTarget> },
+    /// Saves a story list (My Story's privacy, or a custom story), here and
+    /// in Storage Service; a new id adds one.
+    SaveStoryList(StoryList),
+    /// Deletes a custom story list, and the stories sent to it for
+    /// everyone (Desktop's `deleteDistributionList`).
+    DeleteStoryList { id: String },
+    /// Turns stories off (deleting the ones we sent, for everyone) or on,
+    /// for the whole account (`AccountRecord.storiesDisabled`).
+    SetStoriesDisabled(bool),
+    /// Story view receipts on or off, for the whole account
+    /// (`AccountRecord.storyViewReceiptsEnabled`).
+    SetStoryViewReceipts(bool),
     /// Calls a 1:1 chat (Desktop's call buttons, after the lobby).
     StartCall { conversation: ConversationId, video: bool },
     /// Answers the ringing call, with our camera on or off.
@@ -258,7 +270,7 @@ pub enum ChatChange {
 }
 
 /// A story list (Desktop's distribution list), from Storage Service.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct StoryList {
     /// Its UUID; My Story's is [`MY_STORY_ID`].
     pub id: String,
@@ -269,10 +281,29 @@ pub struct StoryList {
     pub allows_replies: bool,
 }
 
+impl StoryList {
+    /// My Story as Desktop starts it: all Signal connections, replies on.
+    pub fn my_story() -> Self {
+        Self { id: MY_STORY_ID.into(), name: String::new(), members: Vec::new(), block_list: true, allows_replies: true }
+    }
+
+    pub fn is_my_story(&self) -> bool {
+        self.id == MY_STORY_ID
+    }
+
+    /// A new custom story (Desktop's `createDistributionList`): replies on.
+    pub fn new_custom(name: String, members: Vec<String>) -> Self {
+        Self { id: uuid::Uuid::new_v4().to_string(), name, members, block_list: false, allows_replies: true }
+    }
+}
+
 /// Desktop's `MY_STORY_ID`.
 pub const MY_STORY_ID: &str = "00000000-0000-0000-0000-000000000000";
 /// Settings key: the story lists (JSON [`StoryList`]s), from Storage Service.
 pub const SETTING_STORY_LISTS: &str = "story_lists";
+/// Settings key: `"true"` once My Story's viewers were chosen (the
+/// account's `hasSetMyStoriesPrivacy`); until then the first post asks.
+pub const SETTING_MY_STORY_PRIVACY_SET: &str = "my_story_privacy_set";
 /// Settings key: chats whose stories are hidden (JSON conversation ids).
 pub const SETTING_HIDDEN_STORIES: &str = signal_store::HIDDEN_STORIES;
 
@@ -367,6 +398,8 @@ pub enum OutgoingStory {
 pub enum StoryTarget {
     /// My Story: whoever its privacy says.
     MyStory,
+    /// A custom story list, by id.
+    List(String),
     /// A group's story, to its members.
     Group(ConversationId),
 }

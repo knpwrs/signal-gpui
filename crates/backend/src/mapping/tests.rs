@@ -737,9 +737,29 @@ fn story_replies_go_with_the_story_in_groups_and_to_the_chat_one_to_one() {
     let mut reply = text("love it", 610);
     reply.story_context = Some(data_message::StoryContext { author_aci: Some(ME.into()), sent_timestamp: Some(300), ..Default::default() });
     let actions = map_content(&content(ALICE, reply), &ctx());
-    let [Action::Insert { message, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+    let [Action::StoryReply { story_author: None, story_sent_at: 300, reply: kept, .. }, Action::Insert { message, .. }] =
+        actions.as_slice()
+    else {
+        panic!("{actions:?}")
+    };
+    assert_eq!((kept.author.as_deref(), kept.body.as_str()), (Some(ALICE), "love it"), "kept with our story too");
     let quote = message.quote.as_ref().unwrap();
     assert_eq!((message.body.as_str(), quote.story, quote.author.as_ref(), quote.sent_at, quote.text.as_str()), ("love it", true, None, 300, "Story"));
+
+    // Ours to Bob's story, from another device: only the chat message.
+    let mut ours = text("ha", 615);
+    ours.story_context = Some(context.clone());
+    let sync = SyncMessage {
+        content: Some(sync_message::Content::Sent(sync_message::Sent {
+            destination_service_id: Some(BOB.into()),
+            timestamp: Some(615),
+            message: Some(ours),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let actions = map_content(&content(ME, sync), &ctx());
+    assert!(matches!(actions.as_slice(), [Action::Insert { .. }]), "{actions:?}");
 
     // A reaction to it: the emoji, "Reacted to your story" (not a lost
     // reaction to a message).
@@ -752,8 +772,52 @@ fn story_replies_go_with_the_story_in_groups_and_to_the_chat_one_to_one() {
         ..Default::default()
     });
     let actions = map_content(&content(ALICE, reaction), &ctx());
-    let [Action::Insert { message, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+    let [Action::StoryReply { reply, .. }, Action::Insert { message, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+    assert_eq!(reply.emoji.as_deref(), Some("🔥"));
     assert_eq!((message.body.as_str(), message.quote.as_ref().unwrap().text.as_str()), ("🔥", "Reacted to your story"));
+}
+
+#[test]
+fn our_stories_keep_who_they_went_to_and_recipient_updates() {
+    let recipient = |sid: &str, lists: &[&str], replies| sync_message::sent::StoryMessageRecipient {
+        destination_service_id: Some(sid.into()),
+        distribution_list_ids: lists.iter().map(|l| (*l).to_owned()).collect(),
+        is_allowed_to_reply: Some(replies),
+        ..Default::default()
+    };
+    let binary = sync_message::sent::StoryMessageRecipient {
+        destination_service_id_binary: Some(ServiceId::parse_from_service_id_string(BOB).unwrap().service_id_binary()),
+        distribution_list_ids: vec!["list".into()],
+        ..Default::default()
+    };
+    let sync = SyncMessage {
+        content: Some(sync_message::Content::Sent(sync_message::Sent {
+            timestamp: Some(700),
+            story_message: Some(text_story("Mine")),
+            story_message_recipients: vec![recipient(ALICE, &["my", "list"], true), binary],
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let actions = map_content(&content(ME, sync), &ctx());
+    let [Action::Story { story, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+    let kept: Vec<_> = story.recipients.iter().map(|r| (r.service_id.as_str(), r.list_ids.len(), r.allows_replies)).collect();
+    assert_eq!(kept, [(ALICE, 2, true), (BOB, 1, false)]);
+
+    // Deleted on the phone: a recipient update, with no story.
+    let sync = SyncMessage {
+        content: Some(sync_message::Content::Sent(sync_message::Sent {
+            destination_service_id: Some(ME.into()),
+            timestamp: Some(700),
+            story_message_recipients: vec![recipient(ALICE, &[], true)],
+            is_recipient_update: Some(true),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let actions = map_content(&content(ME, sync), &ctx());
+    let [Action::StoryRecipientUpdate { sent_at: 700, recipients }] = actions.as_slice() else { panic!("{actions:?}") };
+    assert!(recipients[0].list_ids.is_empty());
 }
 
 #[test]

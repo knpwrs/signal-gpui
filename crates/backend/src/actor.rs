@@ -224,6 +224,9 @@ struct Actor {
     storage_synced: RefCell<bool>,
     /// Long texts cut off last time have been tried again this session.
     long_texts_resumed: RefCell<bool>,
+    /// Held across a story list edit's read and write of the saved lists,
+    /// so two edits at once don't undo each other.
+    story_lists_edit: tokio::sync::Mutex<()>,
     /// Wakes the disappearing-message sweeper when a countdown starts.
     expiry: tokio::sync::Notify,
     /// The last timestamp we sent with: each send gets a later one, since
@@ -293,6 +296,7 @@ pub(crate) async fn run(
         linking: RefCell::new(false),
         storage_synced: RefCell::new(false),
         long_texts_resumed: RefCell::new(false),
+        story_lists_edit: tokio::sync::Mutex::new(()),
         expiry: tokio::sync::Notify::new(),
         last_sent_at: std::cell::Cell::new(0),
     });
@@ -599,6 +603,10 @@ impl Actor {
                     let this = self.clone();
                     tokio::task::spawn_local(async move { this.post_story(story, targets).await });
                 }
+                Command::SaveStoryList(list) => self.save_story_list(list).await,
+                Command::DeleteStoryList { id } => self.delete_story_list(id).await,
+                Command::SetStoriesDisabled(disabled) => self.set_stories_disabled(disabled).await,
+                Command::SetStoryViewReceipts(on) => self.set_story_view_receipts(on).await,
                 Command::StartCall { conversation, video } => self.start_call(conversation, video),
                 Command::AcceptCall { video } => self.accept_call(video),
                 Command::DeclineCall | Command::HangUp => self.hang_up(),
@@ -993,6 +1001,7 @@ impl Actor {
             Action::Delete { conversation, target_author, target_sent_at, sent_at } => {
                 // Found by author too, so only the author's delete matches.
                 let Some(message) = self.db.find_message(&conversation, target_author.as_deref(), target_sent_at).await.ok().flatten() else {
+                    self.apply_story_delete(target_author.as_deref(), target_sent_at).await;
                     return;
                 };
                 if !crate::deletes::can_receive(&message, self.is_note_to_self(&conversation), sent_at) {
@@ -1098,6 +1107,7 @@ impl Actor {
                 self.apply_story_reply(group, story_author, story_sent_at, reply).await
             }
             Action::StoryViewed { viewer, sent_at } => self.apply_story_viewed(viewer, sent_at).await,
+            Action::StoryRecipientUpdate { sent_at, recipients } => self.apply_story_recipient_update(sent_at, recipients).await,
             Action::ViewedSync(viewed) => self.apply_viewed_sync(viewed).await,
             Action::ReadSync(entries) => {
                 let mut changed = false;
@@ -1773,6 +1783,7 @@ impl Actor {
             hidden_stories,
             stories_disabled,
             story_view_receipts,
+            my_story_privacy_set,
         } = match storage::fetch(manager).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -1793,7 +1804,17 @@ impl Actor {
         {
             warn!(%error, "failed to save link preview setting");
         }
-        self.save_story_settings(story_lists, hidden_stories, stories_disabled, story_view_receipts).await;
+        {
+            let _edit = self.story_lists_edit.lock().await;
+            self.save_story_settings(
+                Some(story_lists),
+                Some(hidden_stories),
+                stories_disabled,
+                story_view_receipts,
+                my_story_privacy_set,
+            )
+            .await;
+        }
         match self.db.apply_chat_states(&chats).await {
             Ok(true) => self.emit(Event::ConversationsChanged),
             Ok(false) => {}

@@ -487,6 +487,7 @@ async fn seed_stories(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
         pointer: None,
         allows_replies: true,
         read: author.is_none(),
+        recipients: Vec::new(),
     };
     let text = |text: &str, font, background| {
         StoryContent::Text(TextStory { text: text.into(), font, foreground: None, text_background: None, background, preview: None })
@@ -520,9 +521,47 @@ async fn seed_stories(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
     db.insert_story(&group, now).await?;
     let reply = StoryReply { author: Some(aci(SAM).into()), author_name: Some("Sam Okafor".into()), sent_at: now - 2 * HOUR, body: "Me!".into(), emoji: None };
     db.add_story_reply(Some(aci(PRIYA)), group.sent_at, &reply).await?;
-    db.insert_story(&story(None, None, HOUR, None, text("Packing for the weekend", StoryFont::Script, StoryBackground::Color(0xff4437d8))), now)
-        .await?;
+    // Ours, to My Story: seen by two, with a reply and a reaction.
+    let mine = NewStory {
+        recipients: [MAYA, JORDAN, SAM]
+            .iter()
+            .map(|p| signal_store::StoryRecipient {
+                service_id: aci(p).into(),
+                list_ids: vec![crate::MY_STORY_ID.into()],
+                allows_replies: true,
+            })
+            .collect(),
+        ..story(None, None, HOUR, None, text("Packing for the weekend", StoryFont::Script, StoryBackground::Color(0xff4437d8)))
+    };
+    db.insert_story(&mine, now).await?;
+    db.add_story_view(mine.sent_at, aci(MAYA), now - 50 * MINUTE).await?;
+    db.add_story_view(mine.sent_at, aci(JORDAN), now - 20 * MINUTE).await?;
+    let reply = |who: &str, name: &str, ago: i64, body: &str, emoji: bool| StoryReply {
+        author: Some(aci(who).into()),
+        author_name: Some(name.into()),
+        sent_at: now - ago,
+        body: body.into(),
+        emoji: emoji.then(|| body.into()),
+    };
+    db.add_story_reply(None, mine.sent_at, &reply(MAYA, "Maya Chen", 45 * MINUTE, "Where to?", false)).await?;
+    db.add_story_reply(None, mine.sent_at, &reply(JORDAN, "Jordan Reyes", 15 * MINUTE, "😮", true)).await?;
     Ok(())
+}
+
+/// Who a demo story list sends to, as the real backend works it out
+/// (`list_members`): My Story as a block list is everyone in the demo's
+/// contacts but those it names.
+async fn demo_list_members(db: &AppDb, list: &crate::StoryList) -> Vec<String> {
+    if list.is_my_story() && list.block_list {
+        let people = db.people().await.unwrap_or_default();
+        people.into_iter().filter_map(|p| p.id.as_direct().map(str::to_owned)).filter(|p| !list.members.contains(p)).collect()
+    } else {
+        list.members.clone()
+    }
+}
+
+async fn demo_story_lists(db: &AppDb) -> Vec<crate::StoryList> {
+    db.setting(crate::SETTING_STORY_LISTS).await.ok().flatten().and_then(|json| serde_json::from_str(&json).ok()).unwrap_or_default()
 }
 
 fn write_demo_photo(path: &Path, width: u32, height: u32) -> std::io::Result<()> {
@@ -1181,10 +1220,44 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
             }
             // Demo stories are here already, and replies go nowhere.
             Command::FetchStory { .. } | Command::ReplyToStory { .. } => {}
-            // A posted story is ours here at once; nothing is sent.
+            // A posted story is ours here at once; nothing is sent. Story
+            // lists share one story (and timestamp), as in `post_story`.
             Command::PostStory { story, targets } => {
                 let now = now();
-                for (ix, target) in targets.iter().enumerate() {
+                let all_lists = demo_story_lists(&db).await;
+                let mut recipients: Vec<signal_store::StoryRecipient> = Vec::new();
+                let mut groups = Vec::new();
+                for target in &targets {
+                    let list = match target {
+                        crate::StoryTarget::MyStory => {
+                            all_lists.iter().find(|l| l.is_my_story()).cloned().unwrap_or_else(crate::StoryList::my_story)
+                        }
+                        crate::StoryTarget::List(id) => match all_lists.iter().find(|l| &l.id == id) {
+                            Some(list) => list.clone(),
+                            None => continue,
+                        },
+                        crate::StoryTarget::Group(group) => {
+                            groups.push(group.clone());
+                            continue;
+                        }
+                    };
+                    for member in demo_list_members(&db, &list).await {
+                        match recipients.iter_mut().find(|r| r.service_id == member) {
+                            Some(r) => {
+                                r.list_ids.push(list.id.clone());
+                                r.allows_replies |= list.allows_replies;
+                            }
+                            None => recipients.push(signal_store::StoryRecipient {
+                                service_id: member,
+                                list_ids: vec![list.id.clone()],
+                                allows_replies: list.allows_replies,
+                            }),
+                        }
+                    }
+                }
+                let to_lists = targets.iter().any(|t| !matches!(t, crate::StoryTarget::Group(_)));
+                let rows = to_lists.then_some(None).into_iter().chain(groups.into_iter().map(Some));
+                for (ix, group) in rows.enumerate() {
                     let content = match &story {
                         crate::OutgoingStory::Text(text) => signal_store::StoryContent::Text((**text).clone()),
                         crate::OutgoingStory::Media { bytes, content_type, caption } => {
@@ -1210,15 +1283,12 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                             }
                         }
                     };
-                    let group = match target {
-                        crate::StoryTarget::MyStory => None,
-                        crate::StoryTarget::Group(group) => Some(group.clone()),
-                    };
                     let story = signal_store::NewStory {
                         author: None,
                         author_name: None,
                         sent_at: now + ix as i64,
                         received_at: now,
+                        recipients: if group.is_none() { recipients.clone() } else { Vec::new() },
                         group,
                         content,
                         pointer: None,
@@ -1228,6 +1298,43 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     let _ = db.insert_story(&story, now).await;
                 }
                 emit(Event::StoriesChanged);
+            }
+            // Story settings are kept here only.
+            Command::SaveStoryList(list) => {
+                let mut lists = demo_story_lists(&db).await;
+                match lists.iter_mut().find(|l| l.id == list.id) {
+                    Some(existing) => *existing = list.clone(),
+                    None => lists.push(list.clone()),
+                }
+                if let Ok(json) = serde_json::to_string(&lists) {
+                    let _ = db.set_setting(crate::SETTING_STORY_LISTS, &json).await;
+                }
+                if list.is_my_story() {
+                    let _ = db.set_setting(crate::SETTING_MY_STORY_PRIVACY_SET, "true").await;
+                }
+                emit(Event::StorySettingsChanged);
+            }
+            Command::DeleteStoryList { id } => {
+                let mut lists = demo_story_lists(&db).await;
+                lists.retain(|l| l.id != id || l.is_my_story());
+                if let Ok(json) = serde_json::to_string(&lists) {
+                    let _ = db.set_setting(crate::SETTING_STORY_LISTS, &json).await;
+                }
+                emit(Event::StorySettingsChanged);
+            }
+            Command::SetStoriesDisabled(disabled) => {
+                let _ = db.set_setting(crate::SETTING_STORIES_DISABLED, if disabled { "true" } else { "false" }).await;
+                if disabled && let Ok(files) = db.remove_all_stories().await {
+                    for file in files {
+                        let _ = std::fs::remove_file(file);
+                    }
+                }
+                emit(Event::StorySettingsChanged);
+                emit(Event::StoriesChanged);
+            }
+            Command::SetStoryViewReceipts(on) => {
+                let _ = db.set_setting(crate::SETTING_STORY_VIEW_RECEIPTS, if on { "true" } else { "false" }).await;
+                emit(Event::StorySettingsChanged);
             }
             Command::PressMegaphone { id, .. } => {
                 if megaphone.as_ref().is_some_and(|m| m.id == id) {

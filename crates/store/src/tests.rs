@@ -1209,6 +1209,7 @@ async fn stories_last_a_day_and_keep_views_and_replies() {
         pointer: None,
         allows_replies: true,
         read: false,
+        recipients: Vec::new(),
     };
     let theirs = db.insert_story(&story(Some("a"), now - 1_000, text("hi")), now).await.unwrap().unwrap();
     assert_eq!(db.insert_story(&story(Some("a"), now - 1_000, text("hi")), now).await.unwrap(), None, "once");
@@ -1238,22 +1239,59 @@ async fn stories_last_a_day_and_keep_views_and_replies() {
 
     assert!(db.mark_story_read(Some("a"), now - 1_000).await.unwrap());
     assert!(!db.mark_story_read(Some("a"), now - 1_000).await.unwrap(), "once");
-    assert!(db.add_story_view(now - 500, "b").await.unwrap());
-    assert!(db.add_story_view(now - 500, "b").await.unwrap());
-    assert!(!db.add_story_view(now - 1_000, "b").await.unwrap(), "not ours");
+    assert!(db.add_story_view(now - 500, "b", now - 400).await.unwrap());
+    assert!(db.add_story_view(now - 500, "b", now - 300).await.unwrap());
+    assert!(!db.add_story_view(now - 1_000, "b", now).await.unwrap(), "not ours");
     let reply = StoryReply { author: Some("b".into()), author_name: None, sent_at: now, body: "nice".into(), emoji: None };
     assert_eq!(db.add_story_reply(Some("a"), now - 1_000, &reply).await.unwrap(), Some(theirs));
     assert_eq!(db.add_story_reply(Some("a"), 1, &reply).await.unwrap(), None, "no such story");
     let theirs_now = db.story(theirs).await.unwrap().unwrap();
     assert!(theirs_now.read);
     assert_eq!(theirs_now.replies, [reply]);
-    assert_eq!(db.story(ours).await.unwrap().unwrap().views, ["b"]);
+    assert_eq!(db.story(ours).await.unwrap().unwrap().views, [StoryView { viewer: "b".into(), at: Some(now - 400) }], "the first time");
 
     // A day after: gone, with the photo's file to delete.
     let later = now - 500 + STORY_LIFETIME_MS;
     assert_eq!(db.next_story_expiry().await.unwrap(), Some(now - 1_000 + STORY_LIFETIME_MS));
     assert_eq!(db.remove_expired_stories(later).await.unwrap(), ["/tmp/x.jpg"]);
     assert!(db.stories(later).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn our_stories_keep_who_they_went_to() {
+    let db = test_db().await;
+    let now = 10 * STORY_LIFETIME_MS;
+    let recipient = |sid: &str, lists: &[&str]| StoryRecipient {
+        service_id: sid.into(),
+        list_ids: lists.iter().map(|l| (*l).to_owned()).collect(),
+        allows_replies: true,
+    };
+    let story = NewStory {
+        author: None,
+        author_name: None,
+        sent_at: now - 10,
+        received_at: now - 10,
+        group: None,
+        content: StoryContent::Text(TextStory { text: "hi".into(), ..Default::default() }),
+        pointer: None,
+        allows_replies: true,
+        read: true,
+        recipients: vec![recipient("a", &["my"]), recipient("b", &["my", "close"])],
+    };
+    let id = db.insert_story(&story, now).await.unwrap().unwrap();
+    assert_eq!(db.story(id).await.unwrap().unwrap().recipients, story.recipients);
+    db.set_story_recipients(id, &[recipient("b", &["my"])]).await.unwrap();
+    assert_eq!(db.story(id).await.unwrap().unwrap().recipients, [recipient("b", &["my"])]);
+
+    // Views kept as plain strings, before their times were, still read.
+    sqlx::query("UPDATE stories SET views = '[\"c\"]' WHERE id = ?").bind(id).execute(&db.writer).await.unwrap();
+    assert_eq!(db.story(id).await.unwrap().unwrap().views, [StoryView { viewer: "c".into(), at: None }]);
+    assert!(db.add_story_view(now - 10, "d", now).await.unwrap());
+    assert_eq!(db.story(id).await.unwrap().unwrap().views.len(), 2);
+
+    assert_eq!(db.remove_story(id).await.unwrap(), None, "a text story has no file");
+    assert_eq!(db.story(id).await.unwrap(), None);
+    assert_eq!(db.remove_story(id).await.unwrap(), None);
 }
 
 #[tokio::test]

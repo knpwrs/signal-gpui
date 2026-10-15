@@ -73,6 +73,42 @@ pub struct StoryReply {
     pub emoji: Option<String>,
 }
 
+/// Someone one of our stories went to (Desktop's `StoryMessageRecipient`):
+/// the story lists that sent it to them (none for a group's story), and
+/// whether they may reply.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoryRecipient {
+    pub service_id: String,
+    #[serde(default)]
+    pub list_ids: Vec<String>,
+    #[serde(default)]
+    pub allows_replies: bool,
+}
+
+/// Someone who viewed one of our stories, and when we heard (unix
+/// millis; `None` for views kept before the time was).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StoryView {
+    pub viewer: String,
+    pub at: Option<i64>,
+}
+
+impl<'de> serde::Deserialize<'de> for StoryView {
+    /// Older rows list viewers as plain strings.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Stored {
+            Viewer(String),
+            Full { viewer: String, at: Option<i64> },
+        }
+        Ok(match Stored::deserialize(deserializer)? {
+            Stored::Viewer(viewer) => StoryView { viewer, at: None },
+            Stored::Full { viewer, at } => StoryView { viewer, at },
+        })
+    }
+}
+
 /// A story as the UI shows it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Story {
@@ -89,8 +125,10 @@ pub struct Story {
     pub read: bool,
     pub expires_at: i64,
     pub replies: Vec<StoryReply>,
-    /// Ours: who viewed it.
-    pub views: Vec<String>,
+    /// Ours: who viewed it, in the order they did.
+    pub views: Vec<StoryView>,
+    /// Ours: who it went to.
+    pub recipients: Vec<StoryRecipient>,
 }
 
 /// A story to keep.
@@ -106,10 +144,12 @@ pub struct NewStory {
     pub pointer: Option<Vec<u8>>,
     pub allows_replies: bool,
     pub read: bool,
+    /// Ours: who it goes to.
+    pub recipients: Vec<StoryRecipient>,
 }
 
 const COLUMNS: &str = "id, author_key, author_name, sent_at, received_at, group_id, content, allows_replies, is_read, \
-                       expires_at, replies, views";
+                       expires_at, replies, views, recipients";
 
 fn story_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Story> {
     let author: String = row.try_get("author_key")?;
@@ -127,6 +167,7 @@ fn story_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Story> {
         expires_at: row.try_get("expires_at")?,
         replies: json("replies")?.map(|r| serde_json::from_str(&r)).transpose()?.unwrap_or_default(),
         views: json("views")?.map(|v| serde_json::from_str(&v)).transpose()?.unwrap_or_default(),
+        recipients: json("recipients")?.map(|r| serde_json::from_str(&r)).transpose()?.unwrap_or_default(),
     })
 }
 
@@ -140,7 +181,7 @@ impl AppDb {
         }
         Ok(sqlx::query_scalar(
             "INSERT INTO stories (author_key, author_name, sent_at, received_at, group_id, content, pointer, \
-                allows_replies, is_read, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                allows_replies, is_read, expires_at, recipients) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT (author_key, sent_at) DO NOTHING RETURNING id",
         )
         .bind(story.author.as_deref().unwrap_or(""))
@@ -153,6 +194,7 @@ impl AppDb {
         .bind(story.allows_replies)
         .bind(story.read)
         .bind(expires_at)
+        .bind(if story.recipients.is_empty() { None } else { Some(serde_json::to_string(&story.recipients)?) })
         .fetch_optional(&self.writer)
         .await?)
     }
@@ -222,18 +264,18 @@ impl AppDb {
         Ok(done.rows_affected() > 0)
     }
 
-    /// Someone viewed one of ours (a VIEWED receipt). Returns whether it's
-    /// one of ours.
-    pub async fn add_story_view(&self, sent_at: i64, viewer: &str) -> Result<bool> {
+    /// Someone viewed one of ours (a VIEWED receipt), heard of at `at`.
+    /// Returns whether it's one of ours.
+    pub async fn add_story_view(&self, sent_at: i64, viewer: &str, at: i64) -> Result<bool> {
         let mut tx = self.write().await?;
         let views: Option<Option<String>> = sqlx::query_scalar("SELECT views FROM stories WHERE author_key = '' AND sent_at = ?")
             .bind(sent_at)
             .fetch_optional(&mut *tx)
             .await?;
         let Some(views) = views else { return Ok(false) };
-        let mut views: Vec<String> = views.map(|v| serde_json::from_str(&v)).transpose()?.unwrap_or_default();
-        if !views.iter().any(|v| v == viewer) {
-            views.push(viewer.to_owned());
+        let mut views: Vec<StoryView> = views.map(|v| serde_json::from_str(&v)).transpose()?.unwrap_or_default();
+        if !views.iter().any(|v| v.viewer == viewer) {
+            views.push(StoryView { viewer: viewer.to_owned(), at: Some(at) });
             sqlx::query("UPDATE stories SET views = ? WHERE author_key = '' AND sent_at = ?")
                 .bind(serde_json::to_string(&views)?)
                 .bind(sent_at)
@@ -284,6 +326,30 @@ impl AppDb {
                 StoryContent::Text(_) => None,
             })
             .collect())
+    }
+
+    /// Who one of ours goes to now (after a story list it went to was
+    /// deleted).
+    pub async fn set_story_recipients(&self, id: i64, recipients: &[StoryRecipient]) -> Result<()> {
+        sqlx::query("UPDATE stories SET recipients = ? WHERE id = ?")
+            .bind(serde_json::to_string(recipients)?)
+            .bind(id)
+            .execute(&self.writer)
+            .await?;
+        Ok(())
+    }
+
+    /// Removes one story (deleted for everyone), returning its saved file
+    /// to delete.
+    pub async fn remove_story(&self, id: i64) -> Result<Option<String>> {
+        let content: Option<String> = sqlx::query_scalar("DELETE FROM stories WHERE id = ? RETURNING content")
+            .bind(id)
+            .fetch_optional(&self.writer)
+            .await?;
+        Ok(content.and_then(|c| match serde_json::from_str::<StoryContent>(&c).ok()? {
+            StoryContent::Media { attachment, .. } => attachment.local_path,
+            StoryContent::Text(_) => None,
+        }))
     }
 
     /// Removes every story (stories turned off), returning their saved

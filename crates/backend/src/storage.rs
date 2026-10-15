@@ -3,7 +3,8 @@
 //! names, profile keys, pins and archived/muted state from it; contact sync
 //! only carries names from the phone's address book.
 //!
-//! Pins and per-chat flags (archived, muted, marked unread, blocked) are also
+//! Pins, per-chat flags (archived, muted, marked unread, blocked, hidden
+//! stories), the account's story settings and story lists are also
 //! written back. Records are immutable on the server: a change
 //! uploads the edited record under a new random key, deletes the old one and
 //! bumps the manifest version, all in one write that fails with 409 if
@@ -74,6 +75,8 @@ pub(crate) struct StorageSnapshot {
     pub stories_disabled: Option<bool>,
     /// The account's `storyViewReceiptsEnabled`, when set.
     pub story_view_receipts: Option<bool>,
+    /// The account's `hasSetMyStoriesPrivacy`.
+    pub my_story_privacy_set: Option<bool>,
 }
 
 /// Reads the account record and every contact record from the Storage Service.
@@ -128,6 +131,7 @@ pub(crate) async fn fetch(manager: &SignalManager) -> anyhow::Result<StorageSnap
                     snapshot.pinned = Some(pinned(&account));
                     snapshot.link_previews = Some(account.link_previews);
                     snapshot.stories_disabled = Some(account.stories_disabled);
+                    snapshot.my_story_privacy_set = Some(account.has_set_my_stories_privacy);
                     snapshot.story_view_receipts = match account.story_view_receipts_enabled() {
                         presage::proto::OptionalBool::Enabled => Some(true),
                         presage::proto::OptionalBool::Disabled => Some(false),
@@ -195,22 +199,7 @@ pub(crate) enum PinEdit {
 /// changing only its pinned-conversation entries. `Ok(None)` when there is
 /// nothing to change.
 pub(crate) fn edit_pins(record: &[u8], edit: &PinEdit) -> anyhow::Result<Option<Vec<u8>>> {
-    let fields = wire::fields(record).context("malformed storage record")?;
-    let account = fields
-        .iter()
-        .find(|f| f.number == RECORD_ACCOUNT)
-        .and_then(|f| f.payload)
-        .context("storage record is not an account record")?;
-    let Some(account) = edit_account_pins(account, edit)? else { return Ok(None) };
-    let mut out = Vec::with_capacity(record.len() + 64);
-    for field in &fields {
-        if field.number == RECORD_ACCOUNT {
-            wire::put_len(&mut out, RECORD_ACCOUNT, &account);
-        } else {
-            out.extend_from_slice(field.raw);
-        }
-    }
-    Ok(Some(out))
+    edit_inner(record, RECORD_ACCOUNT, |account| edit_account_pins(account, edit))
 }
 
 fn edit_account_pins(account: &[u8], edit: &PinEdit) -> anyhow::Result<Option<Vec<u8>>> {
@@ -299,25 +288,31 @@ impl ChatEdit {
 /// record, changing only that one field. `Ok(None)` when it's already set.
 pub(crate) fn edit_chat_record(record: &[u8], edit: ChatEdit) -> anyhow::Result<Option<Vec<u8>>> {
     let fields = wire::fields(record).context("malformed storage record")?;
-    let (kind, chat) = fields
+    let kind = fields
         .iter()
-        .find_map(|f| Some((f.number, f.payload?)).filter(|(n, _)| matches!(*n, RECORD_CONTACT | RECORD_GROUP_V2)))
+        .find(|f| f.payload.is_some() && matches!(f.number, RECORD_CONTACT | RECORD_GROUP_V2))
+        .map(|f| f.number)
         .context("storage record is not a contact or group")?;
     let (number, value) = edit.field(kind == RECORD_GROUP_V2);
-    let chat_fields = wire::fields(chat).context("malformed chat record")?;
-    // proto3: the last occurrence wins, and absent means zero.
-    let current = chat_fields.iter().rev().find(|f| f.number == number).and_then(|f| f.varint).unwrap_or(0);
-    if current == value {
-        return Ok(None);
-    }
-    let mut edited = Vec::with_capacity(chat.len() + 12);
-    for field in chat_fields.iter().filter(|f| f.number != number) {
-        edited.extend_from_slice(field.raw);
-    }
-    if value != 0 {
-        wire::put_varint_field(&mut edited, number, value);
-    }
-    let mut out = Vec::with_capacity(record.len() + 12);
+    edit_inner(record, kind, |chat| set_varint(chat, number, value))
+}
+
+/// Rewrites the record held in field `kind` of an encoded `StorageRecord`
+/// with `edit`, copying every other byte. `Ok(None)` when `edit` changes
+/// nothing.
+fn edit_inner(
+    record: &[u8],
+    kind: u32,
+    edit: impl FnOnce(&[u8]) -> anyhow::Result<Option<Vec<u8>>>,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let fields = wire::fields(record).context("malformed storage record")?;
+    let inner = fields
+        .iter()
+        .find(|f| f.number == kind)
+        .and_then(|f| f.payload)
+        .context("storage record holds another kind of record")?;
+    let Some(edited) = edit(inner)? else { return Ok(None) };
+    let mut out = Vec::with_capacity(record.len() + edited.len());
     for field in &fields {
         if field.number == kind {
             wire::put_len(&mut out, kind, &edited);
@@ -326,6 +321,187 @@ pub(crate) fn edit_chat_record(record: &[u8], edit: ChatEdit) -> anyhow::Result<
         }
     }
     Ok(Some(out))
+}
+
+/// Sets varint field `number` of an encoded message to `value` (0 leaves
+/// it out, as proto3 writes it). `Ok(None)` when it's already that.
+fn set_varint(message: &[u8], number: u32, value: u64) -> anyhow::Result<Option<Vec<u8>>> {
+    let fields = wire::fields(message).context("malformed record")?;
+    // proto3: the last occurrence wins, and absent means zero.
+    let current = fields.iter().rev().find(|f| f.number == number).and_then(|f| f.varint).unwrap_or(0);
+    if current == value {
+        return Ok(None);
+    }
+    let mut edited = Vec::with_capacity(message.len() + 12);
+    for field in fields.iter().filter(|f| f.number != number) {
+        edited.extend_from_slice(field.raw);
+    }
+    if value != 0 {
+        wire::put_varint_field(&mut edited, number, value);
+    }
+    Ok(Some(edited))
+}
+
+/// A change to one of the account record's story settings.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum AccountEdit {
+    /// `storiesDisabled` (Desktop's `hasStoriesDisabled`).
+    StoriesDisabled(bool),
+    /// `storyViewReceiptsEnabled`, an `OptionalBool`.
+    StoryViewReceipts(bool),
+    /// `hasSetMyStoriesPrivacy`: My Story's viewers were chosen.
+    HasSetMyStoriesPrivacy(bool),
+}
+
+impl AccountEdit {
+    /// The `AccountRecord` field and its value.
+    fn field(self) -> (u32, u64) {
+        match self {
+            AccountEdit::HasSetMyStoriesPrivacy(on) => (26, u64::from(on)),
+            AccountEdit::StoriesDisabled(on) => (29, u64::from(on)),
+            // OptionalBool: ENABLED = 1, DISABLED = 2.
+            AccountEdit::StoryViewReceipts(on) => (30, if on { 1 } else { 2 }),
+        }
+    }
+}
+
+/// Applies `edits` to an encoded `StorageRecord` holding the account
+/// record, changing only those fields. `Ok(None)` when they're all set.
+pub(crate) fn edit_account(record: &[u8], edits: &[AccountEdit]) -> anyhow::Result<Option<Vec<u8>>> {
+    edit_inner(record, RECORD_ACCOUNT, |account| {
+        let mut current = account.to_vec();
+        let mut changed = false;
+        for edit in edits {
+            let (number, value) = edit.field();
+            if let Some(edited) = set_varint(&current, number, value)? {
+                current = edited;
+                changed = true;
+            }
+        }
+        Ok(changed.then_some(current))
+    })
+}
+
+/// Changes story settings in the account record, for the whole account.
+pub(crate) async fn write_account(manager: &SignalManager, edits: &[AccountEdit]) -> anyhow::Result<()> {
+    let session = Session::new(manager).await?;
+    for _ in 0..3 {
+        let manifest = session.manifest().await?;
+        let ikm = manifest_ikm(&manifest);
+        let old_key = manifest
+            .identifiers
+            .iter()
+            .find(|id| id.r#type() == IdentifierType::Account)
+            .map(|id| id.raw.clone())
+            .context("storage has no account record")?;
+        let record = session.read_raw(&old_key, ikm).await?;
+        let Some(record) = edit_account(&record, edits)? else { return Ok(()) };
+        if session.commit(manager, &manifest, Some(&old_key), IdentifierType::Account, &record).await? {
+            return Ok(());
+        }
+    }
+    bail!("storage kept changing on another device; try again")
+}
+
+const RECORD_STORY_LIST: u32 = 5; // StorageRecord.storyDistributionList
+// StoryDistributionListRecord's fields, all but `identifier` (1).
+const LIST_NAME: u32 = 2;
+const LIST_MEMBERS: u32 = 3;
+const LIST_DELETED_AT: u32 = 4;
+const LIST_ALLOWS_REPLIES: u32 = 5;
+const LIST_IS_BLOCK_LIST: u32 = 6;
+const LIST_MEMBERS_BINARY: u32 = 7;
+
+/// Sets a story list record's name, members, replies and block list (or
+/// marks it deleted, at `deleted_at` unix millis, as Desktop's
+/// `deleteDistributionList` does: no name, no members), keeping its
+/// identifier and any fields this client doesn't know. Members go in both
+/// forms, as the pins do. `Ok(None)` when nothing changes.
+pub(crate) fn edit_story_list(record: &[u8], list: &crate::StoryList, deleted_at: u64) -> anyhow::Result<Option<Vec<u8>>> {
+    let edited = edit_inner(record, RECORD_STORY_LIST, |inner| {
+        let fields = wire::fields(inner).context("malformed story list record")?;
+        let mut out = Vec::with_capacity(inner.len() + 64);
+        for field in fields.iter().filter(|f| !(LIST_NAME..=LIST_MEMBERS_BINARY).contains(&f.number)) {
+            out.extend_from_slice(field.raw);
+        }
+        let deleted = deleted_at != 0;
+        let members: Vec<ServiceId> = if deleted {
+            Vec::new()
+        } else {
+            list.members.iter().filter_map(|m| ServiceId::parse_from_service_id_string(m)).collect()
+        };
+        if !deleted && !list.name.is_empty() {
+            wire::put_len(&mut out, LIST_NAME, list.name.as_bytes());
+        }
+        for member in &members {
+            wire::put_len(&mut out, LIST_MEMBERS, member.service_id_string().as_bytes());
+        }
+        if deleted {
+            wire::put_varint_field(&mut out, LIST_DELETED_AT, deleted_at);
+        }
+        if list.allows_replies && !deleted {
+            wire::put_varint_field(&mut out, LIST_ALLOWS_REPLIES, 1);
+        }
+        if list.block_list && !deleted {
+            wire::put_varint_field(&mut out, LIST_IS_BLOCK_LIST, 1);
+        }
+        for member in &members {
+            wire::put_len(&mut out, LIST_MEMBERS_BINARY, &member.service_id_binary());
+        }
+        let decode = |bytes: &[u8]| presage::proto::StoryDistributionListRecord::decode(bytes).ok();
+        let same = decode(inner).zip(decode(&out)).is_some_and(|(old, new)| {
+            (old.name.as_str(), old.deleted_at_timestamp, old.allows_replies, old.is_block_list)
+                == (new.name.as_str(), new.deleted_at_timestamp, new.allows_replies, new.is_block_list)
+                && story_list_members(&old) == story_list_members(&new)
+        });
+        Ok((!same).then_some(out))
+    })?;
+    Ok(edited)
+}
+
+/// A new, empty record for story list `id`.
+fn new_story_list_record(id: &Uuid) -> Vec<u8> {
+    let list = presage::proto::StoryDistributionListRecord { identifier: id.as_bytes().to_vec(), ..Default::default() };
+    StorageRecord { record: Some(Record::StoryDistributionList(list)) }.encode_to_vec()
+}
+
+fn is_story_list(record: &StorageRecord, id: &Uuid) -> bool {
+    matches!(&record.record, Some(Record::StoryDistributionList(list)) if list.identifier == id.as_bytes())
+}
+
+/// Saves a story list (Desktop's `StoryDistributionListRecord`) for the
+/// whole account, adding it if Storage Service doesn't have it; with
+/// `deleted_at`, marks it deleted.
+pub(crate) async fn write_story_list(manager: &SignalManager, list: &crate::StoryList, deleted_at: u64) -> anyhow::Result<()> {
+    let id = Uuid::parse_str(&list.id).context("not a story list id")?;
+    let session = Session::new(manager).await?;
+    let kind = IdentifierType::StoryDistributionList;
+    for _ in 0..3 {
+        let manifest = session.manifest().await?;
+        let ikm = manifest_ikm(&manifest);
+        let keys: Vec<Vec<u8>> =
+            manifest.identifiers.iter().filter(|key| key.r#type() == kind).map(|key| key.raw.clone()).collect();
+        let mut existing = None;
+        for batch in keys.chunks(READ_BATCH) {
+            existing = session
+                .read_many(batch, ikm)
+                .await?
+                .into_iter()
+                .find(|(_, raw)| StorageRecord::decode(raw.as_slice()).is_ok_and(|record| is_story_list(&record, &id)));
+            if existing.is_some() {
+                break;
+            }
+        }
+        let (old_key, record) = match existing {
+            Some((key, raw)) => (Some(key), raw),
+            None => (None, new_story_list_record(&id)),
+        };
+        let Some(record) = edit_story_list(&record, list, deleted_at)? else { return Ok(()) };
+        if session.commit(manager, &manifest, old_key.as_deref(), kind, &record).await? {
+            return Ok(());
+        }
+    }
+    bail!("storage kept changing on another device; try again")
 }
 
 /// Whether a decoded record is the one for `conversation`.
@@ -581,18 +757,24 @@ fn story_list(record: &presage::proto::StoryDistributionListRecord) -> Option<cr
         return None;
     }
     let id = Uuid::from_slice(&record.identifier).ok()?;
+    Some(crate::StoryList {
+        id: id.to_string(),
+        name: record.name.clone(),
+        members: story_list_members(record),
+        block_list: record.is_block_list,
+        allows_replies: record.allows_replies,
+    })
+}
+
+/// A story list's members as service id strings, from the binary form when
+/// it's there (as Desktop reads them).
+fn story_list_members(record: &presage::proto::StoryDistributionListRecord) -> Vec<String> {
     let members = if record.recipient_service_ids_binary.is_empty() {
         record.recipient_service_ids.iter().filter_map(|s| ServiceId::parse_from_service_id_string(s)).collect::<Vec<_>>()
     } else {
         record.recipient_service_ids_binary.iter().filter_map(|b| ServiceId::parse_from_service_id_binary(b)).collect()
     };
-    Some(crate::StoryList {
-        id: id.to_string(),
-        name: record.name.clone(),
-        members: members.iter().map(ServiceId::service_id_string).collect(),
-        block_list: record.is_block_list,
-        allows_replies: record.allows_replies,
-    })
+    members.iter().map(ServiceId::service_id_string).collect()
 }
 
 fn contact_chat(record: &ContactRecord) -> Option<ChatState> {
@@ -854,6 +1036,95 @@ mod tests {
         );
         let deleted = StoryDistributionListRecord { identifier: vec![1; 16], deleted_at_timestamp: 5, ..Default::default() };
         assert_eq!(story_list(&deleted), None);
+    }
+
+    #[test]
+    fn account_story_settings_keep_every_other_field() {
+        let account = AccountRecord {
+            given_name: "Ken".into(),
+            pinned_conversations: vec![pin_for(&ConversationId::group(&[0xab; 32])).unwrap()],
+            ..Default::default()
+        };
+        let mut account_bytes = account.encode_to_vec();
+        wire::put_len(&mut account_bytes, 999, b"future account field");
+        let mut record = Vec::new();
+        wire::put_len(&mut record, RECORD_ACCOUNT, &account_bytes);
+
+        let edits = [AccountEdit::StoriesDisabled(true), AccountEdit::StoryViewReceipts(false)];
+        let edited = edit_account(&record, &edits).unwrap().unwrap();
+        let decoded = decode_account(&edited);
+        assert!(decoded.stories_disabled);
+        assert_eq!(decoded.story_view_receipts_enabled(), presage::proto::OptionalBool::Disabled);
+        assert_eq!((decoded.given_name.as_str(), decoded.pinned_conversations.len()), ("Ken", 1));
+        assert!(edited.windows(20).any(|w| w == b"future account field"));
+        assert_eq!(edit_account(&edited, &edits).unwrap(), None, "already so");
+
+        let edited = edit_account(&edited, &[AccountEdit::StoryViewReceipts(true), AccountEdit::HasSetMyStoriesPrivacy(true)])
+            .unwrap()
+            .unwrap();
+        let decoded = decode_account(&edited);
+        assert_eq!(decoded.story_view_receipts_enabled(), presage::proto::OptionalBool::Enabled);
+        assert!(decoded.has_set_my_stories_privacy && decoded.stories_disabled);
+        assert!(edit_account(&edited, &[AccountEdit::StoriesDisabled(false)]).unwrap().is_some());
+    }
+
+    #[test]
+    fn story_list_edits_write_desktops_fields_and_keep_unknown_ones() {
+        use presage::proto::StoryDistributionListRecord;
+        let decode = |record: &[u8]| match StorageRecord::decode(record).unwrap().record {
+            Some(Record::StoryDistributionList(list)) => list,
+            other => panic!("{other:?}"),
+        };
+        let id = Uuid::from_bytes([3; 16]);
+        let mut inner = StoryDistributionListRecord {
+            identifier: id.as_bytes().to_vec(),
+            name: "Hikers".into(),
+            recipient_service_ids: vec!["stale".into()],
+            allows_replies: true,
+            ..Default::default()
+        }
+        .encode_to_vec();
+        wire::put_len(&mut inner, 99, b"future list field");
+        let mut record = Vec::new();
+        wire::put_len(&mut record, RECORD_STORY_LIST, &inner);
+
+        let other = "6b1a2b3c-0000-4000-8000-000000000002";
+        let list = crate::StoryList {
+            id: id.to_string(),
+            name: "Close friends".into(),
+            members: vec![ACI.into(), other.into(), "not a service id".into()],
+            block_list: false,
+            allows_replies: false,
+        };
+        let edited = edit_story_list(&record, &list, 0).unwrap().unwrap();
+        let decoded = decode(&edited);
+        assert_eq!(decoded.identifier, id.as_bytes());
+        assert_eq!(decoded.name, "Close friends");
+        assert_eq!(decoded.recipient_service_ids, [ACI, other]);
+        assert_eq!(story_list_members(&decoded), [ACI, other], "the binary forms too");
+        assert!(!decoded.allows_replies && !decoded.is_block_list);
+        assert!(edited.windows(17).any(|w| w == b"future list field"));
+        assert_eq!(story_list(&decoded).unwrap(), crate::StoryList { members: vec![ACI.into(), other.into()], ..list.clone() });
+        assert_eq!(edit_story_list(&edited, &list, 0).unwrap(), None, "already so");
+
+        // Deleted as Desktop deletes one: no name, no members.
+        let deleted = decode(&edit_story_list(&edited, &list, 1234).unwrap().unwrap());
+        assert_eq!(deleted.deleted_at_timestamp, 1234);
+        assert!(deleted.name.is_empty() && deleted.recipient_service_ids.is_empty() && deleted.recipient_service_ids_binary.is_empty());
+        assert_eq!(story_list(&deleted), None);
+
+        // A new one, such as My Story set to "All except…".
+        let my_story = crate::StoryList {
+            id: crate::MY_STORY_ID.into(),
+            name: String::new(),
+            members: vec![ACI.into()],
+            block_list: true,
+            allows_replies: true,
+        };
+        let fresh = new_story_list_record(&Uuid::nil());
+        assert!(is_story_list(&StorageRecord::decode(fresh.as_slice()).unwrap(), &Uuid::nil()));
+        let saved = decode(&edit_story_list(&fresh, &my_story, 0).unwrap().unwrap());
+        assert_eq!(story_list(&saved).unwrap(), my_story);
     }
 
     #[test]

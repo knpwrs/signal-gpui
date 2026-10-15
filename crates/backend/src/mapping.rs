@@ -96,8 +96,10 @@ pub enum Action {
         /// Its photo or video, to download.
         pointer: Option<AttachmentPointer>,
     },
-    /// A reply or reaction to a group story, kept with the story.
+    /// A reply or reaction to a group story, or one to one to our story,
+    /// kept with the story.
     StoryReply {
+        /// The group, or the chat with whoever replied to ours.
         group: ConversationId,
         /// The story's author; `None` = ours.
         story_author: Option<String>,
@@ -106,6 +108,8 @@ pub enum Action {
     },
     /// `viewer` viewed our stories sent at these times (a VIEWED receipt).
     StoryViewed { viewer: String, sent_at: Vec<i64> },
+    /// Who our story sent at `sent_at` goes to now, from another device.
+    StoryRecipientUpdate { sent_at: i64, recipients: Vec<signal_store::StoryRecipient> },
     /// We viewed these on another device: `(author, sent_at)`.
     ViewedSync(Vec<(Option<String>, i64)>),
     /// Someone (`None`: us, on another device) started a group call.
@@ -799,6 +803,7 @@ fn map_story(story: &presage::proto::StoryMessage, author: Option<String>, sent_
             content,
             pointer: None,
             allows_replies: story.allows_replies.unwrap_or(false),
+            recipients: Vec::new(),
         },
         pointer,
     })
@@ -873,12 +878,23 @@ fn map_story_reply(
         }];
     }
     let outgoing = author.is_none();
+    // A reply to our story is also kept with it, for its Replies list
+    // (Desktop's `loadStoryReplies` finds a story's direct replies too).
+    let mut out = Vec::new();
+    if story_author.is_none() && !outgoing {
+        out.push(Action::StoryReply {
+            group: conversation.clone(),
+            story_author: None,
+            story_sent_at,
+            reply: signal_store::StoryReply { author: author.clone(), author_name: None, sent_at: ts, body: body.clone(), emoji: emoji.clone() },
+        });
+    }
     let text = match (&emoji, story_author.is_none()) {
         (None, _) => "Story".to_owned(),
         (Some(_), true) => "Reacted to your story".to_owned(),
         (Some(_), false) => "Reacted to a story".to_owned(),
     };
-    vec![Action::Insert {
+    out.push(Action::Insert {
         message: NewMessage {
             conversation_id: conversation,
             sent_at: ts,
@@ -907,7 +923,8 @@ fn map_story_reply(
         long_text: if emoji.is_some() { None } else { long_text_of(dm) },
         preview_image: None,
         timer_version: dm.expire_timer_version,
-    }]
+    });
+    out
 }
 
 /// `envelope_ts` dates the edit when its message carries no timestamp.
@@ -927,6 +944,25 @@ fn map_edit(edit: &EditMessage, origin: Origin, envelope_ts: i64, ctx: &MapConte
     })
 }
 
+/// A sent transcript's story recipients, the binary service id preferred.
+fn story_recipients(recipients: &[sync_message::sent::StoryMessageRecipient]) -> Vec<signal_store::StoryRecipient> {
+    recipients
+        .iter()
+        .filter_map(|r| {
+            let sid = r
+                .destination_service_id_binary
+                .as_deref()
+                .and_then(ServiceId::parse_from_service_id_binary)
+                .or_else(|| r.destination_service_id.as_deref().and_then(ServiceId::parse_from_service_id_string))?;
+            Some(signal_store::StoryRecipient {
+                service_id: sid.service_id_string(),
+                list_ids: r.distribution_list_ids.clone(),
+                allows_replies: r.is_allowed_to_reply.unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
 fn map_sync(sync: &SyncMessage, envelope_ts: i64, ctx: &MapContext) -> Vec<Action> {
     let mut out = Vec::new();
     if let Some(sync_message::Content::Sent(sent)) = &sync.content {
@@ -943,9 +979,20 @@ fn map_sync(sync: &SyncMessage, envelope_ts: i64, ctx: &MapContext) -> Vec<Actio
         if let Some(edit) = &sent.edit_message {
             out.extend(map_edit(edit, Origin::Outgoing { destination }, ts, ctx));
         }
+        let recipients = story_recipients(&sent.story_message_recipients);
         // A story we posted from another device.
         if let Some(story) = &sent.story_message {
-            out.extend(map_story(story, None, ts, ctx));
+            out.extend(map_story(story, None, ts, ctx).map(|mut action| {
+                if let Action::Story { story, .. } = &mut action {
+                    story.recipients = recipients;
+                }
+                action
+            }));
+        } else if sent.is_recipient_update() {
+            // Who one of our stories goes to changed on another device
+            // (Desktop's `onStoryRecipientUpdate`): a story list was
+            // deleted, or the story was deleted for everyone.
+            out.push(Action::StoryRecipientUpdate { sent_at: ts, recipients });
         }
     }
     let viewed: Vec<(Option<String>, i64)> = sync
