@@ -26,6 +26,13 @@ pub fn avatar(name: &str, color: u8, size: Pixels) -> Div {
         .child(SharedString::from(initials(name)))
 }
 
+/// The room left at the window's top for the macOS traffic lights (Desktop's
+/// `--title-bar-drag-area-height`): content in the leftmost pane starts
+/// below them, and in full screen, where they're gone, at the top.
+pub fn title_bar_inset(window: &gpui_kit::Window) -> Pixels {
+    if window.is_fullscreen() { px(0.) } else { px(40.) }
+}
+
 /// A person's avatar: their profile photo once downloaded, else initials.
 pub fn person_avatar(photo: Option<&std::path::Path>, name: &str, color: u8, size: Pixels) -> AnyElement {
     match photo {

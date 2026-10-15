@@ -314,7 +314,7 @@ impl StoriesPane {
 }
 
 impl Render for StoriesPane {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::get(cx);
         let collapsed = self.state.read(cx).nav_collapsed;
         let groups = self.state.read(cx).story_groups();
@@ -335,7 +335,8 @@ impl Render for StoriesPane {
                     .gap_2()
                     .pr_4()
                     // Clear the macOS traffic lights while the tabs are hidden.
-                    .pl(px(if collapsed { 92. } else { 16. }))
+                    .when(collapsed, |d| d.mt(crate::views::common::title_bar_inset(window)))
+                    .pl(px(16.))
                     .when(collapsed, |d| d.child(crate::views::nav::show_tabs_button(&self.state, palette, cx)))
                     .child(div().flex_1().text_lg().font_weight(FontWeight::SEMIBOLD).child("Stories"))
                     .child(self.render_add_story()),

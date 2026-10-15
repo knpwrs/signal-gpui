@@ -75,7 +75,7 @@ fn item(
 }
 
 /// The rail.
-pub fn render(state: &Entity<AppState>, palette: Palette, cx: &mut App) -> AnyElement {
+pub fn render(state: &Entity<AppState>, palette: Palette, window: &gpui_kit::Window, cx: &mut App) -> AnyElement {
     let (tab, chats, stories, stories_on) = {
         let s = state.read(cx);
         (s.tab, s.unread_chats_badge() as usize, s.unread_story_chats(), !s.stories_disabled)
@@ -116,7 +116,7 @@ pub fn render(state: &Entity<AppState>, palette: Palette, cx: &mut App) -> AnyEl
         .flex()
         .flex_col()
         // Under the macOS traffic lights.
-        .pt(px(40.))
+        .pt(crate::views::common::title_bar_inset(window))
         .pb_2()
         .bg(palette.sidebar)
         .border_r_1()

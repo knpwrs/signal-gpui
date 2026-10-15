@@ -50,7 +50,7 @@ impl CallsPane {
 }
 
 impl Render for CallsPane {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::get(cx);
         let collapsed = self.state.read(cx).nav_collapsed;
         let rows: Vec<_> = self
@@ -87,7 +87,8 @@ impl Render for CallsPane {
                     .items_center()
                     .gap_2()
                     .pr_4()
-                    .pl(px(if collapsed { 92. } else { 16. }))
+                    .when(collapsed, |d| d.mt(crate::views::common::title_bar_inset(window)))
+                    .pl(px(16.))
                     .when(collapsed, |d| d.child(crate::views::nav::show_tabs_button(&self.state, palette, cx)))
                     .child(div().flex_1().text_lg().font_weight(FontWeight::SEMIBOLD).child("Calls")),
             )

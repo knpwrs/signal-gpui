@@ -268,7 +268,7 @@ impl Render for RootView {
                 .size_full()
                 .flex()
                 // Desktop's tabs, unless hidden.
-                .when(!nav_collapsed, |d| d.child(crate::views::nav::render(&self.state, palette, cx)))
+                .when(!nav_collapsed, |d| d.child(crate::views::nav::render(&self.state, palette, window, cx)))
                 // Dragging the chat list's edge (Desktop's drag handle).
                 .on_drag_move(cx.listener(move |this, event: &gpui_kit::DragMoveEvent<SidebarResize>, _, cx| {
                     this.sidebar_preferred = f32::from(event.event.position.x) - rail;

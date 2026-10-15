@@ -465,12 +465,12 @@ impl Sidebar {
 
     /// The narrow sidebar's top (Desktop's narrow NavSidebar): room for the
     /// window's buttons, then new group, settings and search, stacked.
-    fn render_narrow_header(&self, palette: Palette, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+    fn render_narrow_header(&self, palette: Palette, inset: gpui_kit::Pixels, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let collapsed = self.state.read(cx).nav_collapsed;
         div()
             .flex_none()
             // Under the macOS traffic lights when the tabs aren't there.
-            .pt(px(if collapsed { 44. } else { 12. }))
+            .pt(if collapsed { inset + px(4.) } else { px(12.) })
             .pb_2()
             .when(collapsed, |d| d.child(crate::views::nav::show_tabs_button(&self.state, palette, cx)))
             .flex()
@@ -886,8 +886,9 @@ impl Focusable for Sidebar {
 impl Render for Sidebar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::get(cx);
-        let narrow_header = self.narrow.then(|| self.render_narrow_header(palette, cx));
+        let narrow_header = self.narrow.then(|| self.render_narrow_header(palette, crate::views::common::title_bar_inset(_window), cx));
         let collapsed = self.state.read(cx).nav_collapsed;
+        let inset = crate::views::common::title_bar_inset(_window);
         let show_tabs = collapsed.then(|| crate::views::nav::show_tabs_button(&self.state, palette, cx));
         let state = self.state.read(cx);
         let connection = state.connection.clone();
@@ -924,9 +925,10 @@ impl Render for Sidebar {
                     .flex()
                     .items_center()
                     .h(px(52.))
-                    // Clear the macOS traffic lights while the tabs (under
-                    // them otherwise) are hidden.
-                    .pl(px(if collapsed { 92. } else { 16. }))
+                    // Below the macOS traffic lights while the tabs (under
+                    // them otherwise) are hidden, as Desktop's header is.
+                    .when(collapsed, |d| d.mt(inset))
+                    .pl(px(16.))
                     .pr_4()
                     .when_some(show_tabs, |d, button| d.child(button))
                     .when(self.archive_open, |d| {
