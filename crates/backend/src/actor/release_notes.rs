@@ -72,10 +72,15 @@ impl Actor {
             return Ok(());
         }
         let manifest = release_notes::manifest(&client).await?;
-        // Megaphones first, as Desktop: a failure there doesn't stop the notes.
-        if let Err(error) = self.save_megaphones(&client, &manifest.megaphones, phone).await {
-            warn!(error = %format!("{error:#}"), "megaphones: couldn't save");
-        }
+        // Megaphones first, as Desktop: a failure there doesn't stop the
+        // notes, but the manifest is read again next time to retry it.
+        let megaphones_saved = match self.save_megaphones(&client, &manifest.megaphones, phone).await {
+            Ok(all) => all,
+            Err(error) => {
+                warn!(error = %format!("{error:#}"), "megaphones: couldn't save");
+                false
+            }
+        };
         self.megaphone_check.notify_one();
         let due = release_notes::due(&manifest.announcements, &watermark, &current);
         if due.is_empty() {
@@ -84,7 +89,9 @@ impl Actor {
             info!(count = due.len(), "release notes: adding");
             self.add_release_notes(&client, due, phone).await?;
         }
-        self.db.set_setting(SETTING_MANIFEST_HASH, &hash).await?;
+        if megaphones_saved {
+            self.db.set_setting(SETTING_MANIFEST_HASH, &hash).await?;
+        }
         self.db.set_setting(SETTING_DESKTOP_VERSION, &current.to_string()).await?;
         Ok(())
     }
@@ -214,13 +221,14 @@ impl Actor {
 
     /// Desktop's `deleteUnknownMegaphones` and `saveNewMegaphones`: keeps
     /// what the manifest still lists, and saves new ones (their words and
-    /// image) that haven't ended and are for our country.
+    /// image) that haven't ended and are for our country. Returns whether
+    /// every new one was saved.
     async fn save_megaphones(
         &self,
         client: &reqwest::Client,
         listed: &[megaphones::ManifestMegaphone],
         phone: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let listed: Vec<_> = listed.iter().filter(|m| m.desktop_min_version.is_some()).collect();
         let mut saved = self.saved_megaphones().await;
         let before = saved.len();
@@ -233,6 +241,7 @@ impl Actor {
             keep
         });
         let mut changed = saved.len() != before;
+        let mut all_saved = true;
         let aci = self.self_aci();
         let locales = release_notes::locales(&sys_locale::get_locale().unwrap_or_else(|| "en".into()));
         let now_seconds = now_millis() / 1000;
@@ -250,13 +259,16 @@ impl Actor {
                     saved.push(new);
                     changed = true;
                 }
-                Err(error) => warn!(id = megaphone.uuid, error = %format!("{error:#}"), "megaphones: skipped"),
+                Err(error) => {
+                    warn!(id = megaphone.uuid, error = %format!("{error:#}"), "megaphones: skipped");
+                    all_saved = false;
+                }
             }
         }
         if changed {
             self.db.set_setting(SETTING_MEGAPHONES, &serde_json::to_string(&saved)?).await?;
         }
-        Ok(())
+        Ok(all_saved)
     }
 
     async fn fetch_megaphone(
