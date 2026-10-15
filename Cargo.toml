@@ -34,6 +34,10 @@ libsqlite3-sys = { version = "0.36.0" }
 chrono = "0.4"
 uuid = { version = "1", features = ["v4", "serde"] }
 
+# presage with the changes this app needs (see vendor/README.md).
+[patch."https://github.com/whisperfish/presage"]
+presage = { path = "vendor/presage" }
+
 [patch.crates-io]
 # presage-store-sqlite links SQLCipher through whisperfish's libsqlite3-sys fork.
 libsqlite3-sys = { git = "https://github.com/whisperfish/rusqlite", rev = "2a42b3354c9194700d08aa070f70a131a470e7dc" }
