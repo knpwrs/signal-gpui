@@ -53,6 +53,22 @@ impl<C: WebSocketType> SignalWebSocket<C> {
         self.request_json_with(request, put_messages_errors).await
     }
 
+    /// signal-gpui: a story (or group story reply), sealed, flagged as a
+    /// story, and without an access key (Signal-Server's
+    /// `MessageController`: stories need no access).
+    pub async fn send_messages_story(
+        &mut self,
+        messages: OutgoingPushMessages,
+    ) -> Result<SendMessageResponse, ServiceError> {
+        let request = WebSocketRequestMessage::new(Method::PUT)
+            .path(format!(
+                "/v1/messages/{}?story=true",
+                messages.destination.service_id_string()
+            ))
+            .json(&messages)?;
+        self.request_json_with(request, put_messages_errors).await
+    }
+
     pub async fn send_messages_unidentified(
         &mut self,
         messages: OutgoingPushMessages,

@@ -591,11 +591,67 @@ where
     async fn try_send_message(
         &mut self,
         recipient: ServiceId,
+        unidentified_access: Option<&UnidentifiedAccess>,
+        content_body: &ContentBody,
+        timestamp: u64,
+        include_pni_signature: bool,
+        online: bool,
+    ) -> SendMessageResult {
+        self.try_send(
+            recipient,
+            unidentified_access,
+            content_body,
+            timestamp,
+            include_pni_signature,
+            online,
+            false,
+        )
+        .await
+    }
+
+    /// signal-gpui: send a story, or a reply to a group story, to one
+    /// recipient (all their devices). As Signal's clients do (libsignal-net's
+    /// `send_message` with `UserBasedSendAuthorization::Story`), it goes
+    /// sealed with our sender certificate and the story flag, without an
+    /// access key, and never falls back to an identified send. No sync
+    /// message is sent: the caller sends one transcript for every recipient.
+    #[tracing::instrument(
+        skip(self, certificate, message),
+        fields(recipient = recipient.service_id_string()),
+    )]
+    pub async fn send_story(
+        &mut self,
+        recipient: &ServiceId,
+        certificate: &SenderCertificate,
+        message: impl Into<ContentBody>,
+        timestamp: u64,
+    ) -> SendMessageResult {
+        let access = UnidentifiedAccess {
+            key: Vec::new(),
+            certificate: certificate.clone(),
+        };
+        self.try_send(
+            *recipient,
+            Some(&access),
+            &message.into(),
+            timestamp,
+            false,
+            false,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn try_send(
+        &mut self,
+        recipient: ServiceId,
         mut unidentified_access: Option<&UnidentifiedAccess>,
         content_body: &ContentBody,
         timestamp: u64,
         include_pni_signature: bool,
         online: bool,
+        story: bool,
     ) -> SendMessageResult {
         trace!("trying to send a message");
 
@@ -635,7 +691,10 @@ where
                 online,
             };
 
-            let send = if let Some(unidentified) = &unidentified_access {
+            let send = if story {
+                tracing::debug!("sending a story");
+                self.unidentified_ws.send_messages_story(messages).await
+            } else if let Some(unidentified) = &unidentified_access {
                 tracing::debug!("sending via unidentified");
                 self.unidentified_ws
                     .send_messages_unidentified(messages, unidentified)
@@ -656,7 +715,7 @@ where
                     });
                 },
                 Err(ServiceError::Unauthorized)
-                    if unidentified_access.is_some() =>
+                    if unidentified_access.is_some() && !story =>
                 {
                     tracing::trace!("unauthorized error using unidentified; retry over identified");
                     unidentified_access = None;

@@ -16,4 +16,9 @@ upstream workspace). Changes:
 ## libsignal-service
 
 whisperfish/libsignal-service-rs at `fb92b13c82fde40ba4d10696cf79aa4f36ce25f1`
-(presage's), without its examples and dev-dependencies. Unchanged so far.
+(presage's), without its examples and dev-dependencies. Changes:
+
+- `src/sender.rs`, `src/websocket/sender.rs`: `MessageSender::send_story`
+  sends sealed with the story flag (`PUT /v1/messages/{id}?story=true`),
+  without an access key and without falling back to an identified send,
+  as libsignal-net's story sends do. Upstream can't send stories.
