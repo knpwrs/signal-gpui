@@ -281,11 +281,19 @@ impl Sidebar {
         let key: Vec<u8> = items.iter().map(Item::kind).collect();
         if key != self.layout_key {
             let old = self.list.item_count();
+            // A splice counts rows added at the top of an empty list as
+            // above the visible one and jumps to the end; rows are by
+            // position here, so keep the position.
+            let top = self.list.logical_scroll_top();
             if items.len() > old {
                 self.list.splice(old..old, items.len() - old);
             } else if items.len() < old {
                 self.list.splice(items.len()..old, 0);
             }
+            self.list.scroll_to(ListOffset {
+                item_ix: top.item_ix.min(items.len().saturating_sub(1)),
+                offset_in_item: top.offset_in_item,
+            });
             self.list.remeasure();
             self.layout_key = key;
         }
@@ -423,6 +431,10 @@ impl Sidebar {
 
         let row = div()
             .id(SharedString::from(format!("conv-{}", conversation.id.0)))
+            .debug_selector({
+                let id = conversation.id.0.clone();
+                move || format!("conv-{id}")
+            })
             .size_full()
             .px_3()
             .flex()
@@ -773,6 +785,8 @@ impl Render for Sidebar {
             )
             .child(
                 div()
+                    .id("sidebar-search")
+                    .debug_selector(|| "sidebar-search".into())
                     .px_3()
                     .pb_2()
                     .child(
@@ -1102,6 +1116,61 @@ mod tests {
             sidebar.set_query(String::new(), cx);
         });
         assert_eq!(sidebar.read_with(&cx, |s, _| s.list.logical_scroll_top().item_ix), 0);
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn clearing_a_search_returns_to_the_top_of_the_list(cx: &mut TestAppContext) {
+        use gpui_kit::VisualTestContext;
+        cx.update(gpui_kit::init);
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config { data_dir: dir.path().to_owned(), db_key: [7; 32], device_name: "test".into(), demo: true };
+        let (backend, _events) = Backend::start(config).unwrap();
+        let state = cx.update(|cx| crate::state::new_state(backend.clone(), cx));
+        // Short, so the chat list scrolls.
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(gpui_kit::Bounds { origin: Default::default(), size: size(px(340.), px(300.)) })),
+            ..Default::default()
+        };
+        let (window, sidebar) = cx.update(|cx| {
+            let state = state.clone();
+            gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| Sidebar::new(state, window, cx))).unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window, cx);
+        for _ in 0..300 {
+            state.update(&mut cx, |s, cx| s.reload_conversations(cx));
+            cx.run_until_parked();
+            if state.read_with(&cx, |s, _| s.conversations.len() >= 6) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let drawn = |cx: &mut VisualTestContext| {
+            let ids: Vec<ConversationId> = state.read_with(cx, |s, _| s.conversations.iter().map(|c| c.id.clone()).collect());
+            ids.iter()
+                .enumerate()
+                .filter_map(|(ix, id)| cx.debug_bounds(Box::leak(format!("conv-{}", id.0).into_boxed_str())).map(|b| (ix, b.top())))
+                .collect::<Vec<_>>()
+        };
+        cx.run_until_parked();
+        assert_eq!(drawn(&mut cx).first().map(|(ix, _)| *ix), Some(0), "the list starts at the top");
+        let input = sidebar.read_with(&cx, |s, _| s.search_input());
+        cx.update(|window, cx| window.focus(&input.focus_handle(cx), cx));
+        // Nothing matches: the list empties, then refills on clearing.
+        cx.simulate_input("zzzz");
+        cx.executor().advance_clock(SEARCH_DEBOUNCE * 2);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-a backspace");
+        cx.executor().advance_clock(SEARCH_DEBOUNCE * 2);
+        cx.run_until_parked();
+        assert_eq!(sidebar.read_with(&cx, |s, _| s.query.clone()), "");
+        let top = sidebar.read_with(&cx, |s, _| s.list.logical_scroll_top());
+        assert_eq!((top.item_ix, top.offset_in_item), (0, px(0.)), "{top:?}");
+        // And on screen: the first chat is drawn, below the search box.
+        let search = cx.debug_bounds("sidebar-search").expect("search box drawn");
+        let first = drawn(&mut cx).first().copied();
+        assert!(matches!(first, Some((0, y)) if y >= search.bottom()), "{first:?}");
         backend.shutdown();
     }
 
