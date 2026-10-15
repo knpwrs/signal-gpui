@@ -579,6 +579,8 @@ impl AppState {
                     notifier.set_badge(0);
                 }
                 self.account = None;
+                // Its megaphones (the backend's check ended with it).
+                self.megaphones.clear();
                 // And its call (the backend's ended with it).
                 self.call = None;
                 self.lobby = None;

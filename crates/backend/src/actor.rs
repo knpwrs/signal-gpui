@@ -551,6 +551,7 @@ impl Actor {
         if let Some(task) = self.receiver.borrow_mut().take() {
             task.abort();
         }
+        self.stop_release_notes();
         self.manager.borrow_mut().take();
 
         let (url_tx, url_rx) = oneshot::channel();
@@ -603,6 +604,8 @@ impl Actor {
         if let Some(task) = self.history.borrow_mut().take() {
             task.abort();
         }
+        // They'd make the Signal chat again in the wiped database.
+        self.stop_release_notes();
         let manager = self.manager.borrow_mut().take();
         if let Some(manager) = manager
             && let Err(error) = manager.unlink_self().await

@@ -24,6 +24,14 @@ const SETTING_MEGAPHONES: &str = "megaphones";
 const MEGAPHONE_CHECK: Duration = Duration::from_secs(12 * 60 * 60);
 
 impl Actor {
+    /// Stops fetching release notes and showing megaphones (the account is
+    /// going).
+    pub(super) fn stop_release_notes(&self) {
+        for task in [self.release_notes.borrow_mut().take(), self.megaphones.borrow_mut().take()].into_iter().flatten() {
+            task.abort();
+        }
+    }
+
     /// Runs for the life of the account: fetches when due, then waits.
     pub(super) async fn release_notes_loop(self: Rc<Self>, phone: Option<String>) {
         loop {
