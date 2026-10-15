@@ -3592,6 +3592,21 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn enter_sends_selected_text_rather_than_replacing_it(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        wait_for_messages(&backend, MAYA, 1, |_| true);
+        let (mut cx, view) = open_view(cx, &backend, MAYA);
+        cx.update(|window, cx| {
+            let composer = view.read(cx).composer.clone();
+            composer.update(cx, |c, cx| c.focus(window, cx));
+        });
+        cx.simulate_input("all of it");
+        cx.simulate_keystrokes("cmd-a enter");
+        wait_for_messages(&backend, MAYA, 1, |m| m.body == "all of it" && m.direction == Direction::Outgoing);
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
     fn member_labels_show_beside_names(cx: &mut TestAppContext) {
         let (backend, _dir) = demo_backend(cx);
         wait_for_messages(&backend, GROUP, 1, |m| m.direction == Direction::Incoming);

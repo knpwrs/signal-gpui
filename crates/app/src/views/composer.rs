@@ -1009,6 +1009,21 @@ impl Render for Composer {
                     cx.stop_propagation();
                 }
             }))
+            .capture_action(cx.listener(|this, enter: &Enter, window, cx| {
+                // Only the message input's (the emoji picker's search, say,
+                // keeps its own).
+                if enter.shift || !this.input.read(cx).focus_handle(cx).is_focused(window) {
+                    return;
+                }
+                // Handled before the input sees it: it would first replace a
+                // selection (a word just made bold, say) with a line break.
+                cx.stop_propagation();
+                if this.typeahead.is_some() {
+                    this.accept_typeahead(None, window, cx);
+                } else {
+                    this.submit(window, cx);
+                }
+            }))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 this.add_paths(paths.paths().to_vec(), window, cx);
             }))
@@ -1026,12 +1041,6 @@ impl Render for Composer {
                         cx.stop_propagation();
                         t.selected = (t.selected + 1) % t.results.len();
                         cx.notify();
-                    }
-                }))
-                .capture_action(cx.listener(|this, enter: &Enter, window, cx| {
-                    if !enter.shift && this.typeahead.is_some() {
-                        cx.stop_propagation();
-                        this.accept_typeahead(None, window, cx);
                     }
                 }))
                 .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
