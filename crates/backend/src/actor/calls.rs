@@ -317,6 +317,23 @@ impl Actor {
                     }
                     self.emit_call();
                 }
+                CallEvent::CameraFailed { error } => {
+                    let group_sharing = self.group_sharing().is_some_and(|(sharing, _)| sharing);
+                    let sharing = self.call.borrow().as_ref().is_some_and(|c| c.sharing);
+                    if group_sharing {
+                        // A share has the video now: no camera after it.
+                        self.set_group_sharing(true, Some(false));
+                    } else if sharing {
+                        if let Some(call) = self.call.borrow_mut().as_mut() {
+                            call.camera_before_sharing = false;
+                        }
+                    } else {
+                        // Off, so it can be turned on again (and they see it off).
+                        self.with_calls(|calls| calls.set_video_enabled(false));
+                        self.group_media(None, Some(false));
+                    }
+                    self.emit(Event::CameraFailed(error));
+                }
                 CallEvent::RemoteAudio { peer, enabled } => {
                     if let Some(call) = self.call.borrow_mut().as_mut().filter(|c| c.peer == peer) {
                         call.remote_audio = enabled;

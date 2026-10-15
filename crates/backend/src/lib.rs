@@ -434,6 +434,8 @@ pub enum Event {
     ShareSources(Result<Vec<signal_calls::ShareSource>, String>),
     /// The devices calls can use, and which are chosen.
     CallDevices(CallDevices),
+    /// Our camera couldn't start, or stopped on its own: why.
+    CameraFailed(String),
     /// The call changed (`None`: no call any more).
     Call(Option<CallUpdate>),
     /// A 1:1 chat's safety number, or why there isn't one.

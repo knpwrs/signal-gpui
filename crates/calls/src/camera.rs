@@ -26,15 +26,26 @@ pub(crate) struct Camera {
 }
 
 impl Camera {
-    /// `choice`: the camera's name (else the first).
-    pub(crate) fn start(source: VideoSource, preview: FrameSlot, choice: Option<String>) -> anyhow::Result<Self> {
+    /// `choice`: the camera's name (else the first). `failed` hears why
+    /// it stopped, if it stops on its own.
+    pub(crate) fn start(
+        source: VideoSource,
+        preview: FrameSlot,
+        choice: Option<String>,
+        failed: impl FnOnce(String) + Send + 'static,
+    ) -> anyhow::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let thread = std::thread::Builder::new()
             .name("camera".into())
             .spawn(move || {
                 if let Err(error) = run(&flag, &source, &preview, choice.as_deref()) {
-                    tracing::warn!(error = %format!("{error:#}"), "camera stopped");
+                    let error = format!("{error:#}");
+                    tracing::warn!(%error, "camera stopped");
+                    // (Not when it was stopped; it was meant to.)
+                    if !flag.load(Ordering::Relaxed) {
+                        failed(error);
+                    }
                 }
             })
             .context("starting the camera thread")?;
@@ -49,6 +60,39 @@ impl Drop for Camera {
             let _ = thread.join();
         }
     }
+}
+
+/// The formats to ask for, best first: 720p at 30 fps (as Desktop sends
+/// at most), then whatever the camera has. On macOS nokhwa lists the
+/// camera's NV12 formats as YUYV, so asking for NV12 never matches there;
+/// and `Closest` only finds a frame rate at exactly the size asked for.
+fn requests() -> Vec<RequestedFormatType> {
+    let hd = |format| RequestedFormatType::Closest(CameraFormat::new(Resolution::new(1280, 720), format, 30));
+    vec![
+        hd(FrameFormat::YUYV),
+        hd(FrameFormat::NV12),
+        hd(FrameFormat::MJPEG),
+        RequestedFormatType::HighestResolution(Resolution::new(1280, 720)),
+        RequestedFormatType::AbsoluteHighestFrameRate,
+        RequestedFormatType::None,
+    ]
+}
+
+/// Opens the camera with the first format it can give.
+fn open(index: &CameraIndex) -> anyhow::Result<nokhwa::Camera> {
+    let mut last = anyhow!("no camera formats");
+    for request in requests() {
+        let opened = nokhwa::Camera::new(index.clone(), RequestedFormat::new::<RgbAFormat>(request))
+            .and_then(|mut camera| camera.open_stream().map(|()| camera));
+        match opened {
+            Ok(camera) => {
+                tracing::info!(format = %camera.camera_format(), "camera started");
+                return Ok(camera);
+            }
+            Err(error) => last = anyhow!("{error}"),
+        }
+    }
+    Err(last)
 }
 
 /// The cameras there are, by name.
@@ -70,9 +114,6 @@ fn run(stop: &AtomicBool, source: &VideoSource, preview: &FrameSlot, choice: Opt
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    // 720p at 30 fps, as Desktop sends at most.
-    let wanted = CameraFormat::new(Resolution::new(1280, 720), FrameFormat::NV12, 30);
-    let format = RequestedFormat::new::<RgbAFormat>(RequestedFormatType::Closest(wanted));
     let index = choice
         .and_then(|name| {
             nokhwa::query(nokhwa::utils::ApiBackend::Auto)
@@ -82,8 +123,7 @@ fn run(stop: &AtomicBool, source: &VideoSource, preview: &FrameSlot, choice: Opt
                 .map(|c| c.index().clone())
         })
         .unwrap_or(CameraIndex::Index(0));
-    let mut camera = nokhwa::Camera::new(index, format).map_err(|e| anyhow!("{e}"))?;
-    camera.open_stream().map_err(|e| anyhow!("{e}"))?;
+    let mut camera = open(&index)?;
     let mut failures = 0;
     while !stop.load(Ordering::Relaxed) {
         let frame = match camera.frame() {

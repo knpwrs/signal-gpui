@@ -1026,6 +1026,22 @@ mod tests {
         backend.shutdown();
     }
 
+    #[gpui_kit::test]
+    fn a_camera_that_fails_turns_off_and_says_why(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config { data_dir: dir.path().to_owned(), db_key: [7; 32], device_name: "test".into(), demo: true };
+        let (backend, _events) = Backend::start(config).unwrap();
+        let state = cx.update(|cx| crate::state::new_state(backend.clone(), cx));
+        let maya = ConversationId("d:00000000-0000-4000-8000-00000000a11c".into());
+        state.update(cx, |s, cx| s.open_call_lobby(maya, true, cx));
+        state.update(cx, |s, cx| s.handle(signal_backend::Event::CameraFailed("no camera".into()), cx));
+        let (video, error) = state.read_with(cx, |s, _| (s.lobby.as_ref().unwrap().video, s.last_error.clone()));
+        assert!(!video, "the toggle shows it off");
+        assert_eq!(error.as_deref(), Some("Couldn't start your camera: no camera"));
+        backend.shutdown();
+    }
+
     #[test]
     fn lobby_names_read_like_desktop() {
         let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();

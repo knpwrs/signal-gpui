@@ -58,6 +58,8 @@ pub enum CallEvent {
     RemoteAudio { peer: String, enabled: bool },
     /// They started or stopped presenting their screen.
     RemoteSharing { peer: String, enabled: bool },
+    /// Our camera stopped on its own (it couldn't start, or went away).
+    CameraFailed { error: String },
     /// A group call's message (ring, media keys…) for one person, as an
     /// opaque `CallMessage`.
     SendOpaque { recipient: Vec<u8>, data: Vec<u8>, urgent: bool },
@@ -373,6 +375,8 @@ pub struct Calls {
     /// Sharing the screen, in place of the camera.
     share: Option<screen::Share>,
     group_frames: GroupFrames,
+    /// RingRTC's events' way out, for ours too.
+    emit: Emit,
 }
 
 impl Calls {
@@ -386,7 +390,8 @@ impl Calls {
         remote: FrameSlot,
         group_frames: GroupFrames,
     ) -> anyhow::Result<Self> {
-        let handler = Handler { emit: Arc::new(emit) };
+        let emit: Emit = Arc::new(emit);
+        let handler = Handler { emit: emit.clone() };
         let mut factory = PeerConnectionFactory::new(&pcf::AudioConfig::default(), false, "", None)
             .map_err(|e| anyhow!("{e}"))
             .context("starting WebRTC")?;
@@ -418,6 +423,7 @@ impl Calls {
             remote,
             local,
             group_frames,
+            emit,
             camera: None,
             share: None,
         })
@@ -499,7 +505,9 @@ impl Calls {
             return;
         }
         if enabled && self.camera.is_none() {
-            match camera::Camera::start(self.source.clone(), self.local.clone(), self.camera_choice.clone()) {
+            let emit = self.emit.clone();
+            let failed = move |error| emit(CallEvent::CameraFailed { error });
+            match camera::Camera::start(self.source.clone(), self.local.clone(), self.camera_choice.clone(), failed) {
                 Ok(camera) => self.camera = Some(camera),
                 Err(error) => tracing::warn!(error = %format!("{error:#}"), "couldn't start the camera"),
             }

@@ -442,6 +442,13 @@ impl AppState {
             Event::SafetyNumber { conversation, result } => self.safety_number = Some((conversation, result)),
             Event::Call(update) => self.on_call(update, cx),
             Event::CallDevices(devices) => self.call_devices = Some(devices),
+            Event::CameraFailed(error) => {
+                if let Some(lobby) = &mut self.lobby {
+                    lobby.video = false;
+                }
+                self.call_video = false;
+                self.report_error(format!("Couldn't start your camera: {error}"), cx);
+            }
             Event::ShareSources(sources) => self.share_sources = Some(sources),
             Event::GroupPeek { conversation, users } => {
                 if let Some(lobby) = self.lobby.as_mut().filter(|l| l.conversation == conversation) {
