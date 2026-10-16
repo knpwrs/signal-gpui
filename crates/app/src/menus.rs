@@ -137,10 +137,31 @@ pub fn install(cx: &mut App) {
     cx.on_action(|_: &PasteAndMatchStyle, cx| {
         with_active_window(cx, |window, cx| window.dispatch_action(Box::new(Paste), cx))
     });
-    // From the menu with the main window hidden (shown, it handles it).
+    // From the menu with the main window hidden or nothing in it focused
+    // (otherwise the window handles them): the window comes back with them.
     cx.on_action(|_: &ShowKeyboardShortcuts, cx| {
         crate::main_window::show(cx);
         crate::main_window::update(cx, crate::views::shortcut_guide::open);
+    });
+    cx.on_action(|_: &About, cx| {
+        crate::main_window::show(cx);
+        crate::main_window::update(cx, crate::views::about::open);
+    });
+    cx.on_action(|_: &ShowDebugLog, cx| {
+        let Some(state) = crate::main_window::state(cx) else { return };
+        crate::main_window::show(cx);
+        crate::main_window::update(cx, move |window, cx| crate::views::debug_log::open(state, window, cx));
+    });
+    cx.on_action(|_: &OpenSettings, cx| {
+        let Some(state) = crate::main_window::state(cx) else { return };
+        let ready = {
+            let state = state.read(cx);
+            matches!(state.screen, crate::state::Screen::Main) && !state.is_loading()
+        };
+        if ready {
+            crate::main_window::show(cx);
+            crate::main_window::update(cx, move |window, cx| crate::views::settings::open(state, window, cx));
+        }
     });
     cx.on_action(|_: &ContactUs, cx| cx.open_url(CONTACT_URL));
     cx.on_action(|_: &GoToForums, cx| cx.open_url(FORUMS_URL));
@@ -198,6 +219,17 @@ mod tests {
         vcx.dispatch_action(CloseWindow);
         vcx.run_until_parked();
         assert!(vcx.update(|_, cx| cx.windows().contains(&window)));
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn menu_items_reach_a_hidden_window(cx: &mut TestAppContext) {
+        let (backend, _state, window, _dir) = crate::main_window::tests::open_demo(cx);
+        cx.update(install);
+        // As macOS sends a menu item with no window in front.
+        cx.update(|cx| cx.dispatch_action(&crate::shortcuts::ShowKeyboardShortcuts));
+        let mut vcx = gpui_kit::VisualTestContext::from_window(window, cx);
+        assert!(crate::views::test_support::shows(&mut vcx, "shortcut-guide"));
         backend.shutdown();
     }
 }
