@@ -916,6 +916,11 @@ async fn drop_later_migrations(db: &AppDb) {
     sqlx::query("DROP TABLE profile_sharing").execute(&db.writer).await.unwrap();
     sqlx::query("DROP TABLE story_send_modes").execute(&db.writer).await.unwrap();
     sqlx::query("ALTER TABLE conversations DROP COLUMN group_state").execute(&db.writer).await.unwrap();
+    for column in ["message_request", "reported", "added_by"] {
+        sqlx::query(AssertSqlSafe(format!("ALTER TABLE conversations DROP COLUMN {column}"))).execute(&db.writer).await.unwrap();
+    }
+    sqlx::query("ALTER TABLE messages DROP COLUMN server_guid").execute(&db.writer).await.unwrap();
+    sqlx::query("DROP TABLE system_contacts").execute(&db.writer).await.unwrap();
 }
 
 /// Rewrites the migration history to look like a pre-squash database that
@@ -2027,4 +2032,157 @@ fn locators_saved_before_the_backup_tier_still_read() {
     let json = serde_json::to_string(&backup_only).unwrap();
     assert!(!json.contains("cdn_key"), "{json}");
     assert_eq!(serde_json::from_str::<RemoteAttachment>(&json).unwrap(), backup_only);
+}
+
+#[tokio::test]
+async fn direct_chats_are_message_requests_until_trusted() {
+    let db = test_db().await;
+    let alice = conv("d:alice");
+    // No messages yet: not a request (Desktop's empty 1:1 chat).
+    db.upsert_conversation(&alice, ConversationUpdate::default()).await.unwrap();
+    assert!(db.conversation(&alice).await.unwrap().unwrap().accepted);
+    // Their message makes it one.
+    db.insert_message(&incoming("d:alice", "alice", 10, "hi")).await.unwrap();
+    let chat = db.conversation(&alice).await.unwrap().unwrap();
+    assert!(!chat.accepted);
+    assert_eq!(chat.message_request, MessageRequestResponse::Unknown);
+    // A notice doesn't count as ours.
+    db.insert_notice(&alice, 11, &Notice::Timer { by: None, seconds: 60 }).await.unwrap();
+    assert!(!db.conversation(&alice).await.unwrap().unwrap().accepted);
+    // Each makes it accepted: an address book entry, profile sharing,
+    // a message of ours, or our answer.
+    db.replace_system_contacts(&["alice".into()]).await.unwrap();
+    let chat = db.conversation(&alice).await.unwrap().unwrap();
+    assert!(chat.accepted && chat.system_contact);
+    assert!(!db.replace_system_contacts(&["alice".into()]).await.unwrap(), "unchanged");
+    db.replace_system_contacts(&[]).await.unwrap();
+    assert!(!db.conversation(&alice).await.unwrap().unwrap().accepted);
+    db.set_profile_sharing(&alice, true).await.unwrap();
+    assert!(db.conversation(&alice).await.unwrap().unwrap().accepted);
+    db.set_profile_sharing(&alice, false).await.unwrap();
+    db.set_message_request(&alice, MessageRequestResponse::Accept).await.unwrap();
+    let chat = db.conversation(&alice).await.unwrap().unwrap();
+    assert!(chat.accepted);
+    assert_eq!(chat.message_request, MessageRequestResponse::Accept);
+    db.set_message_request(&alice, MessageRequestResponse::Block).await.unwrap();
+    assert!(!db.conversation(&alice).await.unwrap().unwrap().accepted);
+    db.insert_message(&outgoing("d:alice", 20, "hello")).await.unwrap();
+    assert!(db.conversation(&alice).await.unwrap().unwrap().accepted);
+    // Note to Self and the Signal chat always are.
+    db.upsert_conversation(&conv("d:me"), ConversationUpdate { kind: Some(ConversationKind::NoteToSelf), ..Default::default() })
+        .await
+        .unwrap();
+    db.insert_message(&incoming(&ConversationId::signal().0, SIGNAL_ACI, 5, "news")).await.unwrap();
+    assert!(db.conversation(&conv("d:me")).await.unwrap().unwrap().accepted);
+    assert!(db.conversation(&ConversationId::signal()).await.unwrap().unwrap().accepted);
+}
+
+#[tokio::test]
+async fn groups_are_accepted_when_someone_trusted_added_us() {
+    let db = test_db().await;
+    let group = conv("g:aa");
+    db.upsert_conversation(&group, ConversationUpdate { kind: Some(ConversationKind::Group), ..Default::default() }).await.unwrap();
+    // Desktop: a group nobody trusted added us to is a request, messages or not.
+    assert!(!db.conversation(&group).await.unwrap().unwrap().accepted);
+    db.upsert_conversation(&group, ConversationUpdate { added_by: Some("bob".into()), ..Default::default() }).await.unwrap();
+    assert!(!db.conversation(&group).await.unwrap().unwrap().accepted);
+    db.set_profile_sharing(&conv("d:bob"), true).await.unwrap();
+    let chat = db.conversation(&group).await.unwrap().unwrap();
+    assert!(chat.accepted);
+    assert_eq!(chat.added_by.as_deref(), Some("bob"));
+    // Not an invitation, though, until we take it; a request to join is.
+    let state = |membership| GroupState { membership, ..Default::default() };
+    let invited = state(Membership::Invited { by: Some("carol".into()) });
+    db.upsert_conversation(&group, ConversationUpdate { group_state: Some(invited), ..Default::default() }).await.unwrap();
+    let chat = db.conversation(&group).await.unwrap().unwrap();
+    assert!(chat.invited() && !chat.accepted);
+    assert_eq!(chat.inviter(), Some("carol"));
+    let requesting = state(Membership::Requesting { password: String::new() });
+    db.upsert_conversation(&group, ConversationUpdate { group_state: Some(requesting), ..Default::default() }).await.unwrap();
+    let chat = db.conversation(&group).await.unwrap().unwrap();
+    assert!(chat.accepted && chat.inviter() == Some("bob"));
+    db.upsert_conversation(&group, ConversationUpdate { group_state: Some(state(Membership::Invited { by: None })), ..Default::default() })
+        .await
+        .unwrap();
+    assert!(!db.conversation(&group).await.unwrap().unwrap().accepted);
+    db.set_message_request(&group, MessageRequestResponse::Accept).await.unwrap();
+    assert!(db.conversation(&group).await.unwrap().unwrap().accepted);
+    // Our invitation is the chat's preview, naming who sent it.
+    db.replace_contact_names(&[("bob".into(), "Bob Stone".into())]).await.unwrap();
+    let invited = Notice::Group { by: Some("bob".into()), change: GroupNotice::Invited { member: None } };
+    db.insert_notice(&group, 50, &invited).await.unwrap();
+    let chat = db.conversation(&group).await.unwrap().unwrap();
+    assert_eq!((chat.last_message_preview.as_deref(), chat.last_message_at), (Some("Bob Stone invited you to the group."), 50));
+    // Someone else's invitation isn't.
+    let other_invite = Notice::Group { by: Some("bob".into()), change: GroupNotice::Invited { member: Some("carol".into()) } };
+    db.insert_notice(&group, 60, &other_invite).await.unwrap();
+    assert_eq!(db.conversation(&group).await.unwrap().unwrap().last_message_at, 50);
+    // Group profile sharing (Storage Service's `whitelisted`) counts too.
+    let other = conv("g:bb");
+    db.insert_message(&incoming("g:bb", "carol", 1, "hi")).await.unwrap();
+    assert!(!db.conversation(&other).await.unwrap().unwrap().accepted);
+    db.set_profile_sharing(&other, true).await.unwrap();
+    assert!(db.conversation(&other).await.unwrap().unwrap().accepted);
+}
+
+#[tokio::test]
+async fn spam_reports_name_the_newest_incoming_server_guids() {
+    let db = test_db().await;
+    let chat = conv("g:aa");
+    for (at, author, guid) in [(1, "bob", "g1"), (2, "bob", "g2"), (3, "carol", "g3"), (4, "bob", "g4"), (5, "bob", "g5")] {
+        db.insert_received(&incoming("g:aa", author, at, "spam"), None, Some(guid)).await.unwrap();
+    }
+    // A re-delivery keeps the first.
+    db.insert_received(&incoming("g:aa", "bob", 5, "spam"), None, Some("other")).await.unwrap();
+    // Ours never have one.
+    db.insert_received(&outgoing("g:aa", 6, "no"), None, Some("mine")).await.unwrap();
+    db.insert_message(&incoming("g:aa", "bob", 7, "no guid")).await.unwrap();
+    assert_eq!(db.server_guids_for_spam(&chat, None).await.unwrap(), ["g5", "g4", "g3"]);
+    assert_eq!(db.server_guids_for_spam(&chat, Some("bob")).await.unwrap(), ["g5", "g4", "g2"]);
+    assert!(db.server_guids_for_spam(&conv("d:x"), None).await.unwrap().is_empty());
+
+    assert_eq!(db.reporting_token("bob").await.unwrap(), None);
+    assert!(db.set_reporting_token("bob", "dG9rZW4=").await.unwrap());
+    assert!(!db.set_reporting_token("bob", "dG9rZW4=").await.unwrap());
+    assert_eq!(db.reporting_token("bob").await.unwrap().as_deref(), Some("dG9rZW4="));
+    // No chat for them is made.
+    let bob = conv("d:bob");
+    assert!(db.conversation(&bob).await.unwrap().is_none());
+    db.upsert_conversation(&bob, ConversationUpdate::default()).await.unwrap();
+    db.set_reported(&bob).await.unwrap();
+    assert!(db.conversation(&bob).await.unwrap().unwrap().reported);
+
+    // Clearing a blocked request keeps the chat and its block.
+    db.insert_message(&incoming("d:bob", "bob", 1, "spam")).await.unwrap();
+    db.set_blocked(&bob, true).await.unwrap();
+    db.clear_messages(&bob).await.unwrap();
+    let chat = db.conversation(&bob).await.unwrap().unwrap();
+    assert!(chat.blocked && chat.unread_count == 0 && chat.last_message_preview.is_none());
+    assert!(db.messages(&bob, None, 10).await.unwrap().is_empty());
+}
+
+#[test]
+fn message_request_answers_round_trip_the_wire_numbers() {
+    for n in 0..=6 {
+        assert_eq!(MessageRequestResponse::from_wire(n).to_wire(), n);
+    }
+    assert_eq!(MessageRequestResponse::from_wire(99), MessageRequestResponse::Unknown);
+    assert!(MessageRequestResponse::BlockAndSpam.blocks() && MessageRequestResponse::BlockAndSpam.spam());
+    assert!(MessageRequestResponse::BlockAndDelete.deletes() && !MessageRequestResponse::Accept.blocks());
+    // The Signal chat's id is spelled out in the accepted SQL.
+    assert!(CONVERSATION_COLUMNS.contains(&format!("'d:{SIGNAL_ACI}'")));
+}
+
+#[tokio::test]
+async fn whether_a_chat_is_accepted_is_found_by_index() {
+    let db = test_db().await;
+    let rows: Vec<(i64, i64, i64, String)> =
+        sqlx::query_as(AssertSqlSafe(format!("EXPLAIN QUERY PLAN SELECT {CONVERSATION_COLUMNS} FROM conversations")))
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    let plan = rows.into_iter().map(|r| r.3).collect::<Vec<_>>().join("; ");
+    assert!(!plan.contains("SCAN m"), "{plan}");
+    assert!(!plan.contains("SCAN s"), "{plan}");
+    assert!(!plan.contains("SCAN p"), "{plan}");
 }

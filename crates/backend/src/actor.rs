@@ -3000,6 +3000,7 @@ impl Actor {
             can_add_members: None,
             ended: None,
             group_state: None,
+            added_by: None,
         })
     }
 

@@ -440,6 +440,11 @@ mod tests {
             avatar_path: None,
             last_outgoing_status: None,
             unread_poll_votes: false,
+            accepted: true,
+            message_request: Default::default(),
+            reported: false,
+            added_by: None,
+            system_contact: true,
         };
         assert!(can_have_nickname(&chat));
         chat.kind = ConversationKind::NoteToSelf;

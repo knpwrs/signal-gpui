@@ -15,6 +15,7 @@ use sqlx::{
 mod call_history;
 mod call_links;
 mod early;
+mod message_requests;
 mod nickname;
 mod poll;
 mod stories;
@@ -22,6 +23,7 @@ mod view_once;
 pub use call_history::*;
 pub use call_links::*;
 pub use early::*;
+pub use message_requests::*;
 pub use nickname::*;
 pub use poll::*;
 pub use stories::*;
@@ -110,6 +112,23 @@ pub struct Conversation {
     /// (Desktop's `hasUnreadPollVotes`). It isn't in `unread_count`, as
     /// Desktop's isn't, but reading the chat clears it.
     pub unread_poll_votes: bool,
+    /// Desktop's `isConversationAccepted`: not a message request. Note to
+    /// Self and the Signal chat are; others when we accepted (here, on
+    /// another device, or Storage Service's `whitelisted`), share our
+    /// profile with them, or sent a message there. A 1:1 chat also when
+    /// they're in our address book or haven't messaged us; a group when
+    /// someone we trust added us (not an invitation we haven't taken).
+    pub accepted: bool,
+    /// Our last answer to its message request (Desktop's
+    /// `messageRequestResponseType`).
+    pub message_request: MessageRequestResponse,
+    /// We reported it as spam (Desktop's `isReported`).
+    pub reported: bool,
+    /// Who added us to the group outright (an ACI, Desktop's `addedBy`);
+    /// who invited us is in [`Conversation::group_state`].
+    pub added_by: Option<String>,
+    /// A person in our address book (Desktop's `isInSystemContacts`).
+    pub system_contact: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -661,6 +680,16 @@ pub enum Notice {
     /// Desktop's "You ended the poll: …" (`by`: the poll's creator, `None`
     /// for us). `sent_at` names the poll ("View poll").
     PollEnded { by: Option<String>, question: String, sent_at: i64 },
+    /// A message request answered (Desktop's `message-request-response-event`
+    /// messages): accepted, blocked, unblocked or reported. `group` for a
+    /// group's; `who`, in a 1:1 chat, the person.
+    MessageRequest {
+        event: MessageRequestEvent,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        group: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        who: Option<String>,
+    },
 }
 
 /// One change to a group, as a notice shows it. Service ids are `None`
@@ -706,6 +735,23 @@ pub enum GroupNotice {
     LinkReset,
     /// Admin approval for the link changed (`access-invite-link`).
     LinkApproval { on: bool },
+}
+
+impl Conversation {
+    /// We're invited to this group and haven't joined (Desktop's
+    /// `areWePending`).
+    pub fn invited(&self) -> bool {
+        matches!(self.group_state.membership, Membership::Invited { .. })
+    }
+
+    /// Who brought us into this group: who invited us, or added us
+    /// outright (Desktop's `getAddedByForGroup`).
+    pub fn inviter(&self) -> Option<&str> {
+        match &self.group_state.membership {
+            Membership::Invited { by: Some(by) } => Some(by),
+            _ => self.added_by.as_deref(),
+        }
+    }
 }
 
 impl Message {
@@ -784,6 +830,8 @@ pub struct ConversationUpdate {
     /// The group was ended for everyone.
     pub ended: Option<bool>,
     pub group_state: Option<GroupState>,
+    /// Who added us to the group outright (an ACI; Desktop's `addedBy`).
+    pub added_by: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -970,7 +1018,19 @@ const CONVERSATION_COLUMNS: &str = "id, kind, title, phone, color, members, last
       WHERE m.conversation_id = conversations.id AND m.notice IS NULL ORDER BY m.sent_at DESC, m.id DESC LIMIT 1) \
       AS last_outgoing_status, \
      EXISTS (SELECT 1 FROM messages m \
-      WHERE m.conversation_id = conversations.id AND m.unread_poll_votes = 1) AS unread_poll_votes";
+      WHERE m.conversation_id = conversations.id AND m.unread_poll_votes = 1) AS unread_poll_votes, \
+     message_request, reported, added_by, \
+     EXISTS (SELECT 1 FROM system_contacts s WHERE s.service_id = substr(conversations.id, 3)) AS system_contact, \
+     (kind = 'note_to_self' OR id = 'd:11111111-1111-4111-8111-111111111111' OR message_request = 1 \
+      OR EXISTS (SELECT 1 FROM profile_sharing p WHERE p.id = conversations.id) \
+      OR EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = conversations.id AND m.author_key = '' AND m.notice IS NULL) \
+      OR (kind = 'direct' AND (EXISTS (SELECT 1 FROM system_contacts s WHERE s.service_id = substr(conversations.id, 3)) \
+          OR NOT EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = conversations.id AND m.author_key NOT IN ('', 'notice')))) \
+      OR (kind = 'group' AND json_extract(group_state, '$.membership.kind') = 'requesting') \
+      OR (kind = 'group' AND COALESCE(json_extract(group_state, '$.membership.kind'), 'member') = 'member' \
+          AND added_by IS NOT NULL \
+          AND (EXISTS (SELECT 1 FROM system_contacts s WHERE s.service_id = conversations.added_by) \
+               OR EXISTS (SELECT 1 FROM profile_sharing p WHERE p.id = 'd:' || conversations.added_by)))) AS accepted";
 
 const MESSAGE_COLUMNS: &str = "id, conversation_id, sent_at, received_at, direction, author, \
      author_name, body, status, reactions, quote, attachments, link_preview, deleted, edited, expires_in, expire_start, edit_count, notice, mentions, styles, cta, deleted_by_admin, long_text, poll, view_once";
@@ -1142,6 +1202,11 @@ fn conversation_from_row(row: &SqliteRow) -> Result<Conversation> {
         avatar_path: row.try_get("avatar_path")?,
         last_outgoing_status: row.try_get::<Option<i64>, _>("last_outgoing_status")?.map(status_from_i64),
         unread_poll_votes: row.try_get("unread_poll_votes")?,
+        accepted: row.try_get("accepted")?,
+        message_request: MessageRequestResponse::from_wire(row.try_get("message_request")?),
+        reported: row.try_get("reported")?,
+        added_by: row.try_get("added_by")?,
+        system_contact: row.try_get("system_contact")?,
     })
 }
 
@@ -1529,7 +1594,8 @@ impl AppDb {
                 can_label = COALESCE(?, can_label), \
                 can_add_members = COALESCE(?, can_add_members), \
                 group_ended = COALESCE(?, group_ended), \
-                group_state = COALESCE(?, group_state) \
+                group_state = COALESCE(?, group_state), \
+                added_by = COALESCE(?, added_by) \
              WHERE id = ?",
         )
         .bind(update.kind.map(kind_to_str))
@@ -1547,6 +1613,7 @@ impl AppDb {
         .bind(update.can_add_members)
         .bind(update.ended)
         .bind(update.group_state.map(|g| serde_json::to_string(&g)).transpose()?)
+        .bind(update.added_by)
         .bind(&id.0)
         .execute(&mut *tx)
         .await?;
@@ -1819,14 +1886,21 @@ impl AppDb {
     /// [`insert_message`](Self::insert_message), a view-once message when
     /// `view_once` says (a message delivered again keeps its state).
     pub async fn insert_message_view_once(&self, msg: &NewMessage, view_once: Option<ViewOnce>) -> Result<i64> {
+        self.insert_received(msg, view_once, None).await
+    }
+
+    /// [`Self::insert_message_view_once`], keeping the server's GUID for an
+    /// incoming message (for a spam report).
+    pub async fn insert_received(&self, msg: &NewMessage, view_once: Option<ViewOnce>, server_guid: Option<&str>) -> Result<i64> {
         let mut tx = self.write().await?;
         ensure_conversation(&mut tx, &msg.conversation_id).await?;
         let incoming = msg.direction == Direction::Incoming;
         let author_key = msg.author.as_deref().unwrap_or("");
         let inserted: Option<i64> = sqlx::query_scalar(
             "INSERT INTO messages (conversation_id, sent_at, received_at, direction, author, \
-                author_key, author_name, body, status, quote, attachments, link_preview, expires_in, is_read, expire_start, view_once) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                author_key, author_name, body, status, quote, attachments, link_preview, expires_in, is_read, expire_start, view_once, \
+                server_guid) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT (conversation_id, author_key, sent_at) DO NOTHING \
              RETURNING id",
         )
@@ -1847,6 +1921,7 @@ impl AppDb {
         // Ours count down from when they're sent; others' from when read.
         .bind((!incoming && msg.expires_in > 0).then_some(msg.received_at))
         .bind(view_once.map(ViewOnce::to_i64))
+        .bind(server_guid.filter(|_| incoming))
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -2457,7 +2532,9 @@ impl AppDb {
                     .execute(&mut *tx)
                     .await?;
             }
-            if matches!(notice, Notice::PollEnded { .. }) {
+            if matches!(notice, Notice::PollEnded { .. })
+                || matches!(notice, Notice::Group { change: GroupNotice::Invited { member: None }, .. })
+            {
                 refresh_preview(&mut tx, conversation).await?;
             }
         }
@@ -2841,6 +2918,7 @@ impl AppDb {
         sqlx::query("DELETE FROM call_links").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM profile_sharing").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM story_send_modes").execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM system_contacts").execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -2905,9 +2983,11 @@ async fn current_long_text(conn: &mut sqlx::SqliteConnection, message_id: i64) -
 async fn refresh_preview(conn: &mut sqlx::SqliteConnection, id: &ConversationId) -> Result<()> {
     let row = sqlx::query(
         "SELECT m.sent_at, m.body, m.styles, m.deleted, m.attachments, m.direction, m.author_name, m.poll, m.view_once, m.notice, c.kind, \
-            (SELECT title FROM conversations p WHERE p.id = 'd:' || json_extract(m.notice, '$.by')) AS notice_by_name \
+            COALESCE((SELECT name FROM contact_names n WHERE n.service_id = json_extract(m.notice, '$.by')), \
+                (SELECT title FROM conversations p WHERE p.id = 'd:' || json_extract(m.notice, '$.by'))) AS notice_by_name \
          FROM messages m JOIN conversations c ON c.id = m.conversation_id \
-         WHERE m.conversation_id = ? AND (m.notice IS NULL OR json_extract(m.notice, '$.type') = 'poll_ended') \
+         WHERE m.conversation_id = ? AND (m.notice IS NULL OR json_extract(m.notice, '$.type') = 'poll_ended' \
+            OR (json_extract(m.notice, '$.change.kind') = 'invited' AND json_extract(m.notice, '$.change.member') IS NULL)) \
          ORDER BY m.sent_at DESC, m.id DESC LIMIT 1",
     )
     .bind(&id.0)
@@ -2923,6 +3003,17 @@ async fn refresh_preview(conn: &mut sqlx::SqliteConnection, id: &ConversationId)
             let view_once = row.try_get::<Option<i64>, _>("view_once")?.map(ViewOnce::from_i64);
             let notice: Option<Notice> =
                 row.try_get::<Option<String>, _>("notice")?.map(|n| serde_json::from_str(&n)).transpose()?;
+            // Our invitation to a group is its preview, as Desktop's
+            // `GroupV2--pending-add--one--you--other` becomes the chat's
+            // last message.
+            if let Some(Notice::Group { by, change: GroupNotice::Invited { member: None } }) = &notice {
+                let name: Option<String> = row.try_get("notice_by_name")?;
+                let text = match (by, name) {
+                    (Some(_), Some(name)) => format!("{name} invited you to the group."),
+                    _ => "You were invited to the group.".to_owned(),
+                };
+                return set_preview(conn, id, Some(text), row.try_get("sent_at")?).await;
+            }
             let text = if let Some(Notice::PollEnded { by, question, .. }) = &notice {
                 // Desktop's preview of `poll-terminate`: its text after 📊,
                 // with no sender before it.

@@ -24,6 +24,21 @@ pub fn notice_text(notice: &Notice, name: impl Fn(&str) -> String) -> String {
         // Desktop's `icu:PollTerminate--you` / `--other`.
         Notice::PollEnded { by: None, question, .. } => format!("You ended the poll: {question}"),
         Notice::PollEnded { by: Some(by), question, .. } => format!("{} ended the poll: {question}", name(by)),
+        Notice::MessageRequest { event, group, who } => message_request_text(*event, *group, who.as_deref(), name),
+    }
+}
+
+/// Desktop's `MessageRequestResponseNotification` wording.
+fn message_request_text(event: signal_store::MessageRequestEvent, group: bool, who: Option<&str>, name: impl Fn(&str) -> String) -> String {
+    use signal_store::MessageRequestEvent;
+    match (event, group, who) {
+        (MessageRequestEvent::Accept, false, Some(who)) => format!("You accepted {}'s message request", name(who)),
+        (MessageRequestEvent::Accept, _, _) => "You accepted the message request".into(),
+        (MessageRequestEvent::Block, true, _) => "You blocked the group".into(),
+        (MessageRequestEvent::Block, false, _) => "You blocked this person".into(),
+        (MessageRequestEvent::Unblock, true, _) => "You unblocked the group".into(),
+        (MessageRequestEvent::Unblock, false, _) => "You unblocked this person".into(),
+        (MessageRequestEvent::Spam, _, _) => "Reported as spam".into(),
     }
 }
 
@@ -266,6 +281,14 @@ mod tests {
         assert_eq!(text(group(by("a"), GroupNotice::Removed { member: None })), "Alice removed you.");
         assert_eq!(text(group(None, GroupNotice::Added { member: by("b") })), "You added Bob.");
         assert_eq!(text(group(by("a"), GroupNotice::Admin { member: by("b"), admin: true })), "Alice made Bob an admin.");
+        use signal_store::MessageRequestEvent as E;
+        let request = |event, group, who: Option<String>| text(Notice::MessageRequest { event, group, who });
+        assert_eq!(request(E::Accept, false, by("a")), "You accepted Alice's message request");
+        assert_eq!(request(E::Accept, true, None), "You accepted the message request");
+        assert_eq!(request(E::Block, false, by("a")), "You blocked this person");
+        assert_eq!(request(E::Block, true, None), "You blocked the group");
+        assert_eq!(request(E::Unblock, false, by("a")), "You unblocked this person");
+        assert_eq!(request(E::Spam, false, by("a")), "Reported as spam");
     }
 
     #[test]
