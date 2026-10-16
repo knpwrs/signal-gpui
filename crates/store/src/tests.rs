@@ -2471,3 +2471,43 @@ fn payment_descriptions_are_desktops() {
     assert_eq!(PaymentEvent::Activated.description(Some("Sam"), None), "Sam can now accept Payments.");
     assert_eq!(content_preview(&MessageContent::Payment(note), Some("Sam"), None), "💳 Payment");
 }
+
+#[tokio::test]
+async fn chat_colors_change_as_desktops_picker_changes_them() {
+    let db = test_db().await;
+    assert_eq!(db.chat_colors().await.unwrap(), ChatColors::default());
+    assert_eq!(db.chat_colors().await.unwrap().of(&conv("d:a")), &ChatColor::preset("ultramarine"));
+
+    let blue = CustomColor { start: HueSaturation { hue: 200., saturation: 50., lightness: None }, end: None, deg: None };
+    assert!(db.edit_chat_colors(ChatColorEdit::Default(ChatColor::preset("crimson"))).await.unwrap());
+    assert!(!db.edit_chat_colors(ChatColorEdit::Default(ChatColor::preset("crimson"))).await.unwrap(), "no change");
+    db.edit_chat_colors(ChatColorEdit::AddCustom { id: "c1".into(), color: blue, chat: Some(conv("d:a")) }).await.unwrap();
+    db.edit_chat_colors(ChatColorEdit::Chat(conv("g:b"), Some(ChatColor::preset("sea")))).await.unwrap();
+    let colors = db.chat_colors().await.unwrap();
+    assert_eq!(colors.default, ChatColor::preset("crimson"));
+    assert_eq!(colors.of(&conv("d:a")), &ChatColor::Custom { id: "c1".into(), value: blue });
+    assert_eq!(colors.of(&conv("d:c")), &ChatColor::preset("crimson"));
+    assert_eq!(colors.chats_with("c1"), 1);
+
+    // Editing a custom color changes it, not the copy a chat keeps (as
+    // Desktop's `editCustomColor`); the picker then chooses it again.
+    let green = CustomColor { start: HueSaturation { hue: 120., ..blue.start }, ..blue };
+    db.edit_chat_colors(ChatColorEdit::EditCustom { id: "c1".into(), color: green }).await.unwrap();
+    let colors = db.chat_colors().await.unwrap();
+    assert_eq!(colors.custom.get("c1"), Some(green));
+    assert_eq!(colors.of(&conv("d:a")), &ChatColor::Custom { id: "c1".into(), value: blue });
+
+    // Removing it takes it from every chat and resets the default, as
+    // Desktop's `removeCustomColor` does.
+    db.edit_chat_colors(ChatColorEdit::RemoveCustom { id: "c1".into() }).await.unwrap();
+    let colors = db.chat_colors().await.unwrap();
+    assert!(colors.custom.colors.is_empty());
+    assert_eq!(colors.of(&conv("d:a")), &ChatColor::default());
+    assert_eq!(colors.of(&conv("g:b")), &ChatColor::preset("sea"));
+
+    db.edit_chat_colors(ChatColorEdit::ResetChats).await.unwrap();
+    assert!(db.chat_colors().await.unwrap().chats.is_empty());
+    db.edit_chat_colors(ChatColorEdit::Chat(conv("g:b"), Some(ChatColor::preset("sea")))).await.unwrap();
+    db.edit_chat_colors(ChatColorEdit::Chat(conv("g:b"), None)).await.unwrap();
+    assert!(db.chat_colors().await.unwrap().chats.is_empty());
+}

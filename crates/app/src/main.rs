@@ -2,6 +2,7 @@
 
 mod assets;
 mod avatar_presets;
+mod chat_color;
 mod audio;
 mod emoji_usage;
 mod fonts;

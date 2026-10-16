@@ -41,6 +41,8 @@ pub enum Page {
     PhoneNumber,
     /// Privacy's Blocked page.
     Blocked,
+    /// Appearance's "Chat color" (Desktop's `ChatColorPicker`).
+    ChatColor,
 }
 
 impl Page {
@@ -61,6 +63,7 @@ impl Page {
             Page::WhileMuted => "While muted",
             Page::PhoneNumber => "Phone Number",
             Page::Blocked => "Blocked",
+            Page::ChatColor => "Chat Color",
         }
     }
 
@@ -76,6 +79,7 @@ impl Page {
             Page::WhileMuted => "settings-page-while-muted",
             Page::PhoneNumber => "settings-page-phone-number",
             Page::Blocked => "settings-page-blocked",
+            Page::ChatColor => "settings-page-chat-color",
         }
     }
 
@@ -84,6 +88,7 @@ impl Page {
         match self {
             Page::WhileMuted => Some(Page::Notifications),
             Page::PhoneNumber | Page::Blocked => Some(Page::Privacy),
+            Page::ChatColor => Some(Page::Appearance),
             _ => None,
         }
     }
@@ -147,6 +152,10 @@ fn render(settings: &Entity<Settings>, window: &mut Window, cx: &mut App) -> Any
     let body = match page {
         Page::General => general::render(settings, palette, window, cx),
         Page::Appearance => appearance::render(settings, palette, cx),
+        Page::ChatColor => {
+            let state = settings.read(cx).state.clone();
+            crate::views::chat_colors::render(&state, None, palette, cx)
+        }
         Page::Chats => chats::render(settings, palette, cx),
         Page::Calls => calls::render(settings, palette, cx),
         Page::Notifications => notifications::render(settings, palette, cx),

@@ -282,6 +282,8 @@ pub struct AppState {
     pub last_error: Option<String>,
     /// Installed sticker packs (refreshed when the picker opens).
     pub sticker_packs: Vec<std::sync::Arc<signal_backend::StickerPackView>>,
+    /// Chat colors: the default, custom colors, and each chat's own.
+    pub chat_colors: signal_store::ChatColors,
     /// Whether a Giphy API key is saved (GIF search needs one).
     pub has_giphy_key: bool,
     /// Decoded looping videos (GIFs), by file and width.
@@ -499,6 +501,7 @@ impl AppState {
             prefs_read: 0,
             login_item: Default::default(),
             sticker_packs: Vec::new(),
+            chat_colors: Default::default(),
             has_giphy_key: std::env::var_os("GIPHY_API_KEY").is_some(),
             loops: Default::default(),
             audio: None,
@@ -972,6 +975,8 @@ impl AppState {
             }
             HistoryProgress::Skipped => self.history = None,
             HistoryProgress::Done { .. } => {
+                // The transfer brings the phone's chat colors.
+                self.reload_chat_colors(cx);
                 self.history = Some(progress);
                 // Shown for a moment, then out of the way.
                 cx.spawn(async move |this, cx| {
@@ -1442,6 +1447,46 @@ impl AppState {
         })
         .detach();
         self.load_prefs(cx);
+        self.reload_chat_colors(cx);
+    }
+
+    /// Reads the chat colors again.
+    pub fn reload_chat_colors(&mut self, cx: &mut Context<Self>) {
+        let db = self.backend.db().clone();
+        let read = self.backend.spawn(async move { db.chat_colors().await });
+        cx.spawn(async move |this, cx| {
+            let Ok(colors) = read.await else { return };
+            let _ = this.update(cx, |this, cx| {
+                this.chat_colors = colors;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Changes the chat colors (Desktop's `ChatColorPicker` actions): here
+    /// at once, then saved. They stay on this device, as Desktop's do.
+    pub fn edit_chat_colors(&mut self, edit: signal_store::ChatColorEdit, cx: &mut Context<Self>) {
+        if !self.chat_colors.apply(edit.clone()) {
+            return;
+        }
+        cx.notify();
+        let db = self.backend.db().clone();
+        let write = self.backend.spawn(async move { db.edit_chat_colors(edit).await });
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = write.await {
+                let _ = this.update(cx, |this, cx| {
+                    this.report_error(format!("Couldn't save the chat color: {error}"), cx);
+                    this.reload_chat_colors(cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// What our bubbles in `chat` are filled with.
+    pub fn bubble_fill(&self, chat: &ConversationId) -> crate::chat_color::BubbleFill {
+        crate::chat_color::fill(self.chat_colors.of(chat))
     }
 
     /// Reads Settings' other values, and applies the theme and zoom.

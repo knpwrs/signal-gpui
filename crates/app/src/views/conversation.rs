@@ -1763,8 +1763,16 @@ impl ConversationView {
         let show_meta = last;
         let outgoing = message.direction == Direction::Outgoing;
         let corners = Corners::for_bubble(outgoing, first, last);
-        let (bg, fg, meta_color) = if outgoing {
-            (palette.bubble_out, palette.bubble_out_text, palette.bubble_out_meta)
+        // Ours take the chat's color (Desktop's chat colors), solid or a
+        // gradient; `bg` stands for it where one color is needed.
+        let ours = outgoing.then(|| self.state.read(cx).bubble_fill(&self.id));
+        let (bg, fg, meta_color) = if let Some(ours) = ours {
+            let bg = match ours {
+                crate::chat_color::BubbleFill::Solid(color) => color,
+                // The time's room in the text is drawn clear on a gradient.
+                crate::chat_color::BubbleFill::Gradient(..) => gpui_kit::transparent_black(),
+            };
+            (bg, palette.bubble_out_text, palette.bubble_out_meta)
         } else if self.id.is_signal() {
             // Desktop's own color for release notes, with white text.
             let white = Hsla { h: 0., s: 0., l: 1., a: 1. };
@@ -1773,6 +1781,7 @@ impl ConversationView {
             (palette.bubble_in, palette.bubble_in_text, palette.text_secondary)
         };
 
+        let fill: gpui_kit::Background = ours.map_or_else(|| bg.into(), crate::chat_color::BubbleFill::background);
         let jumbo = jumbo_count(message);
 
         let meta = show_meta.then(|| {
@@ -1797,11 +1806,11 @@ impl ConversationView {
         }
 
         if let Some(view_once) = message.view_once.filter(|_| !message.deleted) {
-            return self.render_view_once(message, view_once, show_author, corners, (bg, fg, meta_color), meta.map(IntoElement::into_any_element), palette, cx);
+            return self.render_view_once(message, view_once, show_author, corners, (fill, fg, meta_color), meta.map(IntoElement::into_any_element), palette, cx);
         }
 
         if let Some(content) = message.content.as_ref().filter(|_| !message.deleted) {
-            return self.render_content(message, content, show_author, corners, (bg, fg, meta_color), meta, palette, cx);
+            return self.render_content(message, content, show_author, corners, (fill, fg, meta_color), meta, palette, cx);
         }
 
         // Stickers stand alone, without a bubble, at Desktop's size.
@@ -1829,7 +1838,7 @@ impl ConversationView {
                             .px_2()
                             .py_1p5()
                             .rounded_lg()
-                            .bg(bg)
+                            .bg(fill)
                             .text_color(fg)
                             .child(self.render_quote(message.id, quote, fg, palette, cx)),
                     )
@@ -1900,7 +1909,7 @@ impl ConversationView {
                 .flex()
                 .flex_col()
                 .w(px(width))
-                .bg(bg)
+                .bg(fill)
                 .text_color(fg)
                 .when(header, |d| {
                     d.child(
@@ -1981,7 +1990,7 @@ impl ConversationView {
                 .flex()
                 .flex_col()
                 .when_some(full.as_ref().map(|(_, (width, _))| *width), |d, width| d.w(px(width)))
-                .bg(bg)
+                .bg(fill)
                 .text_color(fg)
                 .when(header, |d| {
                     d.child(
@@ -2032,7 +2041,7 @@ impl ConversationView {
             .gap_1()
             .px_3()
             .py_2()
-            .bg(bg)
+            .bg(fill)
             .text_color(fg)
             .when(show_author && !outgoing, |d| {
                 d.child(author_line(author_name, author_color, author_label, author_open))
@@ -2071,7 +2080,7 @@ impl ConversationView {
         content: &signal_store::MessageContent,
         show_author: bool,
         corners: Corners,
-        (bg, fg, meta_color): (Hsla, Hsla, Hsla),
+        (bg, fg, meta_color): (gpui_kit::Background, Hsla, Hsla),
         meta: Option<impl IntoElement>,
         palette: Palette,
         cx: &mut Context<Self>,
@@ -2133,7 +2142,7 @@ impl ConversationView {
         view_once: ViewOnce,
         show_author: bool,
         corners: Corners,
-        (bg, fg, meta_color): (Hsla, Hsla, Hsla),
+        (bg, fg, meta_color): (gpui_kit::Background, Hsla, Hsla),
         meta: Option<AnyElement>,
         palette: Palette,
         cx: &mut Context<Self>,

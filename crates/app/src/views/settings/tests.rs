@@ -132,6 +132,33 @@ fn pages_are_listed_and_open_from_the_list(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn appearance_chooses_the_default_chat_color(cx: &mut TestAppContext) {
+    use signal_store::{CHAT_COLOR_DEFAULT, ChatColor};
+    let h = Harness::open(cx, Page::Appearance);
+    h.click(cx, "chat-color");
+    assert_eq!(cx.read(|cx| h.settings.read(cx).page), Page::ChatColor);
+    assert!(h.shown(cx, "chat-color-ultramarine") && h.shown(cx, "chat-color-tangerine"));
+    h.click(cx, "chat-color-crimson");
+    assert_eq!(cx.read(|cx| h.state.read(cx).chat_colors.default.clone()), ChatColor::preset("crimson"));
+    assert!(wait(cx, |_| h.stored(CHAT_COLOR_DEFAULT).is_some_and(|json| json.contains("crimson"))));
+    // Our bubbles everywhere take it, the timeline's included.
+    let chat = signal_store::ConversationId("d:x".into());
+    let fill = cx.read(|cx| h.state.read(cx).bubble_fill(&chat));
+    assert_eq!(fill, crate::chat_color::preset("crimson").unwrap());
+
+    // A custom gradient, made in the editor, becomes the default.
+    h.click(cx, "chat-color-add");
+    h.click(cx, "custom-color-gradient");
+    h.click(cx, "custom-color-end");
+    h.click(cx, "custom-color-save");
+    let default = cx.read(|cx| h.state.read(cx).chat_colors.default.clone());
+    let ChatColor::Custom { value, .. } = default else { panic!("{default:?}") };
+    assert!(value.end.is_some());
+    assert_eq!(cx.read(|cx| h.state.read(cx).chat_colors.custom.colors.len()), 1);
+    assert!(h.shown(cx, "chat-color-custom-0"));
+}
+
+#[gpui_kit::test]
 fn general_shows_the_account_and_opens_at_login(cx: &mut TestAppContext) {
     use std::sync::atomic::{AtomicBool, Ordering};
     // A stand-in login item: nothing is registered with the system.

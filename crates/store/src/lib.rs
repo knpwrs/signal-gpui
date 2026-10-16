@@ -14,6 +14,7 @@ use sqlx::{
 
 mod call_history;
 mod call_links;
+mod chat_colors;
 mod content;
 mod early;
 mod message_requests;
@@ -26,6 +27,7 @@ mod stories;
 mod view_once;
 pub use call_history::*;
 pub use call_links::*;
+pub use chat_colors::*;
 pub use content::*;
 pub use early::*;
 pub use message_requests::*;

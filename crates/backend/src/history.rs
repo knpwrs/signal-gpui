@@ -537,6 +537,10 @@ pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: imp
     // Who's in our address book (Desktop's `isInSystemContacts`).
     let mut system: Vec<String> = Vec::new();
     let mut imported = Imported::default();
+    // Chat colors (Desktop's `#fromCustomChatColors` and `#fromChatStyle`):
+    // custom colors by their backup id, then the default and each chat's.
+    let mut colors = signal_store::ChatColors::default();
+    let mut custom_by_id: HashMap<u64, (String, signal_store::CustomColor)> = HashMap::new();
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64;
     let mut frames = delimited(plain);
     // First comes the BackupInfo.
@@ -604,11 +608,25 @@ pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: imp
                 if let Some(order) = chat.pinnedOrder {
                     pinned.push((order, id.clone()));
                 }
+                if let Some(color) = chat.style.as_ref().and_then(|style| chat_color(style, &custom_by_id)) {
+                    colors.chats.insert(id.0.clone(), color);
+                }
                 chats.insert(chat.id, id);
                 imported.chats += 1;
             }
             Some(proto::frame::Item::Account(account)) => {
                 imported.settings = Some(account_settings(&account));
+                if let Some(settings) = account.accountSettings.as_ref() {
+                    for custom in &settings.customChatColors {
+                        let Some(color) = custom.color.as_ref().and_then(custom_color) else { continue };
+                        let id = uuid::Uuid::new_v4().to_string();
+                        colors.custom.colors.push((id.clone(), color));
+                        custom_by_id.insert(custom.id, (id, color));
+                    }
+                    if let Some(color) = settings.defaultChatStyle.as_ref().and_then(|style| chat_color(style, &custom_by_id)) {
+                        colors.default = color;
+                    }
+                }
                 // Desktop: `hasKeyTransparencyDisabled` unless the account allows it.
                 let allowed = account.accountSettings.as_ref().is_some_and(|s| s.allowAutomaticKeyVerification);
                 let value = if allowed { "false" } else { "true" };
@@ -636,6 +654,9 @@ pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: imp
         }
     }
     db.apply_chat_states(&states).await?;
+    if colors != signal_store::ChatColors::default() {
+        db.edit_chat_colors(signal_store::ChatColorEdit::Import(colors)).await?;
+    }
     db.apply_profile_sharing(&sharing).await?;
     db.add_system_contacts(&system).await?;
     db.set_story_send_modes(&modes).await?;
@@ -644,6 +665,62 @@ pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: imp
         db.replace_pinned(&pinned.into_iter().map(|(_, id)| id).collect::<Vec<_>>()).await?;
     }
     Ok(imported)
+}
+
+/// Desktop's `rgbIntToDesktopHSL`: a backup's `0xAARRGGBB` as Desktop's
+/// hue (degrees), saturation (percent) and lightness (0 to 1), as
+/// `ts/util/rgbToHSL.std.ts` computes them.
+fn desktop_hsl(argb: u32) -> signal_store::HueSaturation {
+    let [_, r, g, b] = argb.to_be_bytes().map(|c| f64::from(c) / 255.);
+    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    let c = max - min;
+    let l = max - c / 2.;
+    let h = if c == 0. {
+        0.
+    } else if max == r {
+        60. * (((g - b) / c + 6.) % 6.)
+    } else if max == g {
+        60. * ((b - r) / c + 2.)
+    } else {
+        60. * ((r - g) / c + 4.)
+    };
+    let s = if l == 0. || l == 1. { 0. } else { (max - l) / l.min(1. - l) };
+    signal_store::HueSaturation { hue: h as f32, saturation: (s * 100.) as f32, lightness: Some(l as f32) }
+}
+
+/// A backup's custom color (Desktop's `#fromCustomChatColors`): solid, or a
+/// gradient from its first color to its last, its angle turned to
+/// Desktop's (`360 - angle - 90`).
+fn custom_color(color: &proto::chat_style::custom_chat_color::Color) -> Option<signal_store::CustomColor> {
+    use proto::chat_style::custom_chat_color::Color;
+    match color {
+        Color::Solid(argb) => Some(signal_store::CustomColor { start: desktop_hsl(*argb), end: None, deg: None }),
+        Color::Gradient(gradient) => {
+            let (start, end) = (gradient.colors.first()?, gradient.colors.last()?);
+            let deg = (360 - i64::from(gradient.angle) - 90).rem_euclid(360) as f32;
+            Some(signal_store::CustomColor { start: desktop_hsl(*start), end: Some(desktop_hsl(*end)), deg: Some(deg) })
+        }
+        _ => None,
+    }
+}
+
+/// A chat style's bubble color (Desktop's `#fromChatStyle`): a preset, a
+/// custom color by its backup id, or none for the automatic color (no
+/// wallpaper is imported, as Desktop imports none outside its tests).
+fn chat_color(
+    style: &proto::ChatStyle,
+    custom: &HashMap<u64, (String, signal_store::CustomColor)>,
+) -> Option<signal_store::ChatColor> {
+    use proto::chat_style::BubbleColor;
+    match style.bubbleColor.as_ref()? {
+        BubbleColor::AutoBubbleColor(_) => None,
+        BubbleColor::BubbleColorPreset(preset) => {
+            let index = usize::try_from(preset.value() - 1).ok().filter(|i| *i < signal_store::CHAT_COLOR_PRESETS.len()).unwrap_or(0);
+            Some(signal_store::ChatColor::preset(signal_store::CHAT_COLOR_PRESETS[index]))
+        }
+        BubbleColor::CustomColorId(id) => custom.get(id).map(|(id, value)| signal_store::ChatColor::Custom { id: id.clone(), value: *value }),
+        _ => None,
+    }
 }
 
 /// One chat item; `Ok(false)` for kinds that aren't imported (updates
@@ -1649,5 +1726,38 @@ mod tests {
         assert_eq!(system_contact(&recipient(contact.clone())), None, "a profile name isn't the address book's");
         contact.systemGivenName = "Alice".into();
         assert_eq!(system_contact(&recipient(contact)), Some(Aci::from_uuid_bytes([0xa1; 16]).service_id_string()));
+    }
+
+    #[test]
+    fn chat_styles_read_as_desktops_import_reads_them() {
+        use proto::chat_style::{BubbleColor, BubbleColorPreset, Gradient, custom_chat_color::Color};
+        // Pure red: hue 0, saturation 100%, lightness a half.
+        let red = desktop_hsl(0xffff0000);
+        assert_eq!((red.hue, red.saturation, red.lightness), (0., 100., Some(0.5)));
+        let blue = desktop_hsl(0xff0000ff);
+        assert_eq!(blue.hue, 240.);
+        assert_eq!(custom_color(&Color::Solid(0xffff0000)).unwrap().end, None);
+        // A backup's 0 degrees (bottom to top) is Desktop's 270.
+        let gradient = Gradient { angle: 0, colors: vec![0xffff0000, 0xff00ff00, 0xff0000ff], ..Default::default() };
+        let color = custom_color(&Color::Gradient(gradient)).unwrap();
+        assert_eq!((color.deg, color.end.map(|e| e.hue)), (Some(270.), Some(240.)));
+        assert!(custom_color(&Color::Gradient(Gradient::default())).is_none(), "no colors");
+
+        let custom = HashMap::from([(7u64, ("c7".to_owned(), color))]);
+        let style = |bubble| proto::ChatStyle { bubbleColor: Some(bubble), ..Default::default() };
+        let preset = |p| style(BubbleColor::BubbleColorPreset(protobuf::EnumOrUnknown::new(p)));
+        assert_eq!(chat_color(&preset(BubbleColorPreset::GRADIENT_SEA), &custom), Some(signal_store::ChatColor::preset("sea")));
+        assert_eq!(chat_color(&preset(BubbleColorPreset::SOLID_CRIMSON), &custom), Some(signal_store::ChatColor::preset("crimson")));
+        assert_eq!(
+            chat_color(&preset(BubbleColorPreset::UNKNOWN_BUBBLE_COLOR_PRESET), &custom),
+            Some(signal_store::ChatColor::preset("ultramarine"))
+        );
+        assert_eq!(
+            chat_color(&style(BubbleColor::CustomColorId(7)), &custom),
+            Some(signal_store::ChatColor::Custom { id: "c7".into(), value: color })
+        );
+        assert_eq!(chat_color(&style(BubbleColor::CustomColorId(8)), &custom), None, "missing: automatic");
+        assert_eq!(chat_color(&style(BubbleColor::AutoBubbleColor(Default::default())), &custom), None);
+        assert_eq!(chat_color(&proto::ChatStyle::default(), &custom), None);
     }
 }

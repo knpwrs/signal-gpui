@@ -2,6 +2,7 @@ pub mod about;
 pub mod call;
 pub mod calls;
 pub mod all_media;
+pub mod chat_colors;
 pub mod chat_menu;
 pub mod challenge;
 pub mod chat_settings;

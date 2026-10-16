@@ -75,7 +75,7 @@ checked:
   send doesn't report it), nor messages from the link-time backup.
 - **Missed call notifications:** Desktop 8.34 has none (only the incoming
   call notification), so there are none here either.
-- **Not here from Desktop's pages:** language, chat color, spell check,
+- **Not here from Desktop's pages:** language, spell check,
   text formatting, the default skin tone, chat folders, chat export, the
   badge count settings, notification profiles, "Reset" notification
   settings, sent media quality, the device name, and the Account page.
@@ -587,4 +587,23 @@ tests and a demo-mode UI test; nothing here has met a real message. Left:
 - **Badge lookup:** the subscription configuration's fetch
   (`GET /v1/subscription/configuration`) hasn't been tried against the
   server.
+
+## Chat colors
+
+Desktop's `ChatColorPicker` for the default (Settings, Appearance, "Chat
+color") and per chat (its settings), its 22 presets, custom colors made in
+the `CustomColorEditor` (solid or gradient), and our bubbles in the
+timeline filled with them, gradients drawn as gradients. Like Desktop's,
+they stay on this device: no Storage Service record carries them; only the
+link-time history transfer brings the phone's (`defaultChatStyle`,
+`customChatColors`, each chat's `style`). Tested with store, history-import
+and color unit tests and a demo-mode Settings test. Left:
+
+- **Wallpapers:** Desktop 8.34 has none (`1410-remove-wallpaper`; its backup
+  import keeps wallpapers only in its tests), so none here either.
+- **The gradient dial:** Desktop drags two knobs around the sample to set
+  the angle (`GradientDial`); here Start and End are buttons and an angle
+  slider turns it.
+- **A custom color's menu** opens on right-click; Desktop opens it on a
+  click of the chosen color.
 

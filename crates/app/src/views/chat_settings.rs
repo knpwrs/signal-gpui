@@ -130,6 +130,7 @@ pub fn open(state: Entity<AppState>, conversation: Conversation, window: &mut Wi
                 crate::views::safety_number::open(safety_state.clone(), chat.id.clone(), chat.title.clone(), window, cx);
             });
             let body = body.when(direct, |d| d.child(div().child(safety)));
+            let body = body.child(div().child(chat_color_button(&state, &conversation.id, cx)));
             let body = match nickname {
                 Some(nickname) if crate::views::nickname::can_have_nickname(&conversation) => {
                     body.child(nickname_rows(state.clone(), conversation.clone(), nickname, palette))
@@ -296,6 +297,7 @@ pub fn open(state: Entity<AppState>, conversation: Conversation, window: &mut Wi
                 )
             })
             .child(panels)
+            .child(div().child(chat_color_button(&state, &conversation.id, cx)))
             .child(field("Members"))
             // Desktop's `canAddNewMembers`.
             .when(conversation.can_add_members && !conversation.left && !conversation.ended, |d| {
@@ -323,6 +325,17 @@ pub fn open(state: Entity<AppState>, conversation: Conversation, window: &mut Wi
             }),
         )
     });
+}
+
+/// Desktop's "Chat color" row in a chat's details, with its swatch.
+fn chat_color_button(state: &Entity<AppState>, chat: &signal_store::ConversationId, cx: &App) -> Button {
+    let color = state.read(cx).chat_colors.of(chat).clone();
+    let (state, chat) = (state.clone(), chat.clone());
+    Button::new("chat-color")
+        .outline()
+        .small()
+        .child(div().flex().items_center().gap_2().child(crate::views::chat_colors::swatch_for(&color)).child("Chat color"))
+        .on_click(move |_, window, cx| crate::views::chat_colors::open_for_chat(state.clone(), chat.clone(), window, cx))
 }
 
 /// Desktop's "Nickname" row (with "Delete" once there's one) and the note,
