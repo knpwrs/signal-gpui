@@ -160,10 +160,7 @@ pub fn toggle(text: &str, selection: Range<usize>, style: TextStyle) -> (String,
     if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
         return (text.to_owned(), start..end);
     }
-    let wrapped = start >= m.len()
-        && text.get(start - m.len()..start) == Some(m)
-        && text.get(end..end + m.len()) == Some(m);
-    if wrapped {
+    if is_wrapped(text, start..end, style) {
         let text = format!("{}{}{}", &text[..start - m.len()], &text[start..end], &text[end + m.len()..]);
         return (text, start - m.len()..end - m.len());
     }
@@ -181,9 +178,26 @@ pub fn toggle(text: &str, selection: Range<usize>, style: TextStyle) -> (String,
     (text, trimmed_start + m.len()..trimmed_end + m.len())
 }
 
+/// Whether the selection sits just inside `style`'s markers, so that
+/// toggling it unwraps it (the formatting popover shows it as on).
+pub fn is_wrapped(text: &str, selection: Range<usize>, style: TextStyle) -> bool {
+    let m = marker(style);
+    let (start, end) = (selection.start.min(selection.end), selection.start.max(selection.end));
+    start >= m.len() && text.get(start - m.len()..start) == Some(m) && text.get(end..end + m.len()) == Some(m)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrapped_selections_show_their_style() {
+        let text = "a *bold* word";
+        assert!(is_wrapped(text, 3..7, TextStyle::Bold));
+        assert!(!is_wrapped(text, 3..7, TextStyle::Italic));
+        assert!(!is_wrapped(text, 0..1, TextStyle::Bold));
+        assert!(!is_wrapped(text, 9..13, TextStyle::Bold), "at the end");
+    }
 
     fn styled(text: &str) -> (String, Vec<(String, TextStyle)>) {
         let (plain, spans) = parse(text);

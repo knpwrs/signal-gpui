@@ -127,11 +127,20 @@ pub enum Toggle {
     /// "In-chat message sounds": a pop as a message arrives in the open
     /// chat, a whoosh as we send one.
     MessageSounds,
+    /// "Show text formatting popover when text is selected" (Desktop's
+    /// `textFormatting`, on by default).
+    TextFormatting,
 }
 
 impl Toggle {
-    pub const ALL: [Toggle; 5] =
-        [Self::IncomingCalls, Self::CallSounds, Self::AlwaysRelayCalls, Self::NotificationSounds, Self::MessageSounds];
+    pub const ALL: [Toggle; 6] = [
+        Self::IncomingCalls,
+        Self::CallSounds,
+        Self::AlwaysRelayCalls,
+        Self::NotificationSounds,
+        Self::MessageSounds,
+        Self::TextFormatting,
+    ];
 
     pub fn key(self) -> &'static str {
         match self {
@@ -140,12 +149,13 @@ impl Toggle {
             Self::AlwaysRelayCalls => signal_backend::SETTING_ALWAYS_RELAY_CALLS,
             Self::NotificationSounds => "notification_sounds",
             Self::MessageSounds => "message_sounds",
+            Self::TextFormatting => "text_formatting",
         }
     }
 
     /// Desktop's defaults (`Preferences.preload.tsx`).
     pub fn default_on(self) -> bool {
-        matches!(self, Self::IncomingCalls | Self::CallSounds)
+        matches!(self, Self::IncomingCalls | Self::CallSounds | Self::TextFormatting)
     }
 }
 
@@ -253,6 +263,7 @@ mod tests {
         assert!(prefs.auto_convert_emoji && prefs.contacts_synced_at.is_none());
         assert!(prefs.on(Toggle::IncomingCalls) && prefs.on(Toggle::CallSounds) && !prefs.on(Toggle::AlwaysRelayCalls));
         assert!(!prefs.on(Toggle::NotificationSounds) && !prefs.on(Toggle::MessageSounds));
+        assert!(prefs.on(Toggle::TextFormatting));
         assert!(prefs.flags[&AccountSetting::ReactionNotifications] && !prefs.flags[&AccountSetting::NotifyCallsIfMuted]);
 
         let values: HashMap<String, Option<String>> = [

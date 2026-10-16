@@ -1,7 +1,7 @@
 //! Desktop's Chats page: address book photos, keeping muted chats
-//! archived, link previews, emoticons, chat folders, and importing the
-//! phone's contacts. (Its spell check, text formatting, skin tone and chat
-//! export aren't here.)
+//! archived, link previews, emoticons, the text formatting popover, chat
+//! folders, and importing the phone's contacts. (Its spell check, skin tone
+//! and chat export aren't here.)
 
 use gpui_kit::component::button::Button;
 use gpui_kit::component::{Disableable as _, Sizable as _};
@@ -10,6 +10,7 @@ use gpui_kit::{AnyElement, App, Entity, SharedString, div};
 use signal_backend::AccountSetting;
 
 use super::{Settings, list, switch};
+use crate::prefs::Toggle;
 use crate::state::ContactSync;
 use crate::theme::Palette;
 
@@ -26,6 +27,7 @@ pub(super) fn render(settings: &Entity<Settings>, palette: Palette, cx: &mut App
         })
     };
     let emoji_state = state.clone();
+    let formatting_state = state.clone();
     let sync_state = state.clone();
     let pending = matches!(sync, ContactSync::Pending(_));
     div()
@@ -55,6 +57,15 @@ pub(super) fn render(settings: &Entity<Settings>, palette: Palette, cx: &mut App
             Some("Text input"),
             None,
             [
+                switch(
+                    "text-formatting",
+                    "Show text formatting popover when text is selected",
+                    None,
+                    prefs.on(Toggle::TextFormatting),
+                    false,
+                    palette,
+                    move |on, _, cx| formatting_state.update(cx, |s, cx| s.set_toggle(Toggle::TextFormatting, on, cx)),
+                ),
                 flag(
                     "link-previews",
                     "Generate link previews",

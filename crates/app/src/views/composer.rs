@@ -1679,7 +1679,7 @@ impl Focusable for Composer {
 }
 
 impl Render for Composer {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::get(cx);
         let typeahead_open = self.typeahead.is_some();
         let can_send =
@@ -1761,6 +1761,7 @@ impl Render for Composer {
                 }))
             })
             .when_some(self.typeahead.as_ref(), |d, t| d.child(deferred(self.render_typeahead(t, palette, cx))))
+            .children(self.render_formatting_menu(palette, window, cx))
             .when(self.picker_open, |d| {
                 d.child(deferred(
                     div()
@@ -1903,6 +1904,77 @@ impl Render for Composer {
 }
 
 impl Composer {
+    /// Desktop's formatting popover (`ts/quill/formatting/menu.dom.tsx`):
+    /// over selected text, with "Show text formatting popover when text is
+    /// selected" on, a button for each style (lit when the selection has
+    /// it), each toggling it as its shortcut does.
+    fn render_formatting_menu(&self, palette: Palette, window: &Window, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
+        use signal_store::TextStyle;
+        if !self.state.read(cx).prefs.on(crate::prefs::Toggle::TextFormatting) || self.typeahead.is_some() || self.recording.is_some() {
+            return None;
+        }
+        let input = self.input.read(cx);
+        let selection = input.selected_range();
+        if selection.is_empty() || !input.focus_handle(cx).is_focused(window) {
+            return None;
+        }
+        let bounds = input.range_to_bounds(&selection)?;
+        let text = input.value().to_string();
+        const STYLES: [(TextStyle, IconName, &str); 5] = [
+            (TextStyle::Bold, IconName::Bold, "Mark selected text as bold"),
+            (TextStyle::Italic, IconName::Italic, "Mark selected text as italic"),
+            (TextStyle::Strikethrough, IconName::Strikethrough, "Mark selected text as strikethrough"),
+            (TextStyle::Monospace, IconName::Code, "Mark selected text as monospace"),
+            (TextStyle::Spoiler, IconName::EyeOff, "Mark selected text as a spoiler"),
+        ];
+        let buttons = STYLES.map(|(style, icon, label)| {
+            let on = crate::formatting::is_wrapped(&text, selection.clone(), style);
+            div()
+                .id(SharedString::from(format!("format-{style:?}")))
+                .debug_selector(move || format!("format-{style:?}"))
+                .size(px(28.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .cursor_pointer()
+                .when(on, |d| d.bg(palette.row_hover))
+                .hover(|d| d.bg(palette.row_hover))
+                .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(label).build(window, cx))
+                // Keep the selection: the input stays focused.
+                .on_mouse_down(gpui_kit::MouseButton::Left, |_, window, _| window.prevent_default())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.format(style, window, cx);
+                    this.focus(window, cx);
+                }))
+                .child(Icon::new(icon).size_4().text_color(if on { palette.accent } else { palette.text }))
+        });
+        Some(
+            deferred(
+                gpui_kit::anchored()
+                    .position(gpui_kit::point(bounds.left(), bounds.top()))
+                    .anchor(gpui_kit::Anchor::BottomLeft)
+                    .offset(gpui_kit::point(px(0.), px(-6.)))
+                    .snap_to_window_with_margin(px(8.))
+                    .child(
+                        div()
+                            .debug_selector(|| "formatting-menu".into())
+                            .flex()
+                            .gap_0p5()
+                            .p_1()
+                            .rounded_lg()
+                            .bg(palette.popover)
+                            .border_1()
+                            .border_color(palette.panel_border)
+                            .shadow_md()
+                            .occlude()
+                            .children(buttons),
+                    ),
+            )
+            .into_any_element(),
+        )
+    }
+
     /// Desktop hides the expand tab while view-once is on.
     fn view_once_active(&self) -> bool {
         self.view_once && self.view_once_eligible()
@@ -2700,6 +2772,36 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(sent.get(), 1);
         assert_eq!(text(&f, cx), "");
+    }
+
+    #[gpui_kit::test]
+    fn selected_text_gets_the_formatting_popover(cx: &mut TestAppContext) {
+        let f = mount(cx);
+        let target = input_id(&f, cx);
+        let mut vcx = gpui_kit::VisualTestContext::from_window(f.window, cx);
+        vcx.update(|window, cx| {
+            window.click(target.clone(), cx);
+            window.input("make it bold", cx);
+        });
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("formatting-menu").is_none(), "nothing selected");
+        vcx.simulate_keystrokes("cmd-a");
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+        let bold = vcx.debug_bounds("format-Bold").expect("the popover over the selection");
+        vcx.simulate_click(bold.center(), gpui_kit::Modifiers::none());
+        vcx.run_until_parked();
+        assert_eq!(text(&f, cx), "*make it bold*");
+
+        // Off in Settings: no popover.
+        let state = cx.update(|cx| f.composer.read(cx).state.clone());
+        cx.update(|cx| state.update(cx, |s, cx| s.set_toggle(crate::prefs::Toggle::TextFormatting, false, cx)));
+        let mut vcx = gpui_kit::VisualTestContext::from_window(f.window, cx);
+        vcx.simulate_keystrokes("cmd-a");
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("formatting-menu").is_none());
     }
 
     #[gpui_kit::test]
