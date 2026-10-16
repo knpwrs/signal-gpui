@@ -8,9 +8,11 @@ mod fonts;
 mod formatting;
 mod image_cache;
 mod keys;
+mod login_item;
 mod loop_cache;
 mod notifications;
 mod platform;
+mod prefs;
 mod recorder;
 mod sidebar_width;
 mod ringtone;
@@ -225,7 +227,7 @@ fn main() -> Result<()> {
             ..Default::default()
         };
         let opened = gpui_kit::open_window(options, cx, |window, cx| {
-            window.observe_window_appearance(|window, cx| Theme::sync_system_appearance(Some(window), cx))
+            window.observe_window_appearance(crate::prefs::appearance_changed)
                 .detach();
             cx.new(|cx| RootView::new(state.clone(), window, cx))
         });

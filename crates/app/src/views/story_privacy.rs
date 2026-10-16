@@ -426,7 +426,7 @@ fn render_lists(privacy: &Entity<Privacy>, palette: Palette, cx: &App) -> AnyEle
             "If you opt out of stories you will no longer be able to share or view stories.",
         ))
         .child(div().child(Button::new("privacy-stories-off").label("Turn off stories").small().outline().on_click(
-            move |_, window, cx| crate::views::settings::confirm_stories_off(off_state.clone(), window, cx),
+            move |_, window, cx| crate::views::settings::confirm_stories_off(off_state.clone(), true, window, cx),
         )))
         .into_any_element()
 }

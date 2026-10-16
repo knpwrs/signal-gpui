@@ -308,6 +308,12 @@ pub struct AppState {
     pub recent_stickers: Vec<(Vec<u8>, u32)>,
     /// How images are optimized before sending (our setting, not Signal's).
     pub image_optimization: signal_backend::media::Optimization,
+    /// Settings' other values (theme, zoom, the account's on/off settings).
+    pub prefs: crate::prefs::Prefs,
+    /// Open at computer login, as the system last said.
+    pub open_at_login: bool,
+    /// The system's login item (a stand-in in tests).
+    pub login_item: crate::login_item::LoginItem,
     reload_task: Option<Task<()>>,
     reload_pending: bool,
     /// Demo mode opens the first conversation once loaded.
@@ -381,6 +387,9 @@ impl AppState {
             emoji_usage: EmojiUsageCache::default(),
             last_error: None,
             image_optimization: Default::default(),
+            prefs: Default::default(),
+            open_at_login: false,
+            login_item: Default::default(),
             sticker_packs: Vec::new(),
             has_giphy_key: std::env::var_os("GIPHY_API_KEY").is_some(),
             loops: Default::default(),
@@ -905,6 +914,8 @@ impl AppState {
                 self.sticker_packs.clear();
                 self.has_giphy_key = std::env::var_os("GIPHY_API_KEY").is_some();
                 self.image_optimization = Default::default();
+                self.prefs = Default::default();
+                crate::prefs::apply(self.prefs.theme, self.prefs.zoom, cx);
                 self.seen_admin_delete_education = false;
                 self.kt_status = None;
                 self.key_transparency_disabled = false;
@@ -1042,6 +1053,59 @@ impl AppState {
             });
         })
         .detach();
+        self.load_prefs(cx);
+    }
+
+    /// Reads Settings' other values, and applies the theme and zoom.
+    fn load_prefs(&mut self, cx: &mut Context<Self>) {
+        let db = self.backend.db().clone();
+        let read = self.backend.spawn(async move {
+            let mut values = HashMap::new();
+            for key in crate::prefs::Prefs::keys() {
+                values.insert(key.to_owned(), db.setting(key).await?);
+            }
+            Ok::<_, signal_store::Error>(values)
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(values) = read.await else { return };
+            let _ = this.update(cx, |this, cx| {
+                this.prefs = crate::prefs::Prefs::from_values(&values);
+                crate::prefs::apply(this.prefs.theme, this.prefs.zoom, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Desktop's Theme choice (Appearance).
+    pub fn set_theme(&mut self, theme: crate::prefs::ThemeSetting, cx: &mut Context<Self>) {
+        self.prefs.theme = theme;
+        crate::prefs::apply(theme, self.prefs.zoom, cx);
+        self.save_setting(signal_backend::SETTING_THEME, theme.as_setting().into(), cx);
+        cx.notify();
+    }
+
+    /// Desktop's Zoom level (Appearance).
+    pub fn set_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {
+        self.prefs.zoom = zoom;
+        crate::prefs::apply(self.prefs.theme, zoom, cx);
+        self.save_setting(crate::prefs::ZOOM_KEY, zoom.to_string(), cx);
+        cx.notify();
+    }
+
+    /// Reads whether the app opens at login (Settings asks as it opens).
+    pub fn refresh_open_at_login(&mut self, cx: &mut Context<Self>) {
+        self.open_at_login = (self.login_item.is_enabled)();
+        cx.notify();
+    }
+
+    /// Desktop's "Open at computer login".
+    pub fn set_open_at_login(&mut self, on: bool, cx: &mut Context<Self>) {
+        match (self.login_item.set)(on) {
+            Ok(()) => self.open_at_login = on,
+            Err(error) => self.report_error(format!("Couldn't change opening at login: {error}"), cx),
+        }
+        cx.notify();
     }
 
     /// The stories still up, from the store.
@@ -1198,6 +1262,7 @@ impl AppState {
     /// the whole account.
     pub fn set_account_setting(&mut self, setting: signal_backend::AccountSetting, on: bool, cx: &mut Context<Self>) {
         use signal_backend::AccountSetting;
+        self.prefs.flags.insert(setting, on);
         match setting {
             AccountSetting::ReadReceipts => self.read_receipts = on,
             AccountSetting::TypingIndicators => {
