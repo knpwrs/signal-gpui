@@ -192,6 +192,10 @@ pub enum Command {
     /// Archives, mutes, marks unread or blocks a chat for the whole account
     /// (Storage Service).
     SetChat { conversation: ConversationId, change: ChatChange },
+    /// Sets (or, all empty, deletes) the nickname and note we give someone
+    /// in a 1:1 chat, here and for the whole account (Storage Service), as
+    /// Desktop's "Nickname" dialog does. `plain_name` is ignored.
+    SetNickname { conversation: ConversationId, nickname: signal_store::ContactNickname },
     /// Sets a chat's disappearing-message timer (seconds; 0 turns it off)
     /// for everyone in it.
     SetExpireTimer { conversation: ConversationId, seconds: u32 },

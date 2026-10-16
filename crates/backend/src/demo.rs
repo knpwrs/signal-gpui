@@ -386,6 +386,18 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
         db.mark_read(&ConversationId(read.into())).await?;
     }
 
+    // Names as Storage Service gives them. Leo's profile says "Leonardo
+    // Martin"; we gave him a nickname (what his chat is titled) and a note.
+    let people = [MAYA, JORDAN, PRIYA, SAM, ANA, LEO];
+    let names: Vec<(String, String)> = people.iter().map(|p| (aci(p).to_owned(), name(p).to_owned())).collect();
+    let leo = signal_store::ContactNickname {
+        given: "Leo".into(),
+        family: "Martin".into(),
+        note: "Rent is split 50/50, due on the 1st. Allergic to cats.".into(),
+        plain_name: Some("Leonardo Martin".into()),
+    };
+    db.replace_contacts(&names, &[(aci(LEO).to_owned(), leo)]).await?;
+
     db.replace_pinned(&[ConversationId(GROUP.into()), ConversationId(SELF.into())]).await?;
     // People and groups without a chat yet: found by search.
     db.replace_directory(&[
@@ -1054,6 +1066,22 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                         done
                     }
                 };
+                let _ = events.unbounded_send(Event::ConversationsChanged);
+            }
+            Command::SetNickname { conversation, nickname } => {
+                let Some(sid) = conversation.as_direct().filter(|_| conversation.0 != SELF).map(str::to_owned) else { continue };
+                let Ok(name) = db.set_contact_nickname(&sid, &signal_store::limit_nickname(&nickname)).await else { continue };
+                let phone = db.conversation(&conversation).await.ok().flatten().and_then(|c| c.phone);
+                let Some(title) = name.or(phone) else { continue };
+                let update = ConversationUpdate { title: Some(title.clone()), ..Default::default() };
+                let _ = db.upsert_conversation(&conversation, update).await;
+                let _ = db.retitle_directory_entry(&conversation, &title).await;
+                let names = vec![(sid, title)];
+                if let Ok(renamed) = db.rename_authors(&names).await
+                    && renamed > 0
+                {
+                    emit(Event::AuthorNamesChanged(names));
+                }
                 let _ = events.unbounded_send(Event::ConversationsChanged);
             }
             Command::SetPinned { conversation, pinned } => {

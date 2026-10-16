@@ -55,6 +55,9 @@ pub(crate) struct StorageContact {
     pub e164: Option<String>,
     /// Hidden or blocked on the phone: not offered for new chats.
     pub hidden: bool,
+    /// The nickname and note we gave them, and the name without the
+    /// nickname.
+    pub nickname: signal_store::ContactNickname,
 }
 
 /// What we read from the Storage Service.
@@ -543,6 +546,75 @@ pub(crate) async fn write_chat(manager: &SignalManager, conversation: &Conversat
     if conversation.is_signal() {
         return Ok(());
     }
+    write_chat_record(manager, conversation, |record| edit_chat_record(record, edit)).await
+}
+
+const CONTACT_NICKNAME: u32 = 22; // ContactRecord.nickname
+const CONTACT_NOTE: u32 = 23; // ContactRecord.note
+const NAME_GIVEN: u32 = 1; // ContactRecord.Name.given
+const NAME_FAMILY: u32 = 2; // ContactRecord.Name.family
+
+/// Sets a contact record's nickname and note (Desktop's `toContactRecord`
+/// in `ts/services/storageRecordOps.preload.ts`: a `nickname` only when
+/// either name is set, a `note` only when there is one), keeping every
+/// other field, unknown ones in `nickname` too. `Ok(None)` when they're
+/// already so.
+pub(crate) fn edit_contact_nickname(record: &[u8], nickname: &signal_store::ContactNickname) -> anyhow::Result<Option<Vec<u8>>> {
+    edit_inner(record, RECORD_CONTACT, |contact| {
+        let fields = wire::fields(contact).context("malformed contact record")?;
+        let current = ContactRecord::decode(contact).context("malformed contact record")?;
+        let (given, family, note) = (nickname.given.trim(), nickname.family.trim(), nickname.note.trim());
+        let (old_given, old_family) =
+            current.nickname.as_ref().map_or(("", ""), |n| (n.given.as_str(), n.family.as_str()));
+        if (old_given, old_family, current.note.as_str()) == (given, family, note) {
+            return Ok(None);
+        }
+        // proto3 merges repeated message fields: the last one's names win,
+        // and its other fields add up. Keep the unknown ones of each.
+        let mut name = Vec::new();
+        for field in fields.iter().filter(|f| f.number == CONTACT_NICKNAME) {
+            let inner = field.payload.and_then(wire::fields).context("malformed nickname")?;
+            for kept in inner.iter().filter(|f| !matches!(f.number, NAME_GIVEN | NAME_FAMILY)) {
+                name.extend_from_slice(kept.raw);
+            }
+        }
+        if !given.is_empty() {
+            wire::put_len(&mut name, NAME_GIVEN, given.as_bytes());
+        }
+        if !family.is_empty() {
+            wire::put_len(&mut name, NAME_FAMILY, family.as_bytes());
+        }
+        let mut out = Vec::with_capacity(contact.len() + name.len() + note.len() + 8);
+        for field in fields.iter().filter(|f| !matches!(f.number, CONTACT_NICKNAME | CONTACT_NOTE)) {
+            out.extend_from_slice(field.raw);
+        }
+        if !given.is_empty() || !family.is_empty() {
+            wire::put_len(&mut out, CONTACT_NICKNAME, &name);
+        }
+        if !note.is_empty() {
+            wire::put_len(&mut out, CONTACT_NOTE, note.as_bytes());
+        }
+        Ok(Some(out))
+    })
+}
+
+/// Sets the nickname and note we give someone, for the whole account.
+pub(crate) async fn write_nickname(
+    manager: &SignalManager,
+    conversation: &ConversationId,
+    nickname: &signal_store::ContactNickname,
+) -> anyhow::Result<()> {
+    ensure!(conversation.as_group().is_none() && !conversation.is_signal(), "only a person can have a nickname");
+    write_chat_record(manager, conversation, |record| edit_contact_nickname(record, nickname)).await
+}
+
+/// Edits a chat's contact or group record with `edit`, adding the record
+/// if Storage Service has none.
+async fn write_chat_record(
+    manager: &SignalManager,
+    conversation: &ConversationId,
+    edit: impl Fn(&[u8]) -> anyhow::Result<Option<Vec<u8>>>,
+) -> anyhow::Result<()> {
     let session = Session::new(manager).await?;
     let kind = if conversation.as_group().is_some() { IdentifierType::Groupv2 } else { IdentifierType::Contact };
     for _ in 0..3 {
@@ -566,7 +638,7 @@ pub(crate) async fn write_chat(manager: &SignalManager, conversation: &Conversat
                 (None, raw)
             }
         };
-        let Some(record) = edit_chat_record(&record, edit)? else { return Ok(()) };
+        let Some(record) = edit(&record)? else { return Ok(()) };
         if session.commit(manager, &manifest, old_key.as_deref(), kind, &record).await? {
             return Ok(());
         }
@@ -812,25 +884,29 @@ fn record_aci(record: &ContactRecord) -> Option<Uuid> {
     (!aci.is_nil()).then_some(aci)
 }
 
-fn join_name(given: &str, family: &str) -> Option<String> {
-    let name = format!("{} {}", given.trim(), family.trim());
-    let name = name.trim();
-    (!name.is_empty()).then(|| name.to_owned())
-}
-
+/// What a contact record says about someone. Their name follows Desktop's
+/// `getTitleNoDefault` (`ts/util/getTitle.preload.ts`): the nickname we gave
+/// them, then their address-book name (its nickname, else given and family
+/// names), then their profile name; names combine as `combineNames` does.
 pub(crate) fn from_record(record: &ContactRecord) -> Option<StorageContact> {
+    use signal_store::combine_names;
     let aci = record_aci(record)?;
-    let nickname = record.nickname.as_ref().and_then(|n| join_name(&n.given, &n.family));
-    let system = Some(record.system_nickname.trim().to_owned())
-        .filter(|n| !n.is_empty())
-        .or_else(|| join_name(&record.system_given_name, &record.system_family_name));
-    let profile = join_name(&record.given_name, &record.family_name);
+    let nickname = signal_store::ContactNickname {
+        given: record.nickname.as_ref().map(|n| n.given.trim().to_owned()).unwrap_or_default(),
+        family: record.nickname.as_ref().map(|n| n.family.trim().to_owned()).unwrap_or_default(),
+        note: record.note.trim().to_owned(),
+        plain_name: Some(record.system_nickname.trim().to_owned())
+            .filter(|n| !n.is_empty())
+            .or_else(|| combine_names(&record.system_given_name, &record.system_family_name))
+            .or_else(|| combine_names(&record.given_name, &record.family_name)),
+    };
     Some(StorageContact {
         aci,
-        name: nickname.or(system).or(profile),
+        name: nickname.nickname().or_else(|| nickname.plain_name.clone()),
         profile_key: record.profile_key.as_slice().try_into().ok(),
         e164: Some(record.e164.clone()).filter(|e| !e.is_empty()),
         hidden: record.hidden || record.blocked,
+        nickname,
     })
 }
 
@@ -859,7 +935,77 @@ mod tests {
         assert_eq!(from_record(&record).unwrap().name.as_deref(), Some("Jon"));
 
         record.nickname = Some(Name { given: "J".into(), family: String::new() });
-        assert_eq!(from_record(&record).unwrap().name.as_deref(), Some("J"));
+        record.note = " Owes me lunch ".into();
+        let c = from_record(&record).unwrap();
+        assert_eq!(c.name.as_deref(), Some("J"));
+        assert_eq!(
+            c.nickname,
+            signal_store::ContactNickname {
+                given: "J".into(),
+                family: String::new(),
+                note: "Owes me lunch".into(),
+                plain_name: Some("Jon".into())
+            }
+        );
+        // A family name alone is a nickname too.
+        record.nickname = Some(Name { given: String::new(), family: "Doe".into() });
+        assert_eq!(from_record(&record).unwrap().name.as_deref(), Some("Doe"));
+    }
+
+    fn contact_record(contact: &ContactRecord, extra_contact: &[u8]) -> Vec<u8> {
+        let mut inner = contact.encode_to_vec();
+        inner.extend_from_slice(extra_contact);
+        let mut record = Vec::new();
+        wire::put_len(&mut record, RECORD_CONTACT, &inner);
+        record
+    }
+
+    fn decode_contact(record: &[u8]) -> ContactRecord {
+        match StorageRecord::decode(record).unwrap().record {
+            Some(Record::Contact(contact)) => contact,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn nickname_edits_change_only_the_nickname_and_note() {
+        let nick = |given: &str, family: &str, note: &str| signal_store::ContactNickname {
+            given: given.into(),
+            family: family.into(),
+            note: note.into(),
+            plain_name: None,
+        };
+        let contact = ContactRecord { aci: ACI.into(), given_name: "Maurice".into(), archived: true, ..Default::default() };
+        // A field this client doesn't know in the contact record, and one in a nickname.
+        let mut unknown = Vec::new();
+        wire::put_len(&mut unknown, 99, b"future contact field");
+        let mut name = Vec::new();
+        wire::put_len(&mut name, NAME_GIVEN, b"Old");
+        wire::put_len(&mut name, 7, b"future name field");
+        wire::put_len(&mut unknown, CONTACT_NICKNAME, &name);
+        let record = contact_record(&contact, &unknown);
+        let contains = |haystack: &[u8], needle: &[u8]| haystack.windows(needle.len()).any(|w| w == needle);
+
+        let edited = edit_contact_nickname(&record, &nick(" Mo ", "", "Met at the gym")).unwrap().unwrap();
+        let decoded = decode_contact(&edited);
+        assert_eq!(decoded.nickname.as_ref().map(|n| (n.given.as_str(), n.family.as_str())), Some(("Mo", "")));
+        assert_eq!(decoded.note, "Met at the gym");
+        assert!(decoded.archived && decoded.given_name == "Maurice");
+        assert!(contains(&edited, b"future contact field") && contains(&edited, b"future name field"));
+        assert!(!contains(&edited, b"Old"));
+        assert_eq!(edit_contact_nickname(&edited, &nick("Mo", "", "Met at the gym")).unwrap(), None, "already so");
+
+        // Deleted, as Desktop's "Delete": no nickname and no note.
+        let cleared = edit_contact_nickname(&edited, &nick("", "", "")).unwrap().unwrap();
+        let decoded = decode_contact(&cleared);
+        assert!(decoded.nickname.is_none() && decoded.note.is_empty());
+        assert!(contains(&cleared, b"future contact field"));
+        assert_eq!(from_record(&decoded).unwrap().name.as_deref(), Some("Maurice"));
+
+        // On a record made for someone storage didn't know yet.
+        let (_, fresh) = new_chat_record(&ConversationId::direct(ACI)).unwrap();
+        let named = decode_contact(&edit_contact_nickname(&fresh, &nick("", "Diaz", "")).unwrap().unwrap());
+        assert_eq!(from_record(&named).unwrap().nickname.family, "Diaz");
     }
 
     #[test]

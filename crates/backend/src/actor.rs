@@ -598,6 +598,7 @@ impl Actor {
                 }
                 Command::SetPinned { conversation, pinned } => self.set_pinned(conversation, pinned).await,
                 Command::SetChat { conversation, change } => self.set_chat(conversation, change).await,
+                Command::SetNickname { conversation, nickname } => self.set_nickname(conversation, nickname).await,
                 Command::SetExpireTimer { conversation, seconds } => self.set_expire_timer(conversation, seconds).await,
                 Command::UpdateGroup { conversation, title, description } => {
                     self.update_group(conversation, title, description).await
@@ -1792,6 +1793,55 @@ impl Actor {
         }
     }
 
+    /// Desktop's `updateNicknameAndNote`: the nickname and note change here
+    /// right away (the chat's title, its messages' author names, search),
+    /// then in Storage Service. If that write fails, re-reading it puts
+    /// things back.
+    async fn set_nickname(self: Rc<Self>, conversation: ConversationId, nickname: signal_store::ContactNickname) {
+        let Some(manager) = self.manager() else { return };
+        // Desktop's `canHaveNicknameAndNote`: people, not groups, the
+        // Signal chat or ourselves.
+        let Some(sid) = conversation.as_direct().map(str::to_owned) else { return };
+        if conversation.is_signal() || self.is_note_to_self(&conversation) {
+            return;
+        }
+        let nickname = signal_store::limit_nickname(&nickname);
+        if let Err(error) = self.db.set_contact_nickname(&sid, &nickname).await {
+            return self.error("failed to save the nickname", error);
+        }
+        self.names.borrow_mut().remove(&sid);
+        self.titled.borrow_mut().remove(&conversation);
+        let name = self.name_of(&sid).await;
+        match &name {
+            Some(name) => {
+                if let Err(error) = self.db.retitle_directory_entry(&conversation, name).await {
+                    warn!(%error, "failed to rename directory entry");
+                }
+                self.ensure_title(&conversation).await;
+            }
+            // No name left (no profile name known yet): the number, rather
+            // than keep showing the nickname.
+            None => {
+                let phone = self.db.conversation(&conversation).await.ok().flatten().and_then(|c| c.phone);
+                let update = ConversationUpdate { title: Some(phone.unwrap_or_else(|| short_id(&sid))), ..Default::default() };
+                if let Err(error) = self.db.upsert_conversation(&conversation, update).await {
+                    self.error("failed to update conversation", error);
+                }
+            }
+        }
+        self.emit(Event::ConversationsChanged);
+        if let Some(name) = name {
+            self.rename_authors(vec![(sid, name)]).await;
+        }
+        match storage::write_nickname(&manager, &conversation, &nickname).await {
+            Ok(()) => self.storage_written(),
+            Err(error) => {
+                self.error("couldn't save the nickname on your other devices", format!("{error:#}"));
+                self.sync_storage(&manager).await;
+            }
+        }
+    }
+
     /// Reads names, profile keys, pins and archived/muted state from the
     /// Storage Service, then re-titles.
     async fn sync_storage(self: &Rc<Self>, manager: &SignalManager) {
@@ -1843,6 +1893,7 @@ impl Actor {
         }
         let mut store = self.store.clone();
         let mut names = Vec::new();
+        let mut nicknames = Vec::new();
         for contact in &contacts {
             let service_id = Aci::from(contact.aci).service_id_string();
             if let Some(key) = contact.profile_key
@@ -1850,11 +1901,14 @@ impl Actor {
             {
                 debug!(%error, "failed to save profile key");
             }
+            if !contact.nickname.is_empty() {
+                nicknames.push((service_id.clone(), contact.nickname.clone()));
+            }
             if let Some(name) = &contact.name {
                 names.push((service_id, name.clone()));
             }
         }
-        if let Err(error) = self.db.replace_contact_names(&names).await {
+        if let Err(error) = self.db.replace_contacts(&names, &nicknames).await {
             self.error("failed to save contact names", error);
             return;
         }
