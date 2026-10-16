@@ -432,8 +432,7 @@ impl AppState {
     /// poll ("Alice voted in the poll "📊 Poll: …""), or ended theirs.
     /// They follow the same rules as messages' (setting, muted chats, the
     /// chat in front), except while catching up, when they're dropped.
-    /// They aren't taken down when the chat is read, since neither counts
-    /// as unread here.
+    /// Both are unread until the chat is read, which takes them down.
     fn notify_poll(&mut self, conversation: ConversationId, message_id: i64, sender: String, ended: bool, cx: &mut Context<Self>) {
         let setting = self.notification_setting;
         if self.catching_up.is_some() || self.notifier.is_none() || setting == crate::notifications::NotificationSetting::Off {
@@ -467,6 +466,7 @@ impl AppState {
                     subtitle: None,
                     body: &body,
                 });
+                this.shown_notifications.entry(chat.id.clone()).or_default().push(id);
             });
         })
         .detach();
@@ -478,7 +478,7 @@ impl AppState {
         let Some(notifier) = self.notifier.clone() else { return };
         let all = || self.conversations.iter().chain(&self.archived);
         let read: Vec<ConversationId> = all()
-            .filter(|c| c.unread_count == 0 && self.shown_notifications.contains_key(&c.id))
+            .filter(|c| c.unread_count == 0 && !c.unread_poll_votes && self.shown_notifications.contains_key(&c.id))
             .map(|c| c.id.clone())
             .collect();
         for id in read {
@@ -1691,9 +1691,8 @@ impl AppState {
 /// preview (`icu:notificationPollVoteMessage`); an end is the notice's
 /// text after 📊 (`icu:PollTerminate--other`).
 fn poll_activity_text(sender: &str, group: Option<&str>, question: &str, ended: bool) -> String {
-    let question_line: String = question.split_whitespace().collect::<Vec<_>>().join(" ");
     if ended {
-        return format!("📊 {sender} ended the poll: {question_line}");
+        return signal_store::poll_ended_preview(Some(sender), question);
     }
     let title = match group {
         Some(group) => format!("{sender} in {group}"),

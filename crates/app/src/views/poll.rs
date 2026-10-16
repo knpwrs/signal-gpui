@@ -28,6 +28,44 @@ use crate::views::conversation::ConversationView;
 pub const POLL_WIDTH: f32 = 275.;
 const CHECKBOX: f32 = 24.;
 const CHECKBOX_GAP: f32 = 12.;
+/// Desktop shows a vote's spinner once it has been sending this long
+/// (`DELAY_BEFORE_SHOWING_PENDING_ANIMATION`), fading in over 250 ms.
+const PENDING_SPINNER_DELAY_MS: f32 = 500.;
+const PENDING_SPINNER_FADE_MS: f32 = 250.;
+
+/// The options our vote still sending changes (Desktop's `pendingVoteDiff`):
+/// ones it adds or takes away compared with the vote that was sent.
+pub fn pending_changes(tally: &PollTally) -> BTreeSet<u32> {
+    tally.pending.as_ref().map(|pending| pending.symmetric_difference(&tally.ours).copied().collect()).unwrap_or_default()
+}
+
+/// Desktop's `SpinnerV2` around a checkbox whose vote is sending: an arc
+/// turning in the checkbox's stroke color, shown after a moment.
+fn pending_spinner(key: String, color: Hsla) -> AnyElement {
+    use gpui_kit::{Animation, AnimationExt as _, Transformation, percentage};
+    let total = PENDING_SPINNER_DELAY_MS + PENDING_SPINNER_FADE_MS;
+    div()
+        .absolute()
+        .inset_0()
+        .child(
+            Icon::new(IconName::LoaderCircle)
+                .size(px(CHECKBOX))
+                .text_color(color)
+                .with_animation(
+                    SharedString::from(format!("{key}-turn")),
+                    Animation::new(std::time::Duration::from_millis(1000)).repeat(),
+                    |icon, delta| icon.transform(Transformation::rotate(percentage(delta))),
+                ),
+        )
+        .with_animation(
+            SharedString::from(format!("{key}-show")),
+            Animation::new(std::time::Duration::from_millis(total as u64)),
+            move |spinner, delta| {
+                spinner.opacity(((delta * total - PENDING_SPINNER_DELAY_MS) / PENDING_SPINNER_FADE_MS).clamp(0., 1.))
+            },
+        )
+        .into_any_element()
+}
 
 /// Desktop's status line under the question.
 pub fn status_text(poll: &Poll) -> &'static str {
@@ -79,10 +117,15 @@ pub fn render_poll(
     // Incoming bubbles use the accent; ours, which are the accent, use white.
     let (fill, track) = if outgoing { (fg, Hsla { a: 0.3, ..fg }) } else { (palette.accent, Hsla { a: 0.12, ..fg }) };
     let chosen = tally.chosen().clone();
-    let pending = tally.pending.is_some();
+    let changing = pending_changes(&tally);
+    // Each vote of ours sending starts its own spinners' delay.
+    let sending = poll.our_pending_vote().map_or(0, |v| v.vote_count);
+    // The checkbox's stroke: quiet in theirs, white in ours (Desktop's).
+    let stroke = if outgoing { fg } else { secondary };
     let options = poll.options.iter().enumerate().map(|(ix, option)| {
         let count = tally.count(ix);
         let checked = chosen.contains(&(ix as u32));
+        let spinning = changing.contains(&(ix as u32));
         let next = vote_after_click(&tally, poll.allow_multiple, ix as u32, !checked);
         let state = state.clone();
         div()
@@ -93,23 +136,40 @@ pub fn render_poll(
                     div()
                         .id(SharedString::from(format!("poll-{id}-option-{ix}")))
                         .debug_selector(move || format!("poll-{id}-option-{ix}"))
+                        .relative()
                         .flex_none()
                         .size(px(CHECKBOX))
                         .flex()
                         .items_center()
                         .justify_center()
                         .rounded_full()
-                        .border_2()
                         .cursor_pointer()
-                        .border_color(if checked { fill } else { secondary })
-                        .when(checked, |d| d.bg(fill))
-                        // A vote still sending shows, fainter.
-                        .when(pending, |d| d.opacity(0.6))
+                        // Sending (Desktop's `PollCheckbox` while pending): no
+                        // border or fill, the check in the stroke color, and
+                        // the spinner turning around it.
+                        .when(!spinning, |d| d.border_2().border_color(if checked { fill } else { secondary }))
+                        .when(checked && !spinning, |d| d.bg(fill))
                         .on_click(move |_, _, cx| {
                             state.read(cx).send(Command::VotePoll { message_id: id, options: next.clone() });
                         })
                         .when(checked, |d| {
-                            d.child(Icon::new(IconName::Check).size_4().text_color(if outgoing { palette.accent } else { palette.on_accent }))
+                            let check = if spinning {
+                                stroke
+                            } else if outgoing {
+                                palette.accent
+                            } else {
+                                palette.on_accent
+                            };
+                            d.child(Icon::new(IconName::Check).size_4().text_color(check))
+                        })
+                        .when(spinning, |d| {
+                            d.child(
+                                div()
+                                    .absolute()
+                                    .inset_0()
+                                    .debug_selector(move || format!("poll-{id}-sending-{ix}"))
+                                    .child(pending_spinner(format!("poll-{id}-{ix}-vote-{sending}"), stroke)),
+                            )
                         }),
                 )
             })

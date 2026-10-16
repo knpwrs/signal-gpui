@@ -136,7 +136,10 @@ impl ConversationView {
                     }
                 }
                 AppEvent::TypingChanged { conversation } if *conversation == this.id => cx.notify(),
-                AppEvent::ConversationsChanged => cx.notify(),
+                AppEvent::ConversationsChanged => {
+                    this.read_open_poll_votes(cx);
+                    cx.notify()
+                }
                 AppEvent::AuthorNamesChanged(names) => this.rename_authors(names, cx),
                 _ => {}
             }),
@@ -509,10 +512,19 @@ impl ConversationView {
 
     fn mark_read(&self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
-        if state.conversation(&self.id).is_some_and(|c| c.unread_count > 0) {
+        if state.conversation(&self.id).is_some_and(|c| c.unread_count > 0 || c.unread_poll_votes) {
             state.send(Command::MarkRead {
                 conversation: self.id.clone(),
             });
+        }
+    }
+
+    /// Someone voted in our poll here while we're looking at the newest
+    /// messages: read at once, as Desktop's `markOpenConversationRead`.
+    fn read_open_poll_votes(&self, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        if self.window_active && self.at_end() && state.conversation(&self.id).is_some_and(|c| c.unread_poll_votes) {
+            state.send(Command::MarkRead { conversation: self.id.clone() });
         }
     }
 
@@ -528,7 +540,7 @@ impl ConversationView {
         if !self.window_active {
             return;
         }
-        let unread = self.state.read(cx).conversation(&self.id).is_some_and(|c| c.unread_count > 0);
+        let unread = self.state.read(cx).conversation(&self.id).is_some_and(|c| c.unread_count > 0 || c.unread_poll_votes);
         if unread || self.unseen > 0 {
             // Not gated on the cached count: a message that just arrived may
             // not be counted in the list we hold yet.
@@ -5024,7 +5036,18 @@ mod tests {
 
         let tuesday = bounds(&mut cx, format!("poll-{id}-option-0"));
         cx.simulate_click(tuesday.center(), gpui_kit::Modifiers::none());
-        let voted = changed(&mut cx, &view, &backend, HOUSE, |m| m.poll.as_ref().is_some_and(|p| !p.tally().ours.is_empty()));
+        // While it sends, Tuesday (the option it changes) has Desktop's
+        // spinner; Sunday, unchanged, doesn't.
+        changed(&mut cx, &view, &backend, HOUSE, |m| m.poll.as_ref().is_some_and(|p| p.our_pending_vote().is_some()));
+        bounds(&mut cx, format!("poll-{id}-sending-0"));
+        assert!(cx.debug_bounds(Box::leak(format!("poll-{id}-sending-2").into_boxed_str())).is_none());
+        // Sent: counted, and no longer pending (a pending vote counts too).
+        let voted = changed(&mut cx, &view, &backend, HOUSE, |m| {
+            m.poll.as_ref().is_some_and(|p| !p.tally().ours.is_empty() && p.our_pending_vote().is_none())
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds(Box::leak(format!("poll-{id}-sending-0").into_boxed_str())).is_none(), "sent: no spinner");
         let tally = voted.poll.unwrap().tally();
         assert_eq!(tally.ours, [0].into());
         assert_eq!((tally.count(0), tally.unique_voters), (2, 3));
@@ -5131,6 +5154,58 @@ mod tests {
         cx.simulate_click(bubble.center(), gpui_kit::Modifiers::none());
         cx.run_until_parked();
         assert_eq!(std::fs::read_dir(dir.path().join("view-once")).unwrap().count(), 1);
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn votes_in_our_poll_are_unread_until_the_chat_is_read(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        // The group's seeding is done once its last message is in.
+        wait_for_messages(&backend, GROUP, 1, |m| m.body.contains("first aid kit"));
+        let chat = |backend: &Backend| {
+            let db = backend.db().clone();
+            futures::executor::block_on(backend.spawn(async move { db.conversation(&ConversationId(GROUP.into())).await }))
+                .unwrap()
+                .unwrap()
+        };
+        let unread_before = chat(&backend).unread_count;
+        backend.send(Command::SendPoll {
+            conversation: ConversationId(GROUP.into()),
+            question: "Snacks?".into(),
+            options: vec!["Chips".into(), "Fruit".into()],
+            allow_multiple: false,
+        });
+        // The demo's member votes a moment later: unread, though not an
+        // unread message.
+        let mut unread = false;
+        for _ in 0..300 {
+            if chat(&backend).unread_poll_votes {
+                unread = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(unread, "the vote never came");
+        assert_eq!(chat(&backend).unread_count, unread_before);
+        // Opening the chat reads it.
+        let (mut cx, view) = open_view(cx, &backend, GROUP);
+        cx.update(|_, cx| view.update(cx, |v, _| v.window_active = true));
+        // The chat list as the backend's event would load it (this test
+        // doesn't pump backend events into the state).
+        let state = view.read_with(&cx, |v, _| v.state.clone());
+        cx.update(|_, cx| state.update(cx, |s, cx| s.handle(signal_backend::Event::ConversationsChanged, cx)));
+        let mut read = false;
+        for _ in 0..300 {
+            // Drawn, so the list sees the newest messages on screen.
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            if !chat(&backend).unread_poll_votes {
+                read = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(read, "opening the chat didn't read the vote");
         backend.shutdown();
     }
 }

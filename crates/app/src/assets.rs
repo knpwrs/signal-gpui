@@ -33,6 +33,7 @@ gpui_kit::assets::icon_assets!(
         File,
         Forward,
         Info,
+        LoaderCircle,
         RotateCcw,
         Image,
         Lock,
