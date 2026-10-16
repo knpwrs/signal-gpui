@@ -533,9 +533,12 @@ pub struct StickerView {
 /// A story to post.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutgoingStory {
-    Text(Box<signal_store::TextStory>),
-    /// A photo, or an MP4 video of up to 30 seconds, with a caption.
-    Media { bytes: std::sync::Arc<Vec<u8>>, content_type: String, caption: String },
+    /// A text story, with the link preview it shows (Desktop's
+    /// `TextAttachment.preview`; its image is uploaded with it).
+    Text { story: Box<signal_store::TextStory>, preview: Option<LinkPreviewDraft> },
+    /// A photo, or an MP4 video of up to 30 seconds, with a caption and its
+    /// formatting (byte spans over the caption).
+    Media { bytes: std::sync::Arc<Vec<u8>>, content_type: String, caption: String, styles: Vec<signal_store::StyleSpan> },
 }
 
 /// Where a story goes (Desktop's `SendStoryModal`).

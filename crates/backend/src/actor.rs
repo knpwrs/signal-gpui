@@ -4308,7 +4308,11 @@ impl Actor {
 
     /// The preview image was optimized when it was fetched; upload it as is.
     async fn upload_preview_image(&self, manager: &SignalManager, path: &std::path::Path) -> anyhow::Result<AttachmentPointer> {
-        let bytes = tokio::fs::read(path).await?;
+        self.upload_preview_bytes(manager, tokio::fs::read(path).await?).await
+    }
+
+    /// A link preview's image, already optimized, uploaded as is.
+    async fn upload_preview_bytes(&self, manager: &SignalManager, bytes: Vec<u8>) -> anyhow::Result<AttachmentPointer> {
         let (kind, width, height) = media::probe(&bytes).context("link preview image is not an image")?;
         let spec = AttachmentSpec {
             content_type: kind.content_type().into(),

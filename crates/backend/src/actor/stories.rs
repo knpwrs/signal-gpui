@@ -541,19 +541,60 @@ impl Actor {
         }
         let base = self.next_timestamp();
         // The attachment: uploaded once for every target.
-        let (attachment, local) = match &story {
-            crate::OutgoingStory::Text(text) => (presage::proto::story_message::Attachment::TextAttachment(text_attachment(text)), None),
-            crate::OutgoingStory::Media { bytes, content_type, caption } => {
+        let (attachment, local, body_ranges) = match &story {
+            crate::OutgoingStory::Text { story: text, preview } => {
+                let mut wire = text_attachment(text);
+                if let Some(preview) = preview {
+                    // Desktop's `sendStory`: the preview's image uploaded
+                    // with it. Without the image, the preview still goes.
+                    let image = match &preview.image {
+                        Some(image) => match self.upload_preview_bytes(&manager, image.bytes.to_vec()).await {
+                            Ok(pointer) => Some(pointer),
+                            Err(error) => {
+                                warn!(error = %format!("{error:#}"), "couldn't upload the story's link preview image");
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+                    wire.preview = Some(presage::proto::Preview {
+                        url: Some(preview.url.clone()),
+                        title: Some(preview.title.clone()),
+                        description: preview.description.clone(),
+                        date: preview.date.map(|d| d as u64),
+                        image,
+                    });
+                }
+                (presage::proto::story_message::Attachment::TextAttachment(wire), None, Vec::new())
+            }
+            crate::OutgoingStory::Media { bytes, content_type, caption, styles } => {
                 match self.upload_story_media(&manager, bytes, content_type, caption, base).await {
-                    Ok((pointer, meta)) => (presage::proto::story_message::Attachment::FileAttachment(pointer), Some(meta)),
+                    // The caption's formatting (Desktop's `bodyRanges` on
+                    // the story).
+                    Ok((pointer, meta)) => (
+                        presage::proto::story_message::Attachment::FileAttachment(pointer),
+                        Some(meta),
+                        mapping::style_ranges(&mapping::wire_styles(caption, styles)),
+                    ),
                     Err(error) => return self.error("couldn't post the story", format!("{error:#}")),
                 }
             }
         };
         let content = match (&story, &local) {
-            (crate::OutgoingStory::Text(text), _) => signal_store::StoryContent::Text((**text).clone()),
-            (crate::OutgoingStory::Media { caption, .. }, Some(meta)) => {
-                signal_store::StoryContent::Media { attachment: meta.clone(), caption: caption.clone(), styles: Vec::new() }
+            (crate::OutgoingStory::Text { story: text, preview }, _) => {
+                let mut text = (**text).clone();
+                // Shown as received ones are: without the image.
+                text.preview = preview.as_ref().map(|p| signal_store::LinkPreview {
+                    url: p.url.clone(),
+                    title: Some(p.title.clone()).filter(|t| !t.trim().is_empty()),
+                    description: p.description.clone(),
+                    date: p.date,
+                    image: None,
+                });
+                signal_store::StoryContent::Text(text)
+            }
+            (crate::OutgoingStory::Media { caption, styles, .. }, Some(meta)) => {
+                signal_store::StoryContent::Media { attachment: meta.clone(), caption: caption.clone(), styles: styles.clone() }
             }
             (crate::OutgoingStory::Media { .. }, None) => return,
         };
@@ -587,6 +628,7 @@ impl Actor {
             let message = presage::proto::StoryMessage {
                 attachment: Some(attachment.clone()),
                 allows_replies: Some(allows_replies),
+                body_ranges: body_ranges.clone(),
                 ..Default::default()
             };
             self.keep_our_story(base, None, content.clone(), allows_replies, recipients.clone()).await;
@@ -614,6 +656,7 @@ impl Actor {
                 group: self.group_context(&group).await,
                 attachment: Some(attachment.clone()),
                 allows_replies: Some(true),
+                body_ranges: body_ranges.clone(),
                 ..Default::default()
             };
             let recipients: Vec<signal_store::StoryRecipient> = self

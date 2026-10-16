@@ -1729,8 +1729,18 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 let rows = to_lists.then_some(None).into_iter().chain(groups.into_iter().map(Some));
                 for (ix, group) in rows.enumerate() {
                     let content = match &story {
-                        crate::OutgoingStory::Text(text) => signal_store::StoryContent::Text((**text).clone()),
-                        crate::OutgoingStory::Media { bytes, content_type, caption } => {
+                        crate::OutgoingStory::Text { story: text, preview } => {
+                            let mut text = (**text).clone();
+                            text.preview = preview.as_ref().map(|p| signal_store::LinkPreview {
+                                url: p.url.clone(),
+                                title: Some(p.title.clone()),
+                                description: p.description.clone(),
+                                date: p.date,
+                                image: None,
+                            });
+                            signal_store::StoryContent::Text(text)
+                        }
+                        crate::OutgoingStory::Media { bytes, content_type, caption, styles } => {
                             let path = data_dir.join("attachments").join(format!("story-sent-{now}-{ix}"));
                             if std::fs::write(&path, bytes.as_slice()).is_err() {
                                 continue;
@@ -1749,7 +1759,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                                     remote: None,
                                 },
                                 caption: caption.clone(),
-                                styles: Vec::new(),
+                                styles: styles.clone(),
                             }
                         }
                     };

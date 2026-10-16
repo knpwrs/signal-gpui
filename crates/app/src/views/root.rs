@@ -818,6 +818,102 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn a_text_story_takes_a_link_preview_and_the_sliders_color(cx: &mut TestAppContext) {
+        use crate::views::story_creator::Target;
+        let (mut cx, state, root, backend, _dir) = demo_window(cx);
+        wait(&mut cx, "the demo", &|cx| state.read_with(cx, |s, _| !s.group_stories().is_empty()));
+        state.update(&mut cx, |s, cx| s.create_text_story(cx));
+        wait(&mut cx, "the creator", &|cx| cx.debug_bounds("story-creator").is_some());
+        let creator = root.read_with(&cx, |r, _| r.story_creator.as_ref().map(|(c, _)| c.clone())).unwrap();
+        let url = "https://signal.org/blog/";
+        let draft = signal_backend::LinkPreviewDraft {
+            url: url.into(),
+            title: "Signal Blog".into(),
+            description: None,
+            date: None,
+            image: None,
+        };
+        // A link in the text is previewed (the answer stands in for the
+        // backend's fetch), and shown while it's there.
+        cx.update(|window, cx| {
+            creator.update(cx, |c, cx| {
+                c.text.update(cx, |input, cx| input.set_value(format!("Read {url}"), window, cx));
+                c.on_text_changed(&format!("Read {url}"), cx);
+                c.on_link_preview(url, Some(std::rc::Rc::new(draft.clone())), cx);
+                c.color.update(cx, |slider, cx| slider.set_value(51., window, cx));
+            })
+        });
+        let shown = |cx: &VisualTestContext| creator.read_with(cx, |c, cx| c.text_story(cx).preview.map(|p| p.url));
+        assert_eq!(shown(&cx).as_deref(), Some(url));
+        assert_eq!(creator.read_with(&cx, |c, cx| c.text_story(cx).foreground), Some(0xff00_ffd0));
+        cx.update(|window, cx| {
+            creator.update(cx, |c, cx| {
+                c.text.update(cx, |input, cx| input.set_value("No link", window, cx));
+                c.on_text_changed("No link", cx);
+            })
+        });
+        assert_eq!(shown(&cx), None, "it goes with the link");
+
+        // Added with the link button, it stays.
+        cx.update(|window, cx| {
+            creator.update(cx, |c, cx| {
+                c.text.update(cx, |input, cx| input.set_value(format!("Read {url}"), window, cx));
+                c.on_text_changed(&format!("Read {url}"), cx);
+                c.on_link_preview(url, Some(std::rc::Rc::new(draft.clone())), cx);
+                c.link_input.update(cx, |input, cx| input.set_value(url, window, cx));
+            })
+        });
+        click(&mut cx, "story-link");
+        click(&mut cx, "story-add-link");
+        assert!(creator.read_with(&cx, |c, _| !c.link_open), "the field closes");
+        cx.update(|window, cx| {
+            creator.update(cx, |c, cx| {
+                c.text.update(cx, |input, cx| input.set_value("Worth a read", window, cx));
+                c.on_text_changed("Worth a read", cx);
+            })
+        });
+        assert_eq!(shown(&cx).as_deref(), Some(url));
+
+        let before = state.read_with(&cx, |s, _| s.stories.iter().filter(|s| s.author.is_none()).count());
+        creator.update(&mut cx, |c, cx| {
+            c.targets.insert(Target::Group(HIKERS.into()));
+            c.send(cx);
+        });
+        wait(&mut cx, "the story", &|cx| state.read_with(cx, |s, _| s.stories.iter().filter(|s| s.author.is_none()).count() == before + 1));
+        let posted = state.read_with(&cx, |s, _| s.stories.iter().filter(|s| s.author.is_none()).max_by_key(|s| s.sent_at).cloned().unwrap());
+        let signal_store::StoryContent::Text(text) = posted.content else { panic!("a text story") };
+        assert_eq!((text.text.as_str(), text.preview.map(|p| p.url)), ("Worth a read", Some(url.to_owned())));
+        assert_eq!(text.foreground, Some(0xff00_ffd0));
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn a_photo_storys_caption_keeps_its_formatting(cx: &mut TestAppContext) {
+        use crate::views::story_creator::{StoryCreator, Target};
+        let (mut cx, state, _root, backend, dir) = demo_window(cx);
+        wait(&mut cx, "the demo", &|cx| state.read_with(cx, |s, _| !s.group_stories().is_empty()));
+        // The demo keeps the bytes as they are; they needn't be a real photo.
+        let path = dir.path().join("photo.png");
+        std::fs::write(&path, b"not really a png").unwrap();
+        let bytes = std::sync::Arc::new(std::fs::read(&path).unwrap());
+        let creator = cx.update(|window, cx| cx.new(|cx| StoryCreator::media(state.clone(), bytes, "image/png".into(), path, window, cx)));
+        let before = state.read_with(&cx, |s, _| s.stories.iter().filter(|s| s.author.is_none()).count());
+        cx.update(|window, cx| {
+            creator.update(cx, |c, cx| {
+                c.caption.update(cx, |input, cx| input.set_value("*Summit* at last", window, cx));
+                c.targets.insert(Target::Group(HIKERS.into()));
+                c.send(cx);
+            })
+        });
+        wait(&mut cx, "the story", &|cx| state.read_with(cx, |s, _| s.stories.iter().filter(|s| s.author.is_none()).count() == before + 1));
+        let posted = state.read_with(&cx, |s, _| s.stories.iter().filter(|s| s.author.is_none()).max_by_key(|s| s.sent_at).cloned().unwrap());
+        let signal_store::StoryContent::Media { caption, styles, .. } = posted.content else { panic!("a photo story") };
+        assert_eq!(caption, "Summit at last");
+        assert_eq!(styles, [signal_store::StyleSpan { start: 0, len: 6, style: signal_store::TextStyle::Bold }]);
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
     fn our_story_shows_who_viewed_and_replied(cx: &mut TestAppContext) {
         let (mut cx, state, root, backend, _dir) = demo_window(cx);
         wait(&mut cx, "the demo", &|cx| state.read_with(cx, |s, _| s.my_stories().iter().any(|s| !s.views.is_empty())));

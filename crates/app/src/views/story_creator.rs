@@ -3,19 +3,22 @@
 //! or a photo or video with a caption; then where to send it.
 
 use std::collections::BTreeSet;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::{Disableable as _, Sizable as _};
 use gpui_kit::prelude::*;
 use gpui_kit::{
     Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, KeyDownEvent, ObjectFit, Render,
     SharedString, Subscription, Window, div, img, px,
 };
-use signal_backend::{Command, OutgoingStory, StoryTarget};
+use signal_backend::{Command, LinkPreviewDraft, OutgoingStory, StoryTarget};
 use signal_store::{ConversationId, StoryBackground, StoryFont, StorySendMode, TextStory};
 
 use crate::state::AppState;
@@ -52,6 +55,89 @@ const FONTS: [(StoryFont, &str); 5] = [
     (StoryFont::Script, "Script"),
     (StoryFont::Condensed, "Condensed"),
 ];
+
+/// Desktop's `COLOR_WHITE_INT` and `COLOR_BLACK_INT`.
+const WHITE: u32 = 0xffff_ffff;
+const BLACK: u32 = 0xff00_0000;
+
+/// How long a link must stay the same before its preview is fetched.
+const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(200);
+
+/// Desktop's text color slider (`ts/mediaEditor/util/color.std.ts`): black
+/// up to 7, then the hues from red round to pink, then white from 95.
+fn slider_hsl(percentage: f32) -> (f32, f32, f32) {
+    const MAX_BLACK: f32 = 7.;
+    const MIN_WHITE: f32 = 95.;
+    let ratio = |min: f32, max: f32| (percentage - min) / (max - min);
+    if percentage <= MAX_BLACK {
+        (0., 0.5, 0.5 * ratio(0., MAX_BLACK))
+    } else if percentage >= MIN_WHITE {
+        (0., 0., (0.5 + ratio(MIN_WHITE, 100.)).min(1.))
+    } else {
+        (338. * ratio(MAX_BLACK, MIN_WHITE), 1., 0.5)
+    }
+}
+
+/// The slider's color as ARGB (Desktop's `getRGBANumber`, through its
+/// `ts/util/hslToRGB.std.ts`).
+pub(crate) fn slider_color(percentage: f32) -> u32 {
+    let (h, s, l) = slider_hsl(percentage);
+    let a = s * l.min(1. - l);
+    let f = |n: f32| {
+        let k = (n + h / 30.) % 12.;
+        let v = l - a * (k - 3.).min(9. - k).clamp(-1., 1.);
+        (255. * v).round().clamp(0., 255.) as u32
+    };
+    0xff00_0000 | (f(0.) << 16) | (f(8.) << 8) | f(4.)
+}
+
+/// The story's text color and its pill's with the slider at `percentage`
+/// (Desktop's `TextStoryCreator`): with a pill, white turns to black so
+/// the text still shows.
+fn text_colors(percentage: f32, background: TextBackground) -> (u32, Option<u32>) {
+    let color = slider_color(percentage);
+    let light = percentage >= 95.;
+    match background {
+        TextBackground::None => (color, None),
+        TextBackground::Background => (if light { BLACK } else { color }, Some(WHITE)),
+        TextBackground::Inverse => (WHITE, Some(if light { BLACK } else { color })),
+    }
+}
+
+/// An ARGB color, for drawing.
+fn argb_hsla(argb: u32) -> Hsla {
+    Hsla::from(gpui_kit::Rgba {
+        r: ((argb >> 16) & 0xff) as f32 / 255.,
+        g: ((argb >> 8) & 0xff) as f32 / 255.,
+        b: (argb & 0xff) as f32 / 255.,
+        a: (argb >> 24) as f32 / 255.,
+    })
+}
+
+/// A link whose preview is being looked up, or was.
+#[derive(Clone)]
+struct FetchedLink {
+    url: String,
+    /// `None` while it loads; `Some(None)` when there's none.
+    preview: Option<Option<Rc<LinkPreviewDraft>>>,
+}
+
+/// Desktop's `LinkPreviewApplied`: a preview from a link in the text,
+/// which goes when the link does, or one added with the link button,
+/// which stays.
+#[derive(Clone)]
+enum AppliedLink {
+    Automatic(Rc<LinkPreviewDraft>),
+    Manual(Rc<LinkPreviewDraft>),
+}
+
+impl AppliedLink {
+    fn preview(&self) -> &Rc<LinkPreviewDraft> {
+        match self {
+            AppliedLink::Automatic(p) | AppliedLink::Manual(p) => p,
+        }
+    }
+}
 
 /// Desktop's text background: none, a white pill, or the inverse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,7 +215,17 @@ pub struct StoryCreator {
     /// Choosing where to send it.
     pub(crate) choosing: bool,
     pub(crate) text: Entity<InputState>,
-    caption: Entity<InputState>,
+    pub(crate) caption: Entity<InputState>,
+    /// Desktop's text color slider, 0 to 100 (white at 100).
+    pub(crate) color: Entity<SliderState>,
+    /// The link button's URL field, and whether it's open.
+    pub(crate) link_input: Entity<InputState>,
+    pub(crate) link_open: bool,
+    /// The last link looked up, from the text or the link field.
+    fetched: Option<FetchedLink>,
+    /// The link preview the story shows.
+    applied: Option<AppliedLink>,
+    preview_task: Option<gpui_kit::Task<()>>,
     font: usize,
     text_background: TextBackground,
     background: usize,
@@ -178,9 +274,32 @@ impl StoryCreator {
     fn new(state: Entity<AppState>, draft: Draft, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let text = cx.new(|cx| InputState::new(window, cx).placeholder("Add text"));
         let caption = cx.new(|cx| InputState::new(window, cx).placeholder("Add a message"));
+        let color = cx.new(|_| SliderState::new().min(0.).max(100.).step(1.).default_value(100.));
+        let link_input = cx.new(|cx| InputState::new(window, cx).placeholder("Type or paste a URL"));
         let subscriptions = vec![
-            cx.subscribe(&text, |_, _, _: &InputEvent, cx| cx.notify()),
+            cx.subscribe(&text, |this, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let text = input.read(cx).value().to_string();
+                    this.on_text_changed(&text, cx);
+                }
+                cx.notify();
+            }),
             cx.subscribe(&caption, |_, _, _: &InputEvent, cx| cx.notify()),
+            cx.subscribe(&color, |_, _, _: &SliderEvent, cx| cx.notify()),
+            cx.subscribe(&link_input, |this, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let url = input.read(cx).value().trim().to_owned();
+                    if signal_backend::link_preview::should_preview(&url) {
+                        this.look_up(url, cx);
+                    }
+                }
+                cx.notify();
+            }),
+            cx.subscribe(&state, |this, _, event: &crate::state::AppEvent, cx| {
+                if let crate::state::AppEvent::LinkPreview { url, preview } = event {
+                    this.on_link_preview(url, preview.clone(), cx);
+                }
+            }),
         ];
         // Desktop's `SendStoryModal` starts with nothing chosen.
         Self {
@@ -189,6 +308,12 @@ impl StoryCreator {
             choosing: false,
             text,
             caption,
+            color,
+            link_input,
+            link_open: false,
+            fetched: None,
+            applied: None,
+            preview_task: None,
             font: 0,
             text_background: TextBackground::None,
             background: 0,
@@ -199,39 +324,114 @@ impl StoryCreator {
         }
     }
 
-    fn text_story(&self, cx: &gpui_kit::App) -> TextStory {
-        let (foreground, text_background) = match self.text_background {
-            TextBackground::None => (None, None),
-            // A white pill, black text.
-            TextBackground::Background => (Some(0xff00_0000), Some(0xffff_ffff)),
-            // A black pill, white text.
-            TextBackground::Inverse => (Some(0xffff_ffff), Some(0xff00_0000)),
-        };
+    fn slider_value(&self, cx: &gpui_kit::App) -> f32 {
+        self.color.read(cx).value().start()
+    }
+
+    pub(crate) fn text_story(&self, cx: &gpui_kit::App) -> TextStory {
+        let (foreground, text_background) = text_colors(self.slider_value(cx), self.text_background);
         TextStory {
             text: self.text.read(cx).value().to_string(),
             font: FONTS[self.font].0,
-            foreground,
+            foreground: Some(foreground),
             text_background,
             background: backgrounds()[self.background].clone(),
-            preview: None,
+            preview: self.applied.as_ref().map(|applied| {
+                let p = applied.preview();
+                signal_store::LinkPreview {
+                    url: p.url.clone(),
+                    title: Some(p.title.clone()).filter(|t| !t.trim().is_empty()),
+                    description: p.description.clone(),
+                    date: p.date,
+                    image: None,
+                }
+            }),
         }
     }
 
+    /// Desktop's `hasChanges`: some text, or a link preview.
     fn ready(&self, cx: &gpui_kit::App) -> bool {
         match &self.draft {
-            Draft::Text => !self.text.read(cx).value().trim().is_empty(),
+            Draft::Text => !self.text.read(cx).value().trim().is_empty() || self.applied.is_some(),
             Draft::Media { .. } => true,
         }
     }
 
+    /// Looks up a link's preview once the link has stayed the same a
+    /// moment, as the composer does.
+    fn look_up(&mut self, url: String, cx: &mut Context<Self>) {
+        if let Some(fetched) = self.fetched.as_ref().filter(|f| f.url == url) {
+            // Looked up already: a link typed again gets what was found.
+            if let Some(preview) = fetched.preview.clone() {
+                self.on_link_preview(&url, preview, cx);
+            }
+            return;
+        }
+        self.fetched = Some(FetchedLink { url: url.clone(), preview: None });
+        self.preview_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(PREVIEW_DEBOUNCE).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.fetched.as_ref().is_some_and(|f| f.url == url && f.preview.is_none()) {
+                    this.state.read(cx).send(Command::FetchLinkPreview { url });
+                }
+            });
+        }));
+    }
+
+    /// Desktop's text story creator previews the text's first link and
+    /// shows it while the link stays in the text, unless one was added
+    /// with the link button.
+    pub(crate) fn on_text_changed(&mut self, text: &str, cx: &mut Context<Self>) {
+        if matches!(self.applied, Some(AppliedLink::Manual(_))) {
+            return;
+        }
+        let links = signal_backend::link_preview::links_in(text);
+        if matches!(&self.applied, Some(AppliedLink::Automatic(p)) if !links.contains(&p.url)) {
+            self.applied = None;
+        }
+        if let Some(link) = signal_backend::link_preview::first_previewable(text) {
+            self.look_up(link, cx);
+        }
+    }
+
+    pub(crate) fn on_link_preview(&mut self, url: &str, preview: Option<Rc<LinkPreviewDraft>>, cx: &mut Context<Self>) {
+        let Some(fetched) = self.fetched.as_mut().filter(|f| f.url == url) else { return };
+        fetched.preview = Some(preview.clone());
+        if let Some(preview) = preview
+            && !matches!(self.applied, Some(AppliedLink::Manual(_)))
+            && signal_backend::link_preview::links_in(self.text.read(cx).value().as_ref()).contains(&preview.url)
+        {
+            self.applied = Some(AppliedLink::Automatic(preview));
+        }
+        cx.notify();
+    }
+
+    /// The link field's preview, once it's found.
+    fn link_field_preview(&self, cx: &gpui_kit::App) -> Option<Rc<LinkPreviewDraft>> {
+        let url = self.link_input.read(cx).value().trim().to_owned();
+        self.fetched.as_ref().filter(|f| f.url == url).and_then(|f| f.preview.clone().flatten())
+    }
+
+    /// The link field's "Add link": the story shows its preview.
+    pub(crate) fn add_link(&mut self, cx: &mut Context<Self>) {
+        let Some(preview) = self.link_field_preview(cx) else { return };
+        self.applied = Some(AppliedLink::Manual(preview));
+        self.link_open = false;
+        cx.notify();
+    }
+
     pub(crate) fn send(&mut self, cx: &mut Context<Self>) {
         let story = match &self.draft {
-            Draft::Text => OutgoingStory::Text(Box::new(self.text_story(cx))),
-            Draft::Media { bytes, content_type, .. } => OutgoingStory::Media {
-                bytes: bytes.clone(),
-                content_type: content_type.clone(),
-                caption: self.caption.read(cx).value().trim().to_owned(),
+            Draft::Text => OutgoingStory::Text {
+                story: Box::new(self.text_story(cx)),
+                preview: self.applied.as_ref().map(|a| (**a.preview()).clone()),
             },
+            Draft::Media { bytes, content_type, .. } => {
+                // Formatting written as in the composer (`*bold*` and so
+                // on) styles the caption.
+                let (caption, styles) = crate::formatting::parse(self.caption.read(cx).value().trim());
+                OutgoingStory::Media { bytes: bytes.clone(), content_type: content_type.clone(), caption, styles }
+            }
         };
         let targets: Vec<StoryTarget> = self
             .targets
@@ -269,7 +469,7 @@ impl StoryCreator {
         let preview = match &self.draft {
             Draft::Text => {
                 let mut story = self.text_story(cx);
-                if story.text.trim().is_empty() {
+                if story.text.trim().is_empty() && story.preview.is_none() {
                     story.text = "Add text".into();
                 }
                 render_text_story(&story, height)
@@ -330,8 +530,49 @@ impl StoryCreator {
                             .child(control("story-background", "Background".into()).on_click(cx.listener(|this, _, _, cx| {
                                 this.background = (this.background + 1) % backgrounds().len();
                                 cx.notify();
-                            }))),
+                            })))
+                            .child(tagged(
+                                "story-link",
+                                control("story-link", "Link".into()).on_click(cx.listener(|this, _, window, cx| {
+                                    this.link_open = !this.link_open;
+                                    if this.link_open {
+                                        let input = this.link_input.clone();
+                                        input.update(cx, |input, cx| input.focus(window, cx));
+                                    }
+                                    cx.notify();
+                                })),
+                            )),
                     )
+                    // Desktop's hue slider: the text's color.
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().flex_1().child(Slider::new(&self.color).horizontal()))
+                            .child(
+                                div()
+                                    .size(px(18.))
+                                    .flex_none()
+                                    .rounded_full()
+                                    .border_1()
+                                    .border_color(white)
+                                    .bg(argb_hsla(slider_color(self.slider_value(cx)))),
+                            ),
+                    )
+                    .when(self.link_open, |d| d.child(self.render_link_field(cx)))
+                    .when(self.applied.is_some(), |d| {
+                        d.child(
+                            Button::new("story-remove-link")
+                                .label("Remove link preview")
+                                .small()
+                                .ghost()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.applied = None;
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .into_any_element(),
                 Draft::Media { .. } => div().w(width).child(Input::new(&self.caption)).into_any_element(),
             })
@@ -498,6 +739,46 @@ impl StoryCreator {
                 });
             }))
         })
+    }
+
+    /// Desktop's link field: a URL, its preview, and "Add link".
+    fn render_link_field(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let white = Hsla { h: 0., s: 0., l: 1., a: 1. };
+        let preview = self.link_field_preview(cx);
+        let body = match &preview {
+            Some(preview) => div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().truncate().font_weight(FontWeight::SEMIBOLD).child(preview.title.clone()))
+                        .child(div().truncate().text_xs().opacity(0.7).child(preview.url.clone())),
+                )
+                .child(tagged(
+                    "story-add-link",
+                    Button::new("story-add-link")
+                        .label("Add link")
+                        .small()
+                        .primary()
+                        .on_click(cx.listener(|this, _, _, cx| this.add_link(cx))),
+                )),
+            None => div().text_sm().opacity(0.7).child("Add a link for viewers of your story"),
+        };
+        div()
+            .id("story-link-field")
+            .debug_selector(|| "story-link-field".into())
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_2()
+            .rounded(px(8.))
+            .bg(Hsla { a: 0.1, ..white })
+            .child(Input::new(&self.link_input))
+            .child(body)
+            .into_any_element()
     }
 
     /// Desktop's "Choose groups": groups whose story isn't on the list yet.
@@ -688,5 +969,23 @@ mod tests {
         assert!(story_file_problem(&mp4(0, 1000, 31_500), "video/mp4").is_some_and(|p| p.contains("too long")));
         assert!(story_file_problem(b"", "video/quicktime").is_some_and(|p| p.contains("unsupported")));
         assert_eq!(story_file_problem(b"", "image/png"), None);
+    }
+
+    #[test]
+    fn the_text_color_slider_gives_desktops_colors() {
+        // Values worked through Desktop's `getRGBANumber` and `hslToRGB`.
+        assert_eq!(slider_color(100.), WHITE);
+        assert_eq!(slider_color(0.), BLACK);
+        // Halfway along the hues: 169 degrees.
+        assert_eq!(slider_color(51.), 0xff00_ffd0);
+        // The dark end's last step (half saturated), then the first hue.
+        assert_eq!(slider_color(7.), 0xffbf_4040);
+        assert_eq!(slider_color(8.), 0xffff_1000);
+        // With a pill, white text turns black; an inverse pill takes the color.
+        assert_eq!(text_colors(100., TextBackground::None), (WHITE, None));
+        assert_eq!(text_colors(100., TextBackground::Background), (BLACK, Some(WHITE)));
+        assert_eq!(text_colors(100., TextBackground::Inverse), (WHITE, Some(BLACK)));
+        assert_eq!(text_colors(51., TextBackground::Inverse), (WHITE, Some(0xff00_ffd0)));
+        assert_eq!(text_colors(51., TextBackground::Background), (0xff00_ffd0, Some(WHITE)));
     }
 }
