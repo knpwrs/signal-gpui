@@ -25,6 +25,8 @@ const ANA: &str = "d:00000000-0000-4000-8000-0000000000f0";
 const LEO: &str = "d:00000000-0000-4000-8000-0000000000f1";
 const GROUP: &str = "g:0000000000000000000000000000000000000000000000000000000000000001";
 const HOUSE: &str = "g:0000000000000000000000000000000000000000000000000000000000000003";
+/// A group Maya invited us to (`demo_groups.rs`).
+const INVITED: &str = "g:0000000000000000000000000000000000000000000000000000000000000005";
 /// How long a vote here shows as sending.
 const DEMO_VOTE_SENDING: Duration = Duration::from_millis(800);
 const SELF: &str = "d:00000000-0000-4000-8000-000000000001";
@@ -125,6 +127,8 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
         },
     )
     .await?;
+
+    crate::demo_groups::seed(db, HOUSE, INVITED, aci(MAYA), aci(JORDAN), aci(PRIYA), aci(SAM)).await?;
 
     let now = now();
     let name = |id: &str| match id {
@@ -735,6 +739,9 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
     let call: std::rc::Rc<std::cell::RefCell<Option<(crate::CallUpdate, i64, bool)>>> = Default::default();
 
     while let Some(command) = commands.next().await {
+        if crate::demo_groups::handle(&db, &data_dir, &command, &emit).await {
+            continue;
+        }
         match command {
             // Calls ring, then connect, without going anywhere.
             Command::StartCall { conversation, video } => {
@@ -1354,12 +1361,13 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 }
                 let _ = events.unbounded_send(Event::ConversationsChanged);
             }
-            Command::CreateGroup { title, members } => {
+            Command::CreateGroup { title, members, avatar, expire_timer } => {
                 let key: [u8; 32] = rand::Rng::random(&mut rand::rng());
                 let conversation = ConversationId::group(&key);
                 let update = ConversationUpdate {
                     kind: Some(ConversationKind::Group),
                     title: Some(title.trim().to_owned()),
+                    expire_timer: Some(expire_timer),
                     members: Some(members),
                     admins: Some(vec![SELF.trim_start_matches("d:").into()]),
                     can_label: Some(true),
@@ -1367,6 +1375,13 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     ..Default::default()
                 };
                 let _ = db.upsert_conversation(&conversation, update).await;
+                // The picked photo, as the group's (`media::group_avatar`).
+                if let Some(photo) = avatar.and_then(|image| crate::media::group_avatar(&image).ok()) {
+                    let file = data_dir.join("avatars").join(format!("demo-{}.jpg", conversation.0.replace(':', "-")));
+                    if std::fs::create_dir_all(data_dir.join("avatars")).and_then(|_| std::fs::write(&file, photo)).is_ok() {
+                        let _ = db.set_avatar(&conversation, file.to_str()).await;
+                    }
+                }
                 let _ = events.unbounded_send(Event::ConversationsChanged);
                 emit(Event::GroupCreated(conversation));
             }
@@ -1914,7 +1929,21 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 emit(Event::StorySettingsChanged);
             }
             Command::CancelKeyTransparency => {}
-            Command::Link
+            // Group administration is `demo_groups::handle`'s.
+            Command::SetGroupAvatar { .. }
+            | Command::RemoveFromGroup { .. }
+            | Command::SetGroupAdmin { .. }
+            | Command::SetGroupPermission { .. }
+            | Command::ChangeGroupLink { .. }
+            | Command::AnswerJoinRequest { .. }
+            | Command::RevokeGroupInvites { .. }
+            | Command::AcceptGroupInvite { .. }
+            | Command::DeclineGroupInvite { .. }
+            | Command::CancelJoinRequest { .. }
+            | Command::OpenGroupLink { .. }
+            | Command::JoinGroupLink { .. }
+            | Command::RefreshGroup { .. }
+            | Command::Link
             | Command::Typing { .. }
             | Command::FetchAttachment { .. }
             | Command::FetchLongText { .. }

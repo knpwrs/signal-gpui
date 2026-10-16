@@ -5,6 +5,7 @@ mod call_log;
 mod call_links;
 mod calls;
 mod early;
+mod group_admin;
 mod group_calls;
 mod polls;
 mod stories;
@@ -180,6 +181,10 @@ enum Outbound {
     PollVote { message: i64, vote_count: u32, attempt: u32 },
     /// Sync message to our other devices.
     Sync { body: SyncMessage },
+    /// A group update to someone outside the group's members: an invitee,
+    /// or someone just removed (Desktop's `includePendingMembers` and
+    /// `extraConversationsForSend`). Sent as it is, not as a 1:1 message.
+    GroupUpdateTo { recipient: String, body: ContentBody, timestamp: u64 },
     /// A story (or group story reply) to one recipient, part of `job`.
     Story { recipient: String, body: ContentBody, timestamp: u64, job: u64 },
     /// A story to many at once with our sender key for `target` (a group's
@@ -316,6 +321,12 @@ struct Actor {
     /// Each group's revision when its details (members, admins, access) were
     /// last read, to read them again when a message names a newer one.
     group_revisions: RefCell<HashMap<ConversationId, u32>>,
+    /// One group change at a time per group (`group_admin.rs`).
+    group_locks: RefCell<HashMap<ConversationId, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    /// Held while a group's stored state is read and written again.
+    group_state_locks: RefCell<HashMap<ConversationId, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    /// When each group was last fetched for its chat or details.
+    group_fetches: RefCell<HashMap<ConversationId, std::time::Instant>>,
     /// Group identifier -> master key, for typing indicators.
     group_ids: RefCell<HashMap<Vec<u8>, [u8; 32]>>,
     profile_fetches: RefCell<HashSet<String>>,
@@ -444,6 +455,9 @@ pub(crate) async fn run(
         names: RefCell::default(),
         titled: RefCell::default(),
         group_revisions: RefCell::default(),
+        group_locks: RefCell::default(),
+        group_state_locks: RefCell::default(),
+        group_fetches: RefCell::default(),
         group_ids: RefCell::default(),
         profile_fetches: RefCell::default(),
         receiver: RefCell::new(None),
@@ -825,7 +839,26 @@ impl Actor {
                     self.update_group(conversation, title, description).await
                 }
                 Command::LeaveGroup { conversation } => self.leave_group(conversation).await,
-                Command::CreateGroup { title, members } => self.create_group(title, members).await,
+                Command::CreateGroup { title, members, avatar, expire_timer } => {
+                    self.create_group(title, members, avatar, expire_timer).await
+                }
+                Command::SetGroupAvatar { conversation, image } => self.set_group_avatar(conversation, image).await,
+                Command::RemoveFromGroup { conversation, service_id } => self.remove_from_group(conversation, service_id).await,
+                Command::SetGroupAdmin { conversation, member, admin } => self.set_group_admin(conversation, member, admin).await,
+                Command::SetGroupPermission { conversation, permission } => {
+                    self.set_group_permission(conversation, permission).await
+                }
+                Command::ChangeGroupLink { conversation, change } => self.change_group_link(conversation, change).await,
+                Command::AnswerJoinRequest { conversation, member, approve } => {
+                    self.answer_join_request(conversation, member, approve).await
+                }
+                Command::RevokeGroupInvites { conversation, invitees } => self.revoke_group_invites(conversation, invitees).await,
+                Command::AcceptGroupInvite { conversation } => self.accept_group_invite(conversation).await,
+                Command::DeclineGroupInvite { conversation, block } => self.decline_group_invite(conversation, block).await,
+                Command::CancelJoinRequest { conversation } => self.cancel_join_request(conversation).await,
+                Command::OpenGroupLink { url } => self.open_group_link(url).await,
+                Command::JoinGroupLink { url } => self.join_group_link(url).await,
+                Command::RefreshGroup { conversation } => self.refresh_group(conversation).await,
                 Command::SetMemberLabel { conversation, emoji, text } => self.set_member_label(conversation, emoji, text).await,
                 Command::LoadSafetyNumber { conversation } => self.emit_safety_number(conversation).await,
                 Command::CheckKeyTransparency { conversation } => self.check_key_transparency(conversation),
@@ -1134,6 +1167,9 @@ impl Actor {
                         self.titled.borrow_mut().remove(&conversation);
                         self.ensure_title(&conversation).await;
                         self.emit(Event::ConversationsChanged);
+                        // presage's copy lacks announcement-only and bans:
+                        // fetch those too (at most every few minutes).
+                        tokio::task::spawn_local(self.clone().refresh_group(conversation));
                     }
                 }
                 // Like Desktop, nothing from someone you blocked gets through.
@@ -1611,7 +1647,7 @@ impl Actor {
 
     /// Desktop's "New group": a new master key, the group created on the
     /// group server with us as admin, then a message so members see it.
-    async fn create_group(self: Rc<Self>, title: String, members: Vec<String>) {
+    async fn create_group(self: Rc<Self>, title: String, members: Vec<String>, avatar: Option<Vec<u8>>, expire_timer: u32) {
         let title = title.trim().to_owned();
         if title.is_empty() {
             return self.emit(Event::Error("A group needs a name".into()));
@@ -1634,7 +1670,12 @@ impl Actor {
         let key: [u8; 32] = rand::Rng::random(&mut rand::rng());
         let created = async {
             let session = crate::groups::GroupSession::new(&manager, key).await?;
-            session.create(&title, (me, mine), &candidates).await?;
+            // Desktop's avatar picker: the picked image made a group photo.
+            let photo = match avatar {
+                Some(image) => Some(tokio::task::spawn_blocking(move || crate::media::group_avatar(&image)).await??),
+                None => None,
+            };
+            session.create(&title, (me, mine), &candidates, photo.as_deref(), expire_timer).await?;
             let group = session.fetch().await?;
             self.store.save_group(key, group).await.map_err(|e| anyhow::anyhow!("{e}"))?;
             anyhow::Ok(())
@@ -1645,6 +1686,9 @@ impl Actor {
         }
         let conversation = ConversationId::group(&key);
         self.ensure_title(&conversation).await;
+        if let Some(manager) = self.manager() {
+            self.refresh_group_avatar(&manager, key, false).await;
+        }
         self.emit(Event::ConversationsChanged);
         self.emit(Event::GroupCreated(conversation.clone()));
         // Members' apps learn of the group from its first message.
@@ -1666,6 +1710,7 @@ impl Actor {
             let key: [u8; 32] =
                 conversation.as_group().and_then(|k| k.try_into().ok()).ok_or_else(|| anyhow::anyhow!("not a group"))?;
             let me = Aci::parse_from_service_id_string(&self.self_aci()).ok_or_else(|| anyhow::anyhow!("no account"))?;
+            let _lock = self.group_lock(&conversation).await;
             let session = crate::groups::GroupSession::new(&manager, key).await?;
             let current = session.fetch().await?;
             if current.terminated {
@@ -1768,6 +1813,11 @@ impl Actor {
 
     /// Leaves a group. Like Desktop, the last admin must name another first.
     async fn leave_group(self: Rc<Self>, conversation: ConversationId) {
+        // Desktop's `leaveGroupV2`: an invitation is declined.
+        if matches!(self.stored_group_state(&conversation).await.membership, signal_store::Membership::Invited { .. }) {
+            self.decline_invite(&conversation).await;
+            return;
+        }
         let me = self.self_aci();
         let Some(key) = conversation.as_group().and_then(|k| <[u8; 32]>::try_from(k).ok()) else { return };
         if let Ok(Some(group)) = self.store.group(key).await {
@@ -1805,6 +1855,7 @@ impl Actor {
         let manager = self.manager().ok_or_else(|| anyhow::anyhow!("not connected"))?;
         let key: [u8; 32] =
             conversation.as_group().and_then(|k| k.try_into().ok()).ok_or_else(|| anyhow::anyhow!("not a group"))?;
+        let _lock = self.group_lock(conversation).await;
         let session = crate::groups::GroupSession::new(&manager, key).await?;
         let current = session.fetch().await?;
         self.change_group_in(&session, conversation, key, &current, build).await
@@ -1825,6 +1876,22 @@ impl Actor {
     ) -> anyhow::Result<()> {
         let mut actions = presage::proto::group_change::Actions { version: current.version + 1, ..Default::default() };
         build(&session.operations, &mut actions)?;
+        self.submit_group_change(session, conversation, key, current, actions, Vec::new()).await
+    }
+
+    /// Has the group server apply `actions`, applies the change here, then
+    /// sends it to the members, the people invited, and `extra` (Desktop's
+    /// `modifyGroupV2`, with `getGroupV2Info({ includePendingMembers: true,
+    /// extraConversationsForSend })`).
+    pub(super) async fn submit_group_change(
+        self: &Rc<Self>,
+        session: &crate::groups::GroupSession,
+        conversation: &ConversationId,
+        key: [u8; 32],
+        current: &presage::libsignal_service::groups_v2::Group,
+        actions: presage::proto::group_change::Actions,
+        extra: Vec<String>,
+    ) -> anyhow::Result<()> {
         let signed = session.modify(actions).await?;
         let timestamp = self.next_timestamp();
         // The members to tell are the ones before the change (when leaving,
@@ -1837,10 +1904,26 @@ impl Actor {
         let expire_timer = self.db.conversation(conversation).await.ok().flatten().map(|c| c.expire_timer);
         self.apply_group_change(key, &signed, timestamp).await;
         let left = self.db.conversation(conversation).await.ok().flatten().is_some_and(|c| c.left);
-        if !left && let Ok(group) = session.fetch().await
-            && let Err(error) = self.store.save_group(key, group).await
-        {
-            warn!(%error, "failed to save the changed group");
+        let after = if left { None } else { session.fetch().await.ok() };
+        // Those invited, before or after the change, hear of it too.
+        let me = self.self_aci();
+        let group = after.as_ref().unwrap_or(current);
+        let members: HashSet<String> = group.members.iter().map(|m| m.aci.service_id_string()).collect();
+        let mut others: Vec<String> = current
+            .members_pending_profile_key
+            .iter()
+            .chain(after.iter().flat_map(|g| &g.members_pending_profile_key))
+            .filter_map(|p| match p.address {
+                ServiceId::Aci(aci) => Some(aci.service_id_string()),
+                ServiceId::Pni(_) => None,
+            })
+            .chain(extra.into_iter().filter(|sid| Aci::parse_from_service_id_string(sid).is_some()))
+            .filter(|sid| *sid != me && !members.contains(sid))
+            .collect();
+        others.sort();
+        others.dedup();
+        if let Some(group) = after {
+            self.save_full_group(key, group).await;
         }
         self.titled.borrow_mut().remove(conversation);
         self.ensure_title(conversation).await;
@@ -1851,6 +1934,9 @@ impl Actor {
             expire_timer: expire_timer.filter(|t| *t > 0),
             ..Default::default()
         };
+        for recipient in others {
+            self.enqueue(Outbound::GroupUpdateTo { recipient, body: data.clone().into(), timestamp: timestamp as u64 });
+        }
         self.enqueue(Outbound::Send { conversation: conversation.clone(), body: data.into(), timestamp: timestamp as u64, message: None });
         Ok(())
     }
@@ -1867,7 +1953,31 @@ impl Actor {
             Err(error) => return warn!(?error, "couldn't decrypt a group change"),
         };
         let conversation = ConversationId::group(&key);
-        let summary = mapping::summarize_group_change(&changes, &self.self_aci());
+        let pni = self.manager().map(|m| m.registration_data().service_ids.pni().service_id_string());
+        let summary = {
+            let _lock = self.group_state_lock(&conversation).await;
+            let before = self.stored_group_state(&conversation).await;
+            let summary = mapping::summarize_group_change(&changes, &self.self_aci(), pni.as_deref(), &before);
+            let mut state = before.clone();
+            mapping::apply_to_group_state(&summary, &mut state);
+            if state != before {
+                let update = ConversationUpdate { group_state: Some(state), ..Default::default() };
+                if let Err(error) = self.db.upsert_conversation(&conversation, update).await {
+                    warn!(%error, "failed to save the group's state");
+                }
+            }
+            summary
+        };
+        match summary.membership {
+            Some(mapping::MembershipChange::Joined | mapping::MembershipChange::Invited { .. }) => {
+                let _ = self.db.set_left(&conversation, false).await;
+            }
+            // Turned down, or our invitation's gone: no longer in it at all.
+            Some(mapping::MembershipChange::Out) => {
+                let _ = self.db.set_left(&conversation, true).await;
+            }
+            Some(mapping::MembershipChange::Requesting) | None => {}
+        }
         if let Some(seconds) = summary.timer {
             let version = self.db.conversation(&conversation).await.ok().flatten().map_or(1, |c| c.expire_timer_version);
             let _ = self.db.set_expire_timer(&conversation, seconds, version).await;
@@ -2830,7 +2940,11 @@ impl Actor {
                 .collect();
             let can_label = !left && !ended && mapping::can_set_member_label(&group, &me);
             let can_add_members = !left && !ended && mapping::can_add_group_members(&group, &me);
+            let pni = self.manager().map(|m| m.registration_data().service_ids.pni().service_id_string());
+            let stored_state = stored.map(|c| c.group_state).unwrap_or_default();
+            let group_state = mapping::group_state_of(&group, key, &me, pni.as_deref(), &stored_state);
             return Some(ConversationUpdate {
+                group_state: Some(group_state),
                 can_add_members: Some(can_add_members),
                 kind: Some(ConversationKind::Group),
                 member_labels: Some(member_labels),
@@ -2893,6 +3007,11 @@ impl Actor {
         if self.titled.borrow().contains(conversation) {
             return;
         }
+        // A group's state is worked out from what's stored: hold it still.
+        let _lock = match conversation.as_group() {
+            Some(_) => Some(self.group_state_lock(conversation).await),
+            None => None,
+        };
         if let Some(update) = self.title_for(conversation).await {
             if let Err(error) = self.db.upsert_conversation(conversation, update).await {
                 self.error("failed to update conversation", error);
@@ -2910,6 +3029,10 @@ impl Actor {
             if self.titled.borrow().contains(&conversation.id) {
                 continue;
             }
+            let _lock = match conversation.id.as_group() {
+                Some(_) => Some(self.group_state_lock(&conversation.id).await),
+                None => None,
+            };
             if let Some(update) = self.title_for(&conversation.id).await {
                 let differs = update.title.as_ref().is_some_and(|t| *t != conversation.title)
                     || update.kind.is_some_and(|k| k != conversation.kind)
@@ -2922,6 +3045,7 @@ impl Actor {
                     || update.can_add_members.is_some_and(|v| v != conversation.can_add_members)
                     || update.admins.as_ref().is_some_and(|a| *a != conversation.admins)
                     || update.member_labels.as_ref().is_some_and(|l| *l != conversation.member_labels)
+                    || update.group_state.as_ref().is_some_and(|g| *g != conversation.group_state)
                     || update.description.as_ref().is_some_and(|d| Some(d).filter(|d| !d.is_empty()) != conversation.description.as_ref());
                 if differs {
                     changed = true;
@@ -4108,6 +4232,12 @@ impl Actor {
                     let Some(me) = ServiceId::parse_from_service_id_string(&me) else { continue };
                     if let Err(error) = manager.send_message(me, body, self.next_timestamp() as u64).await {
                         warn!(%error, "failed to send sync message");
+                    }
+                }
+                Outbound::GroupUpdateTo { recipient, body, timestamp } => {
+                    let Some(to) = ServiceId::parse_from_service_id_string(&recipient) else { continue };
+                    if let Err(error) = manager.send_message(to, body, timestamp).await {
+                        warn!(%error, "failed to send a group update to someone outside the group");
                     }
                 }
             }

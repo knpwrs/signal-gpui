@@ -1,5 +1,6 @@
-//! Desktop's "New group" (pick members, name it, create) and "Add members"
-//! (pick people, confirm), both within the remote config's group size
+//! Desktop's "New group" (pick members, name it, give it a photo and a
+//! disappearing message timer, create; or join one by its link) and "Add
+//! members" (pick people, confirm), both within the remote config's group size
 //! limits: rows stop being pickable at the hard limit, and Desktop's
 //! one-time alerts say when the recommended or the hard limit is reached.
 
@@ -91,6 +92,10 @@ struct Picking {
     people: Vec<DirectoryEntry>,
     chosen: BTreeSet<String>,
     alerts: Alerts,
+    /// A new group's photo (Desktop's avatar picker): the picked file.
+    avatar: Option<(std::path::PathBuf, Vec<u8>)>,
+    /// A new group's disappearing message timer, in seconds.
+    timer: u32,
 }
 
 /// Who's already in the group (ACIs), when adding to one.
@@ -117,7 +122,7 @@ fn open_picker(state: Entity<AppState>, adding: Option<Adding>, window: &mut Win
     let alerts = Alerts { maximum: already >= limits.hard, recommended: already >= limits.recommended };
     let name = cx.new(|cx| InputState::new(window, cx).placeholder("Group name (required)"));
     let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search name or number"));
-    let picking = cx.new(|_| Picking { people: Vec::new(), chosen: BTreeSet::new(), alerts });
+    let picking = cx.new(|_| Picking { people: Vec::new(), chosen: BTreeSet::new(), alerts, avatar: None, timer: 0 });
     let backend = state.read(cx).backend.clone();
     let db = backend.db().clone();
     let query = backend.spawn(async move { db.people().await });
@@ -218,7 +223,11 @@ fn open_picker(state: Entity<AppState>, adding: Option<Adding>, window: &mut Win
                             Some(group) => confirm_additions(create_state.clone(), group.clone(), members, window, cx),
                             None => {
                                 let title = create_name.read(cx).value().trim().to_string();
-                                create_state.read(cx).send(Command::CreateGroup { title, members });
+                                let (avatar, expire_timer) = {
+                                    let picking = create_picking.read(cx);
+                                    (picking.avatar.as_ref().map(|(_, bytes)| bytes.clone()), picking.timer)
+                                };
+                                create_state.read(cx).send(Command::CreateGroup { title, members, avatar, expire_timer });
                                 window.close_all_dialogs(cx);
                             }
                         }
@@ -232,7 +241,7 @@ fn open_picker(state: Entity<AppState>, adding: Option<Adding>, window: &mut Win
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .when(adding_to.is_none(), |d| d.child(Input::new(&name)))
+                    .when(adding_to.is_none(), |d| d.child(Input::new(&name)).child(new_group_extras(&state, &picking, palette, cx)))
                     .child(Input::new(&search))
                     .child(div().text_xs().text_color(palette.text_secondary).child(format!("{} chosen", chosen.len())))
                     .child(div().id("new-group-people").h(px(320.)).overflow_y_scroll().children(rows)),
@@ -243,6 +252,77 @@ fn open_picker(state: Entity<AppState>, adding: Option<Adding>, window: &mut Win
         show_alert(SizeAlert::Maximum, limits.hard, window, cx);
     }
     picked
+}
+
+/// A new group's photo and disappearing message timer (Desktop's
+/// `GroupPeekView` step), and joining one by a link instead.
+fn new_group_extras(state: &Entity<AppState>, picking: &Entity<Picking>, palette: Palette, cx: &App) -> impl IntoElement {
+    use gpui_kit::component::Sizable as _;
+    use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+    let (photo, timer) = {
+        let p = picking.read(cx);
+        (p.avatar.as_ref().map(|(path, _)| path.clone()), p.timer)
+    };
+    let pick = picking.clone();
+    let choose = Button::new("new-group-photo").label(if photo.is_some() { "Change photo" } else { "Add photo" }).outline().small().on_click(
+        move |_, window, cx| {
+            let picked = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
+                files: true,
+                directories: false,
+                multiple: false,
+                prompt: Some("Choose a group photo".into()),
+            });
+            let pick = pick.clone();
+            window
+                .spawn(cx, async move |cx| {
+                    let Ok(Ok(Some(paths))) = picked.await else { return };
+                    let Some(path) = paths.into_iter().next() else { return };
+                    let Ok(bytes) = std::fs::read(&path) else { return };
+                    pick.update(cx, |p, cx| {
+                        p.avatar = Some((path, bytes));
+                        cx.notify();
+                    });
+                })
+                .detach();
+        },
+    );
+    let timers = picking.clone();
+    let timer_button = Button::new("new-group-timer")
+        .label(format!("Disappearing messages: {}", crate::views::chat_menu::format_timer_long(timer)))
+        .outline()
+        .small()
+        .dropdown_menu(move |mut menu, _, _| {
+            for seconds in crate::views::chat_menu::TIMER_CHOICES {
+                let timers = timers.clone();
+                menu = menu.item(PopupMenuItem::new(crate::views::chat_menu::format_timer_long(seconds)).checked(timer == seconds).on_click(
+                    move |_, window, cx| {
+                        timers.update(cx, |p, _| p.timer = seconds);
+                        window.refresh();
+                    },
+                ));
+            }
+            menu
+        });
+    let link_state = state.clone();
+    div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_2()
+        .when_some(photo, |d, path| d.child(person_avatar(Some(&path), "", 0, px(32.))))
+        .child(choose)
+        .child(timer_button)
+        .child(
+            Button::new("new-group-join-link")
+                .label("Join with a group link")
+                .ghost()
+                .small()
+                .text_color(palette.accent)
+                .on_click(move |_, window, cx| {
+                    window.close_all_dialogs(cx);
+                    crate::views::group_admin::open_paste_link(link_state.clone(), window, cx);
+                }),
+        )
 }
 
 /// Desktop's `ConfirmAdditionsModal`: "Add Alice to "Hikers"?".

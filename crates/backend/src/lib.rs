@@ -13,6 +13,7 @@ pub use url::Url;
 
 mod actor;
 mod demo;
+mod demo_groups;
 pub mod mapping;
 mod storage;
 mod groups;
@@ -166,6 +167,19 @@ pub struct Config {
     pub demo: bool,
 }
 
+/// A group a link leads to, as Desktop's `GroupV2JoinDialog` shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupLinkPreview {
+    pub url: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub member_count: u32,
+    /// An admin approves who joins.
+    pub approval: bool,
+    /// The group's photo, downloaded.
+    pub avatar: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     /// Starts linking as a secondary device. Emits `Event::LinkUrl` then `Event::Linked`.
@@ -288,7 +302,46 @@ pub enum Command {
     /// Leaves a group.
     LeaveGroup { conversation: ConversationId },
     /// Creates a group with us as its admin; answered with `Event::GroupCreated`.
-    CreateGroup { title: String, members: Vec<String> },
+    /// `avatar` is a picked image (made a group photo as Desktop does) and
+    /// `expire_timer` the disappearing message timer, in seconds (0: off).
+    CreateGroup { title: String, members: Vec<String>, avatar: Option<Vec<u8>>, expire_timer: u32 },
+    /// Sets the group's photo from a picked image, or removes it (`None`).
+    SetGroupAvatar { conversation: ConversationId, image: Option<Vec<u8>> },
+    /// Removes someone from a group, as Desktop's `removeFromGroupV2` does:
+    /// a member (banned from rejoining by the link), an invitation, or a
+    /// request to join (turned down). `service_id` is an ACI, or a PNI for
+    /// an invitation.
+    RemoveFromGroup { conversation: ConversationId, service_id: String },
+    /// Makes a member an admin, or not (Desktop's `toggleAdmin`).
+    SetGroupAdmin { conversation: ConversationId, member: String, admin: bool },
+    /// Who may edit details, add people or send messages.
+    SetGroupPermission { conversation: ConversationId, permission: group_admin::Permission },
+    /// Turns the group link on or off, resets it, or sets admin approval.
+    ChangeGroupLink { conversation: ConversationId, change: group_admin::LinkChange },
+    /// Approves or turns down a request to join (an ACI).
+    AnswerJoinRequest { conversation: ConversationId, member: String, approve: bool },
+    /// Revokes invitations (service ids).
+    RevokeGroupInvites { conversation: ConversationId, invitees: Vec<String> },
+    /// Accepts our invitation to a group.
+    AcceptGroupInvite { conversation: ConversationId },
+    /// Declines our invitation to a group and deletes the chat (Desktop's
+    /// "Delete and Leave"), or (`block`) declines it and blocks the group
+    /// ("Block and Leave").
+    DeclineGroupInvite { conversation: ConversationId, block: bool },
+    /// Takes back our request to join a group.
+    CancelJoinRequest { conversation: ConversationId },
+    /// A `signal.group` link was opened: answered with
+    /// `Event::GroupLinkPreview` (Desktop's join dialog), `Event::GroupOpened`
+    /// when we're already in (or asking to join) the group, or
+    /// `Event::GroupLinkFailed`.
+    OpenGroupLink { url: String },
+    /// Joins (or asks to join) the group a link names; answered with
+    /// `Event::GroupOpened` or `Event::GroupLinkFailed`.
+    JoinGroupLink { url: String },
+    /// Fetches a group as the server has it now, as Desktop does when a
+    /// group's chat or details open (`fetchLatestGroupV2Data`). At most
+    /// every few minutes per group.
+    RefreshGroup { conversation: ConversationId },
     /// Adds people (ACIs) to a group, inviting those whose profile key we
     /// don't have (Desktop's "Add members").
     AddGroupMembers { conversation: ConversationId, members: Vec<String> },
@@ -850,6 +903,13 @@ pub enum Event {
     KeyTransparencyFailed,
     /// A group we created is ready to open.
     GroupCreated(ConversationId),
+    /// What a group link leads to, for Desktop's join dialog.
+    GroupLinkPreview(GroupLinkPreview),
+    /// Open this group (joined, asked to join, or already in it), with
+    /// Desktop's toast if there is one ("You're already in this group.").
+    GroupOpened { conversation: ConversationId, toast: Option<String> },
+    /// A group link couldn't be read or joined: Desktop's title and words.
+    GroupLinkFailed { title: String, description: String },
     /// Progress of the message history transfer after linking.
     /// Draining the server queue after starting: the server timestamps
     /// (unix millis) of the first queued message and the latest one

@@ -159,7 +159,10 @@ impl Sidebar {
                 | AppEvent::CallLinksChanged
                 | AppEvent::CallLinkCreated(_)
                 | AppEvent::Gifs { .. }
-                | AppEvent::KeyTransparencyFailed => {}
+                | AppEvent::KeyTransparencyFailed
+                | AppEvent::GroupLinkPreview(_)
+                | AppEvent::Alert { .. }
+                | AppEvent::Info(_) => {}
             }),
         ];
         Self {

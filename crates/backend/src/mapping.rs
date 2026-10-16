@@ -233,29 +233,110 @@ mod pointer_bytes {
 
 /// What a group change means here: a notice per change (`by`: who made
 /// it, `None` for us), the new timer if it changed, whether we're out of
-/// the group now, and whether an admin ended it.
+/// the group now, whether an admin ended it, and what changed of the state
+/// presage doesn't keep (announcement-only, bans) or that's ours.
 #[derive(Debug, Default, PartialEq)]
 pub struct GroupChangeSummary {
     pub notices: Vec<signal_store::Notice>,
     pub timer: Option<u32>,
     pub left: bool,
     pub ended: bool,
+    /// Announcement-only was turned on or off.
+    pub announcements_only: Option<bool>,
+    /// Service ids banned and unbanned.
+    pub banned: Vec<String>,
+    pub unbanned: Vec<String>,
+    /// Where we stand now, when this change moved us.
+    pub membership: Option<MembershipChange>,
 }
 
-pub fn summarize_group_change(changes: &presage::libsignal_service::groups_v2::GroupChanges, me: &str) -> GroupChangeSummary {
+/// How a group change moved us.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MembershipChange {
+    /// Invited (`by`: who did, an ACI).
+    Invited { by: String },
+    /// We asked to join by the link.
+    Requesting,
+    /// We're a member now (added, accepted, approved, joined by the link).
+    Joined,
+    /// Our invitation or request is gone (declined, revoked, turned down).
+    Out,
+}
+
+/// Who invited `invitee`, as `before` lists the group's invitations.
+fn inviter_of(before: &signal_store::GroupState, invitee: &str, me: &str) -> signal_store::Inviter {
+    use signal_store::Inviter;
+    match before.invites.iter().find(|i| i.service_id == invitee) {
+        Some(invite) if invite.by == me => Inviter::Us,
+        Some(invite) => Inviter::Person { id: invite.by.clone() },
+        None => Inviter::Unknown,
+    }
+}
+
+/// The notices for a group change, worked out as Desktop's `extractDiffs`
+/// (`ts/groups.preload.ts`) compares the group before and after it: `me`
+/// and `pni` are our ids, `before` the group's state before the change
+/// (for the link and who invited whom).
+pub fn summarize_group_change(
+    changes: &presage::libsignal_service::groups_v2::GroupChanges,
+    me: &str,
+    pni: Option<&str>,
+    before: &signal_store::GroupState,
+) -> GroupChangeSummary {
     use presage::libsignal_service::groups_v2::{AccessRequired, GroupChange, Role};
-    use signal_store::{GroupNotice, Notice};
-    let person = |sid: String| (sid != me).then_some(sid);
-    let by = person(changes.editor.service_id_string());
+    use signal_store::{GroupNotice, Inviter, Notice};
+    let ours = |sid: &str| sid == me || Some(sid) == pni;
+    let person = |sid: String| (!ours(&sid)).then_some(sid);
+    let editor = changes.editor.service_id_string();
+    let by = person(editor.clone());
     let admins_only = |access: &AccessRequired| *access == AccessRequired::Administrator;
     let mut summary = GroupChangeSummary::default();
+    let mut invited = Vec::new();
+    let mut uninvited = Vec::new();
+    // The link before and after (Desktop's `isAccessControlEnabled`).
+    let link_before = before.link.as_ref().map(|l| l.approval);
+    let mut link_after = link_before;
+    let mut new_password = false;
     for change in &changes.changes {
         let notice = match change {
             GroupChange::Title(title) => GroupNotice::Title { title: title.clone() },
             GroupChange::Description(_) => GroupNotice::Description,
             GroupChange::Avatar(_) => GroupNotice::Avatar,
-            GroupChange::NewMember(member) => GroupNotice::Added { member: person(member.aci.service_id_string()) },
-            GroupChange::PromoteRequestingMember { aci, .. } => GroupNotice::Added { member: person(aci.service_id_string()) },
+            GroupChange::NewMember(member) => {
+                let sid = member.aci.service_id_string();
+                if ours(&sid) {
+                    summary.membership = Some(MembershipChange::Joined);
+                }
+                // Only the link lets someone add themselves.
+                if sid == editor {
+                    GroupNotice::JoinedByLink { member: person(sid) }
+                } else {
+                    GroupNotice::Added { member: person(sid) }
+                }
+            }
+            GroupChange::PromotePendingMember { address, .. } => {
+                let sid = address.service_id_string();
+                if ours(&sid) {
+                    summary.membership = Some(MembershipChange::Joined);
+                }
+                let inviter = inviter_of(before, &sid, me);
+                GroupNotice::AcceptedInvite { member: person(sid), inviter }
+            }
+            GroupChange::PromotePendingPniAciMemberProfileKey(promoted) => {
+                let aci = promoted.aci.service_id_string();
+                if ours(&aci) {
+                    summary.membership = Some(MembershipChange::Joined);
+                }
+                let inviter = inviter_of(before, &promoted.pni.service_id_string(), me);
+                GroupNotice::AcceptedInvite { member: person(aci), inviter }
+            }
+            GroupChange::PromoteRequestingMember { aci, .. } => {
+                let sid = aci.service_id_string();
+                if ours(&sid) {
+                    summary.membership = Some(MembershipChange::Joined);
+                }
+                GroupNotice::Approved { member: person(sid) }
+            }
             GroupChange::DeleteMember(aci) => {
                 let member = person(aci.service_id_string());
                 summary.left |= member.is_none();
@@ -264,9 +345,58 @@ pub fn summarize_group_change(changes: &presage::libsignal_service::groups_v2::G
             GroupChange::ModifyMemberRole { aci, role } => {
                 GroupNotice::Admin { member: person(aci.service_id_string()), admin: *role == Role::Administrator }
             }
+            GroupChange::NewPendingMember(pending) => {
+                let sid = pending.address.service_id_string();
+                if ours(&sid) {
+                    summary.membership = Some(MembershipChange::Invited { by: pending.added_by_aci.service_id_string() });
+                }
+                invited.push(sid);
+                continue;
+            }
+            GroupChange::DeletePendingMember(id) => {
+                let sid = id.service_id_string();
+                if ours(&sid) {
+                    summary.membership = Some(MembershipChange::Out);
+                }
+                uninvited.push(sid);
+                continue;
+            }
+            GroupChange::NewRequestingMember(requesting) => {
+                let sid = requesting.aci.service_id_string();
+                if ours(&sid) {
+                    summary.membership = Some(MembershipChange::Requesting);
+                }
+                GroupNotice::Requested { member: person(sid) }
+            }
+            GroupChange::DeleteRequestingMember(aci) => {
+                let sid = aci.service_id_string();
+                if ours(&sid) {
+                    summary.membership = Some(MembershipChange::Out);
+                }
+                GroupNotice::RequestRemoved { member: person(sid) }
+            }
+            GroupChange::InviteLinkAccess(access) => {
+                link_after = matches!(access, AccessRequired::Any | AccessRequired::Administrator).then_some(admins_only(access));
+                continue;
+            }
+            GroupChange::InviteLinkPassword(_) => {
+                new_password = true;
+                continue;
+            }
+            GroupChange::AddBannedMember(banned) => {
+                summary.banned.push(banned.user_id.service_id_string());
+                continue;
+            }
+            GroupChange::DeleteBannedMember(id) => {
+                summary.unbanned.push(id.service_id_string());
+                continue;
+            }
             GroupChange::AttributeAccess(access) => GroupNotice::InfoAccess { admins_only: admins_only(access) },
             GroupChange::MemberAccess(access) => GroupNotice::MemberAccess { admins_only: admins_only(access) },
-            GroupChange::AnnouncementOnly(on) => GroupNotice::AnnouncementsOnly { on: *on },
+            GroupChange::AnnouncementOnly(on) => {
+                summary.announcements_only = Some(*on);
+                GroupNotice::AnnouncementsOnly { on: *on }
+            }
             GroupChange::TerminateGroup => {
                 summary.ended = true;
                 GroupNotice::Ended
@@ -277,12 +407,160 @@ pub fn summarize_group_change(changes: &presage::libsignal_service::groups_v2::G
                 summary.notices.push(Notice::Timer { by: by.clone(), seconds });
                 continue;
             }
-            // Profile keys, invitations, links, bans and labels: no notice.
+            // Profile keys and labels: no notice.
             _ => continue,
         };
         summary.notices.push(Notice::Group { by: by.clone(), change: notice });
     }
+    // Desktop's pending-add-one / -many.
+    match invited.len() {
+        0 => {}
+        1 => summary.notices.push(Notice::Group {
+            by: by.clone(),
+            change: GroupNotice::Invited { member: person(invited.remove(0)) },
+        }),
+        count => {
+            summary.notices.push(Notice::Group { by: by.clone(), change: GroupNotice::InvitedMany { count: count as u32 } })
+        }
+    }
+    // Desktop's pending-remove-one / -many: the inviter, when they all had one.
+    match uninvited.len() {
+        0 => {}
+        1 => {
+            let sid = uninvited.remove(0);
+            let inviter = inviter_of(before, &sid, me);
+            summary.notices.push(Notice::Group { by: by.clone(), change: GroupNotice::InviteRemoved { member: person(sid), inviter } })
+        }
+        count => {
+            let mut inviters = uninvited.iter().map(|sid| inviter_of(before, sid, me));
+            let first = inviters.next().unwrap_or(Inviter::Unknown);
+            let inviter = if inviters.all(|i| i == first) { first } else { Inviter::Unknown };
+            summary
+                .notices
+                .push(Notice::Group { by: by.clone(), change: GroupNotice::InvitesRemoved { count: count as u32, inviter } })
+        }
+    }
+    // The link, as Desktop's `extractDiffs` compares it (`group-link-add`,
+    // `-remove`, `access-invite-link`, `group-link-reset`).
+    let link = match (link_before, link_after) {
+        (None, Some(approval)) => Some(GroupNotice::LinkOn { approval }),
+        (Some(_), None) => Some(GroupNotice::LinkOff),
+        (Some(was), Some(now)) if was != now => Some(GroupNotice::LinkApproval { on: now }),
+        _ => None,
+    };
+    if let Some(link) = link {
+        summary.notices.push(Notice::Group { by: by.clone(), change: link });
+    }
+    if new_password && link_before.is_some() && link_after.is_some() {
+        summary.notices.push(Notice::Group { by, change: GroupNotice::LinkReset });
+    }
     summary
+}
+
+/// A group's administration state from presage's copy of it: `key` its
+/// master key, `me` and `pni` our ids. presage doesn't keep
+/// announcement-only or bans, so those (and a request to join, which needs
+/// the link's password) come from `stored`.
+pub fn group_state_of(
+    group: &presage::model::groups::Group,
+    key: [u8; 32],
+    me: &str,
+    pni: Option<&str>,
+    stored: &signal_store::GroupState,
+) -> signal_store::GroupState {
+    use presage::libsignal_service::groups_v2::AccessRequired;
+    use presage::model::ServiceIdType;
+    use signal_store::{GroupInvite, GroupLink, GroupRequest, GroupState, Membership};
+    let access = group.access_control.as_ref();
+    let link_access = access.map_or(AccessRequired::Unsatisfiable, |a| a.add_from_invite_link);
+    let link = (crate::group_admin::link_enabled(link_access) && !group.invite_link_password.is_empty()).then(|| GroupLink {
+        url: crate::group_admin::link_url(key, &group.invite_link_password),
+        approval: link_access == AccessRequired::Administrator,
+    });
+    let invites: Vec<GroupInvite> = group
+        .pending_members
+        .iter()
+        .map(|p| GroupInvite {
+            service_id: match p.service_id_type {
+                ServiceIdType::PhoneNumberIdentity => {
+                    ServiceId::from(presage::libsignal_service::protocol::Pni::from(p.uuid)).service_id_string()
+                }
+                ServiceIdType::AccountIdentity => ServiceId::from(Aci::from(p.uuid)).service_id_string(),
+            },
+            by: p.added_by_aci.service_id_string(),
+        })
+        .collect();
+    let requests: Vec<GroupRequest> = group
+        .requesting_members
+        .iter()
+        .map(|r| GroupRequest { aci: r.aci.service_id_string(), at: r.timestamp as i64 })
+        .collect();
+    let ours = |sid: &str| sid == me || Some(sid) == pni;
+    let membership = if group.members.iter().any(|m| m.aci.service_id_string() == me) {
+        Membership::Member
+    } else if let Some(invite) = invites.iter().find(|i| ours(&i.service_id)) {
+        Membership::Invited { by: Some(invite.by.clone()) }
+    } else if requests.iter().any(|r| r.aci == me) {
+        match &stored.membership {
+            requesting @ Membership::Requesting { .. } => requesting.clone(),
+            _ => Membership::Requesting { password: String::new() },
+        }
+    } else {
+        Membership::Member
+    };
+    GroupState {
+        announcements_only: stored.announcements_only,
+        info_admins_only: access.is_some_and(|a| a.attributes == AccessRequired::Administrator),
+        members_admins_only: access.is_some_and(|a| a.members == AccessRequired::Administrator),
+        labels_admins_only: access.is_some_and(|a| a.member_label == AccessRequired::Administrator),
+        link,
+        invites,
+        requests,
+        banned: stored.banned.clone(),
+        membership,
+    }
+}
+
+/// [`group_state_of`] for the group as the server has it, which has
+/// announcement-only and bans too.
+pub fn full_group_state(
+    group: &presage::libsignal_service::groups_v2::Group,
+    key: [u8; 32],
+    me: &str,
+    pni: Option<&str>,
+    stored: &signal_store::GroupState,
+) -> signal_store::GroupState {
+    let presage_group = presage::model::groups::Group::from(group.clone());
+    let mut state = group_state_of(&presage_group, key, me, pni, stored);
+    state.announcements_only = group.announcements_only;
+    state.banned = group.members_banned.iter().map(|b| b.user_id.service_id_string()).collect();
+    state
+}
+
+/// The stored state after a change: what presage doesn't keep, and where
+/// we stand.
+pub fn apply_to_group_state(summary: &GroupChangeSummary, state: &mut signal_store::GroupState) {
+    use signal_store::Membership;
+    if let Some(on) = summary.announcements_only {
+        state.announcements_only = on;
+    }
+    state.banned.retain(|b| !summary.unbanned.contains(b));
+    for banned in &summary.banned {
+        if !state.banned.contains(banned) {
+            state.banned.push(banned.clone());
+        }
+    }
+    match &summary.membership {
+        Some(MembershipChange::Invited { by }) => state.membership = Membership::Invited { by: Some(by.clone()) },
+        // The password is the caller's to keep (it isn't in the change).
+        Some(MembershipChange::Requesting) => {
+            if !matches!(state.membership, Membership::Requesting { .. }) {
+                state.membership = Membership::Requesting { password: String::new() };
+            }
+        }
+        Some(MembershipChange::Joined | MembershipChange::Out) => state.membership = Membership::Member,
+        None => {}
+    }
 }
 
 /// The data message an incoming message or our own sync transcript holds.

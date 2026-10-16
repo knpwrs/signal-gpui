@@ -180,13 +180,59 @@ list, mentions, message authors, notifications, search). Tested with
 store, wire-format and demo-mode UI tests; not yet tried with a real
 account or checked on a phone. Not done:
 
-- **Group members' details:** Desktop's contact modal (clicking a member in
-  a group) also opens the Nickname dialog. There's no contact modal here,
-  so a nickname is set from the person's 1:1 Chat settings.
+- **Group members' details:** the contact modal (clicking a member in Group
+  settings) offers Nickname only for someone we already have a 1:1 chat
+  with; Desktop offers it for anyone.
 - **Short names:** Desktop uses the nickname's first name where it shows
   short names (`getTitle` with `isShort`). We show full names everywhere.
 - **Delete menu:** Desktop puts "Delete" in a menu beside the Nickname row,
   always shown; here it's a button shown once there's a nickname or note.
+
+## Group administration
+
+Removing members, admins, permissions (including announcement-only, which
+blocks the composer for others with Desktop's banner), the group link
+(on, off, reset, approval, copy, QR code), requests to join and
+invitations, accepting or declining an invitation, asking to join and
+taking it back, joining by a `signal.group` link, the group photo (in
+settings and when creating a group, with a timer at creation), the notices
+for invitations, requests and the link, and groups in common all follow
+Desktop (`ts/groups.preload.ts`, `ts/groups/joinViaLink.preload.ts`,
+`ts/models/conversations.preload.ts`).
+
+Tested: each change's actions are built from made-up keys and decrypted the
+way every client reads a change, presentations included
+(`crate::group_admin` tests, with a made-up zkgroup server); notices with
+mapping and notice-text tests; the state with store tests; every dialog and
+the composer replacements with demo-mode UI tests. Not tried against
+Signal's group server: the join info, avatar upload form and CDN post,
+`?inviteLinkPassword=` changes, and whether pending members can fetch the
+group (we assume they can, as Desktop does). Not done:
+
+- **OS link handling:** `AppState::open_group_link` opens a link (as a
+  message link click and the paste dialog in New group do); the app doesn't
+  register for `signal.group` or `sgnl://` URLs yet.
+- **Retries:** Desktop retries a change on 409 (the group changed) for a
+  minute, fetching it again; here one conflict fails with an error.
+  Changes are queued one at a time per group, so ours don't conflict with
+  each other.
+- **Profile key credentials** aren't cached: each join, accept or add
+  fetches one (Desktop keeps them until they expire).
+- **Requesting and bouncing:** Desktop folds someone asking and cancelling
+  over and over into one "requested and canceled N requests" notice
+  (`admin-approval-bounce`); each shows here.
+- **Profile sharing** isn't turned on for a group we join or accept (Desktop
+  sets `profileSharing` and its Storage Service record).
+- **Member labels' permission** ("Who can add member labels") isn't in
+  Permissions yet; the backend keeps it (`labels_admins_only`).
+- **Announcement-only groups:** Desktop also checks every member supports
+  them (`canBeAnnouncementGroup`); we don't. Messages from non-admins in
+  such a group are still shown.
+- **Avatar picker:** a file chooser only; Desktop's has preset avatars,
+  text avatars and cropping. The picked image is cropped to its middle
+  square and scaled to 512 pixels, as Desktop's `processImageFile`.
+- **Group updates to people outside the group** (invitees, whoever was
+  removed or turned down) go to ACIs only, one by one.
 
 ## Sticker pack creator
 

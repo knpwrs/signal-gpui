@@ -1,5 +1,6 @@
-//! Changing a group on Signal's group server: its timer, name and
-//! description, and leaving it. libsignal-service can fetch and decrypt
+//! Changing a group on Signal's group server: its timer, name,
+//! description and photo, its members, admins, permissions and link,
+//! invitations and requests to join, and joining by a link. libsignal-service can fetch and decrypt
 //! groups and encrypt each change, but has no call to apply one, so this
 //! authenticates and sends `PATCH /v1/groups/` itself (as Desktop's
 //! `modifyGroupV2`).
@@ -47,10 +48,47 @@ fn credential_for(json: &serde_json::Value, day: u64) -> Option<&str> {
 /// An authenticated connection to one group.
 pub(crate) struct GroupSession {
     service: PushService,
-    params: ServerPublicParams,
+    pub params: ServerPublicParams,
     auth: HttpAuth,
     master_key: [u8; 32],
+    pub secret: GroupSecretParams,
     pub operations: GroupOperations,
+}
+
+/// Why a group link's group can't be shown (Desktop's `joinViaLink` errors).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JoinInfoError {
+    /// An admin removed us: the server says why (`X-Signal-Forbidden-Reason`).
+    Banned,
+    /// The link was reset or turned off (403).
+    Revoked,
+    /// The group was ended (423).
+    Ended,
+    /// Anything else (the network, the server).
+    Failed,
+}
+
+impl std::fmt::Display for JoinInfoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.text().1)
+    }
+}
+
+impl std::error::Error for JoinInfoError {}
+
+impl JoinInfoError {
+    /// Desktop's title and description for each.
+    pub(crate) fn text(self) -> (&'static str, &'static str) {
+        match self {
+            JoinInfoError::Banned => (
+                "Can’t Join Group",
+                "You can't join this group via the group link because an admin removed you. Contact an admin to be added back to the group.",
+            ),
+            JoinInfoError::Revoked => ("Can’t Join Group", "This group link is no longer valid."),
+            JoinInfoError::Ended => ("Error", "Unable to join this group."),
+            JoinInfoError::Failed => ("Link Error", "Couldn't join group. Try again later."),
+        }
+    }
 }
 
 impl GroupSession {
@@ -87,7 +125,7 @@ impl GroupSession {
             username: hex::encode(bincode::serialize(&secret.get_public_params())?),
             password: hex::encode(zkgroup::serialize(&presentation)),
         };
-        Ok(Self { service, params, auth, master_key, operations: GroupOperations::new(secret) })
+        Ok(Self { service, params, auth, master_key, secret, operations: GroupOperations::new(secret) })
     }
 
     fn request(&self, method: reqwest::Method) -> anyhow::Result<reqwest::RequestBuilder> {
@@ -99,7 +137,7 @@ impl GroupSession {
 
     /// A member's credential for adding them to a group: proof of their
     /// profile key that the group server checks without learning it.
-    async fn profile_key_credential(&self, aci: Aci, key: ProfileKey) -> anyhow::Result<ExpiringProfileKeyCredential> {
+    pub(crate) async fn profile_key_credential(&self, aci: Aci, key: ProfileKey) -> anyhow::Result<ExpiringProfileKeyCredential> {
         use base64::Engine as _;
         let randomness: [u8; 32] = rand::rng().random();
         let context = self.params.create_profile_key_credential_request_context(randomness, aci, key);
@@ -133,7 +171,15 @@ impl GroupSession {
         title: &str,
         me: (Aci, ProfileKey),
         members: &[(Aci, Option<ProfileKey>)],
+        avatar: Option<&[u8]>,
+        timer: u32,
     ) -> anyhow::Result<()> {
+        // Desktop's `createGroupV2`: the photo goes up before the group.
+        let avatar = match avatar {
+            Some(image) => self.upload_avatar(image).await.context("uploading the group photo")?,
+            None => String::new(),
+        };
+        let timer = (timer > 0).then_some(presage::libsignal_service::groups_v2::Timer { duration: timer });
         let mine = self.profile_key_credential(me.0, me.1).await.context("getting our own credential")?;
         let mut candidates = Vec::new();
         for (aci, key) in members {
@@ -155,12 +201,12 @@ impl GroupSession {
             .encrypt_group_with_credentials(
                 title,
                 None,
-                None,
+                timer.as_ref(),
                 Some(&access),
                 &mine,
                 &candidates,
                 &self.params,
-                String::new(),
+                avatar,
                 &mut rand::rng(),
             )
             .map_err(|e| anyhow!("{e:?}"))?;
@@ -224,9 +270,39 @@ impl GroupSession {
     /// Applies `actions` (for the next revision) and returns the
     /// server-signed change, to send to the group's members.
     pub(crate) async fn modify(&self, actions: proto::group_change::Actions) -> anyhow::Result<Vec<u8>> {
-        let response = self.request(reqwest::Method::PATCH)?.body(actions.encode_to_vec()).send().await?;
+        self.modify_with_link(actions, None).await
+    }
+
+    /// [`Self::modify`] as someone joining or asking to join by the link
+    /// (`password`: the link's), as Desktop's `modifyGroup` sends it
+    /// (`?inviteLinkPassword=`).
+    pub(crate) async fn modify_with_link(&self, actions: proto::group_change::Actions, password: Option<&[u8]>) -> anyhow::Result<Vec<u8>> {
+        use base64::Engine as _;
+        // URL-safe base64 needs no escaping.
+        let path = match password {
+            Some(password) => {
+                format!("/v1/groups/?inviteLinkPassword={}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(password))
+            }
+            None => "/v1/groups/".to_owned(),
+        };
+        let response = self
+            .service
+            .request(reqwest::Method::PATCH, Endpoint::storage(path), HttpAuthOverride::Identified(self.auth.clone()))?
+            .header("Content-Type", "application/x-protobuf")
+            .body(actions.encode_to_vec())
+            .send()
+            .await?;
         match response.status().as_u16() {
             200 => {}
+            400 => {
+                let body = response.text().await.unwrap_or_default();
+                // Desktop's `joinGroupV2ViaLink`: the server's word for a
+                // request that's already there.
+                if body.contains("cannot ask to join via invite link if already asked to join") {
+                    return Err(AlreadyRequested.into());
+                }
+                bail!("the group server refused the change");
+            }
             403 => bail!("you don't have permission to change this group"),
             409 => bail!("the group changed in the meantime; try again"),
             status => bail!("the group server answered {status}"),
@@ -234,7 +310,84 @@ impl GroupSession {
         let response = GroupChangeResponse::decode(response.bytes().await?)?;
         Ok(response.group_change.context("no signed change in the answer")?.encode_to_vec())
     }
+
+    /// What a group link shows before joining (Desktop's
+    /// `getPreJoinGroupInfo`, `GET /v1/groups/join/{password}`).
+    pub(crate) async fn join_info(&self, password: &[u8]) -> Result<proto::GroupJoinInfo, JoinInfoError> {
+        use base64::Engine as _;
+        let path = format!("/v1/groups/join/{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(password));
+        let response = self
+            .service
+            .request(reqwest::Method::GET, Endpoint::storage(path), HttpAuthOverride::Identified(self.auth.clone()))
+            .map_err(|_| JoinInfoError::Failed)?
+            .header("Content-Type", "application/x-protobuf")
+            .send()
+            .await
+            .map_err(|_| JoinInfoError::Failed)?;
+        match response.status().as_u16() {
+            200 => {}
+            403 if response.headers().contains_key("x-signal-forbidden-reason") => return Err(JoinInfoError::Banned),
+            403 => return Err(JoinInfoError::Revoked),
+            423 => return Err(JoinInfoError::Ended),
+            _ => return Err(JoinInfoError::Failed),
+        }
+        let bytes = response.bytes().await.map_err(|_| JoinInfoError::Failed)?;
+        proto::GroupJoinInfo::decode(bytes).map_err(|_| JoinInfoError::Failed)
+    }
+
+    /// Uploads a group photo (Desktop's `uploadGroupAvatar`: a form from
+    /// `GET /v1/groups/avatar/form`, then a POST to CDN 0) and returns the
+    /// key the group's `avatar` names it by.
+    pub(crate) async fn upload_avatar(&self, image: &[u8]) -> anyhow::Result<String> {
+        let encrypted = crate::group_admin::encrypt_avatar(&self.secret, image);
+        let response = self
+            .service
+            .request(
+                reqwest::Method::GET,
+                Endpoint::storage("/v1/groups/avatar/form"),
+                HttpAuthOverride::Identified(self.auth.clone()),
+            )?
+            .send()
+            .await?
+            .error_for_status()?;
+        let form = proto::AvatarUploadAttributes::decode(response.bytes().await?)?;
+        // Desktop's `verifyAttributes`.
+        let fields = [&form.key, &form.credential, &form.acl, &form.algorithm, &form.date, &form.policy, &form.signature];
+        if fields.iter().any(|f| f.is_empty()) {
+            bail!("the upload form is missing a field");
+        }
+        // Desktop's `makePutParams`, in its order.
+        let body = reqwest::multipart::Form::new()
+            .text("key", form.key.clone())
+            .text("x-amz-credential", form.credential)
+            .text("acl", form.acl)
+            .text("x-amz-algorithm", form.algorithm)
+            .text("x-amz-date", form.date)
+            .text("policy", form.policy)
+            .text("x-amz-signature", form.signature)
+            .text("Content-Type", "application/octet-stream")
+            .part("file", reqwest::multipart::Part::bytes(encrypted).mime_str("application/octet-stream")?);
+        self.service
+            .request(reqwest::Method::POST, Endpoint::cdn(0, "/"), HttpAuthOverride::Unidentified)?
+            .multipart(body)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(form.key)
+    }
 }
+
+/// The server already has our request to join.
+#[derive(Debug)]
+pub(crate) struct AlreadyRequested;
+
+impl std::fmt::Display for AlreadyRequested {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("already asked to join")
+    }
+}
+
+impl std::error::Error for AlreadyRequested {}
 
 /// Downloads and decrypts a group's photo; `path` is the group's `avatar`
 /// (empty when it has none). The CDN needs no credential.

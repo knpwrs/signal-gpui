@@ -150,6 +150,25 @@ pub fn quote_thumbnail(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
     Ok(out)
 }
 
+/// A group photo's side (Desktop's `processImageFile`: at most 512 pixels).
+pub const GROUP_AVATAR_SIZE: u32 = 512;
+
+/// A picked image as Desktop makes it a group photo (`processImageFile`):
+/// upright, cropped to a square from its middle ("cover"), at most 512
+/// pixels a side, as a JPEG.
+pub fn group_avatar(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use image::ImageDecoder as _;
+    let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?.into_decoder()?;
+    let orientation = decoder.orientation()?;
+    let mut image = image::DynamicImage::from_decoder(decoder).context("reading the image")?;
+    image.apply_orientation(orientation);
+    let side = image.width().min(image.height()).min(GROUP_AVATAR_SIZE);
+    let square = image.resize_to_fill(side, side, image::imageops::FilterType::Triangle).to_rgb8();
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90).encode_image(&square)?;
+    Ok(out)
+}
+
 pub fn probe(bytes: &[u8]) -> Option<(ImageKind, u32, u32)> {
     let kind = ImageKind::sniff(bytes)?;
     let size = imagesize::blob_size(bytes).ok()?;
@@ -562,6 +581,15 @@ mod tests {
         let turned = quote_thumbnail(&with_metadata(&encode_jpeg(600, 300), 6)).unwrap();
         assert_eq!(probe(&turned).map(|(_, w, h)| (w, h)), Some((75, 150)));
         assert!(quote_thumbnail(b"not an image").is_err());
+    }
+
+    #[test]
+    fn group_avatars_are_square_jpegs_of_at_most_512() {
+        let wide = group_avatar(&encode_jpeg(800, 400)).unwrap();
+        assert_eq!(probe(&wide).map(|(kind, w, h)| (kind.content_type(), w, h)), Some(("image/jpeg", 400, 400)));
+        let big = group_avatar(&encode_jpeg(1000, 2000)).unwrap();
+        assert_eq!(probe(&big).map(|(_, w, h)| (w, h)), Some((512, 512)));
+        assert!(group_avatar(b"not an image").is_err());
     }
 
     fn encode_jpeg(width: u16, height: u16) -> Vec<u8> {

@@ -2801,6 +2801,12 @@ fn message_text(
     text.child(gpui_kit::InteractiveText::new(("message-text", message_id as u64), styled).on_click(
         ranges,
         move |ix, _, cx| match &actions[ix] {
+            // A group link shows Desktop's join dialog.
+            TextClick::Open(url) if signal_backend::group_admin::is_group_link(url) => {
+                if let Some(state) = view.upgrade().map(|v| v.read(cx).state.clone()) {
+                    state.read(cx).open_group_link(url.clone());
+                }
+            }
             // A call link opens its lobby here, as Desktop does.
             TextClick::Open(url) if url.starts_with("https://signal.link/call/") => {
                 if let Some(state) = view.upgrade().map(|v| v.read(cx).state.clone()) {
@@ -3397,6 +3403,12 @@ impl Render for ConversationView {
                 // Release notes are read-only: no composer, as Desktop's.
                 if self.id.is_signal() {
                     return d;
+                }
+                // An invitation, a request to join, or announcement-only.
+                if let Some(chat) = self.state.read(cx).conversation(&self.id)
+                    && let Some(replacement) = crate::views::group_admin::composer_replacement(&self.state, chat, palette, cx)
+                {
+                    return d.child(replacement);
                 }
                 match self.state.read(cx).conversation(&self.id).filter(|c| c.blocked || c.left || c.ended) {
                     Some(conversation) if conversation.blocked => d.child(self.render_blocked(conversation, palette)),
@@ -4965,7 +4977,7 @@ mod tests {
     fn creating_a_group_opens_it(cx: &mut TestAppContext) {
         let (backend, _dir) = demo_backend(cx);
         wait_for_messages(&backend, GROUP, 1, |_| true);
-        backend.send(Command::CreateGroup { title: "Book club".into(), members: vec![MAYA.trim_start_matches("d:").into()] });
+        backend.send(Command::CreateGroup { title: "Book club".into(), members: vec![MAYA.trim_start_matches("d:").into()], avatar: None, expire_timer: 0 });
         let db = backend.db().clone();
         let mut found = None;
         for _ in 0..300 {

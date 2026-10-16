@@ -584,7 +584,7 @@ fn group_changes_become_notices() {
         ],
         change_epoch: 0,
     };
-    let summary = summarize_group_change(&changes, ME);
+    let summary = summarize_group_change(&changes, ME, None, &Default::default());
     let by = Some(ALICE.to_owned());
     assert_eq!(
         summary.notices,
@@ -606,10 +606,173 @@ fn ending_a_group_is_noticed() {
     let editor = presage::libsignal_service::protocol::Aci::parse_from_service_id_string(ALICE).unwrap();
     let changes =
         GroupChanges { group_id: [0; 32], editor, version: 3, changes: vec![GroupChange::TerminateGroup], change_epoch: 7 };
-    let summary = summarize_group_change(&changes, ME);
+    let summary = summarize_group_change(&changes, ME, None, &Default::default());
     assert!(summary.ended);
     assert!(!summary.left, "ending it doesn't take us out");
     assert_eq!(summary.notices, vec![Notice::Group { by: Some(ALICE.into()), change: GroupNotice::Ended }]);
+}
+
+/// A change by `editor` (an ACI string).
+fn change_by(editor: &str, changes: Vec<presage::libsignal_service::groups_v2::GroupChange>) -> presage::libsignal_service::groups_v2::GroupChanges {
+    let editor = presage::libsignal_service::protocol::Aci::parse_from_service_id_string(editor).unwrap();
+    presage::libsignal_service::groups_v2::GroupChanges { group_id: [0; 32], editor, version: 4, changes, change_epoch: 5 }
+}
+
+fn aci_of(sid: &str) -> presage::libsignal_service::protocol::Aci {
+    presage::libsignal_service::protocol::Aci::parse_from_service_id_string(sid).unwrap()
+}
+
+#[test]
+fn invitations_read_as_desktop_diffs_them() {
+    use presage::libsignal_service::groups_v2::{GroupChange, PendingMember, Role};
+    use signal_store::{GroupInvite, GroupNotice, GroupState, Inviter, Notice};
+    const PNI: &str = "PNI:44444444-4444-4444-8444-444444444444";
+    let pending = |sid: &str| {
+        GroupChange::NewPendingMember(PendingMember {
+            address: ServiceId::parse_from_service_id_string(sid).unwrap(),
+            role: Role::Default,
+            added_by_aci: aci_of(ALICE),
+            timestamp: 0,
+        })
+    };
+    // One invitation (to our PNI): we're invited, by Alice.
+    let summary = summarize_group_change(&change_by(ALICE, vec![pending(PNI)]), ME, Some(PNI), &GroupState::default());
+    let by = Some(ALICE.to_owned());
+    assert_eq!(summary.notices, vec![Notice::Group { by: by.clone(), change: GroupNotice::Invited { member: None } }]);
+    assert_eq!(summary.membership, Some(MembershipChange::Invited { by: ALICE.into() }));
+    // Several: counted.
+    let summary = summarize_group_change(&change_by(ALICE, vec![pending(BOB), pending(PNI)]), ME, None, &GroupState::default());
+    assert_eq!(summary.notices, vec![Notice::Group { by: by.clone(), change: GroupNotice::InvitedMany { count: 2 } }]);
+
+    // Bob declines the invitation we sent; he accepts another.
+    let before = GroupState { invites: vec![GroupInvite { service_id: BOB.into(), by: ME.into() }], ..Default::default() };
+    let declined = GroupChange::DeletePendingMember(ServiceId::parse_from_service_id_string(BOB).unwrap());
+    let summary = summarize_group_change(&change_by(BOB, vec![declined]), ME, None, &before);
+    assert_eq!(
+        summary.notices,
+        vec![Notice::Group { by: Some(BOB.into()), change: GroupNotice::InviteRemoved { member: Some(BOB.into()), inviter: Inviter::Us } }]
+    );
+    let accepted = GroupChange::PromotePendingMember {
+        address: ServiceId::parse_from_service_id_string(BOB).unwrap(),
+        profile_key: presage::libsignal_service::prelude::ProfileKey::create([1; 32]),
+    };
+    let summary = summarize_group_change(&change_by(BOB, vec![accepted]), ME, None, &before);
+    assert_eq!(
+        summary.notices,
+        vec![Notice::Group { by: Some(BOB.into()), change: GroupNotice::AcceptedInvite { member: Some(BOB.into()), inviter: Inviter::Us } }]
+    );
+    // Our own invitation revoked: we're out.
+    let revoked = GroupChange::DeletePendingMember(ServiceId::parse_from_service_id_string(ME).unwrap());
+    let summary = summarize_group_change(&change_by(ALICE, vec![revoked]), ME, None, &GroupState::default());
+    assert_eq!(summary.membership, Some(MembershipChange::Out));
+}
+
+#[test]
+fn requests_links_and_bans_read_as_desktop_diffs_them() {
+    use presage::libsignal_service::groups_v2::{AccessRequired, GroupChange, RequestingMember, Role};
+    use signal_store::{GroupLink, GroupNotice, GroupState, Notice};
+    let by = |sid: &str| Some(sid.to_owned());
+    let requesting = GroupChange::NewRequestingMember(RequestingMember {
+        aci: aci_of(ME),
+        profile_key: presage::libsignal_service::prelude::ProfileKey::create([1; 32]),
+        timestamp: 0,
+    });
+    let summary = summarize_group_change(&change_by(ME, vec![requesting]), ME, None, &GroupState::default());
+    assert_eq!(summary.notices, vec![Notice::Group { by: None, change: GroupNotice::Requested { member: None } }]);
+    assert_eq!(summary.membership, Some(MembershipChange::Requesting));
+    let approved = GroupChange::PromoteRequestingMember { aci: aci_of(ME), role: Role::Default };
+    let summary = summarize_group_change(&change_by(ALICE, vec![approved]), ME, None, &GroupState::default());
+    assert_eq!(summary.notices, vec![Notice::Group { by: by(ALICE), change: GroupNotice::Approved { member: None } }]);
+    assert_eq!(summary.membership, Some(MembershipChange::Joined));
+
+    // Turned on with a new password: one notice, not a reset too.
+    let off = GroupState::default();
+    let on = GroupState { link: Some(GroupLink { url: "u".into(), approval: false }), ..Default::default() };
+    let turn_on = vec![GroupChange::InviteLinkAccess(AccessRequired::Any), GroupChange::InviteLinkPassword("cA==".into())];
+    let summary = summarize_group_change(&change_by(ALICE, turn_on), ME, None, &off);
+    assert_eq!(summary.notices, vec![Notice::Group { by: by(ALICE), change: GroupNotice::LinkOn { approval: false } }]);
+    let summary = summarize_group_change(&change_by(ALICE, vec![GroupChange::InviteLinkPassword("cQ==".into())]), ME, None, &on);
+    assert_eq!(summary.notices, vec![Notice::Group { by: by(ALICE), change: GroupNotice::LinkReset }]);
+    let approval = vec![GroupChange::InviteLinkAccess(AccessRequired::Administrator)];
+    let summary = summarize_group_change(&change_by(ALICE, approval), ME, None, &on);
+    assert_eq!(summary.notices, vec![Notice::Group { by: by(ALICE), change: GroupNotice::LinkApproval { on: true } }]);
+    let summary = summarize_group_change(&change_by(ALICE, vec![GroupChange::InviteLinkAccess(AccessRequired::Unsatisfiable)]), ME, None, &on);
+    assert_eq!(summary.notices, vec![Notice::Group { by: by(ALICE), change: GroupNotice::LinkOff }]);
+
+    // Removing Bob bans him (no notice for the ban), and announcement-only
+    // is kept here since presage doesn't.
+    let removed = vec![
+        GroupChange::DeleteMember(aci_of(BOB)),
+        GroupChange::AnnouncementOnly(true),
+    ];
+    let mut summary = summarize_group_change(&change_by(ALICE, removed), ME, None, &on);
+    summary.banned.push(BOB.into());
+    let mut state = on.clone();
+    apply_to_group_state(&summary, &mut state);
+    assert!(state.announcements_only);
+    assert_eq!(state.banned, vec![BOB.to_owned()]);
+    // Someone adding themselves came by the link.
+    let joined = GroupChange::NewMember(presage::libsignal_service::groups_v2::Member {
+        aci: aci_of(BOB),
+        role: Role::Default,
+        profile_key: presage::libsignal_service::prelude::ProfileKey::create([2; 32]),
+        joined_at_version: 4,
+        label: None,
+        label_emoji: None,
+    });
+    let summary = summarize_group_change(&change_by(BOB, vec![joined]), ME, None, &on);
+    assert_eq!(summary.notices, vec![Notice::Group { by: by(BOB), change: GroupNotice::JoinedByLink { member: by(BOB) } }]);
+}
+
+#[test]
+fn group_state_comes_from_presages_copy_and_what_it_lacks() {
+    use presage::libsignal_service::groups_v2::{AccessRequired, Role};
+    use presage::model::groups::{AccessControl, Group, Member, PendingMember, RequestingMember};
+    use signal_store::{GroupState, Membership};
+    let member = |sid: &str, role| Member {
+        aci: aci_of(sid),
+        role,
+        profile_key: presage::libsignal_service::prelude::ProfileKey::create([1; 32]),
+        joined_at_revision: 0,
+        label: None,
+        label_emoji: None,
+    };
+    let group = Group {
+        title: "Hikers".into(),
+        avatar: String::new(),
+        disappearing_messages_timer: None,
+        access_control: Some(AccessControl {
+            attributes: AccessRequired::Administrator,
+            members: AccessRequired::Member,
+            add_from_invite_link: AccessRequired::Administrator,
+            member_label: AccessRequired::Member,
+        }),
+        revision: 3,
+        members: vec![member(ALICE, Role::Administrator)],
+        pending_members: vec![PendingMember {
+            uuid: aci_of(ME).into(),
+            service_id_type: Default::default(),
+            role: Role::Default,
+            added_by_aci: aci_of(ALICE),
+            timestamp: 0,
+        }],
+        requesting_members: vec![RequestingMember {
+            aci: aci_of(BOB),
+            profile_key: presage::libsignal_service::prelude::ProfileKey::create([1; 32]),
+            timestamp: 9,
+        }],
+        invite_link_password: vec![7; 16],
+        description: None,
+    };
+    let stored = GroupState { announcements_only: true, banned: vec!["x".into()], ..Default::default() };
+    let state = group_state_of(&group, [3; 32], ME, None, &stored);
+    assert!(state.info_admins_only && !state.members_admins_only);
+    assert!(state.announcements_only && state.banned == ["x"], "kept from what's stored");
+    let link = state.link.expect("the link is on");
+    assert!(link.approval);
+    assert_eq!(crate::group_admin::parse_link(&link.url), Ok(([3; 32], vec![7; 16])));
+    assert_eq!(state.requests[0].aci, BOB);
+    assert_eq!(state.membership, Membership::Invited { by: Some(ALICE.into()) });
 }
 
 #[test]

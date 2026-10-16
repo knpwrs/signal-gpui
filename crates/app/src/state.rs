@@ -138,6 +138,12 @@ pub enum AppEvent {
     /// Our own key transparency check started failing: Desktop's
     /// `KeyTransparencyErrorDialog`.
     KeyTransparencyFailed,
+    /// Desktop's join dialog for a group link (`GroupV2JoinDialog`).
+    GroupLinkPreview(std::rc::Rc<signal_backend::GroupLinkPreview>),
+    /// Desktop's error dialog: a title and what went wrong.
+    Alert { title: SharedString, description: SharedString },
+    /// A short note to show (Desktop's toasts).
+    Info(SharedString),
 }
 
 /// The key transparency button in the safety number screen, in Desktop's
@@ -721,6 +727,17 @@ impl AppState {
                 self.reload_conversations(cx);
                 self.select(Some(conversation), cx);
             }
+            Event::GroupLinkPreview(preview) => cx.emit(AppEvent::GroupLinkPreview(std::rc::Rc::new(preview))),
+            Event::GroupOpened { conversation, toast } => {
+                self.reload_conversations(cx);
+                self.select(Some(conversation), cx);
+                if let Some(toast) = toast {
+                    cx.emit(AppEvent::Info(toast.into()));
+                }
+            }
+            Event::GroupLinkFailed { title, description } => {
+                cx.emit(AppEvent::Alert { title: title.into(), description: description.into() })
+            }
             Event::Incoming { conversation, message_id, mentions_me } => {
                 self.maybe_notify(conversation, message_id, mentions_me, cx)
             }
@@ -984,6 +1001,13 @@ impl AppState {
             Some(room) => crate::views::calls::link_title(self.call_link(room)),
             None => self.conversation(id).map_or_else(|| "Unknown".to_owned(), |c| c.title.clone()),
         }
+    }
+
+    /// A group link (`https://signal.group/#…`, `sgnl://signal.group/#…` or
+    /// `sgnl://joingroup/#…`), from a message, a paste or the OS: Desktop's
+    /// join dialog shows the group, or its chat opens if we're in it.
+    pub fn open_group_link(&self, url: String) {
+        self.send(Command::OpenGroupLink { url });
     }
 
     /// A `https://signal.link/call/#key=…` URL (from a message, say): the
@@ -1825,6 +1849,10 @@ impl AppState {
     pub fn select(&mut self, id: Option<ConversationId>, cx: &mut Context<Self>) {
         if self.selected == id {
             return;
+        }
+        // Desktop fetches a group as its chat opens (throttled backend-side).
+        if let Some(group) = id.as_ref().filter(|id| id.as_group().is_some()) {
+            self.send(Command::RefreshGroup { conversation: group.clone() });
         }
         self.selected = id;
         cx.emit(AppEvent::SelectionChanged);

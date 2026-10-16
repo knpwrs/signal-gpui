@@ -1,7 +1,8 @@
-//! Desktop's "Group settings" (name, description, members, leave) and
-//! "Chat settings" (who the chat is with).
+//! Desktop's "Group settings" (photo, name, description, members, the
+//! group link, requests and invites, permissions, leave) and "Chat
+//! settings" (who the chat is with, and groups in common).
 
-use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::{Sizable as _, WindowExt as _};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::prelude::*;
@@ -16,6 +17,10 @@ use crate::views::common::{conversation_avatar, person_avatar};
 
 pub fn open(state: Entity<AppState>, conversation: Conversation, window: &mut Window, cx: &mut App) {
     let group = conversation.kind == ConversationKind::Group;
+    // Desktop fetches the group as its details open.
+    if group {
+        state.read(cx).send(Command::RefreshGroup { conversation: conversation.id.clone() });
+    }
     let title = cx.new(|cx| InputState::new(window, cx).default_value(conversation.title.clone()));
     let description =
         cx.new(|cx| InputState::new(window, cx).placeholder("Group description").default_value(conversation.description.clone().unwrap_or_default()));
@@ -131,17 +136,36 @@ pub fn open(state: Entity<AppState>, conversation: Conversation, window: &mut Wi
                 }
                 _ => body,
             };
+            // Desktop's `ConversationDetailsGroups`.
+            let body = match conversation.id.as_direct().filter(|_| direct && !conversation.id.is_signal()) {
+                Some(aci) => body.child(crate::views::group_admin::groups_in_common_section(&state, aci, palette, cx)),
+                None => body,
+            };
             return dialog.title("Chat settings").w(px(420.)).child(body);
         }
+        // The group as it is now: these dialogs stay open while it changes.
+        let conversation = state.read(cx).conversation(&conversation.id).cloned().unwrap_or_else(|| conversation.clone());
         let members = names.read(cx).clone();
-        let member_rows = members.into_iter().map(|(aci, name)| {
+        let member_rows = members.into_iter().filter(|(aci, _)| conversation.members.contains(aci)).map(|(aci, name)| {
             let admin = conversation.admins.contains(&aci);
             let you = aci == me;
+            let (member_state, member_group, member) = (state.clone(), conversation.id.clone(), aci.clone());
+            let selector = format!("member-{aci}");
             div()
+                .id(SharedString::from(selector.clone()))
+                .debug_selector(move || selector)
                 .flex()
                 .items_center()
                 .gap_3()
                 .py_1()
+                .px_1()
+                .rounded_md()
+                // Desktop's `ContactModal`, for anyone but us.
+                .when(!you, |d| {
+                    d.cursor_pointer().hover(|s| s.bg(palette.row_hover)).on_click(move |_, window, cx| {
+                        crate::views::group_admin::open_member(member_state.clone(), member_group.clone(), member.clone(), window, cx)
+                    })
+                })
                 .child(person_avatar(state.read(cx).photo_of(&aci), &name, color_for(&aci), px(28.)))
                 .child(div().flex_1().truncate().child(if you { "You".to_owned() } else { name }))
                 .when_some(conversation.member_labels.get(&aci).cloned(), |d, label| {
@@ -162,6 +186,52 @@ pub fn open(state: Entity<AppState>, conversation: Conversation, window: &mut Wi
             && conversation.admins.contains(&me)
             && signal_backend::remote_config().group_terminate_send();
         let (end_state, end_chat) = (state.clone(), conversation.clone());
+        let admin = crate::views::group_admin::we_are_admin(&conversation, &me);
+        let in_group = !conversation.left && !conversation.ended;
+        let link_on = conversation.group_state.link.is_some();
+        let pending = crate::views::group_admin::pending_count(&conversation);
+        let panel = |id: &'static str, label: String| Button::new(id).label(label).outline().small();
+        let (link_state, panels_id) = (state.clone(), conversation.id.clone());
+        let (requests_state, requests_id) = (state.clone(), conversation.id.clone());
+        let (permissions_state, permissions_id) = (state.clone(), conversation.id.clone());
+        // Desktop's `ConversationDetails` rows: the group link (admins, or
+        // anyone while it's on), requests and invites, and (admins)
+        // permissions.
+        let panels = div()
+            .flex()
+            .flex_wrap()
+            .gap_2()
+            .when(in_group && (admin || link_on), |d| {
+                d.child(panel("group-link", format!("Group link: {}", if link_on { "On" } else { "Off" })).on_click(move |_, window, cx| {
+                    crate::views::group_admin::open_link(link_state.clone(), panels_id.clone(), window, cx)
+                }))
+            })
+            .when(in_group, |d| {
+                d.child(panel("group-requests-invites", format!("Requests & invites ({pending})")).on_click(move |_, window, cx| {
+                    crate::views::group_admin::open_requests(requests_state.clone(), requests_id.clone(), window, cx)
+                }))
+            })
+            .when(in_group && admin, |d| {
+                d.child(panel("group-permissions", "Permissions".into()).on_click(move |_, window, cx| {
+                    crate::views::group_admin::open_permissions(permissions_state.clone(), permissions_id.clone(), window, cx)
+                }))
+            });
+        // Desktop's avatar picker in `EditConversationAttributesModal`.
+        let photo = editable.then(|| {
+            let (pick_state, pick_id) = (state.clone(), conversation.id.clone());
+            let (remove_state, remove_id) = (state.clone(), conversation.id.clone());
+            div()
+                .flex()
+                .gap_2()
+                .child(Button::new("group-photo-change").label("Change photo").outline().small().on_click(move |_, window, cx| {
+                    crate::views::group_admin::pick_avatar(pick_state.clone(), pick_id.clone(), window, cx)
+                }))
+                .when(conversation.avatar_path.is_some(), |d| {
+                    d.child(Button::new("group-photo-remove").label("Remove photo").ghost().small().on_click(move |_, _, cx| {
+                        remove_state.read(cx).send(Command::SetGroupAvatar { conversation: remove_id.clone(), image: None });
+                    }))
+                })
+        });
         dialog.title("Group settings").w(px(460.)).child(
             // Desktop's `ConversationDetails__GroupTerminatedBanner`.
             body.when(conversation.ended, |d| {
@@ -178,6 +248,7 @@ pub fn open(state: Entity<AppState>, conversation: Conversation, window: &mut Wi
                         .child("This group has ended"),
                 )
             })
+            .when_some(photo, |d, photo| d.child(photo))
             .when(editable, |d| {
                 d.child(div().flex().flex_col().gap_1().child(field("Group name")).child(Input::new(&title)))
                     .child(div().flex().flex_col().gap_1().child(field("Description")).child(Input::new(&description)))
@@ -224,6 +295,7 @@ pub fn open(state: Entity<AppState>, conversation: Conversation, window: &mut Wi
                         .child(div().text_xs().text_color(palette.text_secondary).child("Shown next to your name in this group. Up to 24 characters; leave it empty to remove it.")),
                 )
             })
+            .child(panels)
             .child(field("Members"))
             // Desktop's `canAddNewMembers`.
             .when(conversation.can_add_members && !conversation.left && !conversation.ended, |d| {

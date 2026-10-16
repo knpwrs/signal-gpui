@@ -121,6 +121,18 @@ impl RootView {
                     use gpui_kit::component::WindowExt as _;
                     window.push_notification(gpui_kit::component::notification::Notification::error(message.clone()), cx);
                 }
+                if let AppEvent::GroupLinkPreview(preview) = event {
+                    crate::views::group_admin::open_join(state.clone(), preview.clone(), window, cx);
+                }
+                if let AppEvent::Alert { title, description } = event {
+                    use gpui_kit::component::WindowExt as _;
+                    let (title, description) = (title.clone(), description.clone());
+                    window.open_alert_dialog(cx, move |alert, _, _| alert.title(title.clone()).description(description.clone()));
+                }
+                if let AppEvent::Info(message) = event {
+                    use gpui_kit::component::WindowExt as _;
+                    window.push_notification(gpui_kit::component::notification::Notification::new().message(message.clone()), cx);
+                }
                 if let AppEvent::KeyTransparencyFailed = event {
                     crate::views::safety_number::show_error(state.clone(), window, cx);
                 }

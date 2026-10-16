@@ -17,7 +17,7 @@ const MUTE_FOR: [(&str, i64); 4] =
     [("1 hour", HOUR_MS), ("8 hours", 8 * HOUR_MS), ("1 day", 24 * HOUR_MS), ("1 week", 7 * 24 * HOUR_MS)];
 
 /// Desktop's timer choices (`DEFAULT_DURATIONS_IN_SECONDS`).
-const TIMER_CHOICES: [u32; 8] = [0, 4 * WEEK, WEEK, DAY, 8 * HOUR, HOUR, 5 * MINUTE, 30];
+pub(crate) const TIMER_CHOICES: [u32; 8] = [0, 4 * WEEK, WEEK, DAY, 8 * HOUR, HOUR, 5 * MINUTE, 30];
 const MINUTE: u32 = 60;
 const HOUR: u32 = 60 * MINUTE;
 const DAY: u32 = 24 * HOUR;
