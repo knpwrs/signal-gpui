@@ -224,10 +224,11 @@ impl Actor {
         }
         self.emit(Event::StoriesChanged);
         let mut sync = SyncMessage::with_padding(&mut rand::rng());
+        let sender = crate::remote_config::current().wire_service_id(&author);
         sync.viewed = vec![sync_message::Viewed {
-            sender_aci: Some(author.clone()),
+            sender_aci: sender.string(),
+            sender_aci_binary: sender.binary(),
             timestamp: Some(story.sent_at as u64),
-            ..Default::default()
         }];
         self.enqueue(Outbound::Sync { body: sync });
         if self.story_view_receipts().await {
@@ -323,10 +324,11 @@ impl Actor {
         };
         self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id: id });
         self.emit(Event::ConversationsChanged);
+        let wire_author = crate::remote_config::current().wire_service_id(&author);
         let context = presage::proto::data_message::StoryContext {
-            author_aci: Some(author.clone()),
+            author_aci: wire_author.string(),
+            author_aci_binary: wire_author.binary(),
             sent_timestamp: Some(story.sent_at as u64),
-            ..Default::default()
         };
         let data = DataMessage {
             body: emoji.is_none().then_some(body),
@@ -335,9 +337,9 @@ impl Actor {
             reaction: emoji.map(|emoji| presage::proto::data_message::Reaction {
                 emoji: Some(emoji),
                 remove: Some(false),
-                target_author_aci: Some(author),
+                target_author_aci: wire_author.string(),
+                target_author_aci_binary: wire_author.binary(),
                 target_sent_timestamp: Some(story.sent_at as u64),
-                ..Default::default()
             }),
             ..Default::default()
         };
@@ -415,21 +417,22 @@ impl Actor {
             return self.error("failed to keep the reply", error);
         }
         self.emit(Event::StoriesChanged);
+        let wire_author = crate::remote_config::current().wire_service_id(author);
         let data = DataMessage {
             body: emoji.is_none().then_some(body),
             timestamp: Some(timestamp as u64),
             group_v2: Some(context),
             story_context: Some(presage::proto::data_message::StoryContext {
-                author_aci: Some(author.to_owned()),
+                author_aci: wire_author.string(),
+                author_aci_binary: wire_author.binary(),
                 sent_timestamp: Some(story.sent_at as u64),
-                ..Default::default()
             }),
             reaction: emoji.map(|emoji| presage::proto::data_message::Reaction {
                 emoji: Some(emoji),
                 remove: Some(false),
-                target_author_aci: Some(author.to_owned()),
+                target_author_aci: wire_author.string(),
+                target_author_aci_binary: wire_author.binary(),
                 target_sent_timestamp: Some(story.sent_at as u64),
-                ..Default::default()
             }),
             ..Default::default()
         };
@@ -886,11 +889,16 @@ impl Actor {
         } else {
             info!(sent = state.sent.len(), what = state.what, "story sent");
         }
-        let transcript = |r: &signal_store::StoryRecipient| sync_message::sent::StoryMessageRecipient {
-            destination_service_id: Some(r.service_id.clone()),
-            distribution_list_ids: r.list_ids.clone(),
-            is_allowed_to_reply: Some(r.allows_replies),
-            ..Default::default()
+        let config = crate::remote_config::current();
+        let us = config.wire_service_id(&self.self_aci());
+        let transcript = |r: &signal_store::StoryRecipient| {
+            let destination = config.wire_service_id(&r.service_id);
+            sync_message::sent::StoryMessageRecipient {
+                destination_service_id: destination.string(),
+                destination_service_id_binary: destination.binary(),
+                distribution_list_ids: r.list_ids.clone(),
+                is_allowed_to_reply: Some(r.allows_replies),
+            }
         };
         let sent = match state.sync {
             StoryJobSync::Story { message, recipients } => sync_message::Sent {
@@ -908,7 +916,8 @@ impl Actor {
             // Desktop's `sendDeleteStoryForEveryone` sync: the story's own
             // timestamp, sent to us, everyone's lists now.
             StoryJobSync::RecipientUpdate { sent_at, recipients } => sync_message::Sent {
-                destination_service_id: Some(self.self_aci()),
+                destination_service_id: us.string(),
+                destination_service_id_binary: us.binary(),
                 timestamp: Some(sent_at),
                 story_message_recipients: recipients.iter().map(transcript).collect(),
                 is_recipient_update: Some(true),

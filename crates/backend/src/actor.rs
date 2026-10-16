@@ -50,7 +50,9 @@ use tracing::{debug, info, warn};
 use crate::{
     Command, Config, ConnectionState, Event, SETTING_LINK_PREVIEWS, SETTING_READ_RECEIPTS, SETTING_TYPING_INDICATORS,
     VOICE_CONTENT_TYPE, mapping::{self, Action, MapContext},
-    media, storage,
+    media,
+    remote_config::WireServiceId,
+    storage,
 };
 use anyhow::Context as _;
 
@@ -2685,7 +2687,10 @@ impl Actor {
                 let params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(key));
                 Identifier::ThreadGroupId(params.get_group_identifier().to_vec())
             }
-            None => Identifier::ThreadServiceId(conversation.as_direct()?.to_owned()),
+            None => match crate::remote_config::current().wire_service_id(conversation.as_direct()?) {
+                WireServiceId::String(s) => Identifier::ThreadServiceId(s),
+                WireServiceId::Binary(b) => Identifier::ThreadServiceIdBinary(b),
+            },
         };
         Some(presage::proto::ConversationIdentifier { identifier: Some(identifier) })
     }
@@ -2694,7 +2699,14 @@ impl Actor {
         use presage::proto::addressable_message::Author;
         presage::proto::AddressableMessage {
             sent_timestamp: Some(message.sent_at as u64),
-            author: Some(Author::AuthorServiceId(message.author.clone().unwrap_or_else(|| self.self_aci()))),
+            author: Some(
+                match crate::remote_config::current()
+                    .wire_service_id(message.author.as_deref().unwrap_or(&self.self_aci()))
+                {
+                    WireServiceId::String(s) => Author::AuthorServiceId(s),
+                    WireServiceId::Binary(b) => Author::AuthorServiceIdBinary(b),
+                },
+            ),
         }
     }
 
@@ -2765,19 +2777,24 @@ impl Actor {
         self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id });
         self.emit(Event::ConversationsChanged);
         let self_aci = self.self_aci();
-        let mut body_ranges = mapping::mention_ranges(&wire_body, &mentions);
+        let config = crate::remote_config::current();
+        let mut body_ranges = mapping::mention_ranges(&wire_body, &mentions, &config);
         body_ranges.extend(mapping::style_ranges(&wire_styles));
         let data = DataMessage {
             body_ranges,
             body: Some(wire_body),
             timestamp: Some(timestamp),
-            quote: message.quote.as_ref().map(|q| data_message::Quote {
-                id: Some(q.sent_at as u64),
-                author_aci: Some(q.author.clone().unwrap_or_else(|| self_aci.clone())),
-                text: Some(q.text.clone()),
-                attachments: mapping::quoted_attachments(q.attachment.as_ref()),
-                r#type: Some(data_message::quote::Type::Normal.into()),
-                ..Default::default()
+            quote: message.quote.as_ref().map(|q| {
+                let author = config.wire_service_id(q.author.as_deref().unwrap_or(&self_aci));
+                data_message::Quote {
+                    id: Some(q.sent_at as u64),
+                    author_aci: author.string(),
+                    author_aci_binary: author.binary(),
+                    text: Some(q.text.clone()),
+                    attachments: mapping::quoted_attachments(q.attachment.as_ref()),
+                    r#type: Some(data_message::quote::Type::Normal.into()),
+                    ..Default::default()
+                }
             }),
             group_v2: self.group_context(&conversation).await,
             ..Default::default()
@@ -2807,19 +2824,24 @@ impl Actor {
         self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id });
         let timestamp = message.sent_at as u64;
         let self_aci = self.self_aci();
+        let config = crate::remote_config::current();
         // Mentions go back to placeholders and ranges, as first sent.
         let (wire_body, mentioned) = mapping::placeholders_for(&message.body, &message.mentions);
         let data = DataMessage {
-            body_ranges: mapping::mention_ranges(&wire_body, &mentioned),
+            body_ranges: mapping::mention_ranges(&wire_body, &mentioned, &config),
             body: Some(wire_body).filter(|b| !b.is_empty()),
             timestamp: Some(timestamp),
-            quote: message.quote.as_ref().map(|q| data_message::Quote {
-                id: Some(q.sent_at as u64),
-                author_aci: Some(q.author.clone().unwrap_or_else(|| self_aci.clone())),
-                text: Some(q.text.clone()),
-                attachments: mapping::quoted_attachments(q.attachment.as_ref()),
-                r#type: Some(data_message::quote::Type::Normal.into()),
-                ..Default::default()
+            quote: message.quote.as_ref().map(|q| {
+                let author = config.wire_service_id(q.author.as_deref().unwrap_or(&self_aci));
+                data_message::Quote {
+                    id: Some(q.sent_at as u64),
+                    author_aci: author.string(),
+                    author_aci_binary: author.binary(),
+                    text: Some(q.text.clone()),
+                    attachments: mapping::quoted_attachments(q.attachment.as_ref()),
+                    r#type: Some(data_message::quote::Type::Normal.into()),
+                    ..Default::default()
+                }
             }),
             group_v2: self.group_context(&conversation).await,
             ..Default::default()
@@ -3211,7 +3233,7 @@ impl Actor {
             self.emit(Event::MessageChanged { conversation: message.conversation_id, message_id: id });
             self.emit(Event::ConversationsChanged);
         }
-        data.body_ranges = mapping::mention_ranges(&wire_body, mentions);
+        data.body_ranges = mapping::mention_ranges(&wire_body, mentions, &crate::remote_config::current());
         data.body_ranges.extend(mapping::style_ranges(wire_styles));
         data.body = Some(wire_body).filter(|b| !b.is_empty());
     }
@@ -3280,21 +3302,27 @@ impl Actor {
         self.emit(Event::ConversationsChanged);
 
         let self_aci = self.self_aci();
+        let config = crate::remote_config::current();
         let data = DataMessage {
             body: Some(body).filter(|b| !b.is_empty()),
             timestamp: Some(timestamp as u64),
-            quote: quoted.map(|m| data_message::Quote {
-                id: Some(m.sent_at as u64),
-                author_aci: Some(m.author.unwrap_or_else(|| self_aci.clone())),
-                text: Some(signal_store::hide_spoilers(&m.body, &m.styles)),
-                attachments: mapping::quoted_attachments(
-                    m.attachments.first().map(signal_store::QuotedAttachment::of).as_ref(),
-                ),
-                // Desktop's `makeQuote` marks a quoted poll (`isPoll`).
-                r#type: Some(
-                    if m.poll.is_some() { data_message::quote::Type::Poll } else { data_message::quote::Type::Normal }.into(),
-                ),
-                ..Default::default()
+            quote: quoted.map(|m| {
+                let author = config.wire_service_id(m.author.as_deref().unwrap_or(&self_aci));
+                data_message::Quote {
+                    id: Some(m.sent_at as u64),
+                    author_aci: author.string(),
+                    author_aci_binary: author.binary(),
+                    text: Some(signal_store::hide_spoilers(&m.body, &m.styles)),
+                    attachments: mapping::quoted_attachments(
+                        m.attachments.first().map(signal_store::QuotedAttachment::of).as_ref(),
+                    ),
+                    // Desktop's `makeQuote` marks a quoted poll (`isPoll`).
+                    r#type: Some(
+                        if m.poll.is_some() { data_message::quote::Type::Poll } else { data_message::quote::Type::Normal }
+                            .into(),
+                    ),
+                    ..Default::default()
+                }
             }),
             group_v2: self.group_context(&conversation).await,
             ..Default::default()
@@ -3322,14 +3350,16 @@ impl Actor {
         }
         self.emit(Event::MessageChanged { conversation: target.conversation_id.clone(), message_id });
 
+        let target_author = crate::remote_config::current()
+            .wire_service_id(target.author.as_deref().unwrap_or(&self.self_aci()));
         let data = DataMessage {
             timestamp: Some(timestamp as u64),
             reaction: Some(data_message::Reaction {
                 emoji: Some(emoji),
                 remove: Some(remove),
-                target_author_aci: Some(target.author.unwrap_or_else(|| self.self_aci())),
+                target_author_aci: target_author.string(),
+                target_author_aci_binary: target_author.binary(),
                 target_sent_timestamp: Some(target.sent_at as u64),
-                ..Default::default()
             }),
             group_v2: self.group_context(&target.conversation_id).await,
             ..Default::default()
@@ -3465,12 +3495,16 @@ impl Actor {
             }
         }
 
+        let config = crate::remote_config::current();
         let read = unread
             .into_iter()
-            .map(|(author, sent_at)| sync_message::Read {
-                sender_aci: Some(author),
-                timestamp: Some(sent_at as u64),
-                ..Default::default()
+            .map(|(author, sent_at)| {
+                let sender = config.wire_service_id(&author);
+                sync_message::Read {
+                    sender_aci: sender.string(),
+                    sender_aci_binary: sender.binary(),
+                    timestamp: Some(sent_at as u64),
+                }
             })
             .collect();
         self.enqueue(Outbound::Sync {
@@ -3696,11 +3730,14 @@ impl Actor {
     async fn attach_quote_thumbnail(&self, manager: &SignalManager, body: &mut ContentBody) {
         let ContentBody::DataMessage(data) = body else { return };
         let Some(quote) = data.quote.as_mut() else { return };
+        // Either field: which one we filled follows `binaryServiceId`.
+        let (Some(sent_at), Some(author)) = (quote.id, quote.parse_author_aci().map(|a| a.service_id_string())) else {
+            return;
+        };
         let Some(first) = quote.attachments.first_mut() else { return };
         if first.thumbnail.is_some() || !first.content_type.as_deref().is_some_and(|t| t.starts_with("image/")) {
             return;
         }
-        let (Some(sent_at), Some(author)) = (quote.id, quote.author_aci.clone()) else { return };
         let author = (author != self.self_aci()).then_some(author);
         let Ok(Some(quoted)) = self.db.find_message_any(author.as_deref(), sent_at as i64).await else { return };
         let Some(path) =
@@ -3956,11 +3993,12 @@ impl Actor {
         let state = if verified { presage::proto::verified::State::Verified } else { presage::proto::verified::State::Default };
         // Padding, as Desktop sends, so the message's size says nothing.
         let null_message: Vec<u8> = (0..rand::Rng::random_range(&mut rand::rng(), 1..=512)).map(|_| rand::random()).collect();
+        let destination = crate::remote_config::current().wire_service_id(&theirs.service_id_string());
         self.enqueue(Outbound::Sync {
             body: SyncMessage {
                 content: Some(sync_message::Content::Verified(presage::proto::Verified {
-                    destination_aci: Some(theirs.service_id_string()),
-                    destination_aci_binary: Some(theirs.service_id_binary()),
+                    destination_aci: destination.string(),
+                    destination_aci_binary: destination.binary(),
                     identity_key: Some(key.to_vec()),
                     state: Some(state.into()),
                     null_message: Some(null_message),

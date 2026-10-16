@@ -129,6 +129,18 @@ impl RemoteConfig {
         self.feature("binaryServiceId")
     }
 
+    /// How a message we send names `sid` (a service id string), as Desktop
+    /// fills each pair of proto fields (`ts/textsecure/SendMessage.preload.ts`):
+    /// with `binaryServiceId` on, only the `*Binary` field; otherwise only
+    /// the string. Something that isn't a service id goes as the string.
+    pub fn wire_service_id(&self, sid: &str) -> WireServiceId {
+        use presage::libsignal_service::protocol::ServiceId;
+        match ServiceId::parse_from_service_id_string(sid).filter(|_| self.binary_service_id()) {
+            Some(id) => WireServiceId::Binary(id.service_id_binary()),
+            None => WireServiceId::String(sid.to_owned()),
+        }
+    }
+
     // -------------------------------------------------------------- limits
 
     /// How long after sending you can delete for everyone, in millis
@@ -225,6 +237,34 @@ impl RemoteConfig {
 
     fn bytes(&self, key: &str, fallback: u64) -> u64 {
         self.int(key).and_then(|n| u64::try_from(n).ok()).unwrap_or(fallback)
+    }
+}
+
+/// A service id in one of a proto's two fields for it
+/// ([`RemoteConfig::wire_service_id`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireServiceId {
+    /// The string field (`authorAci`, `senderAci`, ...).
+    String(String),
+    /// The binary field (`authorAciBinary`, ...): 16 bytes for an ACI.
+    Binary(Vec<u8>),
+}
+
+impl WireServiceId {
+    /// The string field's value: `None` when the binary field is used.
+    pub fn string(&self) -> Option<String> {
+        match self {
+            Self::String(s) => Some(s.clone()),
+            Self::Binary(_) => None,
+        }
+    }
+
+    /// The binary field's value: `None` when the string field is used.
+    pub fn binary(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::Binary(b) => Some(b.clone()),
+            Self::String(_) => None,
+        }
     }
 }
 
@@ -343,6 +383,20 @@ mod tests {
         assert_eq!(config.group_size_hard_limit(), 2001);
         let receive = RemoteConfig::from_pairs([("global.attachments.maxReceiveBytes", "77")]);
         assert_eq!(receive.attachment_max_receive_bytes(), 77);
+    }
+
+    #[test]
+    fn service_ids_go_in_one_field_by_the_flag() {
+        let aci = "6b1a2b3c-0000-4000-8000-000000000001";
+        let pni = "PNI:6b1a2b3c-0000-4000-8000-000000000002";
+        let off = RemoteConfig::default();
+        assert_eq!(off.wire_service_id(aci), WireServiceId::String(aci.into()));
+        let on = RemoteConfig::from_pairs([("desktop.binaryServiceId.prod", "8.0.0")]);
+        let binary = on.wire_service_id(aci);
+        assert_eq!(binary.binary().map(|b| b.len()), Some(16), "an ACI is its bare UUID");
+        assert_eq!(binary.string(), None);
+        assert_eq!(on.wire_service_id(pni).binary().map(|b| (b.len(), b[0])), Some((17, 1)), "a PNI has a kind byte");
+        assert_eq!(on.wire_service_id("not a service id"), WireServiceId::String("not a service id".into()));
     }
 
     #[test]

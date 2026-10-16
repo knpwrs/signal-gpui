@@ -10,6 +10,8 @@ use presage::proto::{
 };
 use signal_store::{ConversationId, DeliveryStatus, Direction};
 
+use crate::remote_config::RemoteConfig;
+
 use super::*;
 
 const ME: &str = "11111111-1111-4111-8111-111111111111";
@@ -524,8 +526,13 @@ fn mentions_round_trip_through_placeholders() {
     assert_eq!(&text[spans[1].start..spans[1].start + spans[1].len], "@Bob");
     assert_eq!(spans[1].aci, BOB);
     // UTF-16: "hi " 3, placeholder 1, " and " 5, the waving hand 2, space 1.
-    let ranges = mention_ranges(body, &acis);
+    let ranges = mention_ranges(body, &acis, &RemoteConfig::default());
     assert_eq!(ranges.iter().map(|r| r.start.unwrap()).collect::<Vec<_>>(), vec![3, 12]);
+    assert_eq!(mentions(&ranges), acis);
+    // With `binaryServiceId` on, the binary field, read back the same.
+    let binary = RemoteConfig::from_pairs([("desktop.binaryServiceId.prod", "8.0.0")]);
+    let ranges = mention_ranges(body, &acis, &binary);
+    assert!(matches!(ranges[0].associated_value, Some(body_range::AssociatedValue::MentionAciBinary(_))));
     assert_eq!(mentions(&ranges), acis);
     // And back, for sending again.
     assert_eq!(placeholders_for(&text, &spans), (body.to_owned(), acis));

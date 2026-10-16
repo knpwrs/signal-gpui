@@ -1312,8 +1312,15 @@ pub fn placeholders_for(body: &str, spans: &[signal_store::MentionSpan]) -> (Str
 }
 
 /// Signal's mention ranges for a body with a placeholder per mention
-/// (`acis` in order): one UTF-16 position each, length 1.
-pub fn mention_ranges(body: &str, acis: &[String]) -> Vec<presage::proto::BodyRange> {
+/// (`acis` in order): one UTF-16 position each, length 1, naming the
+/// person in the string or binary field as `config` says (Desktop's
+/// `toBodyRange`).
+pub fn mention_ranges(
+    body: &str,
+    acis: &[String],
+    config: &crate::remote_config::RemoteConfig,
+) -> Vec<presage::proto::BodyRange> {
+    use crate::remote_config::WireServiceId;
     use presage::proto::body_range::AssociatedValue;
     let mut ranges = Vec::new();
     let mut utf16 = 0u32;
@@ -1325,7 +1332,10 @@ pub fn mention_ranges(body: &str, acis: &[String]) -> Vec<presage::proto::BodyRa
             ranges.push(presage::proto::BodyRange {
                 start: Some(utf16),
                 length: Some(1),
-                associated_value: Some(AssociatedValue::MentionAci(aci.clone())),
+                associated_value: Some(match config.wire_service_id(aci) {
+                    WireServiceId::String(s) => AssociatedValue::MentionAci(s),
+                    WireServiceId::Binary(b) => AssociatedValue::MentionAciBinary(b),
+                }),
             });
         }
         utf16 += c.len_utf16() as u32;
