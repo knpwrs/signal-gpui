@@ -48,6 +48,9 @@ pub struct ConversationView {
     reaction_picker_for: Option<i64>,
     /// Messages whose spoilers were clicked to show.
     revealed_spoilers: std::collections::HashSet<i64>,
+    /// How much of a long message shows after "Read more" (Desktop's
+    /// `displayLimit`), by message.
+    display_limits: std::collections::HashMap<i64, usize>,
     /// Incoming messages that arrived while scrolled up (shown on the
     /// jump-to-latest button); they're read once scrolled into view.
     unseen: usize,
@@ -184,6 +187,7 @@ impl ConversationView {
 
         let mut this = Self {
             revealed_spoilers: Default::default(),
+            display_limits: Default::default(),
             state,
             id,
             messages: Vec::new(),
@@ -1351,7 +1355,7 @@ impl ConversationView {
                                 render_attachment(message.id, ix + 1, a, &title, fg, palette, &self.state, cx)
                             }))
                             .children(too_big_label(message))
-                            .when(caption, |d| d.child(message_text(message, fg, self.revealed_spoilers.contains(&message.id), spacer.as_deref().map(|s| (s, bg)), cx)))
+                            .when(caption, |d| d.child(message_text(message, fg, self.revealed_spoilers.contains(&message.id), self.display_limits.get(&message.id).copied(), spacer.as_deref().map(|s| (s, bg)), cx)))
                             .when_some(meta, |d, m| d.child(place_meta(m, inline_meta))),
                     )
                 })
@@ -1397,7 +1401,7 @@ impl ConversationView {
                         .pt_1p5()
                         .pb_2()
                         .when(!message.body.is_empty(), |d| {
-                            d.child(message_text(message, fg, self.revealed_spoilers.contains(&message.id), spacer.as_deref().map(|s| (s, bg)), cx))
+                            d.child(message_text(message, fg, self.revealed_spoilers.contains(&message.id), self.display_limits.get(&message.id).copied(), spacer.as_deref().map(|s| (s, bg)), cx))
                         })
                         .when_some(meta, |d, m| d.child(place_meta(m, inline_meta))),
                 )
@@ -1444,7 +1448,7 @@ impl ConversationView {
                 } else if let Some(poll) = poll {
                     d.child(poll)
                 } else if !message.body.is_empty() {
-                    d.child(message_text(message, fg, self.revealed_spoilers.contains(&message.id), spacer.as_deref().map(|s| (s, bg)), cx))
+                    d.child(message_text(message, fg, self.revealed_spoilers.contains(&message.id), self.display_limits.get(&message.id).copied(), spacer.as_deref().map(|s| (s, bg)), cx))
                 } else {
                     d
                 }
@@ -2475,6 +2479,41 @@ enum TextClick {
     Reveal,
     /// Tries the long message's whole text again.
     DownloadText,
+    /// Shows more of a long message.
+    ReadMore,
+}
+
+/// Desktop's "Read more" (`ts/components/conversation/MessageBodyReadMore.dom.tsx`):
+/// a message shows its first 800 characters, and each click shows 3,000
+/// more. One at most 100 past the limit shows whole.
+const READ_MORE_INITIAL: usize = 800;
+const READ_MORE_INCREMENT: usize = 3000;
+const READ_MORE_BUFFER: usize = 100;
+
+/// Where `body` is cut to show `limit` characters, if it is (Desktop's
+/// `graphemeAndLinkAwareSlice`): at the first grapheme that starts at or
+/// past the limit, or past a link that would be cut. Characters are UTF-16
+/// code units, as in Desktop; the cut is a byte offset.
+fn read_more_cut(body: &str, limit: usize) -> Option<usize> {
+    use unicode_segmentation::UnicodeSegmentation as _;
+    let utf16 = |text: &str| text.encode_utf16().count();
+    if utf16(body) <= limit + READ_MORE_BUFFER {
+        return None;
+    }
+    let mut at = 0;
+    let mut starts = body.grapheme_indices(true).map(|(byte, grapheme)| {
+        let start = (byte, at);
+        at += utf16(grapheme);
+        start
+    });
+    let (cut, _) = starts.find(|(_, units)| *units >= limit)?;
+    // Desktop only cuts there if another grapheme starts after it.
+    starts.next()?;
+    let cut = find_links(body)
+        .into_iter()
+        .find(|(link, _)| link.start < cut && link.end > cut)
+        .map_or(cut, |(link, _)| link.end);
+    (cut < body.len()).then_some(cut)
 }
 
 /// Text, its runs, and what clicking where does.
@@ -2593,12 +2632,45 @@ fn long_text_tail(state: signal_store::LongTextState) -> (&'static str, Option<T
 }
 
 /// A message's text: see [`text_runs`]. Clicking a hidden spoiler shows the
-/// message's spoilers.
-fn message_text(message: &Message, fg: Hsla, revealed: bool, spacer: Option<(&str, Hsla)>, cx: &mut Context<ConversationView>) -> AnyElement {
+/// message's spoilers. A long one shows `limit` characters (Desktop's
+/// first 800 when `None`) and "Read more".
+fn message_text(
+    message: &Message,
+    fg: Hsla,
+    revealed: bool,
+    limit: Option<usize>,
+    spacer: Option<(&str, Hsla)>,
+    cx: &mut Context<ConversationView>,
+) -> AnyElement {
     let text = div().text_size(px(BODY_SIZE)).line_height(px(BODY_LINE));
-    let (mut content, mut runs, mut clicks) =
-        text_runs(&message.body, &message.mentions, &message.styles, revealed, fg, None);
-    if let Some(long_text) = &message.long_text {
+    let limit = limit.unwrap_or(READ_MORE_INITIAL);
+    let cut = read_more_cut(&message.body, limit);
+    let (mut content, mut runs, mut clicks) = match cut {
+        None => text_runs(&message.body, &message.mentions, &message.styles, revealed, fg, None),
+        Some(cut) => {
+            // Mentions and formatting stop at the cut too.
+            let mentions: Vec<_> = message
+                .mentions
+                .iter()
+                .filter(|m| m.start < cut)
+                .map(|m| signal_store::MentionSpan { len: m.len.min(cut - m.start), ..m.clone() })
+                .collect();
+            let styles: Vec<_> = message
+                .styles
+                .iter()
+                .filter(|s| s.start < cut)
+                .map(|s| signal_store::StyleSpan { len: s.len.min(cut - s.start), ..*s })
+                .collect();
+            text_runs(&message.body[..cut], &mentions, &styles, revealed, fg, None)
+        }
+    };
+    if cut.is_some() {
+        // Desktop's `${text}...` and its " Read more" button.
+        push_run(&mut content, &mut runs, "... ", fg, FontWeight::NORMAL, false);
+        let start = content.len();
+        push_run(&mut content, &mut runs, "Read more", fg, FontWeight::SEMIBOLD, true);
+        clicks.push((start..content.len(), TextClick::ReadMore));
+    } else if let Some(long_text) = &message.long_text {
         let (label, click) = long_text_tail(long_text.state);
         push_run(&mut content, &mut runs, "... ", fg, FontWeight::NORMAL, false);
         let start = content.len();
@@ -2629,6 +2701,12 @@ fn message_text(message: &Message, fg: Hsla, revealed: bool, spacer: Option<(&st
             }
             TextClick::DownloadText => {
                 let _ = view.update(cx, |this, cx| this.state.read(cx).send(Command::FetchLongText { message_id }));
+            }
+            TextClick::ReadMore => {
+                let _ = view.update(cx, |this, cx| {
+                    this.display_limits.insert(message_id, limit + READ_MORE_INCREMENT);
+                    cx.notify();
+                });
             }
         },
     ))
@@ -3800,6 +3878,63 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("{selector} never rendered");
+    }
+
+    #[test]
+    fn read_more_cuts_where_desktops_does() {
+        // Up to 100 past the limit shows whole.
+        assert_eq!(read_more_cut(&"a".repeat(900), 800), None);
+        assert_eq!(read_more_cut(&"a".repeat(901), 800), Some(800));
+        // Characters are UTF-16 units: "é" is one, "😀" two, both whole.
+        assert_eq!(read_more_cut(&"é".repeat(901), 800), Some(1600), "800 two-byte characters");
+        let emoji = "😀".repeat(451);
+        assert_eq!(read_more_cut(&emoji, 800), Some(400 * 4));
+        let odd = format!("a{}", "😀".repeat(451));
+        assert_eq!(read_more_cut(&odd, 800), Some(1 + 400 * 4), "the emoji starting at unit 799 still shows");
+        // A link the cut would split shows whole.
+        let link = format!("{} https://example.com/a-long-path {}", "a".repeat(789), "b".repeat(200));
+        assert_eq!(read_more_cut(&link, 800), Some(790 + "https://example.com/a-long-path".len()));
+        // Each "Read more" adds 3,000.
+        let long = "a".repeat(10_000);
+        assert_eq!(read_more_cut(&long, READ_MORE_INITIAL + READ_MORE_INCREMENT), Some(3800));
+        assert_eq!(read_more_cut(&long, 9_900), None);
+    }
+
+    #[gpui_kit::test]
+    fn read_more_shows_a_long_message_bit_by_bit(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        wait_for_messages(&backend, NOTE_TO_SELF, 1, |_| true);
+        let db = backend.db().clone();
+        let sent_at = chrono::Utc::now().timestamp_millis();
+        let body = "All the way up the ridge and back. ".repeat(60);
+        let id = futures::executor::block_on(backend.spawn(async move {
+            db.insert_message(&signal_store::NewMessage {
+                conversation_id: ConversationId(NOTE_TO_SELF.into()),
+                sent_at,
+                received_at: sent_at,
+                direction: Direction::Outgoing,
+                author: None,
+                author_name: None,
+                body,
+                status: DeliveryStatus::Sent,
+                quote: None,
+                attachments: vec![],
+                link_preview: None,
+                expires_in: 0,
+            })
+            .await
+        }))
+        .unwrap();
+        let (mut cx, view) = open_view(cx, &backend, NOTE_TO_SELF);
+        let short = bounds(&mut cx, format!("bubble-{id}"));
+        cx.update(|_, cx| {
+            view.update(cx, |this, cx| {
+                this.display_limits.insert(id, READ_MORE_INITIAL + READ_MORE_INCREMENT);
+                cx.notify();
+            })
+        });
+        let full = bounds(&mut cx, format!("bubble-{id}"));
+        assert!(full.size.height > short.size.height * 1.5, "{short:?} then {full:?}");
     }
 
     #[test]
