@@ -720,15 +720,31 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 let Some((update, started, connected)) = call.borrow_mut().take() else { continue };
                 // A group call's notice is "You started a group call", from the start.
                 if update.group {
-                    if let Ok(Some(id)) = db.insert_notice(&update.conversation, started, &signal_store::Notice::GroupCall { by: None, era: None }).await {
+                    // In the call history as a real one is: ringing while
+                    // we're in it (ours), then left.
+                    let era = format!("{started:016x}");
+                    let record = signal_store::GroupCallRecord {
+                        call_id: signal_calls::call_id_from_era(&era),
+                        era: Some(era),
+                        by: None,
+                        incoming: false,
+                        at: started,
+                    };
+                    let mut id = None;
+                    for (event, active) in [(signal_store::CallHistoryEvent::Ringing, true), (signal_store::CallHistoryEvent::Started, false)] {
+                        if let Ok(Some(change)) = db.apply_group_call_event(&update.conversation, &record, event, active, false).await {
+                            id = Some(change.id);
+                        }
+                    }
+                    if let Some(id) = id {
                         emit(Event::MessageChanged { conversation: update.conversation.clone(), message_id: id });
                     }
                     emit(Event::Call(None));
                     continue;
                 }
                 let outcome = if connected { signal_store::CallOutcome::Accepted } else { signal_store::CallOutcome::Unanswered };
-                let notice = signal_store::Notice::Call { incoming: false, video: update.video, outcome, call_id: None };
-                if let Ok(Some(id)) = db.insert_notice(&update.conversation, started, &notice).await {
+                let notice = signal_store::Notice::Call { incoming: false, video: update.video, outcome, call_id: None, unseen: false };
+                if let Ok(Some(id)) = db.record_call(&update.conversation, started, &notice).await {
                     emit(Event::MessageChanged { conversation: update.conversation.clone(), message_id: id });
                 }
                 emit(Event::Call(None));
@@ -1437,6 +1453,28 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
             Command::SetVerified { conversation, verified } => {
                 let _ = db.set_setting(&format!("demo.verified.{}", conversation.0), if verified { "1" } else { "" }).await;
                 emit(Event::SafetyNumber { conversation: conversation.clone(), result: Ok(demo_safety_number(&conversation, verified)) });
+            }
+            Command::MarkCallsRead { conversation } => {
+                let call = match &conversation {
+                    Some(conversation) => db.latest_unseen_call(conversation).await,
+                    None => db.latest_call(None).await,
+                };
+                if let Ok(Some(call)) = call {
+                    let target = signal_store::CallTarget { conversation: Some(call.conversation), call_id: call.call_id, timestamp: call.sent_at };
+                    for (conversation, message_id) in db.mark_calls_seen(&target, conversation.is_some(), now(), None).await.unwrap_or_default() {
+                        emit(Event::MessageChanged { conversation, message_id });
+                    }
+                    emit(Event::ConversationsChanged);
+                }
+            }
+            Command::ClearCallHistory => {
+                if let Ok(Some(call)) = db.latest_call(None).await {
+                    let target = signal_store::CallTarget { conversation: Some(call.conversation), call_id: call.call_id, timestamp: call.sent_at };
+                    for (conversation, message_id) in db.clear_call_history(&target).await.unwrap_or_default() {
+                        emit(Event::MessageRemoved { conversation, message_id });
+                    }
+                    emit(Event::ConversationsChanged);
+                }
             }
             Command::Link
             | Command::Typing { .. }

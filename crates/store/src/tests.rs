@@ -1068,15 +1068,21 @@ async fn safety_number_notices_round_trip() {
 #[tokio::test]
 async fn a_call_seen_here_and_on_another_device_is_one_notice() {
     let db = test_db().await;
-    let call = |outcome| Notice::Call { incoming: true, video: false, outcome, call_id: Some(-7) };
-    // It rang here and went unanswered…
-    let id = db.record_call(&conv("d:a"), 1_000, &call(CallOutcome::Missed)).await.unwrap().unwrap();
+    let call = |outcome, unseen| Notice::Call { incoming: true, video: false, outcome, call_id: Some(-7), unseen };
+    // It rang here and went unanswered: a missed call, not looked at yet…
+    let id = db.record_call(&conv("d:a"), 1_000, &call(CallOutcome::Missed, false)).await.unwrap().unwrap();
+    assert_eq!(db.message(id).await.unwrap().unwrap().notice, Some(call(CallOutcome::Missed, true)));
+    assert_eq!(db.unseen_calls().await.unwrap(), 1);
     // …because the phone answered it (its time differs a little).
-    let again = db.record_call(&conv("d:a"), 1_200, &call(CallOutcome::Accepted)).await.unwrap().unwrap();
+    let again = db.record_call(&conv("d:a"), 1_200, &call(CallOutcome::Accepted, false)).await.unwrap().unwrap();
     assert_eq!(again, id);
-    assert_eq!(db.message(id).await.unwrap().unwrap().notice, Some(call(CallOutcome::Accepted)));
+    assert_eq!(db.message(id).await.unwrap().unwrap().notice, Some(call(CallOutcome::Accepted, false)));
+    assert_eq!(db.unseen_calls().await.unwrap(), 0);
+    // Seen stays seen.
+    db.record_call(&conv("d:a"), 1_200, &call(CallOutcome::Missed, false)).await.unwrap();
+    assert!(!db.message(id).await.unwrap().unwrap().notice.unwrap().call_unseen());
     // Another call at the same moment is its own notice.
-    let other = Notice::Call { incoming: false, video: true, outcome: CallOutcome::Unanswered, call_id: Some(8) };
+    let other = Notice::Call { incoming: false, video: true, outcome: CallOutcome::Unanswered, call_id: Some(8), unseen: false };
     let second = db.record_call(&conv("d:a"), 1_000, &other).await.unwrap().unwrap();
     assert_ne!(second, id);
     // Deleted from the call history elsewhere.
@@ -1084,16 +1090,140 @@ async fn a_call_seen_here_and_on_another_device_is_one_notice() {
     assert!(db.message(id).await.unwrap().is_none());
 }
 
+fn group_call(call_id: i64, era: Option<&str>, by: Option<&str>, at: i64) -> GroupCallRecord {
+    GroupCallRecord { call_id, era: era.map(str::to_owned), by: by.map(str::to_owned), incoming: by.is_some(), at }
+}
+
 #[tokio::test]
-async fn a_group_call_is_noted_once_per_era() {
+async fn a_group_call_is_one_record_that_follows_desktops_statuses() {
     let db = test_db().await;
-    let started = |by: &str, era: &str| Notice::GroupCall { by: Some(by.into()), era: Some(era.into()) };
-    assert!(db.record_group_call(&conv("g:a"), 1_000, &started("alice", "e1")).await.unwrap().is_some());
-    // Bob joined the same call: his update notes nothing new.
-    assert!(db.record_group_call(&conv("g:a"), 2_000, &started("bob", "e1")).await.unwrap().is_none());
-    // The next call has its own era, and the same era in another group is its own call.
-    assert!(db.record_group_call(&conv("g:a"), 3_000, &started("bob", "e2")).await.unwrap().is_some());
-    assert!(db.record_group_call(&conv("g:b"), 3_000, &started("bob", "e1")).await.unwrap().is_some());
+    let g = conv("g:a");
+    let rung = group_call(42, None, Some("alice"), 1_000);
+    // Alice rings us: unseen until we look.
+    let change = db.apply_group_call_event(&g, &rung, CallHistoryEvent::Ringing, false, false).await.unwrap().unwrap();
+    assert_eq!((change.status, change.previous), (GroupCallStatus::Ringing, None));
+    assert_eq!(db.unseen_calls().await.unwrap(), 1);
+    // Bob's update about the same call (by its era) adds nothing.
+    let update = group_call(42, Some("e1"), Some("bob"), 2_000);
+    assert_eq!(db.apply_group_call_event(&g, &update, CallHistoryEvent::Started, false, true).await.unwrap(), None);
+    // We join: accepted, and seen.
+    let joined = db.apply_group_call_event(&g, &update, CallHistoryEvent::Accepted, true, false).await.unwrap().unwrap();
+    assert_eq!((joined.id, joined.status, joined.previous), (change.id, GroupCallStatus::Accepted, Some(GroupCallStatus::Ringing)));
+    let notice = db.message(change.id).await.unwrap().unwrap().notice.unwrap();
+    assert_eq!(
+        notice,
+        Notice::GroupCall {
+            by: Some("alice".into()),
+            era: Some("e1".into()),
+            call_id: Some(42),
+            status: Some(GroupCallStatus::Accepted),
+            incoming: true,
+            unseen: false,
+        }
+    );
+    assert_eq!(db.unseen_calls().await.unwrap(), 0);
+    // A notice from before call ids is found by its era.
+    let old = Notice::GroupCall { by: Some("bob".into()), era: Some("e2".into()), call_id: None, status: None, incoming: false, unseen: false };
+    let old_id = db.insert_notice(&g, 5_000, &old).await.unwrap().unwrap();
+    let change = db
+        .apply_group_call_event(&g, &group_call(43, Some("e2"), None, 6_000), CallHistoryEvent::Accepted, true, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((change.id, change.status), (old_id, GroupCallStatus::Joined));
+    // The same call id in another group is another call.
+    let other = db.apply_group_call_event(&conv("g:b"), &rung, CallHistoryEvent::Missed, false, false).await.unwrap().unwrap();
+    assert_eq!(other.previous, None);
+    assert_eq!(db.remove_group_call(&conv("g:b"), 42).await.unwrap(), Some(other.id));
+}
+
+#[tokio::test]
+async fn calls_follow_the_chats_disappearing_timer_once_seen() {
+    let db = test_db().await;
+    let g = conv("g:a");
+    db.upsert_conversation(&g, ConversationUpdate { expire_timer: Some(60), ..Default::default() }).await.unwrap();
+    // Ours, seen: counts down from now, unless we're still in the call.
+    let ours = db
+        .apply_group_call_event(&g, &group_call(1, Some("e1"), None, 1_000), CallHistoryEvent::Ringing, true, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let message = db.message(ours.id).await.unwrap().unwrap();
+    assert_eq!((message.expires_in, message.expire_start), (60, None));
+    // Leaving starts it.
+    db.apply_group_call_event(&g, &group_call(1, Some("e1"), None, 1_000), CallHistoryEvent::Started, false, false)
+        .await
+        .unwrap();
+    assert!(db.message(ours.id).await.unwrap().unwrap().expire_start.is_some());
+    // A missed one waits until the call history is read…
+    let missed = db
+        .apply_group_call_event(&g, &group_call(2, None, Some("alice"), 2_000), CallHistoryEvent::Missed, false, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let in_call = db
+        .apply_group_call_event(&g, &group_call(3, None, Some("alice"), 3_000), CallHistoryEvent::Accepted, true, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(db.message(missed.id).await.unwrap().unwrap().expire_start, None);
+    let target = CallTarget { conversation: Some(g.clone()), call_id: Some(3), timestamp: 0 };
+    let changed = db.mark_calls_seen(&target, true, 9_000, Some((&g, 3))).await.unwrap();
+    assert_eq!(changed, [(g.clone(), missed.id)]);
+    let message = db.message(missed.id).await.unwrap().unwrap();
+    assert_eq!(message.expire_start, Some(9_000));
+    assert!(!message.notice.unwrap().call_unseen());
+    // …but not the call we're in.
+    assert_eq!(db.message(in_call.id).await.unwrap().unwrap().expire_start, None);
+    // A 1:1 call takes its chat's timer too.
+    db.upsert_conversation(&conv("d:a"), ConversationUpdate { expire_timer: Some(30), ..Default::default() }).await.unwrap();
+    let call = Notice::Call { incoming: false, video: false, outcome: CallOutcome::Accepted, call_id: Some(4), unseen: false };
+    let id = db.record_call(&conv("d:a"), 4_000, &call).await.unwrap().unwrap();
+    let message = db.message(id).await.unwrap().unwrap();
+    assert_eq!(message.expires_in, 30);
+    assert!(message.expire_start.is_some());
+}
+
+#[tokio::test]
+async fn the_call_history_clears_and_reads_up_to_a_call() {
+    let db = test_db().await;
+    let missed = |call_id| Notice::Call { incoming: true, video: false, outcome: CallOutcome::Missed, call_id: Some(call_id), unseen: false };
+    db.record_call(&conv("d:a"), 1_000, &missed(1)).await.unwrap();
+    db.record_call(&conv("d:b"), 2_000, &missed(2)).await.unwrap();
+    let last = db.record_call(&conv("d:a"), 3_000, &missed(3)).await.unwrap().unwrap();
+    db.insert_message(&incoming("d:a", "a", 1_500, "hi")).await.unwrap();
+    assert_eq!(db.unseen_calls().await.unwrap(), 3);
+    let latest = db.latest_call(None).await.unwrap().unwrap();
+    assert_eq!((latest.conversation, latest.call_id, latest.sent_at), (conv("d:a"), Some(3), 3_000));
+    assert_eq!(db.latest_unseen_call(&conv("d:b")).await.unwrap().map(|c| c.call_id), Some(Some(2)));
+    // Read everywhere up to the second call (named by its time).
+    let target = CallTarget { conversation: None, call_id: None, timestamp: 2_500 };
+    assert_eq!(db.mark_calls_seen(&target, false, 5_000, None).await.unwrap().len(), 2);
+    assert_eq!(db.unseen_calls().await.unwrap(), 1);
+    // A call that isn't here names nothing.
+    let unknown = CallTarget { conversation: Some(conv("d:a")), call_id: Some(99), timestamp: 9_000 };
+    assert!(db.clear_call_history(&unknown).await.unwrap().is_empty());
+    // Cleared up to the second call: the third stays, and so do messages.
+    let target = CallTarget { conversation: Some(conv("d:b")), call_id: Some(2), timestamp: 0 };
+    assert_eq!(db.clear_call_history(&target).await.unwrap().len(), 2);
+    let left: Vec<i64> = db.call_history(10).await.unwrap().into_iter().map(|m| m.id).collect();
+    assert_eq!(left, [last]);
+    assert_eq!(db.messages(&conv("d:a"), None, 10).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn the_call_history_reads_only_notices() {
+    let db = test_db().await;
+    let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+        "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM messages WHERE author_key = 'notice' \
+           AND json_extract(notice, '$.type') IN ('call', 'group_call') AND json_extract(notice, '$.unseen') = 1",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    // Through the author index (notices are a few of all messages), not a
+    // scan of every message.
+    assert!(plan.iter().any(|(_, _, _, detail)| detail.contains("messages_author")), "{plan:?}");
 }
 
 #[tokio::test]

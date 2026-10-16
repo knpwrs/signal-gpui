@@ -20,11 +20,30 @@ pub fn notice_text(notice: &Notice, name: impl Fn(&str) -> String) -> String {
         Notice::Group { by, change } => group_text(by.as_deref(), change, name),
         Notice::SafetyNumberChanged { who } => format!("Your safety number with {} has changed.", name(who)),
         Notice::Call { incoming, video, outcome, .. } => call_text(*incoming, *video, *outcome),
-        Notice::GroupCall { by: None, .. } => "You started a group call".into(),
-        Notice::GroupCall { by: Some(by), .. } => format!("{} started a group call", name(by)),
+        notice @ Notice::GroupCall { by, status, .. } => group_call_text(notice.group_call_incoming(), by.as_deref(), *status, name),
         // Desktop's `icu:PollTerminate--you` / `--other`.
         Notice::PollEnded { by: None, question, .. } => format!("You ended the poll: {question}"),
         Notice::PollEnded { by: Some(by), question, .. } => format!("{} ended the poll: {question}", name(by)),
+    }
+}
+
+/// A group call's notice, after Desktop's `getGroupCallNotificationText`:
+/// one rung and missed or declined says so; otherwise who started it.
+/// (Desktop also says "The video call has ended" once it's over, which
+/// needs the call's live state; this doesn't have it.)
+fn group_call_text(
+    incoming: bool,
+    by: Option<&str>,
+    status: Option<signal_store::GroupCallStatus>,
+    name: impl Fn(&str) -> String,
+) -> String {
+    use signal_store::GroupCallStatus;
+    match (incoming, status, by) {
+        (true, Some(GroupCallStatus::Missed), _) => "Missed group call".into(),
+        (true, Some(GroupCallStatus::Declined), _) => "Declined group call".into(),
+        (false, _, _) => "You started a group call".into(),
+        (true, _, Some(by)) => format!("{} started a group call", name(by)),
+        (true, _, None) => "A group call was started".into(),
     }
 }
 
@@ -97,12 +116,25 @@ mod tests {
         assert_eq!(text(Notice::Timer { by: None, seconds: 86_400 }), "You set the disappearing message time to 1 day.");
         assert_eq!(text(Notice::Timer { by: by("a"), seconds: 0 }), "Alice disabled disappearing messages.");
         use signal_store::CallOutcome;
-        let call = |incoming, video, outcome| text(Notice::Call { incoming, video, outcome, call_id: None });
+        let call = |incoming, video, outcome| text(Notice::Call { incoming, video, outcome, call_id: None, unseen: false });
         assert_eq!(call(true, false, CallOutcome::Missed), "Missed voice call");
         assert_eq!(call(false, true, CallOutcome::Accepted), "Outgoing video call");
         assert_eq!(call(true, true, CallOutcome::Accepted), "Incoming video call");
         assert_eq!(call(true, false, CallOutcome::Declined), "Declined voice call");
         assert_eq!(call(false, false, CallOutcome::Unanswered), "Unanswered voice call");
+        use signal_store::GroupCallStatus;
+        let group_call = |by: Option<String>, incoming, status| {
+            text(Notice::GroupCall { by, era: None, call_id: Some(1), status: Some(status), incoming, unseen: false })
+        };
+        assert_eq!(group_call(None, false, GroupCallStatus::Ringing), "You started a group call");
+        assert_eq!(group_call(by("a"), true, GroupCallStatus::Joined), "Alice started a group call");
+        assert_eq!(group_call(None, true, GroupCallStatus::Accepted), "A group call was started");
+        assert_eq!(group_call(by("a"), true, GroupCallStatus::Missed), "Missed group call");
+        assert_eq!(group_call(by("a"), true, GroupCallStatus::Declined), "Declined group call");
+        // Notices from before statuses: who started it.
+        let old = |by| text(Notice::GroupCall { by, era: None, call_id: None, status: None, incoming: false, unseen: false });
+        assert_eq!(old(by("b")), "Bob started a group call");
+        assert_eq!(old(None), "You started a group call");
         assert_eq!(
             text(Notice::SafetyNumberChanged { who: "a".into() }),
             "Your safety number with Alice has changed."

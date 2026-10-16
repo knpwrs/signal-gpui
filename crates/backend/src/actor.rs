@@ -1,6 +1,7 @@
 //! The backend actor: owns the presage manager and applies incoming content to
 //! the app database. Runs on a `LocalSet` because presage's futures are `!Send`.
 
+mod call_log;
 mod calls;
 mod group_calls;
 mod polls;
@@ -622,7 +623,7 @@ impl Actor {
                 Command::SetStoryViewReceipts(on) => self.set_story_view_receipts(on).await,
                 Command::StartCall { conversation, video } => self.start_call(conversation, video),
                 Command::AcceptCall { video } => self.accept_call(video),
-                Command::DeclineCall | Command::HangUp => self.hang_up(),
+                Command::DeclineCall | Command::HangUp => self.hang_up().await,
                 Command::SetCallAudio(enabled) => self.set_call_audio(enabled),
                 Command::SetCallVideo(enabled) => self.set_call_video(enabled),
                 Command::LoadCallDevices => self.load_call_devices().await,
@@ -631,6 +632,8 @@ impl Actor {
                 Command::StopSharing => self.stop_sharing(),
                 Command::SetCallDevice { kind, id } => self.set_call_device(kind, id).await,
                 Command::PeekGroupCall { conversation } => self.peek_group_call(conversation).await,
+                Command::MarkCallsRead { conversation } => self.mark_calls_read(conversation).await,
+                Command::ClearCallHistory => self.clear_call_history().await,
                 Command::Unlink => self.unlink().await,
                 Command::SkipHistory => self.skip_history().await,
             }
@@ -1106,6 +1109,8 @@ impl Actor {
                 self.emit(Event::Typing { conversation, author: sender, started });
             }
             Action::CallEvent(event) => self.on_call_event(event).await,
+            Action::GroupCallEvent(event) => self.on_group_call_event(event).await,
+            Action::CallLogEvent(event) => self.on_call_log_event(event).await,
             Action::GroupCallStarted { conversation, by, era, at } => {
                 // (Not from a blocked group.)
                 if by.is_none() || !self.is_blocked(&conversation).await {
@@ -3354,6 +3359,8 @@ impl Actor {
         // Read messages start disappearing now.
         self.expiry.notify_one();
         self.emit(Event::ConversationsChanged);
+        // Its calls are read too (Desktop's `markConversationRead`).
+        self.mark_calls_read(Some(conversation.clone())).await;
         if unread.is_empty() {
             return;
         }

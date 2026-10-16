@@ -12,9 +12,11 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous},
 };
 
+mod call_history;
 mod nickname;
 mod poll;
 mod stories;
+pub use call_history::*;
 pub use nickname::*;
 pub use poll::*;
 pub use stories::*;
@@ -472,20 +474,39 @@ pub enum Notice {
     SafetyNumberChanged { who: String },
     /// Desktop's "Alice started a group call" (`by`: `None` for us). `era`
     /// names the call (each run of it has its own), so a call is noted once.
+    ///
+    /// It's also the group call's record in the call history (Desktop's
+    /// `callsHistory` row with mode `Group`): `call_id` is RingRTC's id for
+    /// the call (`callIdFromEra`, the same as its ring's id), `status` how it
+    /// went for us, `incoming` whether someone else started it (`by` may
+    /// still be unknown), and `unseen` a call not looked at yet (Desktop's
+    /// `SeenStatus.Unseen`). Notices from before these were kept have only
+    /// `by` and `era`: see [`Notice::group_call_incoming`].
     GroupCall {
         by: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         era: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<GroupCallStatus>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        incoming: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        unseen: bool,
     },
     /// A call, in Desktop's call history words. `call_id` (RingRTC's id, its
     /// bits as an i64 so SQLite's JSON reads it exactly) ties our record of
-    /// a call to our other devices'.
+    /// a call to our other devices'. `unseen`: a missed call not looked at
+    /// yet (set by the store, see `AppDb::record_call`).
     Call {
         incoming: bool,
         video: bool,
         outcome: CallOutcome,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         call_id: Option<i64>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        unseen: bool,
     },
     /// Desktop's "You ended the poll: …" (`by`: the poll's creator, `None`
     /// for us). `sent_at` names the poll ("View poll").
@@ -2156,67 +2177,6 @@ impl AppDb {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(message_from_row).collect()
-    }
-
-    /// Records a call's notice, or updates the one for the same call (seen
-    /// here and on another device, say). Returns its row id.
-    pub async fn record_call(&self, conversation: &ConversationId, at: i64, notice: &Notice) -> Result<Option<i64>> {
-        if let Notice::Call { call_id: Some(call_id), .. } = notice {
-            let existing: Option<i64> = sqlx::query_scalar(
-                "SELECT id FROM messages WHERE conversation_id = ?1 AND author_key = 'notice' \
-                   AND json_extract(notice, '$.type') = 'call' AND json_extract(notice, '$.call_id') = ?2",
-            )
-            .bind(&conversation.0)
-            .bind(call_id)
-            .fetch_optional(&self.pool)
-            .await?;
-            if let Some(id) = existing {
-                sqlx::query("UPDATE messages SET notice = ?2 WHERE id = ?1")
-                    .bind(id)
-                    .bind(serde_json::to_string(notice)?)
-                    .execute(&self.writer)
-                    .await?;
-                return Ok(Some(id));
-            }
-        }
-        // Notices dedupe by time: step past another in the same millisecond.
-        for offset in 0..10 {
-            if let Some(id) = self.insert_notice(conversation, at + offset, notice).await? {
-                return Ok(Some(id));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Notes a group call ("… started a group call") unless its era is
-    /// noted already. `None`: it was.
-    pub async fn record_group_call(&self, conversation: &ConversationId, at: i64, notice: &Notice) -> Result<Option<i64>> {
-        if let Notice::GroupCall { era: Some(era), .. } = notice {
-            let existing: Option<i64> = sqlx::query_scalar(
-                "SELECT id FROM messages WHERE conversation_id = ?1 AND author_key = 'notice' \
-                   AND json_extract(notice, '$.type') = 'group_call' AND json_extract(notice, '$.era') = ?2",
-            )
-            .bind(&conversation.0)
-            .bind(era)
-            .fetch_optional(&self.pool)
-            .await?;
-            if existing.is_some() {
-                return Ok(None);
-            }
-        }
-        self.insert_notice(conversation, at, notice).await
-    }
-
-    /// Removes a call's notice (deleted from the call history elsewhere).
-    pub async fn remove_call(&self, conversation: &ConversationId, call_id: i64) -> Result<Option<i64>> {
-        Ok(sqlx::query_scalar(
-            "DELETE FROM messages WHERE conversation_id = ?1 AND author_key = 'notice' \
-               AND json_extract(notice, '$.type') = 'call' AND json_extract(notice, '$.call_id') = ?2 RETURNING id",
-        )
-        .bind(&conversation.0)
-        .bind(call_id)
-        .fetch_optional(&self.writer)
-        .await?)
     }
 
     pub async fn set_left(&self, id: &ConversationId, left: bool) -> Result<()> {

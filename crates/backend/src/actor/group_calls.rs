@@ -3,13 +3,18 @@
 //! when it asks, carry its HTTP requests and opaque call messages, ring the
 //! group when we start a call no one's in, and tell the group ("… started a
 //! group call").
+//!
+//! Each call is kept in the call history as Desktop keeps it
+//! (`ts/util/callDisposition.preload.ts`, driven from
+//! `ts/services/calling.preload.ts`): rung, missed, declined, joined or
+//! accepted, with our other devices told when we accept one.
 
 use std::sync::OnceLock;
 
 use presage::libsignal_service::content::ContentBody;
 use presage::proto::{CallMessage, call_message};
 use signal_calls::{ClientId, GroupEvent, Participant, RingCancelReason};
-use signal_store::Notice;
+use signal_store::{CallHistoryEvent, GroupCallRecord, GroupCallStatus};
 
 use super::*;
 use crate::{CallParticipant, CallStatus, CallUpdate};
@@ -17,6 +22,18 @@ use crate::{CallParticipant, CallStatus, CallUpdate};
 /// Desktop rings groups of up to this many members (`maxGroupCallRingSize`);
 /// bigger ones are only told.
 const MAX_RING_SIZE: usize = 16;
+
+/// Where a group call's event comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HistorySource {
+    /// Here: our other devices hear of an accepted call.
+    Local,
+    /// Someone's `groupCallUpdate`: recorded only if the call is new to us
+    /// (Desktop's `updateCallHistoryForGroupCallOnPeek`).
+    IfNew,
+    /// Another of our devices' call event sync, which isn't echoed back.
+    OtherDevice,
+}
 
 /// The group call we're in, joining, or being rung for.
 pub(super) struct GroupCall {
@@ -32,11 +49,52 @@ pub(super) struct GroupCall {
     starter: bool,
     /// The call's era, from the calling server.
     era: Option<String>,
+    /// Who started it (their ACI), from the calling server.
+    creator: Option<String>,
+    /// What our joining last recorded in the call history.
+    recorded: Option<CallHistoryEvent>,
     rang: bool,
     announced: bool,
     joined: bool,
     sharing: bool,
     camera_before_sharing: bool,
+}
+
+impl GroupCall {
+    fn new(conversation: ConversationId, key: [u8; 32], status: CallStatus) -> Self {
+        Self {
+            conversation,
+            key,
+            client_id: None,
+            status,
+            video: true,
+            participants: Vec::new(),
+            ring: None,
+            starter: false,
+            era: None,
+            creator: None,
+            recorded: None,
+            rang: false,
+            announced: false,
+            joined: false,
+            sharing: false,
+            camera_before_sharing: false,
+        }
+    }
+
+    /// The call's record in the history, once the calling server has told
+    /// us its era and who started it (Desktop's `getGroupCallMeta`).
+    fn record(&self, me: &str) -> Option<GroupCallRecord> {
+        let (era, creator) = (self.era.clone()?, self.creator.clone()?);
+        let incoming = creator != me;
+        Some(GroupCallRecord {
+            call_id: signal_calls::call_id_from_era(&era),
+            era: Some(era),
+            by: incoming.then_some(creator),
+            incoming,
+            at: now_millis(),
+        })
+    }
 }
 
 impl GroupCall {
@@ -99,6 +157,14 @@ impl Actor {
         self.store.group(key).await.ok().flatten().map(|g| g.members.iter().map(|m| m.aci).collect()).unwrap_or_default()
     }
 
+    /// The group call we're in, as the call history names it (Desktop's
+    /// `getActiveCallIds`): its notice doesn't start disappearing yet.
+    pub(super) fn active_group_call_id(&self) -> Option<(ConversationId, i64)> {
+        let call = self.group_call.borrow();
+        let call = call.as_ref().filter(|g| g.client_id.is_some())?;
+        Some((call.conversation.clone(), signal_calls::call_id_from_era(call.era.as_deref()?)))
+    }
+
     pub(super) fn in_any_call(&self) -> bool {
         self.call.borrow().is_some() || self.group_call.borrow().as_ref().is_some_and(|g| g.client_id.is_some())
     }
@@ -121,22 +187,8 @@ impl Actor {
                 return self.call_not_started();
             }
         };
-        *self.group_call.borrow_mut() = Some(GroupCall {
-            conversation,
-            key,
-            client_id: Some(client_id),
-            status: CallStatus::Connecting,
-            video,
-            participants: Vec::new(),
-            ring: None,
-            starter: true,
-            era: None,
-            rang: false,
-            announced: false,
-            joined: false,
-            sharing: false,
-            camera_before_sharing: false,
-        });
+        *self.group_call.borrow_mut() =
+            Some(GroupCall { client_id: Some(client_id), video, starter: true, ..GroupCall::new(conversation, key, CallStatus::Connecting) });
         self.with_calls(|calls| {
             calls.set_video_enabled(video);
             calls.set_group_audio_muted(client_id, false);
@@ -177,20 +229,54 @@ impl Actor {
     }
 
     /// Declines a ring, or leaves the call. `false`: no group call.
-    pub(super) fn end_group_call(&self) -> bool {
+    pub(super) async fn end_group_call(&self) -> bool {
         let Some(call) = self.group_call.borrow_mut().take() else { return false };
-        match (call.client_id, call.ring) {
-            (Some(client_id), _) => self.with_calls(|calls| {
-                calls.group_end(client_id);
-                calls.reset_media();
-            }),
-            (None, Some((group_id, ring_id, _))) => {
-                self.with_calls(|calls| calls.cancel_group_ring(group_id, ring_id, RingCancelReason::DeclinedByUser));
+        match (call.client_id, &call.ring) {
+            (Some(client_id), _) => {
+                self.with_calls(|calls| {
+                    calls.group_end(client_id);
+                    calls.reset_media();
+                });
+                self.emit_call();
+                self.left_group_call(&call).await;
             }
-            (None, None) => {}
+            (None, Some((group_id, ring_id, ringer))) => {
+                let (group_id, ring_id) = (group_id.clone(), *ring_id);
+                self.with_calls(|calls| calls.cancel_group_ring(group_id, ring_id, RingCancelReason::DeclinedByUser));
+                self.emit_call();
+                // Desktop's transition has a declined group call, though
+                // its own decline leaves the ring's record as it was; ours
+                // says what we did. (Other devices hear "declined on another
+                // device" from RingRTC, which they count as missed.)
+                let record = GroupCallRecord {
+                    call_id: ring_id,
+                    era: None,
+                    by: (!ringer.is_empty()).then(|| ringer.clone()),
+                    incoming: true,
+                    at: now_millis(),
+                };
+                self.group_call_history(&call.conversation, record, CallHistoryEvent::Declined, false, HistorySource::Local).await;
+            }
+            (None, None) => self.emit_call(),
         }
-        self.emit_call();
         true
+    }
+
+    /// We left (or the call ended): Desktop's local state change to "not
+    /// joined", which records the call as started (an accepted ring stays
+    /// accepted) and starts its disappearing countdown; and, as Desktop
+    /// sends on joining and on leaving, a `groupCallUpdate` to the group.
+    async fn left_group_call(&self, call: &GroupCall) {
+        if call.recorded.is_some()
+            && let Some(record) = call.record(&self.self_aci())
+        {
+            self.group_call_history(&call.conversation, record, CallHistoryEvent::Started, false, HistorySource::Local).await;
+        }
+        if call.announced
+            && let Some(era) = call.era.clone()
+        {
+            self.send_group_call_update(&call.conversation, era).await;
+        }
     }
 
     /// Our microphone and camera in a group call (as well as the tracks).
@@ -284,6 +370,7 @@ impl Actor {
                     }
                 }
                 self.announce_group_call(client_id).await;
+                self.record_join_state(client_id).await;
                 self.emit_call();
             }
             GroupEvent::Participants { client_id, participants } => {
@@ -297,8 +384,12 @@ impl Actor {
             GroupEvent::Peek { client_id, peek } => {
                 if let Some(call) = self.group_call.borrow_mut().as_mut().filter(|g| g.client_id == Some(client_id)) {
                     call.era = peek.era_id;
+                    if let Some(creator) = peek.creator.as_deref().and_then(aci_of) {
+                        call.creator = Some(creator);
+                    }
                 }
                 self.announce_group_call(client_id).await;
+                self.record_join_state(client_id).await;
             }
             GroupEvent::PeekResult { request_id, peek } => {
                 let Some(conversation) = self.peeks.borrow_mut().remove(&request_id) else { return };
@@ -310,95 +401,177 @@ impl Actor {
                     let mut call = self.group_call.borrow_mut();
                     if call.as_ref().is_some_and(|g| g.client_id == Some(client_id)) { call.take() } else { None }
                 };
-                if ended.is_some() {
+                if let Some(call) = ended {
                     self.with_calls(|calls| {
                         calls.group_end(client_id);
                         calls.reset_media();
                     });
                     self.emit_call();
+                    self.left_group_call(&call).await;
                 }
             }
             GroupEvent::Ring { group_id, ring_id, sender, ring } => self.on_group_ring(group_id, ring_id, sender, ring).await,
         }
     }
 
+    /// A ring, as Desktop's `handleGroupCallRingUpdate` takes it: one we
+    /// show is ringing in the call history, one we can't (we're busy) is
+    /// a call someone started; when it's over, it was accepted on another
+    /// of our devices or missed.
     async fn on_group_ring(&self, group_id: Vec<u8>, ring_id: i64, sender: Vec<u8>, ring: signal_calls::Ring) {
         let Some(manager) = self.manager() else { return };
         let Some(key) = self.group_for_id(&manager, &group_id).await else { return };
-        match ring {
+        let conversation = ConversationId::group(&key);
+        if self.is_blocked(&conversation).await {
+            return;
+        }
+        let ringer = aci_of(&sender);
+        let record = GroupCallRecord {
+            call_id: ring_id,
+            era: None,
+            by: ringer.clone(),
+            incoming: ringer.as_deref() != Some(self.self_aci().as_str()),
+            at: now_millis(),
+        };
+        let event = match ring {
             signal_calls::Ring::Requested => {
                 if self.in_any_call() || self.group_call.borrow().is_some() {
                     self.with_calls(|calls| calls.cancel_group_ring(group_id, ring_id, RingCancelReason::Busy));
-                    return;
+                    CallHistoryEvent::Started
+                } else {
+                    *self.group_call.borrow_mut() = Some(GroupCall {
+                        ring: Some((group_id, ring_id, ringer.unwrap_or_default())),
+                        ..GroupCall::new(conversation.clone(), key, CallStatus::Ringing)
+                    });
+                    CallHistoryEvent::Ringing
                 }
-                let conversation = ConversationId::group(&key);
-                if self.is_blocked(&conversation).await {
-                    return;
-                }
-                *self.group_call.borrow_mut() = Some(GroupCall {
-                    conversation,
-                    key,
-                    client_id: None,
-                    status: CallStatus::Ringing,
-                    video: true,
-                    participants: Vec::new(),
-                    ring: Some((group_id, ring_id, aci_of(&sender).unwrap_or_default())),
-                    starter: false,
-                    era: None,
-                    rang: false,
-                    announced: false,
-                    joined: false,
-                    sharing: false,
-                    camera_before_sharing: false,
-                });
             }
-            signal_calls::Ring::Over => {
+            signal_calls::Ring::AcceptedElsewhere | signal_calls::Ring::Over => {
                 let mut call = self.group_call.borrow_mut();
                 if call.as_ref().is_some_and(|g| g.client_id.is_none() && g.ring.as_ref().is_some_and(|r| r.1 == ring_id)) {
                     call.take();
                 }
+                if ring == signal_calls::Ring::AcceptedElsewhere { CallHistoryEvent::Accepted } else { CallHistoryEvent::Missed }
             }
-        }
+        };
         self.emit_call();
+        // Accepted on another device: that device already told the others.
+        let source = if event == CallHistoryEvent::Accepted { HistorySource::OtherDevice } else { HistorySource::Local };
+        self.group_call_history(&conversation, record, event, false, source).await;
+    }
+
+    /// Desktop's `updateCallHistoryForGroupCallOnLocalChanged`: in the
+    /// call, once we know its era and who started it, joining someone's
+    /// call accepts it, and joining ours has it ringing (Desktop's
+    /// `getLocalCallEventFromJoinState`). Each change is recorded once.
+    async fn record_join_state(&self, client_id: ClientId) {
+        let me = self.self_aci();
+        let (conversation, record, event) = {
+            let mut call = self.group_call.borrow_mut();
+            let Some(call) = call.as_mut().filter(|g| g.client_id == Some(client_id) && g.joined) else { return };
+            let Some(record) = call.record(&me) else { return };
+            let event = if record.incoming { CallHistoryEvent::Accepted } else { CallHistoryEvent::Ringing };
+            if call.recorded == Some(event) {
+                return;
+            }
+            call.recorded = Some(event);
+            (call.conversation.clone(), record, event)
+        };
+        self.group_call_history(&conversation, record, event, true, HistorySource::Local).await;
+    }
+
+    /// Applies an event to a group call's record (Desktop's
+    /// `updateCallHistoryFromLocalEvent`), and tells our other devices once
+    /// we've accepted it: of a group call's statuses, Desktop syncs only
+    /// that one (`statusToProto`; the declined one it would send, other
+    /// devices refuse for a group call).
+    pub(super) async fn group_call_history(
+        &self,
+        conversation: &ConversationId,
+        record: GroupCallRecord,
+        event: CallHistoryEvent,
+        active: bool,
+        source: HistorySource,
+    ) {
+        let only_new = source == HistorySource::IfNew;
+        let change = match self.db.apply_group_call_event(conversation, &record, event, active, only_new).await {
+            Ok(Some(change)) => change,
+            Ok(None) => return,
+            Err(error) => return self.error("failed to record the call", error),
+        };
+        self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id: change.id });
+        self.emit(Event::ConversationsChanged);
+        // A call notice may have started disappearing.
+        self.expiry.notify_one();
+        if source == HistorySource::Local
+            && change.status == GroupCallStatus::Accepted
+            && change.previous != Some(GroupCallStatus::Accepted)
+            && let Some(key) = conversation.as_group().and_then(|k| <[u8; 32]>::try_from(k).ok())
+        {
+            self.sync_group_call_event(key, record.call_id, change.sent_at, change.incoming);
+        }
+    }
+
+    /// Desktop's call event sync for a group call we accepted
+    /// (`getProtoForCallHistory`): the group's identifier, the call id and
+    /// its time.
+    fn sync_group_call_event(&self, key: [u8; 32], call_id: i64, at: i64, incoming: bool) {
+        use presage::proto::sync_message::call_event::{Direction, Event as CallEventKind, Type};
+        let event = presage::proto::sync_message::CallEvent {
+            conversation_id: Some(crate::groups::group_identifier(key)),
+            call_id: Some(call_id as u64),
+            timestamp: Some(at as u64),
+            r#type: Some(Type::GroupCall.into()),
+            direction: Some(if incoming { Direction::Incoming } else { Direction::Outgoing }.into()),
+            event: Some(CallEventKind::Accepted.into()),
+        };
+        self.enqueue(Outbound::Sync {
+            body: SyncMessage {
+                content: Some(sync_message::Content::CallEvent(event)),
+                ..SyncMessage::with_padding(&mut rand::rng())
+            },
+        });
     }
 
     /// Desktop's `groupCallUpdate`, sent on joining (once we know the
     /// call's era), so the group sees "… started a group call" (once per
     /// era) and looks for the call.
     async fn announce_group_call(&self, client_id: ClientId) {
-        let (conversation, era, starter) = {
+        let (conversation, era) = {
             let mut call = self.group_call.borrow_mut();
             let Some(call) = call.as_mut().filter(|g| g.client_id == Some(client_id) && g.joined && !g.announced) else {
                 return;
             };
             let Some(era) = call.era.clone() else { return };
             call.announced = true;
-            (call.conversation.clone(), era, call.starter)
+            (call.conversation.clone(), era)
         };
-        let Some(context) = self.group_context(&conversation).await else { return };
+        self.send_group_call_update(&conversation, era).await;
+    }
+
+    async fn send_group_call_update(&self, conversation: &ConversationId, era: String) {
+        let Some(context) = self.group_context(conversation).await else { return };
         let timestamp = self.next_timestamp() as u64;
         let data = DataMessage {
             group_v2: Some(context),
-            group_call_update: Some(data_message::GroupCallUpdate { era_id: Some(era.clone()) }),
+            group_call_update: Some(data_message::GroupCallUpdate { era_id: Some(era) }),
             timestamp: Some(timestamp),
             ..Default::default()
         };
         self.enqueue(Outbound::Send { conversation: conversation.clone(), body: data.into(), timestamp, message: None });
-        // Joining someone's call isn't starting one; theirs said so already.
-        if starter {
-            self.on_group_call_started(conversation, None, Some(era), timestamp as i64).await;
-        }
     }
 
+    /// Someone's `groupCallUpdate` (or ours, from another device): a call
+    /// in the history if it's new to us. Desktop peeks the call first and
+    /// takes who started it from the calling server; we take the sender,
+    /// which is who started it unless they joined someone else's.
     pub(super) async fn on_group_call_started(&self, conversation: ConversationId, by: Option<String>, era: Option<String>, at: i64) {
-        match self.db.record_group_call(&conversation, at, &Notice::GroupCall { by, era }).await {
-            Ok(Some(id)) => {
-                self.emit(Event::MessageChanged { conversation, message_id: id });
-                self.emit(Event::ConversationsChanged);
-            }
-            Ok(None) => {}
-            Err(error) => self.error("failed to add notice", error),
-        }
+        // Without an era there's no call to name (Desktop records none).
+        let Some(era) = era else { return };
+        let call_id = signal_calls::call_id_from_era(&era);
+        let active = self.group_call.borrow().as_ref().is_some_and(|g| g.conversation == conversation && g.era.as_deref() == Some(&era));
+        let record = GroupCallRecord { call_id, era: Some(era), incoming: by.is_some(), by, at };
+        self.group_call_history(&conversation, record, CallHistoryEvent::Started, active, HistorySource::IfNew).await;
     }
 
     fn group_key(&self, client_id: ClientId) -> Option<[u8; 32]> {

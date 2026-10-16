@@ -266,9 +266,9 @@ impl Actor {
     }
 
     /// Declines, ends, or stops calling.
-    pub(super) fn hang_up(&self) {
+    pub(super) async fn hang_up(&self) {
         if self.call.borrow().is_none() {
-            self.end_group_call();
+            self.end_group_call().await;
             return;
         }
         self.with_calls(|calls| calls.hangup());
@@ -473,12 +473,15 @@ impl Actor {
             video: call.video,
             outcome,
             call_id: call.call_id.map(|id| id.as_u64() as i64),
+            unseen: false,
         };
         match self.db.record_call(&call.conversation, call.started_at, &notice).await {
             Ok(Some(id)) => self.emit(Event::MessageChanged { conversation: call.conversation.clone(), message_id: id }),
             Ok(None) => {}
             Err(error) => self.error("failed to record the call", error),
         }
+        // Its notice may have started disappearing (Desktop's `disappearingCalls`).
+        self.expiry.notify_one();
         // Our other devices' call history (all of them saw a missed call
         // ring, so that one needs no word).
         if let (Some(call_id), false) = (call.call_id, outcome == CallOutcome::Missed) {
@@ -514,21 +517,54 @@ impl Actor {
     pub(super) async fn on_call_event(&self, event: crate::mapping::CallEventSync) {
         let conversation = ConversationId::direct(&event.peer);
         let result = match event.outcome {
-            None => self.db.remove_call(&conversation, event.call_id).await.map(|id| id.into_iter().collect::<Vec<_>>()),
+            None => match self.db.remove_call(&conversation, event.call_id).await {
+                Ok(Some(id)) => return self.remove_message(&conversation, id).await,
+                Ok(None) => return,
+                Err(error) => Err(error),
+            },
             Some(outcome) => {
-                let notice = Notice::Call { incoming: event.incoming, video: event.video, outcome, call_id: Some(event.call_id) };
-                self.db.record_call(&conversation, event.timestamp, &notice).await.map(|id| id.into_iter().collect())
+                let notice =
+                    Notice::Call { incoming: event.incoming, video: event.video, outcome, call_id: Some(event.call_id), unseen: false };
+                self.db.record_call(&conversation, event.timestamp, &notice).await
             }
         };
         match result {
-            Ok(ids) => {
-                for id in ids {
+            Ok(id) => {
+                if let Some(id) = id {
                     self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id: id });
                 }
                 self.emit(Event::ConversationsChanged);
+                self.expiry.notify_one();
             }
             Err(error) => self.error("failed to record a call", error),
         }
+    }
+
+    /// A group call's event from another of our devices (Desktop's
+    /// `updateCallHistoryFromRemoteEvent`): they joined it, or deleted it
+    /// from the call history. (Desktop refuses the other events for a group
+    /// call.)
+    pub(super) async fn on_group_call_event(&self, event: crate::mapping::GroupCallEventSync) {
+        let Some(manager) = self.manager() else { return };
+        let Some(key) = self.group_for_id(&manager, &event.group_id).await else { return };
+        let conversation = ConversationId::group(&key);
+        if !event.accepted {
+            match self.db.remove_group_call(&conversation, event.call_id).await {
+                Ok(Some(id)) => self.remove_message(&conversation, id).await,
+                Ok(None) => {}
+                Err(error) => self.error("failed to delete a call", error),
+            }
+            return;
+        }
+        let active = self.active_group_call_id().is_some_and(|(c, id)| c == conversation && id == event.call_id);
+        let record = signal_store::GroupCallRecord {
+            call_id: event.call_id,
+            era: None,
+            by: None,
+            incoming: event.incoming,
+            at: event.timestamp,
+        };
+        self.group_call_history(&conversation, record, signal_store::CallHistoryEvent::Accepted, active, super::group_calls::HistorySource::OtherDevice).await;
     }
 
     /// Their identity key and ours, without the type byte (as Desktop passes

@@ -13,7 +13,7 @@ mod camera;
 mod group;
 mod screen;
 
-pub use group::{GroupEvent, GroupFrames, Participant, Peek, Ring, SFU_URL};
+pub use group::{GroupEvent, GroupFrames, Participant, Peek, Ring, SFU_URL, call_id_from_era};
 pub use ringrtc::core::group_call::{ClientId, RingCancelReason};
 pub use ringrtc::lite::http::{Method as HttpMethod, Request as HttpRequest, Response as HttpResponse};
 pub use ringrtc::lite::sfu::{DemuxId, GroupMember};

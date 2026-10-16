@@ -118,6 +118,10 @@ pub enum Action {
     GroupCallStarted { conversation: ConversationId, by: Option<String>, era: Option<String>, at: i64 },
     /// Another of our devices' record of a 1:1 call.
     CallEvent(CallEventSync),
+    /// Another of our devices' record of a group call.
+    GroupCallEvent(GroupCallEventSync),
+    /// Another of our devices cleared or read its call history.
+    CallLogEvent(CallLogEventSync),
     /// Our other device marked a contact's identity key verified (or not).
     Verified { aci: String, identity_key: Vec<u8>, verified: bool },
     /// Our primary device changed the Storage Service (pins, names, ...).
@@ -1082,10 +1086,17 @@ fn map_sync(sync: &SyncMessage, envelope_ts: i64, ctx: &MapContext) -> Vec<Actio
     if !reads.is_empty() {
         out.push(Action::ReadSync(reads));
     }
-    if let Some(sync_message::Content::CallEvent(event)) = &sync.content
-        && let Some(sync) = call_event(event)
+    if let Some(sync_message::Content::CallEvent(event)) = &sync.content {
+        if let Some(sync) = call_event(event) {
+            out.push(Action::CallEvent(sync));
+        } else if let Some(sync) = group_call_event(event) {
+            out.push(Action::GroupCallEvent(sync));
+        }
+    }
+    if let Some(sync_message::Content::CallLogEvent(event)) = &sync.content
+        && let Some(sync) = call_log_event(event, envelope_ts)
     {
-        out.push(Action::CallEvent(sync));
+        out.push(Action::CallLogEvent(sync));
     }
     if let Some(sync_message::Content::Verified(v)) = &sync.content
         && let Some(aci) = parse_aci_with_fallback(v.destination_aci_binary.as_deref(), v.destination_aci.as_deref())
@@ -1274,8 +1285,7 @@ pub fn quoted_attachments(
 #[cfg(test)]
 mod tests;
 
-/// A call event from another of our devices (1:1 calls; group calls
-/// aren't recorded here).
+/// A call event from another of our devices about a 1:1 call.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CallEventSync {
     /// Their ACI.
@@ -1317,5 +1327,85 @@ fn call_event(event: &sync_message::CallEvent) -> Option<CallEventSync> {
         video,
         incoming,
         outcome,
+    })
+}
+
+/// A group call's event from another of our devices (Desktop's
+/// `getCallEventForProto` with a `GROUP_CALL` type).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupCallEventSync {
+    /// The group's identifier.
+    pub group_id: Vec<u8>,
+    pub call_id: i64,
+    pub timestamp: i64,
+    pub incoming: bool,
+    /// They joined it; `false`: they deleted it from the call history.
+    pub accepted: bool,
+}
+
+fn group_call_event(event: &sync_message::CallEvent) -> Option<GroupCallEventSync> {
+    use sync_message::call_event::{Direction, Event, Type};
+    if event.r#type() != Type::GroupCall {
+        return None;
+    }
+    let incoming = match event.direction() {
+        Direction::Incoming => true,
+        Direction::Outgoing => false,
+        Direction::UnknownDirection => return None,
+    };
+    // Desktop throws on the others for a group call.
+    let accepted = match event.event() {
+        Event::Accepted => true,
+        Event::Delete => false,
+        _ => return None,
+    };
+    Some(GroupCallEventSync {
+        group_id: event.conversation_id.clone()?,
+        call_id: event.call_id? as i64,
+        timestamp: event.timestamp? as i64,
+        incoming,
+        accepted,
+    })
+}
+
+/// What a call log event asks (Desktop's `CallLogEvent`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallLogKind {
+    Clear,
+    MarkedAsRead,
+    MarkedAsReadInConversation,
+}
+
+/// Another of our devices cleared or read its call history up to a call.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallLogEventSync {
+    pub kind: CallLogKind,
+    /// The call's chat: an ACI's 16 bytes or a group's identifier (or a
+    /// call link's room id, which names nothing here).
+    pub conversation: Option<Vec<u8>>,
+    pub call_id: Option<i64>,
+    /// The call's time.
+    pub timestamp: i64,
+    /// When they did it (the sync's own time).
+    pub at: i64,
+}
+
+fn call_log_event(event: &sync_message::CallLogEvent, envelope_ts: i64) -> Option<CallLogEventSync> {
+    use sync_message::call_log_event::Type;
+    // An unknown (newer) type is refused, not read as the default `Clear`;
+    // a missing one is proto2's default, `Clear`.
+    let kind = match Type::try_from(event.r#type.unwrap_or_default()).ok()? {
+        Type::Clear => CallLogKind::Clear,
+        Type::MarkedAsRead => CallLogKind::MarkedAsRead,
+        Type::MarkedAsReadInConversation => CallLogKind::MarkedAsReadInConversation,
+        // Desktop doesn't do it either (`UNIMPLEMENTED_ClearInConversation`).
+        Type::ClearInConversation => return None,
+    };
+    Some(CallLogEventSync {
+        kind,
+        conversation: event.conversation_id.clone(),
+        call_id: event.call_id.map(|id| id as i64),
+        timestamp: event.timestamp? as i64,
+        at: envelope_ts,
     })
 }

@@ -587,8 +587,61 @@ fn sync_call_event() {
     assert!(matches!(&declined[..], [Action::CallEvent(e)] if e.outcome == Some(signal_store::CallOutcome::Declined)));
     let deleted = map_content(&content(ME, event(Type::AudioCall, Direction::Outgoing, Event::Delete)), &ctx());
     assert!(matches!(&deleted[..], [Action::CallEvent(e)] if e.outcome.is_none()));
-    // Group calls aren't recorded this way.
-    assert!(map_content(&content(ME, event(Type::GroupCall, Direction::Incoming, Event::Accepted)), &ctx()).is_empty());
+}
+
+#[test]
+fn sync_group_call_events() {
+    use presage::proto::sync_message::call_event::{Direction, Event, Type};
+    let event = |direction: Direction, event: Event| SyncMessage {
+        content: Some(sync_message::Content::CallEvent(sync_message::CallEvent {
+            conversation_id: Some(vec![9; 32]),
+            call_id: Some(7),
+            timestamp: Some(400),
+            r#type: Some(Type::GroupCall.into()),
+            direction: Some(direction.into()),
+            event: Some(event.into()),
+        })),
+        ..Default::default()
+    };
+    assert_eq!(
+        map_content(&content(ME, event(Direction::Incoming, Event::Accepted)), &ctx()),
+        vec![Action::GroupCallEvent(GroupCallEventSync { group_id: vec![9; 32], call_id: 7, timestamp: 400, incoming: true, accepted: true })]
+    );
+    let deleted = map_content(&content(ME, event(Direction::Outgoing, Event::Delete)), &ctx());
+    assert!(matches!(&deleted[..], [Action::GroupCallEvent(e)] if !e.accepted && !e.incoming));
+    // Desktop refuses "not accepted" and "observed" for a group call.
+    assert!(map_content(&content(ME, event(Direction::Incoming, Event::NotAccepted)), &ctx()).is_empty());
+    assert!(map_content(&content(ME, event(Direction::Incoming, Event::Observed)), &ctx()).is_empty());
+}
+
+#[test]
+fn sync_call_log_events() {
+    use presage::proto::sync_message::call_log_event::Type;
+    let event = |kind: Type, call_id: Option<u64>| SyncMessage {
+        content: Some(sync_message::Content::CallLogEvent(sync_message::CallLogEvent {
+            r#type: Some(kind.into()),
+            timestamp: Some(300),
+            conversation_id: Some(vec![1; 16]),
+            call_id,
+        })),
+        ..Default::default()
+    };
+    assert_eq!(
+        map_content(&content(ME, event(Type::Clear, Some(u64::MAX))), &ctx()),
+        vec![Action::CallLogEvent(CallLogEventSync {
+            kind: CallLogKind::Clear,
+            conversation: Some(vec![1; 16]),
+            call_id: Some(-1),
+            timestamp: 300,
+            at: 500,
+        })]
+    );
+    let read = map_content(&content(ME, event(Type::MarkedAsReadInConversation, None)), &ctx());
+    assert!(matches!(&read[..], [Action::CallLogEvent(e)] if e.kind == CallLogKind::MarkedAsReadInConversation && e.call_id.is_none()));
+    let read = map_content(&content(ME, event(Type::MarkedAsRead, None)), &ctx());
+    assert!(matches!(&read[..], [Action::CallLogEvent(e)] if e.kind == CallLogKind::MarkedAsRead));
+    // Desktop doesn't clear one chat's calls either.
+    assert!(map_content(&content(ME, event(Type::ClearInConversation, None)), &ctx()).is_empty());
 }
 
 #[test]

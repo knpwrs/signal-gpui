@@ -52,6 +52,9 @@ pub struct Peek {
     /// The call's era: changes each time it empties and starts again.
     pub era_id: Option<String>,
     pub max_devices: Option<u32>,
+    /// Who started it (their ACI's bytes): Desktop's call history takes
+    /// the call's direction and ringer from this.
+    pub creator: Option<Vec<u8>>,
 }
 
 impl From<&PeekInfo> for Peek {
@@ -60,6 +63,7 @@ impl From<&PeekInfo> for Peek {
             users: info.devices.iter().filter_map(|d| d.user_id.clone()).collect(),
             era_id: info.era_id.clone(),
             max_devices: info.max_devices,
+            creator: info.creator.clone(),
         }
     }
 }
@@ -69,8 +73,11 @@ impl From<&PeekInfo> for Peek {
 pub enum Ring {
     /// They're ringing us.
     Requested,
-    /// It's over: expired, answered or declined elsewhere, busy, or
-    /// cancelled.
+    /// Another of our devices answered it.
+    AcceptedElsewhere,
+    /// It's over unanswered: expired, declined elsewhere, busy, or
+    /// cancelled. (Desktop's call history counts each as missed:
+    /// `ringUpdateToEvent` in `ts/util/callDisposition.preload.ts`.)
     Over,
 }
 
@@ -78,9 +85,16 @@ impl From<RingUpdate> for Ring {
     fn from(update: RingUpdate) -> Self {
         match update {
             RingUpdate::Requested => Self::Requested,
+            RingUpdate::AcceptedOnAnotherDevice => Self::AcceptedElsewhere,
             _ => Self::Over,
         }
     }
+}
+
+/// A group call's id for the call history, from its era (RingRTC's
+/// `callIdFromEra`; a ring's id is the same number), its bits as an i64.
+pub fn call_id_from_era(era: &str) -> i64 {
+    group_call::RingId::from_era_id(era).into()
 }
 
 /// What a group call reports.
@@ -153,6 +167,16 @@ impl VideoSink for GroupSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn call_ids_come_from_eras_as_ringrtcs_do() {
+        // Sixteen hex digits are the id itself (RingRTC's usual case).
+        assert_eq!(call_id_from_era("00000000000000ff"), 255);
+        assert_eq!(call_id_from_era("ffffffffffffffff"), -1);
+        // Anything else is hashed, the same each time.
+        assert_eq!(call_id_from_era("not hex"), call_id_from_era("not hex"));
+        assert_ne!(call_id_from_era("not hex"), call_id_from_era("other"));
+    }
 
     #[test]
     fn each_participant_has_a_slot() {

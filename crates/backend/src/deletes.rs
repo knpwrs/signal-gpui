@@ -185,7 +185,7 @@ mod tests {
         assert_eq!(can_send_as_admin(&old, GROUP, now), Err("too old"));
         let deleted = Message { deleted: true, ..theirs.clone() };
         assert_eq!(can_send_as_admin(&deleted, GROUP, now), Err("already deleted"));
-        let notice = Message { notice: Some(signal_store::Notice::GroupCall { by: None, era: None }), ..theirs };
+        let notice = Message { notice: Some(signal_store::Notice::GroupCall { by: None, era: None, call_id: None, status: None, incoming: false, unseen: false }), ..theirs };
         assert_eq!(can_send_as_admin(&notice, GROUP, now), Err("not a message"));
     }
 

@@ -261,6 +261,13 @@ pub enum Command {
     LoadCallDevices,
     /// Chooses a device for calls (`id` from `Event::CallDevices`), saved.
     SetCallDevice { kind: DeviceKind, id: String },
+    /// Marks the call history read up to its latest call (`None`: every
+    /// chat, as Desktop does when the Calls tab is viewed), and tells our
+    /// other devices. Reading a chat does this for its calls.
+    MarkCallsRead { conversation: Option<ConversationId> },
+    /// Clears the call history (Desktop's "Clear call history"), here and
+    /// on our other devices.
+    ClearCallHistory,
     /// Unlinks this device and wipes local state.
     Unlink,
     /// Stops waiting for the history transfer and continues without it.

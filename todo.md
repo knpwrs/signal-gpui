@@ -31,7 +31,8 @@ flag as on whenever it's set.
 | `sendMessageViaLibsignal` | Sending through libsignal's network stack. | Not applicable. |
 | `keyTransparency` | Key transparency checks in safety numbers. | Not done: safety numbers are shown and can be verified, without key transparency. |
 | `localBackups` | Local (on-disk) backups. | Not applicable. |
-| `disappearingCalls`, `remoteMute.send` | Calls. | Not done: call notices don't follow the disappearing timer, and there's no remote mute. |
+| `disappearingCalls` | Call notices follow the chat's disappearing timer. | Done, always on: a call's notice takes the chat's timer and counts down once it's seen and the call is over (`signal_store::call_history`). |
+| `remoteMute.send` | Muting someone in a group call. | Not done: there's no remote mute. |
 
 ### Limits (`global.*`), with Desktop's defaults
 
@@ -143,17 +144,21 @@ drives RingRTC v2.72.1 with Signal's prebuilt WebRTC, signaling travels as
 with a membership proof from `GET /v1/groups/token`. Not done yet:
 
 - **Call links** and adhoc calls.
-- **Group call history:** a group call leaves "… started a group call" in
-  the chat, but no call event is synced for it, and joining or missing one
-  isn't recorded the way Desktop's call history does.
+- **Group call history** (Desktop's `callDisposition`): Desktop peeks a
+  group's call when a `groupCallUpdate` arrives and takes who started it
+  from the calling server; we take the message's sender. A group call's
+  notice doesn't say "The video call has ended" once it's over, since that
+  needs each chat's live call state. Our own decline is recorded as
+  declined (Desktop's transition allows it, but Desktop's decline leaves
+  the ring's record as it was). Tested with store, mapping and demo-mode
+  tests, not between real devices.
 - **Group call extras:** reactions, raised hands, remote mute, the speaker
   view (the grid is all there is), and paging through more participants
   than fit on screen.
 - **Live testing:** written against RingRTC's API and Desktop's behavior,
   checked with unit tests and demo-mode flow tests; not yet tried between
   real devices (group calls least of all).
-- **Related flags:** `disappearingCalls` (call events follow the chat's
-  disappearing timer) and `remoteMute.send` (muting someone in a group call),
+- **Related flags:** `remoteMute.send` (muting someone in a group call),
   listed above.
 - **libsignal versions:** RingRTC pins libsignal v0.99.1 for zkgroup while
   presage uses v0.99.0; both build side by side. Keep RingRTC's pin in step

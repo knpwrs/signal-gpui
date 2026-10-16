@@ -950,7 +950,7 @@ mod tests {
         let id = maya.clone();
         let messages = futures::executor::block_on(backend.spawn(async move { db.messages(&id, None, 50).await })).unwrap();
         let notice = messages.iter().rev().find_map(|m| m.notice.clone());
-        assert_eq!(notice, Some(Notice::Call { incoming: false, video: true, outcome: CallOutcome::Accepted, call_id: None }));
+        assert_eq!(notice, Some(Notice::Call { incoming: false, video: true, outcome: CallOutcome::Accepted, call_id: None, unseen: false }));
         backend.shutdown();
     }
 
@@ -1039,7 +1039,7 @@ mod tests {
         let db = backend.db().clone();
         let id = group.clone();
         let messages = futures::executor::block_on(backend.spawn(async move { db.messages(&id, None, 50).await })).unwrap();
-        assert!(messages.iter().any(|m| m.notice == Some(Notice::GroupCall { by: None, era: None })));
+        assert!(messages.iter().any(|m| matches!(m.notice, Some(Notice::GroupCall { by: None, incoming: false, status: Some(signal_store::GroupCallStatus::Generic), .. }))));
         backend.shutdown();
     }
 
