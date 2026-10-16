@@ -18,6 +18,7 @@ pub mod emoji_picker;
 pub mod forward;
 pub mod group_admin;
 pub mod image_viewer;
+pub mod lightbox;
 pub mod link;
 pub mod message_content;
 pub mod message_info;

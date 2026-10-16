@@ -48,6 +48,7 @@ gpui_kit::assets::icon_assets!(
         AtSign,
         MessageSquareCheck,
         MessageSquareDot,
+        MessageSquareShare,
         NotebookText,
         Paperclip,
         Pause,

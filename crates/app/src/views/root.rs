@@ -66,7 +66,9 @@ impl RootView {
             }),
             cx.subscribe_in(&state, window, |this, state, event: &AppEvent, window, cx| {
                 if let AppEvent::ViewImage(image) = event {
-                    let viewer = cx.new(|cx| ImageViewer::new(image.clone(), cx));
+                    // One viewer at a time: stepping from a video to a photo swaps them.
+                    this.video_viewer = None;
+                    let viewer = cx.new(|cx| ImageViewer::new(image.clone(), Some(state.clone()), cx));
                     window.focus(&viewer.focus_handle(cx), cx);
                     let closed = cx.subscribe_in(&viewer, window, |this, _, _: &ViewerEvent, window, cx| {
                         this.viewer = None;
@@ -80,7 +82,8 @@ impl RootView {
                     cx.notify();
                 }
                 if let AppEvent::ViewVideo(video) = event {
-                    let viewer = cx.new(|cx| crate::views::video_viewer::VideoViewer::new(video.clone(), cx));
+                    this.viewer = None;
+                    let viewer = cx.new(|cx| crate::views::video_viewer::VideoViewer::new(video.clone(), Some(state.clone()), cx));
                     window.focus(&viewer.focus_handle(cx), cx);
                     let closed = cx.subscribe_in(&viewer, window, |this, _, _: &ViewerEvent, window, cx| {
                         // Dropping it stops the video.

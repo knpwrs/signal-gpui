@@ -2202,6 +2202,7 @@ impl ConversationView {
             .filter(|a| a.content_type.starts_with("image/") || a.gif)
             .and_then(|a| Some((a.local_path.clone()?, media_size(a.width, a.height), viewed_image(a), a.gif)));
         if let Some((path, (width, height), viewed, gif)) = photo {
+            let photo_message = message.id;
             let header = (show_author && !outgoing) || message.quote.is_some();
             let caption = !message.body.is_empty();
             let rest = &message.attachments[1..];
@@ -2258,7 +2259,8 @@ impl ConversationView {
                         // Photos open in the viewer; GIFs just play.
                         .when_some(viewed.filter(|_| !gif), |d, viewed| {
                             d.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
-                                let image = viewed.clone();
+                                let mut image = viewed.clone();
+                                image.in_chat = Some(crate::views::lightbox::InChat::new(this.id.clone(), photo_message, 0));
                                 this.state.update(cx, |state, cx| state.view_image(image, cx));
                             }))
                         })
@@ -4071,6 +4073,7 @@ fn viewed_image(attachment: &AttachmentMeta) -> Option<ViewedImage> {
         size: attachment.width.zip(attachment.height).filter(|(w, h)| *w > 0 && *h > 0),
         file_name: attachment.file_name.clone(),
         view_once: false,
+        in_chat: None,
     })
 }
 
@@ -4252,16 +4255,14 @@ fn render_video(
                     d.child(div().text_xs().text_color(white).child(crate::views::common::format_size(size)))
                 }),
         )
-        .on_click({
-            let state = state.clone();
-            move |_, _, cx| match &path {
-                Some(path) => state.update(cx, |state, cx| {
-                    let video = crate::views::video_viewer::ViewedVideo { path: path.clone(), file_name: file_name.clone(), view_once: false };
-                    state.view_video(video, cx);
-                }),
-                None => state.read(cx).send(Command::FetchAttachment { message_id, index }),
+        .on_click(cx.listener(move |this, _, _, cx| match &path {
+            Some(path) => {
+                let in_chat = Some(crate::views::lightbox::InChat::new(this.id.clone(), message_id, index));
+                let video = crate::views::video_viewer::ViewedVideo { path: path.clone(), file_name: file_name.clone(), view_once: false, in_chat };
+                this.state.update(cx, |state, cx| state.view_video(video, cx));
             }
-        })
+            None => this.state.read(cx).send(Command::FetchAttachment { message_id, index }),
+        }))
         .into_any_element()
 }
 
@@ -4297,7 +4298,8 @@ fn render_attachment(
             .cursor_pointer()
             .when_some(viewed, |d, viewed| {
                 d.on_click(cx.listener(move |this, _, _, cx| {
-                    let image = viewed.clone();
+                    let mut image = viewed.clone();
+                    image.in_chat = Some(crate::views::lightbox::InChat::new(this.id.clone(), message_id, index));
                     this.state.update(cx, |state, cx| state.view_image(image, cx));
                 }))
             })
@@ -5154,12 +5156,17 @@ impl ConversationView {
                 self.state.update(cx, |state, cx| state.toggle_audio(id, 0, path, title, cx));
             }
             None if !first.sticker => self.state.read(cx).send(Command::FetchAttachment { message_id: id, index: 0 }),
-            Some(path) if kind.starts_with("video/") && !first.gif => self.state.update(cx, |state, cx| {
-                let video = crate::views::video_viewer::ViewedVideo { path, file_name: first.file_name.clone(), view_once: false };
-                state.view_video(video, cx);
-            }),
+            // In the lightbox, to step through the chat's media from.
+            Some(path) if kind.starts_with("video/") && !first.gif => {
+                let in_chat = Some(crate::views::lightbox::InChat::new(self.id.clone(), id, 0));
+                self.state.update(cx, |state, cx| {
+                    let video = crate::views::video_viewer::ViewedVideo { path, file_name: first.file_name.clone(), view_once: false, in_chat };
+                    state.view_video(video, cx);
+                })
+            }
             Some(_) if kind.starts_with("image/") => {
-                if let Some(image) = viewed_image(first) {
+                if let Some(mut image) = viewed_image(first) {
+                    image.in_chat = Some(crate::views::lightbox::InChat::new(self.id.clone(), id, 0));
                     self.state.update(cx, |state, cx| state.view_image(image, cx));
                 }
             }

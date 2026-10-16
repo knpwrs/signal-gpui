@@ -52,6 +52,45 @@ pub fn click_at(cx: &mut VisualTestContext, what: &'static str) {
     cx.run_until_parked();
 }
 
+/// [`demo`] with the whole app's window (the root view, which shows the
+/// viewers).
+pub fn demo_root(cx: &mut TestAppContext) -> (Backend, Entity<AppState>, VisualTestContext, tempfile::TempDir) {
+    let (backend, state, dir) = demo_state(cx);
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(gpui_kit::Bounds { origin: Default::default(), size: size(px(1000.), px(800.)) })),
+        ..Default::default()
+    };
+    let (window, _root) = cx
+        .update(|cx| {
+            let state = state.clone();
+            gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| crate::views::root::RootView::new(state, window, cx)))
+        })
+        .unwrap();
+    let cx = VisualTestContext::from_window(window, cx);
+    (backend, state, cx, dir)
+}
+
+/// The demo backend with its events pumped into the app state.
+fn demo_state(cx: &mut TestAppContext) -> (Backend, Entity<AppState>, tempfile::TempDir) {
+    cx.update(gpui_kit::init);
+    cx.executor().allow_parking();
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config { data_dir: dir.path().to_owned(), db_key: [7; 32], device_name: "test".into(), demo: true };
+    let (backend, mut events) = Backend::start(config).unwrap();
+    let state = cx.update(|cx| crate::state::new_state(backend.clone(), cx));
+    cx.update(|cx| {
+        use futures::StreamExt as _;
+        let state = state.clone();
+        cx.spawn(async move |cx| {
+            while let Some(event) = events.next().await {
+                state.update(cx, |state, cx| state.handle(event, cx));
+            }
+        })
+        .detach();
+    });
+    (backend, state, dir)
+}
+
 /// The demo backend with its events pumped into the app state as
 /// `main.rs` does, and a window (the chat list) to open dialogs in.
 pub fn demo(cx: &mut TestAppContext) -> (Backend, Entity<AppState>, VisualTestContext, tempfile::TempDir) {

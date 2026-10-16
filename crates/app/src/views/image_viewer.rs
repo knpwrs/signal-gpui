@@ -5,13 +5,14 @@ use std::path::{Path, PathBuf};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::notification::Notification;
-use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _};
+use gpui_kit::component::{Disableable as _, Sizable as _};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    App, Context, EventEmitter, FocusHandle, Focusable, Hsla, KeyDownEvent, ObjectFit, SharedString, Window,
-    div, img, px,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla, KeyDownEvent, ObjectFit, SharedString, Window, div, img, px,
 };
+
+use crate::state::AppState;
+use crate::views::lightbox::{self, InChat};
 
 const TOOLBAR_HEIGHT: f32 = 52.;
 const MARGIN: f32 = 24.;
@@ -28,6 +29,9 @@ pub struct ViewedImage {
     /// A view-once message's copy (`Event::ViewOnceOpened`): it can't be
     /// saved, and the file is deleted when the viewer closes.
     pub view_once: bool,
+    /// Its place in its chat, for the lightbox's previous and next,
+    /// Forward and "Go to message".
+    pub in_chat: Option<InChat>,
 }
 
 pub enum ViewerEvent {
@@ -36,6 +40,7 @@ pub enum ViewerEvent {
 
 pub struct ImageViewer {
     image: ViewedImage,
+    state: Option<Entity<AppState>>,
     /// `None`: fit the window. Otherwise a scale up to 1 (100%).
     zoom: Option<f32>,
     focus: FocusHandle,
@@ -50,11 +55,48 @@ impl Focusable for ImageViewer {
 }
 
 impl ImageViewer {
-    pub fn new(image: ViewedImage, cx: &mut Context<Self>) -> Self {
+    pub fn new(image: ViewedImage, state: Option<Entity<AppState>>, cx: &mut Context<Self>) -> Self {
         if image.view_once {
             delete_on_release(image.path.clone(), cx);
         }
-        Self { image, zoom: None, focus: cx.focus_handle() }
+        if let (Some(state), Some(in_chat)) = (&state, image.in_chat.as_ref().filter(|c| c.gallery.is_none())) {
+            let this = cx.weak_entity();
+            lightbox::load(state, in_chat.conversation.clone(), cx, move |items, cx| {
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(in_chat) = &mut this.image.in_chat {
+                        in_chat.gallery = Some(std::rc::Rc::new(items));
+                    }
+                    cx.notify();
+                });
+            });
+        }
+        Self { image, state, zoom: None, focus: cx.focus_handle() }
+    }
+
+    /// Desktop's previous and next (not while zoomed in).
+    fn step(&mut self, by: isize, cx: &mut Context<Self>) {
+        if self.zoom.is_some() {
+            return;
+        }
+        let (Some(state), Some(in_chat)) = (&self.state, &self.image.in_chat) else { return };
+        if let Some(item) = in_chat.step(by) {
+            lightbox::show(state, in_chat, &item, cx);
+        }
+    }
+
+    fn can_step(&self, by: isize) -> bool {
+        self.zoom.is_none() && self.state.is_some() && self.image.in_chat.as_ref().is_some_and(|c| c.step(by).is_some())
+    }
+
+    /// Forward, or going to its message: the lightbox closes first.
+    fn leave_for(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(state), Some(in_chat)) = (self.state.clone(), self.image.in_chat.clone()) else { return };
+        cx.emit(ViewerEvent::Close);
+        if forward {
+            lightbox::forward(&state, &in_chat, window, cx);
+        } else {
+            lightbox::go_to(&state, &in_chat, cx);
+        }
     }
 
     fn fit_scale(&self, area: (f32, f32)) -> f32 {
@@ -92,30 +134,27 @@ impl ImageViewer {
         }
     }
 
-    fn download(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let source = self.image.path.clone();
-        let name = download_name(&self.image);
-        let result = dirs_downloads().and_then(|dir| save_copy(&source, &dir, &name).map_err(|e| e.to_string()));
-        let note = match result {
-            Ok(target) => {
-                let shown = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                Notification::new().message(format!("Saved to Downloads as {shown}"))
-            }
-            Err(error) => {
-                tracing::warn!(%error, "failed to save image");
-                Notification::error("Couldn't save the image to Downloads.")
-            }
-        };
-        window.push_notification(note, cx);
+    /// Desktop's Save: a save dialog.
+    fn save(&self, cx: &mut Context<Self>) {
+        lightbox::save_as(self.image.path.clone(), download_name(&self.image), cx);
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let area = available_area(window);
+        // Desktop's lightbox: ⌘S saves the one shown (not a view-once copy).
+        if event.keystroke.modifiers.platform && event.keystroke.key == "s" {
+            if !self.image.view_once {
+                self.save(cx);
+            }
+            return cx.stop_propagation();
+        }
         match event.keystroke.key.as_str() {
             "escape" => cx.emit(ViewerEvent::Close),
             "=" | "+" => self.zoom_by(ZOOM_STEP, area, cx),
             "-" => self.zoom_by(1. / ZOOM_STEP, area, cx),
             "0" => self.actual_size(cx),
+            "left" => self.step(-1, cx),
+            "right" => self.step(1, cx),
             _ => return,
         }
         cx.stop_propagation();
@@ -144,13 +183,6 @@ fn fit_scale(size: Option<(u32, u32)>, area: (f32, f32)) -> f32 {
 fn available_area(window: &Window) -> (f32, f32) {
     let size = window.viewport_size();
     (f32::from(size.width) - MARGIN * 2., f32::from(size.height) - TOOLBAR_HEIGHT - MARGIN * 2.)
-}
-
-fn dirs_downloads() -> Result<PathBuf, String> {
-    let home = std::env::var_os("HOME").ok_or("no home directory")?;
-    let dir = PathBuf::from(home).join("Downloads");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    Ok(dir)
 }
 
 /// The sent file name, else `signal-<time>.<ext>` like Desktop.
@@ -218,12 +250,7 @@ impl gpui_kit::Render for ImageViewer {
         let can_zoom = self.image.size.is_some();
         let fit = self.fit_scale(area);
         let white = Hsla { h: 0., s: 0., l: 1., a: 1. };
-        let title: SharedString = self
-            .image
-            .file_name
-            .clone()
-            .unwrap_or_default()
-            .into();
+        let in_chat = self.image.in_chat.as_ref().filter(|_| self.state.is_some() && !self.image.view_once);
 
         div()
             .id("image-viewer")
@@ -246,7 +273,7 @@ impl gpui_kit::Render for ImageViewer {
                     .px_4()
                     // Clear the macOS traffic lights.
                     .pl(px(92.))
-                    .child(div().flex_1().min_w_0().truncate().text_sm().child(title))
+                    .child(lightbox::header(self.image.in_chat.as_ref(), self.image.file_name.as_deref()))
                     .child(
                         Button::new("zoom-out")
                             .ghost()
@@ -278,15 +305,33 @@ impl gpui_kit::Render for ImageViewer {
                             .disabled(!can_zoom || scale >= 0.999)
                             .on_click(cx.listener(|this, _, _, cx| this.actual_size(cx))),
                     )
-                    // A view-once photo can't be saved (Desktop's lightbox
-                    // hides its save button for one).
+                    // Desktop's Forward and Save, which a view-once photo
+                    // hasn't; and its message in the chat.
+                    .when(in_chat.is_some(), |d| {
+                        d.child(
+                            Button::new("forward-image")
+                                .ghost()
+                                .small()
+                                .icon(IconName::Forward)
+                                .tooltip("Forward")
+                                .on_click(cx.listener(|this, _, window, cx| this.leave_for(true, window, cx))),
+                        )
+                        .child(
+                            Button::new("go-to-image-message")
+                                .ghost()
+                                .small()
+                                .icon(IconName::MessageSquareShare)
+                                .tooltip("Go to message")
+                                .on_click(cx.listener(|this, _, window, cx| this.leave_for(false, window, cx))),
+                        )
+                    })
                     .when(!self.image.view_once, |d| d.child(
                         Button::new("download-image")
                             .ghost()
                             .small()
                             .icon(IconName::Download)
-                            .tooltip("Save to Downloads")
-                            .on_click(cx.listener(|this, _, window, cx| this.download(window, cx))),
+                            .tooltip("Save")
+                            .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
                     ))
                     .child(
                         Button::new("close-image")
@@ -302,6 +347,7 @@ impl gpui_kit::Render for ImageViewer {
                 // image closes, like Desktop.
                 div()
                     .id("image-viewer-area")
+                    .relative()
                     .flex_1()
                     .min_h_0()
                     .overflow_scroll()
@@ -330,6 +376,24 @@ impl gpui_kit::Render for ImageViewer {
                             ),
                     ),
             )
+            // Desktop's previous and next, over the sides.
+            .children([(-1, "lightbox-previous", IconName::ChevronLeft), (1, "lightbox-next", IconName::ChevronRight)].map(
+                |(by, id, icon)| {
+                    self.can_step(by).then(|| {
+                        div()
+                            .absolute()
+                            .top(px(TOOLBAR_HEIGHT))
+                            .bottom_0()
+                            .w(px(80.))
+                            .when(by < 0, |d| d.left_0())
+                            .when(by > 0, |d| d.right_0())
+                            .child(lightbox::nav_button(id, icon, by < 0).on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.step(by, cx);
+                            })))
+                    })
+                },
+            ).into_iter().flatten())
     }
 }
 
@@ -345,6 +409,7 @@ mod tests {
             size: None,
             file_name: name.map(Into::into),
             view_once: false,
+            in_chat: None,
         };
         assert_eq!(download_name(&image(Some("../../etc/passwd"))), "etcpasswd");
         assert!(download_name(&image(None)).starts_with("signal-") && download_name(&image(None)).ends_with(".png"));
@@ -359,7 +424,7 @@ mod tests {
     fn opens_fitted_and_zooms_to_actual_size(cx: &mut gpui_kit::TestAppContext) {
         use gpui_kit::{AppContext as _, VisualTestContext, WindowBounds, WindowOptions, size};
         cx.update(gpui_kit::init);
-        let image = ViewedImage { path: PathBuf::from("/nonexistent.png"), size: Some((4000, 3000)), file_name: None, view_once: false };
+        let image = ViewedImage { path: PathBuf::from("/nonexistent.png"), size: Some((4000, 3000)), file_name: None, view_once: false, in_chat: None };
         let (window, viewer) = cx.update(|cx| {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(gpui_kit::Bounds {
@@ -368,7 +433,7 @@ mod tests {
                 })),
                 ..Default::default()
             };
-            gpui_kit::open_window(options, cx, |_, cx| cx.new(|cx| ImageViewer::new(image, cx))).unwrap()
+            gpui_kit::open_window(options, cx, |_, cx| cx.new(|cx| ImageViewer::new(image, None, cx))).unwrap()
         });
         let mut cx = VisualTestContext::from_window(window, cx);
         let shown = |cx: &mut VisualTestContext| {
@@ -406,9 +471,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("copy.png");
         std::fs::write(&path, b"").unwrap();
-        let image = ViewedImage { path: path.clone(), size: Some((10, 10)), file_name: None, view_once: true };
+        let image = ViewedImage { path: path.clone(), size: Some((10, 10)), file_name: None, view_once: true, in_chat: None };
         let (window, viewer) = cx.update(|cx| {
-            gpui_kit::open_window(Default::default(), cx, |_, cx| cx.new(|cx| ImageViewer::new(image, cx))).unwrap()
+            gpui_kit::open_window(Default::default(), cx, |_, cx| cx.new(|cx| ImageViewer::new(image, None, cx))).unwrap()
         });
         // Only the window holds it now.
         drop(viewer);

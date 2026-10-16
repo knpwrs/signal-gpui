@@ -86,9 +86,9 @@ fn empty(text: &'static str, palette: Palette) -> gpui_kit::AnyElement {
 fn media_grid(messages: &[Message], state: &Entity<AppState>, palette: Palette) -> gpui_kit::AnyElement {
     let tiles: Vec<_> = messages
         .iter()
-        .flat_map(|m| m.attachments.iter())
-        .filter(|a| !a.sticker && !a.gif && a.content_type.starts_with("image/"))
-        .filter_map(|a| Some((a.local_path.clone()?, a.clone())))
+        .flat_map(|m| m.attachments.iter().enumerate().map(move |(index, a)| (m, index, a)))
+        .filter(|(_, _, a)| !a.sticker && !a.gif && a.content_type.starts_with("image/"))
+        .filter_map(|(m, index, a)| Some((a.local_path.clone()?, a.clone(), m.conversation_id.clone(), m.id, index)))
         .collect();
     if tiles.is_empty() {
         return empty("No media", palette);
@@ -97,13 +97,14 @@ fn media_grid(messages: &[Message], state: &Entity<AppState>, palette: Palette) 
         .flex()
         .flex_wrap()
         .gap_1()
-        .children(tiles.into_iter().enumerate().map(|(ix, (path, meta))| {
+        .children(tiles.into_iter().enumerate().map(|(ix, (path, meta, conversation, message_id, index))| {
             let state = state.clone();
             let viewed = ViewedImage {
                 path: path.clone().into(),
                 size: meta.width.zip(meta.height),
                 file_name: meta.file_name.clone(),
                 view_once: false,
+                in_chat: Some(crate::views::lightbox::InChat::new(conversation, message_id, index)),
             };
             div()
                 .id(("media-tile", ix))

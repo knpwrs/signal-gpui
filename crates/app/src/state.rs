@@ -2524,11 +2524,11 @@ impl AppState {
     /// the viewer closes.
     fn view_once(&mut self, opened: signal_backend::OpenedViewOnce, cx: &mut Context<Self>) {
         if opened.content_type.starts_with("video/") {
-            let video = crate::views::video_viewer::ViewedVideo { path: opened.path, file_name: None, view_once: true };
+            let video = crate::views::video_viewer::ViewedVideo { path: opened.path, file_name: None, view_once: true, in_chat: None };
             self.view_video(video, cx);
         } else {
             let size = opened.size.filter(|(w, h)| *w > 0 && *h > 0);
-            let image = crate::views::image_viewer::ViewedImage { path: opened.path, size, file_name: None, view_once: true };
+            let image = crate::views::image_viewer::ViewedImage { path: opened.path, size, file_name: None, view_once: true, in_chat: None };
             self.view_image(image, cx);
         }
     }
