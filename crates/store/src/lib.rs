@@ -422,6 +422,10 @@ pub fn attachment_preview(attachment: &AttachmentMeta) -> &'static str {
     }
 }
 
+/// Settings key: `"true"` to keep muted chats archived when a message
+/// comes (Desktop's `keepMutedChatsArchived`), which a new message reads.
+pub const KEEP_MUTED_CHATS_ARCHIVED: &str = "keep_muted_chats_archived";
+
 /// The Signal chat's made-up account (Desktop's `SIGNAL_ACI`,
 /// `ts/types/SignalConversation.std.ts`): release notes appear from it, and
 /// nothing is ever sent to it.
@@ -1929,19 +1933,20 @@ impl AppDb {
 
         let id = match inserted {
             Some(id) => {
-                if incoming {
-                    // Like Signal, a new message brings an archived chat back
-                    // unless it is muted.
-                    sqlx::query(
-                        "UPDATE conversations SET unread_count = unread_count + 1, \
-                            archived = archived AND muted_until > \
-                                CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) \
-                         WHERE id = ?",
-                    )
-                    .bind(&msg.conversation_id.0)
-                    .execute(&mut *tx)
-                    .await?;
-                }
+                // Desktop's `canConversationBeUnarchived`: a new message,
+                // theirs or ours, brings an archived chat back, unless it's
+                // muted and muted chats are kept archived.
+                sqlx::query(AssertSqlSafe(format!(
+                    "UPDATE conversations SET unread_count = unread_count + ?, \
+                        archived = archived AND muted_until > \
+                            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) \
+                            AND COALESCE((SELECT value = 'true' FROM settings WHERE key = '{KEEP_MUTED_CHATS_ARCHIVED}'), 0) \
+                     WHERE id = ?"
+                )))
+                .bind(i64::from(incoming))
+                .bind(&msg.conversation_id.0)
+                .execute(&mut *tx)
+                .await?;
                 refresh_preview(&mut tx, &msg.conversation_id).await?;
                 id
             }

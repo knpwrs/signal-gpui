@@ -93,8 +93,13 @@ pub fn appearance_changed(window: &mut Window, cx: &mut App) {
     }
 }
 
+/// Settings key: `"false"` to leave typed emoticons as they are (Desktop's
+/// `autoConvertEmoji`, on until turned off).
+pub const AUTO_CONVERT_EMOJI_KEY: &str = "auto_convert_emoji";
+
 /// Every key [`Prefs`] reads.
-pub const KEYS: &[&str] = &[signal_backend::SETTING_THEME, ZOOM_KEY];
+pub const KEYS: &[&str] =
+    &[signal_backend::SETTING_THEME, ZOOM_KEY, AUTO_CONVERT_EMOJI_KEY, signal_backend::SETTING_CONTACTS_SYNCED_AT];
 
 /// The settings as stored.
 #[derive(Debug, Clone, PartialEq)]
@@ -103,11 +108,15 @@ pub struct Prefs {
     pub zoom: f32,
     /// The account's on/off settings as stored, defaults filled in.
     pub flags: BTreeMap<AccountSetting, bool>,
+    /// Typed emoticons become emoji (":-)" → 🙂).
+    pub auto_convert_emoji: bool,
+    /// When the phone's contacts last came (unix millis).
+    pub contacts_synced_at: Option<i64>,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { theme: ThemeSetting::System, zoom: 1., flags: BTreeMap::new() }
+        Self { theme: ThemeSetting::System, zoom: 1., flags: BTreeMap::new(), auto_convert_emoji: true, contacts_synced_at: None }
     }
 }
 
@@ -120,7 +129,14 @@ impl Prefs {
             theme: ThemeSetting::from_setting(get(signal_backend::SETTING_THEME)),
             zoom: get(ZOOM_KEY).and_then(|z| z.parse().ok()).filter(|z: &f32| z.is_finite() && *z > 0.).unwrap_or(1.),
             flags,
+            auto_convert_emoji: get(AUTO_CONVERT_EMOJI_KEY) != Some("false"),
+            contacts_synced_at: get(signal_backend::SETTING_CONTACTS_SYNCED_AT).and_then(|t| t.parse().ok()),
         }
+    }
+
+    /// Whether an account setting is on (its default until loaded).
+    pub fn flag(&self, setting: AccountSetting) -> bool {
+        self.flags.get(&setting).copied().unwrap_or_else(|| setting.default_on())
     }
 
     /// Every key to read.
@@ -137,6 +153,7 @@ mod tests {
     fn stored_values_read_with_desktops_defaults() {
         let prefs = Prefs::from_values(&HashMap::new());
         assert_eq!((prefs.theme, prefs.zoom), (ThemeSetting::System, 1.));
+        assert!(prefs.auto_convert_emoji && prefs.contacts_synced_at.is_none());
         assert!(prefs.flags[&AccountSetting::ReactionNotifications] && !prefs.flags[&AccountSetting::NotifyCallsIfMuted]);
 
         let values: HashMap<String, Option<String>> = [

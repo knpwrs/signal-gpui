@@ -232,7 +232,7 @@ impl Composer {
                 }
             }),
             cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| match event {
-                InputEvent::Change => this.on_change(window, cx),
+                InputEvent::Change => this.on_typed(window, cx),
                 InputEvent::PressEnter { shift: false, .. } => this.submit(window, cx),
                 InputEvent::Blur => this.stop_typing(cx),
                 _ => {}
@@ -378,6 +378,24 @@ impl Composer {
         self.reply_to = Some(message);
         self.focus(window, cx);
         cx.notify();
+    }
+
+    /// The text changed by typing (not by `set_value`): Desktop converts
+    /// emoticons as they're typed (`AutoSubstituteAsciiEmojis`, only for
+    /// the user's own edits), when "Convert typed emoticons to emoji" is on.
+    fn on_typed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.read(cx).prefs.auto_convert_emoji {
+            let (text, cursor) = {
+                let input = self.input.read(cx);
+                (input.value().to_string(), input.cursor())
+            };
+            if let Some((range, emoji)) = signal_emoji::emoticon_replacement_at(&text, cursor) {
+                let glyph = emoji.glyph_with(self.skin_tone(cx)).to_owned();
+                self.insert_emoji(glyph, Some(range), window, cx);
+                return;
+            }
+        }
+        self.on_change(window, cx);
     }
 
     fn on_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1940,6 +1958,27 @@ mod tests {
         assert!(open(&mut cx));
         click(&mut cx, gpui_kit::point(px(790.), px(590.)));
         assert!(!open(&mut cx), "a click off the picker closes it");
+    }
+
+    #[gpui_kit::test]
+    fn typed_emoticons_become_emoji_unless_turned_off(cx: &mut TestAppContext) {
+        let f = mount(cx);
+        let target = input_id(&f, cx);
+        let type_in = |text: &'static str, cx: &mut TestAppContext| {
+            cx.update_window(f.window, |_, window, cx| {
+                window.click(target.clone(), cx);
+                window.input(text, cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+        };
+        type_in("see you <3", cx);
+        assert_eq!(text(&f, cx), "see you ❤️");
+        // Turned off (Settings, Chats), they stay as typed.
+        let state = cx.update(|cx| f.composer.read(cx).state.clone());
+        state.update(cx, |s, cx| s.set_auto_convert_emoji(false, cx));
+        type_in(" :-)", cx);
+        assert_eq!(text(&f, cx), "see you ❤️ :-)");
     }
 
     #[gpui_kit::test]

@@ -83,6 +83,38 @@ pub fn shortcode_replacement_at(text: &str, cursor: usize) -> Option<(Range<usiz
     Some((colon..cursor, emoji))
 }
 
+/// Desktop's typed emoticons and their emoji
+/// (`ts/quill/auto-substitute-ascii-emojis`), longest first so `:-P`
+/// isn't read as something shorter.
+const EMOTICONS: [(&str, &str); 16] = [
+    (":-)", "🙂"),
+    (":-(", "🙁"),
+    (":-D", "😀"),
+    (":-*", "😘"),
+    (":-P", "😛"),
+    (":-p", "😛"),
+    (":'(", "😢"),
+    (":-\\", "😕"),
+    (":-|", "😐"),
+    (";-)", "😉"),
+    ("(Y)", "👍"),
+    ("(N)", "👎"),
+    ("(y)", "👍"),
+    ("(n)", "👎"),
+    ("^_^", "😀"),
+    ("<3", "❤️"),
+];
+
+/// If the text just before `cursor` ends with one of Desktop's emoticons
+/// (":-)", "<3"…), returns the byte range to replace and its emoji. Like
+/// Desktop, it needn't be a word of its own.
+pub fn emoticon_replacement_at(text: &str, cursor: usize) -> Option<(Range<usize>, &'static Emoji)> {
+    let head = text.get(..cursor)?;
+    let (emoticon, glyph) = EMOTICONS.iter().find(|(emoticon, _)| head.ends_with(emoticon))?;
+    let (emoji, _) = by_glyph(glyph)?;
+    Some((cursor - emoticon.len()..cursor, emoji))
+}
+
 /// Number of emoji if `text` consists only of 1..=[`MAX_JUMBO`] emoji
 /// (whitespace allowed), else `None`.
 pub fn jumbo_count(text: &str) -> Option<usize> {
@@ -129,6 +161,25 @@ mod tests {
         assert_eq!(at_end("re:subject"), None);
         assert_eq!(at_end(":-)"), None);
         assert_eq!(at_end("hello :joy "), None);
+    }
+
+    #[test]
+    fn emoticons_become_desktops_emoji() {
+        // (Compared without the emoji presentation selector some glyphs carry.)
+        let at = |text: &str| emoticon_replacement_at(text, text.len()).map(|(range, emoji)| (range, emoji.glyph.trim_end_matches('\u{fe0f}')));
+        assert_eq!(at("hi :-)"), Some((3..6, "🙂")));
+        assert_eq!(at("ok (y)"), Some((3..6, "👍")));
+        assert_eq!(at("x:-P"), Some((1..4, "😛")), "Desktop needn't see a space first");
+        assert_eq!(at("<3"), Some((0..2, "❤")));
+        assert_eq!(at("^_^"), Some((0..3, "😀")));
+        assert_eq!(at(":'("), Some((0..3, "😢")));
+        assert_eq!(at(":-\\"), Some((0..3, "😕")));
+        assert_eq!(at(":)"), None, "only Desktop's list");
+        assert_eq!(at(":-) more"), None, "only just before the cursor");
+        // Every emoticon's emoji is known.
+        for (emoticon, glyph) in EMOTICONS {
+            assert_eq!(at(emoticon).map(|(_, g)| g), Some(glyph.trim_end_matches('\u{fe0f}')), "{emoticon}");
+        }
     }
 
     #[test]

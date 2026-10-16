@@ -12,7 +12,7 @@ mod typeahead;
 use std::sync::LazyLock;
 
 pub use search::{Match, SearchOptions, search, search_with_boost};
-pub use typeahead::{Completion, completion_at, jumbo_count, shortcode_replacement_at};
+pub use typeahead::{Completion, completion_at, emoticon_replacement_at, jumbo_count, shortcode_replacement_at};
 
 /// Emoji groups, in picker order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

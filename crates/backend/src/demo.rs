@@ -1912,6 +1912,11 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 }
                 emit(Event::AccountSettingsChanged);
             }
+            // The made-up phone answers at once.
+            Command::SyncContacts => {
+                let _ = db.set_setting(crate::SETTING_CONTACTS_SYNCED_AT, &now().to_string()).await;
+                emit(Event::ContactsSynced);
+            }
             Command::SetPhoneNumberDiscoverable(on) => {
                 let _ = db.set_setting(crate::SETTING_PHONE_NUMBER_DISCOVERABLE, if on { "true" } else { "false" }).await;
                 emit(Event::AccountSettingsChanged);

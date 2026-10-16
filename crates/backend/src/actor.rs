@@ -928,6 +928,7 @@ impl Actor {
                 Command::SetUniversalExpireTimer(seconds) => self.set_universal_expire_timer(seconds).await,
                 Command::SetPhoneNumberSharing(everybody) => self.set_phone_number_sharing(everybody).await,
                 Command::SetPhoneNumberDiscoverable(on) => self.set_phone_number_discoverable(on).await,
+                Command::SyncContacts => self.request_syncs(),
                 Command::StartCall { conversation, video } if conversation.as_call_link().is_some() => {
                     self.start_link_call(conversation, video).await
                 }
@@ -1075,7 +1076,7 @@ impl Actor {
             warn!(%error, "failed to clear app database");
         }
         // Downloaded and sent media are files, unencrypted: they go too.
-        for dir in ["avatars", "attachments", "stickers", "gif-cache"] {
+        for dir in ["avatars", "attachments", "stickers", "gif-cache", settings::CONTACT_AVATARS_DIR] {
             let _ = std::fs::remove_dir_all(self.config.data_dir.join(dir));
         }
         let _ = std::fs::create_dir_all(self.config.data_dir.join("attachments"));
@@ -1168,6 +1169,9 @@ impl Actor {
                 self.titled.borrow_mut().clear();
                 self.refresh_titles().await;
                 self.backfill_author_names().await;
+                self.save_contact_avatars().await;
+                let _ = self.db.set_setting(crate::SETTING_CONTACTS_SYNCED_AT, &now_millis().to_string()).await;
+                self.emit(Event::ContactsSynced);
             }
             Received::DecryptionError(sender) => {
                 warn!(sender = %sender.service_id_string(), "failed to decrypt message");

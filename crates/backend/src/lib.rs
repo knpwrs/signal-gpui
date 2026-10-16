@@ -59,7 +59,7 @@ pub const SETTING_SEALED_SENDER_INDICATORS: &str = "sealed_sender_indicators";
 pub const SETTING_PREFER_CONTACT_AVATARS: &str = "prefer_contact_avatars";
 /// Settings key: `"true"` to keep muted chats archived when a message comes
 /// (Desktop's `keepMutedChatsArchived`). The store reads it.
-pub const SETTING_KEEP_MUTED_CHATS_ARCHIVED: &str = "keep_muted_chats_archived";
+pub const SETTING_KEEP_MUTED_CHATS_ARCHIVED: &str = signal_store::KEEP_MUTED_CHATS_ARCHIVED;
 /// Settings key: notify when someone reacts to our message (Desktop's
 /// `reaction-notification`; unset is on).
 pub const SETTING_REACTION_NOTIFICATIONS: &str = "reaction_notifications";
@@ -85,6 +85,12 @@ pub const SETTING_PHONE_NUMBER_SHARING: &str = "account.sharing_number";
 /// `phoneNumberDiscoverability`, the account record's
 /// `unlistedPhoneNumber` turned around). Unset counts as not.
 pub const SETTING_PHONE_NUMBER_DISCOVERABLE: &str = key_transparency::SETTING_E164_DISCOVERABLE;
+/// Settings key: when the phone's contacts last came (unix millis),
+/// Desktop's `synced_at`, shown as "Last import at".
+pub const SETTING_CONTACTS_SYNCED_AT: &str = "contacts_synced_at";
+/// Settings key: the photos the phone's address book has for people, as
+/// a JSON object of service id to file (from the contact sync).
+pub const SETTING_CONTACT_AVATARS: &str = "contact_avatars";
 /// Settings key: the app's theme, `"system"`, `"light"` or `"dark"`
 /// (Desktop's `theme-setting`). Not synced; the link-time backup sets it.
 pub const SETTING_THEME: &str = "theme";
@@ -484,6 +490,10 @@ pub enum Command {
     /// Whether people can find us by our number (Desktop's "Who can find
     /// me by number"), on the server and for the whole account.
     SetPhoneNumberDiscoverable(bool),
+    /// Desktop's "Import now" (Chats): asks the phone for its contacts,
+    /// configuration and blocked list (`sendSyncRequests`). The contacts'
+    /// arrival is `Event::ContactsSynced`.
+    SyncContacts,
     /// Adds groups' stories to the list we post to (`Always`, Desktop's
     /// "New group story") or removes them (`Never`, "Remove group story"),
     /// for the whole account (`GroupV2Record.storySendMode`).
@@ -1033,6 +1043,8 @@ pub enum Event {
     /// A view-once message we opened: show it in the viewer, without saving
     /// or forwarding, and delete the copy when it closes.
     ViewOnceOpened(OpenedViewOnce),
+    /// The phone's contacts came (after linking, or "Import now").
+    ContactsSynced,
     /// A new message from someone else arrived (for notifications).
     Incoming { conversation: ConversationId, message_id: i64, mentions_me: bool },
     /// Someone voted in our poll (`ended`: they ended theirs), for

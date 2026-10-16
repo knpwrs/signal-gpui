@@ -4,6 +4,7 @@
 
 mod appearance;
 mod calls;
+mod chats;
 mod data_usage;
 mod general;
 mod notifications;
@@ -29,6 +30,7 @@ pub enum Page {
     #[default]
     General,
     Appearance,
+    Chats,
     Calls,
     Notifications,
     Privacy,
@@ -37,13 +39,15 @@ pub enum Page {
 
 impl Page {
     /// The pages in the list, in Desktop's order.
-    const LIST: [Page; 6] = [Page::General, Page::Appearance, Page::Calls, Page::Notifications, Page::Privacy, Page::DataUsage];
+    const LIST: [Page; 7] =
+        [Page::General, Page::Appearance, Page::Chats, Page::Calls, Page::Notifications, Page::Privacy, Page::DataUsage];
 
     /// Desktop's names (`Preferences__button--…`).
     fn title(self) -> &'static str {
         match self {
             Page::General => "General",
             Page::Appearance => "Appearance",
+            Page::Chats => "Chats",
             Page::Calls => "Calls",
             Page::Notifications => "Notifications",
             Page::Privacy => "Privacy",
@@ -55,6 +59,7 @@ impl Page {
         match self {
             Page::General => "settings-page-general",
             Page::Appearance => "settings-page-appearance",
+            Page::Chats => "settings-page-chats",
             Page::Calls => "settings-page-calls",
             Page::Notifications => "settings-page-notifications",
             Page::Privacy => "settings-page-privacy",
@@ -126,6 +131,7 @@ fn render(settings: &Entity<Settings>, window: &mut Window, cx: &mut App) -> Any
     let body = match page {
         Page::General => general::render(settings, palette, window, cx),
         Page::Appearance => appearance::render(settings, palette, cx),
+        Page::Chats => chats::render(settings, palette, cx),
         Page::Calls => calls::render(settings, palette, cx),
         Page::Notifications => notifications::render(settings, palette, cx),
         Page::Privacy => privacy::render(settings, palette, cx),

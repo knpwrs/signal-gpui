@@ -252,6 +252,11 @@ pub struct AppState {
     /// Our profile, username and link (`None` until read).
     pub own_profile: Option<signal_backend::OwnProfile>,
     pub badges: Badges,
+    /// Photos from the phone's address book by service id (the contact
+    /// sync's), for Desktop's "Use address book photos".
+    contact_avatars: HashMap<String, std::path::PathBuf>,
+    /// Desktop's "Import now", while it runs or once it failed.
+    pub contact_sync: ContactSync,
     pub selected: Option<ConversationId>,
     /// Authors currently typing, per conversation, with expiry.
     typing: HashMap<ConversationId, Vec<(String, Instant)>>,
@@ -366,6 +371,20 @@ pub struct AppState {
 
 impl EventEmitter<AppEvent> for AppState {}
 
+/// How long "Import now" waits for the phone's contacts before saying it
+/// failed.
+const CONTACT_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Desktop's "Import now" in Settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContactSync {
+    Idle,
+    /// Asked for, since then.
+    Pending(Instant),
+    /// They didn't come in time (Desktop's `syncFailed`).
+    Failed,
+}
+
 /// Typing indicators expire if no "stopped" arrives (Signal uses 15s).
 const TYPING_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -381,6 +400,8 @@ impl AppState {
             person_avatars: HashMap::new(),
             own_profile: None,
             badges: Badges::default(),
+            contact_avatars: HashMap::new(),
+            contact_sync: ContactSync::Idle,
             jump: None,
             selected: None,
             typing: HashMap::new(),
@@ -868,6 +889,11 @@ impl AppState {
             }
             Event::UsernameSaved(result) => cx.emit(AppEvent::UsernameSaved(result)),
             Event::UsernameLinkReset(result) => cx.emit(AppEvent::UsernameLinkReset(result)),
+            Event::ContactsSynced => {
+                self.contact_sync = ContactSync::Idle;
+                self.load_prefs(cx);
+                self.reload_conversations(cx);
+            }
             Event::Error(error) => {
                 tracing::warn!("backend error: {error}");
                 self.report_error(error, cx);
@@ -906,6 +932,8 @@ impl AppState {
                 self.person_avatars.clear();
                 self.own_profile = None;
                 self.badges = Badges::default();
+                self.contact_avatars.clear();
+                self.contact_sync = ContactSync::Idle;
                 self.selected = None;
                 // The database was cleared; so are the next account's caches.
                 self.typing.clear();
@@ -967,16 +995,20 @@ impl AppState {
                     db.conversations().await?,
                     db.archived_conversations().await?,
                     db.person_avatars().await?,
+                    db.setting(signal_backend::SETTING_CONTACT_AVATARS).await?,
                 ))
             });
         self.reload_task = Some(cx.spawn(async move |this, cx| {
             let result = query.await;
             let _ = this.update(cx, |this, cx| {
                 match result {
-                    Ok((conversations, archived, avatars)) => {
+                    Ok((conversations, archived, avatars, contact_avatars)) => {
                         this.conversations = conversations;
                         this.archived = archived;
                         this.person_avatars = avatars.into_iter().map(|(sid, path)| (sid, path.into())).collect();
+                        this.contact_avatars = contact_avatars
+                            .and_then(|json| serde_json::from_str::<HashMap<String, std::path::PathBuf>>(&json).ok())
+                            .unwrap_or_default();
                         this.sync_notifications();
                         cx.emit(AppEvent::ConversationsChanged);
                         if std::mem::take(&mut this.auto_select) && this.selected.is_none() {
@@ -2033,8 +2065,42 @@ impl AppState {
     }
 
     /// Someone's downloaded profile photo.
+    /// Someone's photo: their profile photo, or the one in the phone's
+    /// address book, whichever "Use address book photos" puts first (ours
+    /// is always our profile photo), as Desktop's `getAvatar`.
     pub fn photo_of(&self, service_id: &str) -> Option<&std::path::Path> {
-        self.person_avatars.get(service_id).map(|p| p.as_path())
+        let profile = self.person_avatars.get(service_id);
+        let contact = self.contact_avatars.get(service_id);
+        let ours = self.account.as_ref().is_some_and(|a| a.aci == service_id);
+        let prefer_contact = !ours && self.prefs.flag(signal_backend::AccountSetting::PreferContactAvatars);
+        let (first, second) = if prefer_contact { (contact, profile) } else { (profile, contact) };
+        first.or(second).map(|p| p.as_path())
+    }
+
+    /// Desktop's "Import now": asks the phone for its contacts; failed if
+    /// they don't come within a minute.
+    pub fn sync_contacts(&mut self, cx: &mut Context<Self>) {
+        let started = Instant::now();
+        self.contact_sync = ContactSync::Pending(started);
+        self.send(Command::SyncContacts);
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(CONTACT_SYNC_TIMEOUT).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.contact_sync == ContactSync::Pending(started) {
+                    this.contact_sync = ContactSync::Failed;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Desktop's "Convert typed emoticons to emoji".
+    pub fn set_auto_convert_emoji(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.prefs.auto_convert_emoji = on;
+        self.save_setting(crate::prefs::AUTO_CONVERT_EMOJI_KEY, on.to_string(), cx);
+        cx.notify();
     }
 
     pub fn set_chat(&self, conversation: ConversationId, change: signal_backend::ChatChange) {

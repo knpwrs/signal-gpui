@@ -582,13 +582,27 @@ async fn chat_states_apply_to_existing_conversations_only() {
     // An expired mute isn't muted.
     assert!(!db.conversation(&conv("d:b")).await.unwrap().unwrap().muted);
 
-    // Muted and archived: stays archived when a message arrives.
+    // Muted and archived, with muted chats kept archived: stays archived
+    // when a message arrives.
+    db.set_setting(KEEP_MUTED_CHATS_ARCHIVED, "true").await.unwrap();
     db.insert_message(&incoming("d:a", "a", 3, "again")).await.unwrap();
     assert!(db.conversation(&conv("d:a")).await.unwrap().unwrap().archived);
     // Not muted: a new message unarchives.
     db.apply_chat_states(&[state("d:a", true, 0)]).await.unwrap();
     db.insert_message(&incoming("d:a", "a", 4, "once more")).await.unwrap();
     assert!(!db.conversation(&conv("d:a")).await.unwrap().unwrap().archived);
+    // Muted, but muted chats aren't kept archived (Desktop's default).
+    db.set_setting(KEEP_MUTED_CHATS_ARCHIVED, "false").await.unwrap();
+    db.apply_chat_states(&[state("d:a", true, i64::MAX)]).await.unwrap();
+    db.insert_message(&incoming("d:a", "a", 5, "and again")).await.unwrap();
+    assert!(!db.conversation(&conv("d:a")).await.unwrap().unwrap().archived);
+    // Ours brings it back too, without counting as unread.
+    db.apply_chat_states(&[state("d:a", true, 0)]).await.unwrap();
+    let unread = db.conversation(&conv("d:a")).await.unwrap().unwrap().unread_count;
+    db.insert_message(&outgoing("d:a", 6, "mine")).await.unwrap();
+    let a = db.conversation(&conv("d:a")).await.unwrap().unwrap();
+    assert!(!a.archived);
+    assert_eq!(a.unread_count, unread);
 }
 
 #[tokio::test]

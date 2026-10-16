@@ -75,6 +75,60 @@ impl Actor {
         self.write_account(&[storage::AccountEdit::UnlistedPhoneNumber(!discoverable)]).await;
     }
 
+    /// Desktop's "Import now" (`sendSyncRequests`): asks the phone for its
+    /// contacts, configuration and blocked list.
+    pub(super) fn request_syncs(&self) {
+        use sync_message::request::Type;
+        info!("asking the phone for its contacts");
+        for kind in [Type::Contacts, Type::Configuration, Type::Blocked] {
+            self.enqueue(Outbound::Sync {
+                body: SyncMessage {
+                    content: Some(sync_message::Content::Request(sync_message::Request { r#type: Some(kind as i32) })),
+                    ..SyncMessage::with_padding(&mut rand::rng())
+                },
+            });
+        }
+    }
+
+    /// The contact sync's photos (the phone's address book), saved as files
+    /// named after their contents in `contact-avatars/`, for Desktop's "Use
+    /// address book photos". Photos no one has any more are deleted.
+    pub(super) async fn save_contact_avatars(&self) {
+        let dir = self.config.data_dir.join(CONTACT_AVATARS_DIR);
+        let Ok(contacts) = self.store.contacts().await else { return };
+        let mut avatars = std::collections::BTreeMap::new();
+        for contact in contacts.flatten() {
+            let Some(avatar) = contact.avatar.as_ref().filter(|a| !a.reader.is_empty()) else { continue };
+            let name = contact_avatar_name(&avatar.reader, &avatar.content_type);
+            let path = dir.join(&name);
+            if !path.exists() {
+                let written = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, &avatar.reader));
+                if let Err(error) = written {
+                    warn!(%error, "couldn't save a contact's photo");
+                    continue;
+                }
+            }
+            avatars.insert(Aci::from(contact.uuid).service_id_string(), path.to_string_lossy().into_owned());
+        }
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            let kept: std::collections::HashSet<&str> = avatars.values().map(String::as_str).collect();
+            for entry in entries.flatten() {
+                if !kept.contains(entry.path().to_string_lossy().as_ref()) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        match serde_json::to_string(&avatars) {
+            Ok(json) => {
+                if let Err(error) = self.db.set_setting(crate::SETTING_CONTACT_AVATARS, &json).await {
+                    warn!(%error, "failed to save contacts' photos");
+                }
+            }
+            Err(error) => warn!(%error, "failed to save contacts' photos"),
+        }
+        self.emit(Event::ConversationsChanged);
+    }
+
     pub(super) async fn phone_number_discoverable(&self) -> bool {
         crate::setting_on(self.db.setting(crate::SETTING_PHONE_NUMBER_DISCOVERABLE).await.ok().flatten().as_deref())
     }
@@ -112,5 +166,35 @@ impl Actor {
         if let Err(error) = result {
             self.error("couldn't change who can find you by number", format!("{error:#}"));
         }
+    }
+}
+
+/// Where the contact sync's photos are kept.
+pub(crate) const CONTACT_AVATARS_DIR: &str = "contact-avatars";
+
+/// A contact photo's file name: a hash of its bytes, so a changed photo is
+/// a new file.
+fn contact_avatar_name(bytes: &[u8], content_type: &str) -> String {
+    use sha2::Digest as _;
+    let ext = match content_type {
+        "image/png" => "png",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        _ => "jpg",
+    };
+    format!("{}.{ext}", hex::encode(&sha2::Sha256::digest(bytes)[..16]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contact_photos_are_named_after_their_contents() {
+        let a = contact_avatar_name(b"photo one", "image/jpeg");
+        assert!(a.ends_with(".jpg") && a.len() == 32 + 4, "{a}");
+        assert_eq!(a, contact_avatar_name(b"photo one", "image/jpeg"));
+        assert_ne!(a, contact_avatar_name(b"photo two", "image/jpeg"));
+        assert!(contact_avatar_name(b"x", "image/png").ends_with(".png"));
     }
 }

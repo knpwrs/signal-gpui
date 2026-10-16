@@ -212,3 +212,54 @@ fn data_usage_shows_image_optimization(cx: &mut TestAppContext) {
     let h = Harness::open(cx, Page::DataUsage);
     assert_eq!(h.value(cx, "image-optimization").as_deref(), Some("Maximum"));
 }
+
+#[gpui_kit::test]
+fn chats_toggles_save_and_contacts_import(cx: &mut TestAppContext) {
+    use crate::state::ContactSync;
+    use signal_backend::AccountSetting;
+    let h = Harness::open(cx, Page::Chats);
+    // The demo account generates link previews; the rest start at Desktop's defaults.
+    assert_eq!(h.value(cx, "link-previews").as_deref(), Some("on"));
+    assert_eq!(h.value(cx, "keep-muted-chats-archived").as_deref(), Some("off"));
+    assert_eq!(h.value(cx, "address-book-photos").as_deref(), Some("off"));
+    assert_eq!(h.value(cx, "auto-convert-emoji").as_deref(), Some("on"));
+    h.click(cx, "keep-muted-chats-archived");
+    h.click(cx, "address-book-photos");
+    h.click(cx, "link-previews");
+    h.click(cx, "auto-convert-emoji");
+    assert!(wait(cx, |_| h.stored(signal_backend::SETTING_KEEP_MUTED_CHATS_ARCHIVED).as_deref() == Some("true")
+        && h.stored(signal_backend::SETTING_PREFER_CONTACT_AVATARS).as_deref() == Some("true")
+        && h.stored(signal_backend::SETTING_LINK_PREVIEWS).as_deref() == Some("false")
+        && h.stored(crate::prefs::AUTO_CONVERT_EMOJI_KEY).as_deref() == Some("false")));
+    assert!(cx.read(|cx| h.state.read(cx).prefs.flag(AccountSetting::KeepMutedChatsArchived)));
+    assert_eq!(h.value(cx, "auto-convert-emoji").as_deref(), Some("off"));
+
+    // "Import now": the demo phone answers at once, and the time shows.
+    assert_eq!(cx.read(|cx| h.state.read(cx).prefs.contacts_synced_at), None);
+    h.click(cx, "import-contacts");
+    assert!(wait(cx, |cx| h.state.read_with(cx, |s, _| s.contact_sync == ContactSync::Idle && s.prefs.contacts_synced_at.is_some())));
+}
+
+#[gpui_kit::test]
+fn address_book_photos_come_first_when_preferred(cx: &mut TestAppContext) {
+    use signal_backend::AccountSetting;
+    let h = Harness::open(cx, Page::Chats);
+    let dir = tempfile::tempdir().unwrap();
+    let (profile, contact) = (dir.path().join("profile.png"), dir.path().join("contact.png"));
+    // A made-up person with both photos, and one with only an address book photo.
+    let db = h.backend.db().clone();
+    let (p, c) = (profile.to_string_lossy().into_owned(), contact.to_string_lossy().into_owned());
+    let json = format!(r#"{{"person-a":"{c}","person-b":"{c}"}}"#);
+    futures::executor::block_on(h.backend.spawn(async move {
+        db.set_person_avatar("person-a", &p).await?;
+        db.set_setting(signal_backend::SETTING_CONTACT_AVATARS, &json).await
+    }))
+    .unwrap();
+    h.state.update(cx, |s, cx| s.reload_conversations(cx));
+    let photo = |cx: &mut TestAppContext, sid: &str| cx.read(|cx| h.state.read(cx).photo_of(sid).map(|p| p.to_path_buf()));
+    assert!(wait(cx, |cx| photo(cx, "person-b").is_some()));
+    assert_eq!(photo(cx, "person-a").as_deref(), Some(profile.as_path()));
+    h.state.update(cx, |s, cx| s.set_account_setting(AccountSetting::PreferContactAvatars, true, cx));
+    assert_eq!(photo(cx, "person-a").as_deref(), Some(contact.as_path()));
+    assert_eq!(photo(cx, "person-b").as_deref(), Some(contact.as_path()));
+}
