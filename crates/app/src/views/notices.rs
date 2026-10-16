@@ -100,6 +100,120 @@ fn group_text(by: Option<&str>, change: &GroupNotice, name: impl Fn(&str) -> Str
         }
         // Desktop's `GroupV2--terminated--you` and `--other`, without a period.
         GroupNotice::Ended => format!("{} ended the group", actor()),
+        _ => membership_text(by, change, name),
+    }
+}
+
+/// "1 person" or "3 people".
+fn people(count: u32) -> String {
+    if count == 1 { "1 person".into() } else { format!("{count} people") }
+}
+
+/// "an invitation to the group for 1 person" or "invitations to the
+/// group for 3 people".
+fn invitations(count: u32) -> String {
+    if count == 1 { "an invitation to the group for 1 person".into() } else { format!("invitations to the group for {count} people") }
+}
+
+/// Invitations, requests to join and the group link, in Desktop's words
+/// (`renderChangeDetail` in `ts/groupChange.std.ts`, `icu:GroupV2--…`).
+fn membership_text(by: Option<&str>, change: &GroupNotice, name: impl Fn(&str) -> String) -> String {
+    use signal_store::Inviter;
+    let who = by.map(&name);
+    let actor = || who.clone().unwrap_or_else(|| "You".into());
+    let same = |member: &Option<String>| member.as_deref() == by;
+    match change {
+        GroupNotice::JoinedByLink { member: None } => "You joined the group via the group link.".into(),
+        GroupNotice::JoinedByLink { member: Some(m) } => format!("{} joined the group via the group link.", name(m)),
+        GroupNotice::AcceptedInvite { member: None, inviter: Inviter::Person { id } } => {
+            format!("You accepted an invitation to the group from {}.", name(id))
+        }
+        GroupNotice::AcceptedInvite { member: None, .. } => "You accepted an invitation to the group.".into(),
+        GroupNotice::AcceptedInvite { member: Some(m), inviter: Inviter::Us } => {
+            format!("{} accepted your invitation to the group.", name(m))
+        }
+        GroupNotice::AcceptedInvite { member: Some(m), inviter: Inviter::Person { id } } => {
+            format!("{} accepted an invitation to the group from {}.", name(m), name(id))
+        }
+        GroupNotice::AcceptedInvite { member: Some(m), inviter: Inviter::Unknown } => {
+            format!("{} accepted an invitation to the group.", name(m))
+        }
+        GroupNotice::Approved { member: None } => match &who {
+            Some(admin) => format!("{admin} approved your request to join the group."),
+            None => "Your request to join the group has been approved.".into(),
+        },
+        GroupNotice::Approved { member: Some(m) } => match &who {
+            Some(admin) => format!("{admin} approved a request to join the group from {}.", name(m)),
+            None => format!("You approved a request to join the group from {}.", name(m)),
+        },
+        GroupNotice::Invited { member: None } => match &who {
+            Some(admin) => format!("{admin} invited you to the group."),
+            None => "You were invited to the group.".into(),
+        },
+        GroupNotice::Invited { member: Some(m) } => match &who {
+            Some(member) => format!("{member} invited 1 person to the group."),
+            None => format!("You invited {} to the group.", name(m)),
+        },
+        GroupNotice::InvitedMany { count } => format!("{} invited {} to the group.", actor(), people(*count)),
+        GroupNotice::InviteRemoved { member, inviter } => {
+            let invitee = || member.as_deref().map_or_else(|| "you".to_owned(), &name);
+            match (inviter, same(member)) {
+                (Inviter::Us, true) => format!("{} declined your invitation to the group.", invitee()),
+                (Inviter::Us, false) => match &who {
+                    Some(admin) => format!("{admin} revoked the invitation to the group you sent to {}.", invitee()),
+                    None => format!("You rescinded your invitation to {}.", invitee()),
+                },
+                (_, true) if by.is_none() => "You declined the invitation to the group.".into(),
+                (Inviter::Person { id }, true) => format!("1 person invited by {} declined the invitation to the group.", name(id)),
+                (_, true) => "1 person declined their invitation to the group.".into(),
+                (Inviter::Person { id }, false) if by == Some(id.as_str()) => match member {
+                    None => format!("{} revoked their invitation to you.", name(id)),
+                    Some(_) => format!("{} revoked their invitation to 1 person.", name(id)),
+                },
+                (Inviter::Person { id }, false) => {
+                    format!("{} revoked an invitation to the group for 1 person invited by {}.", actor(), name(id))
+                }
+                (Inviter::Unknown, false) => format!("{} revoked an invitation to the group for 1 person.", actor()),
+            }
+        }
+        GroupNotice::InvitesRemoved { count, inviter } => match inviter {
+            Inviter::Us => match &who {
+                Some(admin) => format!(
+                    "{admin} revoked the {}.",
+                    if *count == 1 {
+                        "invitation to the group you sent to 1 person".to_owned()
+                    } else {
+                        format!("invitations to the group you sent to {count} people")
+                    }
+                ),
+                None => format!("You rescinded your invitation to {}.", people(*count)),
+            },
+            Inviter::Person { id } => format!("{} revoked {} invited by {}.", actor(), invitations(*count), name(id)),
+            Inviter::Unknown => format!("{} revoked {}.", actor(), invitations(*count)),
+        },
+        GroupNotice::Requested { member: None } => "You sent a request to join the group.".into(),
+        GroupNotice::Requested { member: Some(m) } => format!("{} requested to join via the group link.", name(m)),
+        GroupNotice::RequestRemoved { member: None } if by.is_none() => "You canceled your request to join the group.".into(),
+        GroupNotice::RequestRemoved { member: None } => "Your request to join the group has been denied by an admin.".into(),
+        GroupNotice::RequestRemoved { member: Some(m) } if by == Some(m.as_str()) => {
+            format!("{} canceled their request to join the group.", name(m))
+        }
+        GroupNotice::RequestRemoved { member: Some(m) } => match &who {
+            Some(admin) => format!("{admin} denied a request to join the group from {}.", name(m)),
+            None => format!("You denied a request to join the group from {}.", name(m)),
+        },
+        GroupNotice::LinkOn { approval } => format!(
+            "{} turned on the group link with admin approval {}.",
+            actor(),
+            if *approval { "enabled" } else { "disabled" }
+        ),
+        GroupNotice::LinkOff => format!("{} turned off the group link.", actor()),
+        GroupNotice::LinkReset => format!("{} reset the group link.", actor()),
+        GroupNotice::LinkApproval { on } => {
+            format!("{} {} admin approval for the group link.", actor(), if *on { "enabled" } else { "disabled" })
+        }
+        // The rest are `group_text`'s.
+        _ => String::new(),
     }
 }
 
@@ -152,5 +266,55 @@ mod tests {
         assert_eq!(text(group(by("a"), GroupNotice::Removed { member: None })), "Alice removed you.");
         assert_eq!(text(group(None, GroupNotice::Added { member: by("b") })), "You added Bob.");
         assert_eq!(text(group(by("a"), GroupNotice::Admin { member: by("b"), admin: true })), "Alice made Bob an admin.");
+    }
+
+    #[test]
+    fn invitations_requests_and_links_read_like_desktop() {
+        use signal_store::Inviter;
+        let by = |s: &str| Some(s.to_owned());
+        let group = |by: Option<String>, change| text(Notice::Group { by, change });
+        let alice = || Inviter::Person { id: "a".into() };
+        assert_eq!(group(by("a"), GroupNotice::Invited { member: None }), "Alice invited you to the group.");
+        assert_eq!(group(None, GroupNotice::Invited { member: by("b") }), "You invited Bob to the group.");
+        assert_eq!(group(by("a"), GroupNotice::Invited { member: by("b") }), "Alice invited 1 person to the group.");
+        assert_eq!(group(by("a"), GroupNotice::InvitedMany { count: 3 }), "Alice invited 3 people to the group.");
+        assert_eq!(
+            group(None, GroupNotice::AcceptedInvite { member: None, inviter: alice() }),
+            "You accepted an invitation to the group from Alice."
+        );
+        assert_eq!(
+            group(by("b"), GroupNotice::AcceptedInvite { member: by("b"), inviter: Inviter::Us }),
+            "Bob accepted your invitation to the group."
+        );
+        assert_eq!(group(None, GroupNotice::InviteRemoved { member: None, inviter: alice() }), "You declined the invitation to the group.");
+        assert_eq!(
+            group(by("b"), GroupNotice::InviteRemoved { member: by("b"), inviter: Inviter::Us }),
+            "Bob declined your invitation to the group."
+        );
+        assert_eq!(group(None, GroupNotice::InviteRemoved { member: by("b"), inviter: Inviter::Us }), "You rescinded your invitation to Bob.");
+        assert_eq!(group(by("a"), GroupNotice::InviteRemoved { member: None, inviter: alice() }), "Alice revoked their invitation to you.");
+        assert_eq!(
+            group(None, GroupNotice::InviteRemoved { member: by("b"), inviter: alice() }),
+            "You revoked an invitation to the group for 1 person invited by Alice."
+        );
+        assert_eq!(
+            group(by("a"), GroupNotice::InvitesRemoved { count: 2, inviter: Inviter::Unknown }),
+            "Alice revoked invitations to the group for 2 people."
+        );
+        assert_eq!(group(None, GroupNotice::Requested { member: None }), "You sent a request to join the group.");
+        assert_eq!(group(by("b"), GroupNotice::Requested { member: by("b") }), "Bob requested to join via the group link.");
+        assert_eq!(group(None, GroupNotice::RequestRemoved { member: by("b") }), "You denied a request to join the group from Bob.");
+        assert_eq!(group(by("b"), GroupNotice::RequestRemoved { member: by("b") }), "Bob canceled their request to join the group.");
+        assert_eq!(group(None, GroupNotice::RequestRemoved { member: None }), "You canceled your request to join the group.");
+        assert_eq!(
+            group(by("a"), GroupNotice::RequestRemoved { member: None }),
+            "Your request to join the group has been denied by an admin."
+        );
+        assert_eq!(group(by("a"), GroupNotice::Approved { member: None }), "Alice approved your request to join the group.");
+        assert_eq!(group(by("b"), GroupNotice::JoinedByLink { member: by("b") }), "Bob joined the group via the group link.");
+        assert_eq!(group(None, GroupNotice::LinkOn { approval: true }), "You turned on the group link with admin approval enabled.");
+        assert_eq!(group(by("a"), GroupNotice::LinkOff), "Alice turned off the group link.");
+        assert_eq!(group(by("a"), GroupNotice::LinkReset), "Alice reset the group link.");
+        assert_eq!(group(None, GroupNotice::LinkApproval { on: false }), "You disabled admin approval for the group link.");
     }
 }

@@ -99,6 +99,8 @@ pub struct Conversation {
     pub can_add_members: bool,
     /// An admin ended the group for everyone (Desktop's `terminated`).
     pub ended: bool,
+    /// A group's administration state (default for 1:1 chats).
+    pub group_state: GroupState,
     /// Decrypted avatar image on disk, if one has been downloaded.
     pub avatar_path: Option<String>,
     /// Delivery status of the latest message when it is ours (for the
@@ -411,6 +413,90 @@ pub struct MemberLabel {
     pub text: String,
 }
 
+/// A group's administration state beyond its members and admins: what
+/// Desktop keeps on a group's conversation as `accessControl`,
+/// `announcementsOnly`, `groupInviteLinkPassword`, `pendingMembersV2`,
+/// `pendingAdminApprovalV2` and `bannedMembersV2`. Every field defaults,
+/// so state written by an older build still reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GroupState {
+    /// Only admins may send messages (Desktop's `announcementsOnly`).
+    #[serde(default)]
+    pub announcements_only: bool,
+    /// Only admins may edit the name, photo, description and timer.
+    #[serde(default)]
+    pub info_admins_only: bool,
+    /// Only admins may add people.
+    #[serde(default)]
+    pub members_admins_only: bool,
+    /// Only admins may have member labels.
+    #[serde(default)]
+    pub labels_admins_only: bool,
+    /// The group link while it's on.
+    #[serde(default)]
+    pub link: Option<GroupLink>,
+    /// People invited and not joined yet.
+    #[serde(default)]
+    pub invites: Vec<GroupInvite>,
+    /// People asking to join through the link.
+    #[serde(default)]
+    pub requests: Vec<GroupRequest>,
+    /// Service ids an admin removed (they can't rejoin by the link).
+    #[serde(default)]
+    pub banned: Vec<String>,
+    /// Where we stand in the group.
+    #[serde(default)]
+    pub membership: Membership,
+}
+
+/// A group's link (`https://signal.group/#…`) while it's on.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GroupLink {
+    pub url: String,
+    /// An admin approves who joins by it.
+    pub approval: bool,
+}
+
+/// An invitation to a group (Desktop's pending member).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GroupInvite {
+    /// Who's invited: an ACI, or a PNI (`PNI:…`).
+    pub service_id: String,
+    /// The member who invited them (an ACI).
+    pub by: String,
+}
+
+/// A request to join a group by its link.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GroupRequest {
+    pub aci: String,
+    /// Unix millis.
+    pub at: i64,
+}
+
+/// Where we stand in a group. Having left is [`Conversation::left`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Membership {
+    #[default]
+    Member,
+    /// Invited, not accepted yet (`by`: who invited us, an ACI).
+    Invited { by: Option<String> },
+    /// We asked to join by the group link and wait for an admin;
+    /// `password` is the link's (base64), which cancelling needs.
+    Requesting { password: String },
+}
+
+/// Who invited someone, as a notice about their invitation says.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Inviter {
+    Us,
+    Person { id: String },
+    /// Not known (or, for several invitations, not one person).
+    Unknown,
+}
+
 /// An @mention in a message body: `body[start..start + len]` is "@Name".
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MentionSpan {
@@ -596,6 +682,30 @@ pub enum GroupNotice {
     MemberAccess { admins_only: bool },
     AnnouncementsOnly { on: bool },
     Ended,
+    /// `member` joined by the group link (Desktop's `member-add-from-link`).
+    JoinedByLink { member: Option<String> },
+    /// `member` accepted an invitation (`member-add-from-invite`).
+    AcceptedInvite { member: Option<String>, inviter: Inviter },
+    /// An admin let `member` in (`member-add-from-admin-approval`).
+    Approved { member: Option<String> },
+    /// One person was invited (`pending-add-one`).
+    Invited { member: Option<String> },
+    /// Several were (`pending-add-many`).
+    InvitedMany { count: u32 },
+    /// An invitation was withdrawn or declined (`pending-remove-one`).
+    InviteRemoved { member: Option<String>, inviter: Inviter },
+    /// Several were (`pending-remove-many`).
+    InvitesRemoved { count: u32, inviter: Inviter },
+    /// `member` asked to join by the link (`admin-approval-add-one`).
+    Requested { member: Option<String> },
+    /// `member`'s request was denied or withdrawn (`admin-approval-remove-one`).
+    RequestRemoved { member: Option<String> },
+    /// The group link was turned on (`group-link-add`).
+    LinkOn { approval: bool },
+    LinkOff,
+    LinkReset,
+    /// Admin approval for the link changed (`access-invite-link`).
+    LinkApproval { on: bool },
 }
 
 impl Message {
@@ -673,6 +783,7 @@ pub struct ConversationUpdate {
     pub can_add_members: Option<bool>,
     /// The group was ended for everyone.
     pub ended: Option<bool>,
+    pub group_state: Option<GroupState>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -854,7 +965,7 @@ fn fts_query(input: &str) -> Option<String> {
 
 const CONVERSATION_COLUMNS: &str = "id, kind, title, phone, color, members, last_message_preview, \
      last_message_at, unread_count, pinned, (muted_until > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)) AS muted, muted_until, archived, \
-     marked_unread, blocked, draft, expire_timer, expire_timer_version, can_edit_info, left_group, description, admins, member_labels, can_label, can_add_members, group_ended, avatar_path, \
+     marked_unread, blocked, draft, expire_timer, expire_timer_version, can_edit_info, left_group, description, admins, member_labels, can_label, can_add_members, group_ended, group_state, avatar_path, \
      (SELECT CASE WHEN m.direction = 1 AND m.deleted = 0 THEN m.status END FROM messages m \
       WHERE m.conversation_id = conversations.id AND m.notice IS NULL ORDER BY m.sent_at DESC, m.id DESC LIMIT 1) \
       AS last_outgoing_status, \
@@ -1023,6 +1134,11 @@ fn conversation_from_row(row: &SqliteRow) -> Result<Conversation> {
         can_label: row.try_get("can_label")?,
         can_add_members: row.try_get("can_add_members")?,
         ended: row.try_get("group_ended")?,
+        group_state: row
+            .try_get::<Option<String>, _>("group_state")?
+            .map(|g| serde_json::from_str(&g))
+            .transpose()?
+            .unwrap_or_default(),
         avatar_path: row.try_get("avatar_path")?,
         last_outgoing_status: row.try_get::<Option<i64>, _>("last_outgoing_status")?.map(status_from_i64),
         unread_poll_votes: row.try_get("unread_poll_votes")?,
@@ -1412,7 +1528,8 @@ impl AppDb {
                 member_labels = COALESCE(?, member_labels), \
                 can_label = COALESCE(?, can_label), \
                 can_add_members = COALESCE(?, can_add_members), \
-                group_ended = COALESCE(?, group_ended) \
+                group_ended = COALESCE(?, group_ended), \
+                group_state = COALESCE(?, group_state) \
              WHERE id = ?",
         )
         .bind(update.kind.map(kind_to_str))
@@ -1429,6 +1546,7 @@ impl AppDb {
         .bind(update.can_label)
         .bind(update.can_add_members)
         .bind(update.ended)
+        .bind(update.group_state.map(|g| serde_json::to_string(&g)).transpose()?)
         .bind(&id.0)
         .execute(&mut *tx)
         .await?;

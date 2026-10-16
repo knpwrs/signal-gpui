@@ -2885,6 +2885,7 @@ impl Actor {
             can_label: None,
             can_add_members: None,
             ended: None,
+            group_state: None,
         })
     }
 

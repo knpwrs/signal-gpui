@@ -122,6 +122,33 @@ async fn groups_keep_who_may_add_and_whether_they_ended() {
 }
 
 #[tokio::test]
+async fn groups_keep_their_administration_state() {
+    let db = test_db().await;
+    let group = conv("g:0b");
+    db.upsert_conversation(&group, ConversationUpdate { title: Some("Hikers".into()), ..Default::default() }).await.unwrap();
+    assert_eq!(db.conversation(&group).await.unwrap().unwrap().group_state, GroupState::default(), "none stored yet");
+    let state = GroupState {
+        announcements_only: true,
+        info_admins_only: true,
+        members_admins_only: false,
+        labels_admins_only: true,
+        link: Some(GroupLink { url: "https://signal.group/#abc".into(), approval: true }),
+        invites: vec![GroupInvite { service_id: "PNI:p".into(), by: "a".into() }],
+        requests: vec![GroupRequest { aci: "r".into(), at: 5 }],
+        banned: vec!["b".into()],
+        membership: Membership::Requesting { password: "cGFzcw==".into() },
+    };
+    db.upsert_conversation(&group, ConversationUpdate { group_state: Some(state.clone()), ..Default::default() }).await.unwrap();
+    assert_eq!(db.conversation(&group).await.unwrap().unwrap().group_state, state);
+    // Other updates leave it alone.
+    db.upsert_conversation(&group, ConversationUpdate { title: Some("Hikers!".into()), ..Default::default() }).await.unwrap();
+    assert_eq!(db.conversation(&group).await.unwrap().unwrap().group_state, state);
+    // State from before a field existed still reads.
+    let old: GroupState = serde_json::from_str(r#"{"announcements_only":true}"#).unwrap();
+    assert!(old.announcements_only && old.membership == Membership::Member && old.link.is_none());
+}
+
+#[tokio::test]
 async fn insert_dedupes_and_tracks_unread_and_preview() {
     let db = test_db().await;
     let id1 = db.insert_message(&incoming("g:aa", "bob", 10, "first")).await.unwrap();
@@ -888,6 +915,7 @@ async fn drop_later_migrations(db: &AppDb) {
     sqlx::query("ALTER TABLE messages DROP COLUMN unread_poll_votes").execute(&db.writer).await.unwrap();
     sqlx::query("DROP TABLE profile_sharing").execute(&db.writer).await.unwrap();
     sqlx::query("DROP TABLE story_send_modes").execute(&db.writer).await.unwrap();
+    sqlx::query("ALTER TABLE conversations DROP COLUMN group_state").execute(&db.writer).await.unwrap();
 }
 
 /// Rewrites the migration history to look like a pre-squash database that

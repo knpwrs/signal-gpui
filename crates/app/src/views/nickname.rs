@@ -432,6 +432,7 @@ mod tests {
             can_add_members: true,
             left: false,
             ended: false,
+            group_state: Default::default(),
             description: None,
             admins: vec![],
             member_labels: Default::default(),
