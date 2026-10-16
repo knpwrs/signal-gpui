@@ -32,7 +32,7 @@ flag as on whenever it's set.
 | `keyTransparency` | Key transparency checks in safety numbers. | Not done: safety numbers are shown and can be verified, without key transparency. |
 | `localBackups` | Local (on-disk) backups. | Not applicable. |
 | `disappearingCalls` | Call notices follow the chat's disappearing timer. | Done, always on: a call's notice takes the chat's timer and counts down once it's seen and the call is over (`signal_store::call_history`). |
-| `remoteMute.send` | Muting someone in a group call. | Not done: there's no remote mute. |
+| `remoteMute.send` | Muting someone in a group call. | Done, always on (`Command::RemoteMute`). |
 
 ### Limits (`global.*`), with Desktop's defaults
 
@@ -153,13 +153,15 @@ with a membership proof from `GET /v1/groups/token`. Not done yet:
   the ring's record as it was). Tested with store, mapping and demo-mode
   tests, not between real devices.
 - **Group call extras:** reactions, raised hands, remote mute, the speaker
-  view (the grid is all there is), and paging through more participants
-  than fit on screen.
+  view and the grid's pages are tested in demo mode and with unit tests,
+  not in a real call. Left: Desktop's sidebar layout, its reaction bursts
+  (many of the same emoji at once), the raised hands queue ("Open queue"),
+  the picker's full emoji choice (it has the six quick reactions), and
+  asking for each tile's video at its own size (on-screen tiles get 360p,
+  the speaker 720p).
 - **Live testing:** written against RingRTC's API and Desktop's behavior,
   checked with unit tests and demo-mode flow tests; not yet tried between
   real devices (group calls least of all).
-- **Related flags:** `remoteMute.send` (muting someone in a group call),
-  listed above.
 - **libsignal versions:** RingRTC pins libsignal v0.99.1 for zkgroup while
   presage uses v0.99.0; both build side by side. Keep RingRTC's pin in step
   when presage moves.

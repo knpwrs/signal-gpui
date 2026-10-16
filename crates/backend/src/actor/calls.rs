@@ -49,6 +49,8 @@ impl ActiveCall {
             group: false,
             participants: Vec::new(),
             ringer: None,
+            raised_hands: Vec::new(),
+            local_demux_id: None,
         }
     }
 }

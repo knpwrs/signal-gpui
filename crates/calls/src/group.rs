@@ -114,6 +114,15 @@ pub enum GroupEvent {
     Ended { client_id: group_call::ClientId },
     /// A ring for a group call: `group_id` is the group's identifier.
     Ring { group_id: Vec<u8>, ring_id: i64, sender: Vec<u8>, ring: Ring },
+    /// Reactions sent in the call since the last, oldest first: who sent
+    /// each (a demux id, ours included) and the emoji.
+    Reactions { client_id: group_call::ClientId, reactions: Vec<(DemuxId, String)> },
+    /// Whose hands are up (ours included), in the order they went up.
+    RaisedHands { client_id: group_call::ClientId, hands: Vec<DemuxId> },
+    /// Someone (`source`) muted our microphone.
+    MutedBy { client_id: group_call::ClientId, source: DemuxId },
+    /// Someone muted someone else (or us on another device).
+    ObservedMute { client_id: group_call::ClientId, source: DemuxId, target: DemuxId },
 }
 
 pub(crate) fn connection(state: &ConnectionState) -> (bool, bool) {

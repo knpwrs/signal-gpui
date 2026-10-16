@@ -28,6 +28,8 @@ const HOUSE: &str = "g:000000000000000000000000000000000000000000000000000000000
 const SELF: &str = "d:00000000-0000-4000-8000-000000000001";
 
 const MINUTE: i64 = 60_000;
+/// Our demux id in the demo's group calls.
+const DEMO_LOCAL_DEMUX: u32 = 100;
 const HOUR: i64 = 60 * MINUTE;
 const DAY: i64 = 24 * HOUR;
 
@@ -687,6 +689,8 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                         })
                         .collect(),
                     ringer: None,
+                    raised_hands: Vec::new(),
+                    local_demux_id: group.then_some(DEMO_LOCAL_DEMUX),
                 };
                 let started = next_sent_at();
                 *call.borrow_mut() = Some((update.clone(), started, false));
@@ -749,7 +753,35 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 }
                 emit(Event::Call(None));
             }
-            Command::AcceptCall { .. } | Command::SetCallAudio(_) | Command::SetCallVideo(_) => {}
+            Command::AcceptCall { .. } | Command::SetCallAudio(_) | Command::SetCallVideo(_) | Command::ShowGroupVideo { .. } => {}
+            // A group call's extras, as RingRTC answers them: our reaction
+            // comes back to us, our hand goes up, and a mute reaches them.
+            Command::CallReact { emoji } => {
+                if call.borrow().as_ref().is_some_and(|(update, _, _)| update.group) {
+                    emit(Event::CallReactions(vec![crate::CallReaction { aci: aci(SELF).into(), demux_id: DEMO_LOCAL_DEMUX, emoji }]));
+                }
+            }
+            Command::RaiseHand(raise) => {
+                let mut current = call.borrow_mut();
+                if let Some((update, _, _)) = current.as_mut().filter(|(update, _, _)| update.group) {
+                    update.raised_hands.retain(|d| *d != DEMO_LOCAL_DEMUX);
+                    if raise {
+                        update.raised_hands.push(DEMO_LOCAL_DEMUX);
+                    }
+                    emit(Event::Call(Some(update.clone())));
+                }
+            }
+            Command::RemoteMute { demux_id } => {
+                let mut current = call.borrow_mut();
+                if let Some((update, _, _)) = current.as_mut()
+                    && let Some(p) = update.participants.iter_mut().find(|p| p.demux_id == demux_id && p.audio)
+                {
+                    p.audio = false;
+                    let target = p.aci.clone();
+                    emit(Event::Call(Some(update.clone())));
+                    emit(Event::CallMuted { by: aci(SELF).into(), target: Some(target) });
+                }
+            }
             // Maya's in the hiking group's call; no one's in the others'.
             Command::PeekGroupCall { conversation } => {
                 let users = if conversation.0 == GROUP { vec![aci(MAYA).to_owned()] } else { Vec::new() };

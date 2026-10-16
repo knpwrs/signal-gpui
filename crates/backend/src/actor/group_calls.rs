@@ -53,6 +53,15 @@ pub(super) struct GroupCall {
     creator: Option<String>,
     /// What our joining last recorded in the call history.
     recorded: Option<CallHistoryEvent>,
+    /// Our demux id, once we're in.
+    our_demux: Option<u32>,
+    /// Whose hands are up, in the order they went up.
+    raised_hands: Vec<u32>,
+    /// Our microphone is on (a remote mute only mutes an open one).
+    audio: bool,
+    /// The participants on screen, from the UI (`None`: all of them), and
+    /// the one shown large.
+    visible: Option<(Vec<u32>, Option<u32>)>,
     rang: bool,
     announced: bool,
     joined: bool,
@@ -74,6 +83,10 @@ impl GroupCall {
             era: None,
             creator: None,
             recorded: None,
+            our_demux: None,
+            raised_hands: Vec::new(),
+            audio: true,
+            visible: None,
             rang: false,
             announced: false,
             joined: false,
@@ -123,6 +136,8 @@ impl GroupCall {
                 })
                 .collect(),
             ringer: self.ring.as_ref().map(|(_, _, ringer)| ringer.clone()),
+            raised_hands: self.raised_hands.clone(),
+            local_demux_id: self.our_demux,
         }
     }
 }
@@ -282,6 +297,9 @@ impl Actor {
     /// Our microphone and camera in a group call (as well as the tracks).
     pub(super) fn group_media(&self, audio: Option<bool>, video: Option<bool>) {
         let Some(client_id) = self.group_call.borrow().as_ref().and_then(|g| g.client_id) else { return };
+        if let (Some(on), Some(call)) = (audio, self.group_call.borrow_mut().as_mut()) {
+            call.audio = on;
+        }
         self.with_calls(|calls| {
             if let Some(on) = audio {
                 calls.set_group_audio_muted(client_id, !on);
@@ -355,6 +373,7 @@ impl Actor {
                     let mut call = self.group_call.borrow_mut();
                     let Some(call) = call.as_mut().filter(|g| g.client_id == Some(client_id)) else { return };
                     call.joined = joined.is_some();
+                    call.our_demux = joined;
                     if call.joined && !matches!(call.status, CallStatus::Connected { .. }) {
                         call.status = CallStatus::Connected { since: now_millis() };
                     }
@@ -374,12 +393,42 @@ impl Actor {
                 self.emit_call();
             }
             GroupEvent::Participants { client_id, participants } => {
-                let sizes: Vec<_> = participants.iter().filter(|p| !p.video_muted).map(|p| (p.demux_id, 640, 360)).collect();
                 if let Some(call) = self.group_call.borrow_mut().as_mut().filter(|g| g.client_id == Some(client_id)) {
                     call.participants = participants;
                 }
-                self.with_calls(|calls| calls.request_group_video(client_id, sizes));
+                self.request_group_video(client_id);
                 self.emit_call();
+            }
+            GroupEvent::Reactions { client_id, reactions } => {
+                let reactions: Vec<_> = reactions
+                    .into_iter()
+                    .filter_map(|(demux_id, emoji)| Some(crate::CallReaction { aci: self.demux_aci(client_id, demux_id)?, demux_id, emoji }))
+                    .collect();
+                if !reactions.is_empty() {
+                    self.emit(Event::CallReactions(reactions));
+                }
+            }
+            GroupEvent::RaisedHands { client_id, hands } => {
+                if let Some(call) = self.group_call.borrow_mut().as_mut().filter(|g| g.client_id == Some(client_id)) {
+                    call.raised_hands = hands;
+                }
+                self.emit_call();
+            }
+            // Desktop's `setMutedBy`: only an open microphone is muted,
+            // and RingRTC tells everyone who did it.
+            GroupEvent::MutedBy { client_id, source } => {
+                let open = self.group_call.borrow().as_ref().is_some_and(|g| g.client_id == Some(client_id) && g.audio);
+                let Some(by) = self.demux_aci(client_id, source).filter(|_| open) else { return };
+                self.with_calls(|calls| calls.set_group_audio_muted_remotely(client_id, source));
+                if let Some(call) = self.group_call.borrow_mut().as_mut() {
+                    call.audio = false;
+                }
+                self.emit(Event::CallMuted { by, target: None });
+            }
+            GroupEvent::ObservedMute { client_id, source, target } => {
+                if let (Some(by), Some(target)) = (self.demux_aci(client_id, source), self.demux_aci(client_id, target)) {
+                    self.emit(Event::CallMuted { by, target: Some(target) });
+                }
             }
             GroupEvent::Peek { client_id, peek } => {
                 if let Some(call) = self.group_call.borrow_mut().as_mut().filter(|g| g.client_id == Some(client_id)) {
@@ -572,6 +621,74 @@ impl Actor {
         let active = self.group_call.borrow().as_ref().is_some_and(|g| g.conversation == conversation && g.era.as_deref() == Some(&era));
         let record = GroupCallRecord { call_id, era: Some(era), incoming: by.is_some(), by, at };
         self.group_call_history(&conversation, record, CallHistoryEvent::Started, active, HistorySource::IfNew).await;
+    }
+
+    /// Whose device a demux id is in the call (ours included).
+    fn demux_aci(&self, client_id: ClientId, demux_id: u32) -> Option<String> {
+        let call = self.group_call.borrow();
+        let call = call.as_ref().filter(|g| g.client_id == Some(client_id))?;
+        if call.our_demux == Some(demux_id) {
+            return Some(self.self_aci());
+        }
+        call.participants.iter().find(|p| p.demux_id == demux_id).and_then(|p| aci_of(&p.user_id))
+    }
+
+    /// Asks for the video of the participants on screen with their camera
+    /// on: the one shown large at 720p, the rest at 360p (Desktop's
+    /// `setGroupCallVideoRequest` asks each at its tile's size). Video
+    /// not asked for isn't sent.
+    fn request_group_video(&self, client_id: ClientId) {
+        let sizes: Vec<_> = {
+            let call = self.group_call.borrow();
+            let Some(call) = call.as_ref().filter(|g| g.client_id == Some(client_id)) else { return };
+            call.participants
+                .iter()
+                .filter(|p| !p.video_muted)
+                .filter_map(|p| match &call.visible {
+                    None => Some((p.demux_id, 640, 360)),
+                    Some((_, Some(main))) if *main == p.demux_id => Some((p.demux_id, 1280, 720)),
+                    Some((visible, _)) if visible.contains(&p.demux_id) => Some((p.demux_id, 640, 360)),
+                    Some(_) => None,
+                })
+                .collect()
+        };
+        self.with_calls(|calls| calls.request_group_video(client_id, sizes));
+    }
+
+    /// The UI's tiles changed (a page, or the speaker view).
+    pub(super) fn show_group_video(&self, visible: Vec<u32>, main: Option<u32>) {
+        let client_id = {
+            let mut call = self.group_call.borrow_mut();
+            let Some(call) = call.as_mut().filter(|g| g.client_id.is_some()) else { return };
+            call.visible = Some((visible, main));
+            call.client_id
+        };
+        if let Some(client_id) = client_id {
+            self.request_group_video(client_id);
+        }
+    }
+
+    /// Desktop's call reactions.
+    pub(super) fn call_react(&self, emoji: String) {
+        let Some(client_id) = self.group_call.borrow().as_ref().filter(|g| g.joined).and_then(|g| g.client_id) else { return };
+        self.with_calls(|calls| calls.group_react(client_id, emoji));
+    }
+
+    pub(super) fn raise_hand(&self, raise: bool) {
+        let Some(client_id) = self.group_call.borrow().as_ref().filter(|g| g.joined).and_then(|g| g.client_id) else { return };
+        self.with_calls(|calls| calls.group_raise_hand(client_id, raise));
+    }
+
+    /// Desktop's "Mute audio" on someone's tile (`remoteMute.send`).
+    pub(super) fn remote_mute(&self, demux_id: u32) {
+        let client_id = {
+            let call = self.group_call.borrow();
+            let Some(call) = call.as_ref().filter(|g| g.joined && g.our_demux != Some(demux_id)) else { return };
+            call.client_id
+        };
+        if let Some(client_id) = client_id {
+            self.with_calls(|calls| calls.group_remote_mute(client_id, demux_id));
+        }
     }
 
     fn group_key(&self, client_id: ClientId) -> Option<[u8; 32]> {

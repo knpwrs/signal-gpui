@@ -251,6 +251,12 @@ pub struct AppState {
     pub call_video: bool,
     /// The call screen is minimized to a small window.
     pub call_minimized: bool,
+    /// A group call's recent reactions, with when each came (Desktop shows
+    /// each for a few seconds).
+    pub call_reactions: Vec<(std::time::Instant, signal_backend::CallReaction)>,
+    /// The group call's latest mute: when, who did it, and whom (`None`:
+    /// us), for Desktop's mute toast.
+    pub call_mute: Option<(std::time::Instant, String, Option<String>)>,
     /// Screens and windows to present (loaded for the picker).
     pub share_sources: Option<Result<Vec<signal_backend::ShareSource>, String>>,
     /// Microphones, speakers and cameras, for Settings (loaded on opening it).
@@ -319,6 +325,8 @@ impl AppState {
             call_audio: true,
             call_video: false,
             call_minimized: false,
+            call_reactions: Vec::new(),
+            call_mute: None,
             ringtone: None,
             call_devices: None,
             share_sources: None,
@@ -622,6 +630,18 @@ impl AppState {
             Event::SafetyNumber { conversation, result } => self.safety_number = Some((conversation, result)),
             Event::Call(update) => self.on_call(update, cx),
             Event::CallDevices(devices) => self.call_devices = Some(devices),
+            Event::CallReactions(reactions) => {
+                let now = std::time::Instant::now();
+                self.call_reactions.retain(|(at, _)| now.duration_since(*at) < std::time::Duration::from_secs(10));
+                self.call_reactions.extend(reactions.into_iter().map(|r| (now, r)));
+            }
+            Event::CallMuted { by, target } => {
+                // Someone muted us: the microphone shows off.
+                if target.is_none() {
+                    self.call_audio = false;
+                }
+                self.call_mute = Some((std::time::Instant::now(), by, target));
+            }
             Event::CameraFailed(error) => {
                 if let Some(lobby) = &mut self.lobby {
                     lobby.video = false;
@@ -1494,6 +1514,8 @@ impl AppState {
             self.call_audio = true;
             self.call_video = false;
             self.call_minimized = false;
+            self.call_reactions.clear();
+            self.call_mute = None;
         }
         self.call = update;
     }

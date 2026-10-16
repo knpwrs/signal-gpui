@@ -327,6 +327,14 @@ impl GroupUpdateHandler for Handler {
             GroupUpdate::Ring { group_id, ring_id, sender_id, update } => {
                 GroupEvent::Ring { group_id, ring_id: ring_id.into(), sender: sender_id, ring: update.into() }
             }
+            GroupUpdate::Reactions(client_id, reactions) => {
+                GroupEvent::Reactions { client_id, reactions: reactions.into_iter().map(|r| (r.demux_id, r.value)).collect() }
+            }
+            GroupUpdate::RaisedHands(client_id, hands) => GroupEvent::RaisedHands { client_id, hands },
+            GroupUpdate::RemoteMute { client_id, mute_source } => GroupEvent::MutedBy { client_id, source: mute_source },
+            GroupUpdate::ObservedRemoteMute { client_id, mute_source, mute_target } => {
+                GroupEvent::ObservedMute { client_id, source: mute_source, target: mute_target }
+            }
             _ => return Ok(()),
         };
         (self.emit)(CallEvent::Group(event));
@@ -619,6 +627,30 @@ impl Calls {
     pub fn set_group_presenting(&mut self, client_id: ClientId, presenting: bool) {
         self.manager.set_presenting(client_id, presenting);
         self.manager.set_sharing_screen(client_id, presenting);
+    }
+
+    /// Sends a reaction (an emoji) to everyone in the call.
+    pub fn group_react(&mut self, client_id: ClientId, value: String) {
+        self.manager.react(client_id, value);
+    }
+
+    /// Raises or lowers our hand.
+    pub fn group_raise_hand(&mut self, client_id: ClientId, raise: bool) {
+        self.manager.raise_hand(client_id, raise);
+    }
+
+    /// Asks a participant's device to mute its microphone (Desktop's
+    /// `sendRemoteMuteRequest`).
+    pub fn group_remote_mute(&mut self, client_id: ClientId, target: DemuxId) {
+        self.manager.send_remote_mute_request(client_id, target);
+    }
+
+    /// Mutes our microphone because `source` asked: RingRTC tells the
+    /// others who did it.
+    pub fn set_group_audio_muted_remotely(&mut self, client_id: ClientId, source: DemuxId) {
+        self.audio_on = false;
+        self.audio.set_enabled(false);
+        self.manager.set_outgoing_audio_muted_remotely(client_id, source);
     }
 
     /// Which participants' video to receive, at what size.

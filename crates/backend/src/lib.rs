@@ -261,6 +261,17 @@ pub enum Command {
     LoadCallDevices,
     /// Chooses a device for calls (`id` from `Event::CallDevices`), saved.
     SetCallDevice { kind: DeviceKind, id: String },
+    /// Sends a reaction (an emoji) to everyone in the group call.
+    CallReact { emoji: String },
+    /// Raises (or lowers) our hand in the group call.
+    RaiseHand(bool),
+    /// Asks a participant's device to mute its microphone (Desktop's
+    /// `sendRemoteMute`, behind the `remoteMute.send` flag; always on).
+    RemoteMute { demux_id: u32 },
+    /// The group call's participants on screen, whose video to receive
+    /// (`main`: one shown large, at a higher resolution). Desktop's
+    /// `setGroupCallVideoRequest`.
+    ShowGroupVideo { visible: Vec<u32>, main: Option<u32> },
     /// Marks the call history read up to its latest call (`None`: every
     /// chat, as Desktop does when the Calls tab is viewed), and tells our
     /// other devices. Reading a chat does this for its calls.
@@ -460,6 +471,20 @@ pub struct CallUpdate {
     pub participants: Vec<CallParticipant>,
     /// Who's ringing us, for a group call's ring (their ACI).
     pub ringer: Option<String>,
+    /// A group call's raised hands (demux ids, ours as `local_demux_id`),
+    /// in the order they went up.
+    pub raised_hands: Vec<u32>,
+    /// Our demux id in a group call, once we're in.
+    pub local_demux_id: Option<u32>,
+}
+
+/// A reaction someone sent in a group call (Desktop's call reactions).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallReaction {
+    /// Their ACI (ours when `demux_id` is our `local_demux_id`).
+    pub aci: String,
+    pub demux_id: u32,
+    pub emoji: String,
 }
 
 /// Someone in a group call (one of their devices).
@@ -608,6 +633,11 @@ pub enum Event {
     CameraFailed(String),
     /// The call changed (`None`: no call any more).
     Call(Option<CallUpdate>),
+    /// Reactions sent in the group call, oldest first.
+    CallReactions(Vec<CallReaction>),
+    /// In the group call, `by` (an ACI) muted `target` (`None`: us; then
+    /// our microphone is off).
+    CallMuted { by: String, target: Option<String> },
     /// A 1:1 chat's safety number, or why there isn't one.
     SafetyNumber { conversation: ConversationId, result: Result<SafetyNumber, String> },
     /// A group we created is ready to open.
