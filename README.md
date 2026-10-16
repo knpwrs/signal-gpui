@@ -25,7 +25,7 @@ The goal is to do what Signal Desktop does, the way it does it. When behavior is
 - **Sync with your other devices**: pins, archived, muted and unread chats, blocks, hidden stories and settings go through Signal's Storage Service, editing only the fields that changed and keeping the ones this client doesn't know.
 - **Desktop's layout**: navigation tabs, a resizable chat list that narrows to avatars, Desktop's wording, and its keyboard shortcuts.
 
-Where Signal's server turns features on through remote config, this client uses Desktop's defaults. `todo.md` lists what's left.
+Where Signal's server turns features on or sets limits through remote config, this client reads the same config and follows it as Desktop 8.34 would. `todo.md` lists what's left.
 
 ## Beyond Signal Desktop
 
