@@ -3,6 +3,7 @@
 
 mod call_log;
 mod calls;
+mod early;
 mod group_calls;
 mod polls;
 mod stories;
@@ -92,8 +93,6 @@ const AVATAR_CHECK_INTERVAL_MS: i64 = 24 * 60 * 60 * 1000;
 const SETTING_GROUP_FETCH_FAILED: &str = "group.fetch_failed.";
 const AVATAR_CHECKS_PER_SYNC: usize = 100;
 const AVATAR_BATCH_DELAY: Duration = Duration::from_secs(5 * 60);
-/// Read syncs kept for messages not here yet.
-const MAX_EARLY_READS: usize = 1000;
 /// `verified.<ACI>`: the identity key (hex) we marked verified for them;
 /// empty when cleared. Verification lapses when their key changes.
 const SETTING_VERIFIED: &str = "verified.";
@@ -196,11 +195,10 @@ struct Actor {
     /// Lets stories go after a day; notified when one arrives.
     story_expiry_task: RefCell<Option<tokio::task::JoinHandle<()>>>,
     story_expiry: tokio::sync::Notify,
-    /// Read syncs that arrived before their message, `(author, sent_at)`,
-    /// applied when it does (as Desktop keeps them). Newest last.
-    early_reads: RefCell<std::collections::VecDeque<(String, i64)>>,
-    /// Poll votes and ends that arrived before their poll (`polls.rs`).
-    early_polls: RefCell<std::collections::VecDeque<Action>>,
+    /// Early events being applied now (`early.rs`), by row.
+    early_replaying: RefCell<HashSet<i64>>,
+    /// Early events have been tried again this session.
+    early_retried: RefCell<bool>,
     /// RingRTC, once a call needs it.
     calls: RefCell<Option<signal_calls::Calls>>,
     /// The call in progress.
@@ -286,8 +284,8 @@ pub(crate) async fn run(
         story_jobs: RefCell::new(HashMap::new()),
         next_story_job: std::cell::Cell::new(0),
         story_expiry: tokio::sync::Notify::new(),
-        early_reads: RefCell::default(),
-        early_polls: RefCell::default(),
+        early_replaying: RefCell::default(),
+        early_retried: RefCell::new(false),
         identities_seen: RefCell::default(),
         calls: RefCell::new(None),
         call: RefCell::new(None),
@@ -480,6 +478,8 @@ impl Actor {
             if !downloads.is_empty() {
                 tokio::task::spawn_local(self.clone().download_transferred(manager.clone(), downloads));
             }
+            // What came for transferred messages before they were here.
+            self.retry_early_events(&manager, false).await;
             let long_texts = std::mem::take(&mut imported.long_texts);
             if !long_texts.is_empty() {
                 let (this, manager) = (self.clone(), manager.clone());
@@ -801,6 +801,11 @@ impl Actor {
             Received::QueueEmpty => {
                 self.emit(Event::Connection(ConnectionState::Online));
                 self.refresh_titles().await;
+                // As Desktop reads its caches again at startup, once
+                // what was waiting on the server is in.
+                if !self.early_retried.replace(true) {
+                    self.retry_early_events(manager, true).await;
+                }
                 if !self.long_texts_resumed.replace(true) {
                     tokio::task::spawn_local(self.clone().resume_long_texts(manager.clone()));
                 }
@@ -953,21 +958,16 @@ impl Actor {
                         if !repeat && let Some(pointer) = &long_text {
                             self.expect_long_text(manager, id, pointer, mentions.clone(), styles.clone()).await;
                         }
-                        if let Some(poll) = &poll {
-                            if let Err(error) = self.db.set_poll(id, poll).await {
-                                self.error("failed to store poll", error);
-                            }
-                            // Votes and its end can come before it.
-                            self.apply_early_poll_events(&message.conversation_id, message.author.as_deref(), message.sent_at).await;
+                        if let Some(poll) = &poll
+                            && let Err(error) = self.db.set_poll(id, poll).await
+                        {
+                            self.error("failed to store poll", error);
                         }
-                        // Already read on another device, before it got here.
-                        let read_early = !repeat
-                            && message.direction == Direction::Incoming
-                            && match &message.author {
-                                Some(author) => self.apply_early_read(author, message.sent_at).await,
-                                None => false,
-                            };
-                        if !repeat && !read_early && message.direction == Direction::Incoming {
+                        // Deletes, edits, reactions, votes, receipts and
+                        // syncs that came before it. One read on another
+                        // device, or deleted, doesn't notify.
+                        let early = self.apply_early_for(manager, message.author.as_deref(), message.sent_at).await;
+                        if !repeat && !early.read && !early.deleted && message.direction == Direction::Incoming {
                             let me = self.self_aci();
                             self.emit(Event::Incoming {
                                 conversation: conversation.clone(),
@@ -1010,96 +1010,12 @@ impl Actor {
                     Err(error) => self.error("failed to store message", error),
                 }
             }
-            Action::React { conversation, target_author, target_sent_at, emoji, author, sent_at, remove } => {
-                let Some(target) = self.find(&conversation, target_author.as_deref(), target_sent_at).await else {
-                    debug!("reaction target not found");
-                    return;
-                };
-                let result = if remove {
-                    self.db.remove_reaction(target, author.as_deref()).await
-                } else {
-                    self.db.set_reaction(target, Reaction { emoji, author, sent_at }).await
-                };
-                match result {
-                    Ok(()) => self.emit(Event::MessageChanged { conversation, message_id: target }),
-                    Err(error) => self.error("failed to store reaction", error),
-                }
-            }
-            Action::Delete { conversation, target_author, target_sent_at, sent_at } => {
-                // Found by author too, so only the author's delete matches.
-                let Some(message) = self.db.find_message(&conversation, target_author.as_deref(), target_sent_at).await.ok().flatten() else {
-                    self.apply_story_delete(target_author.as_deref(), target_sent_at).await;
-                    return;
-                };
-                if !crate::deletes::can_receive(&message, self.is_note_to_self(&conversation), sent_at) {
-                    tracing::info!("ignoring a delete for everyone that came too late");
-                    return;
-                }
-                let target = message.id;
-                match self.db.mark_deleted(target).await {
-                    Ok(()) => {
-                        self.emit(Event::MessageChanged { conversation, message_id: target });
-                        self.emit(Event::ConversationsChanged);
-                    }
-                    Err(error) => self.error("failed to delete message", error),
-                }
-            }
-            Action::AdminDelete { conversation, target_author, target_sent_at, by, sent_at } => {
-                let Some(message) = self.db.find_message(&conversation, target_author.as_deref(), target_sent_at).await.ok().flatten() else {
-                    tracing::info!("ignoring an admin delete: no such message");
-                    return;
-                };
-                // Their role when it arrives (presage has fetched the group
-                // again if the message names a newer revision).
-                let deleter = by.clone().unwrap_or_else(|| self.self_aci());
-                let is_admin = self.is_group_admin(&conversation, &deleter).await;
-                let group = conversation.as_group().is_some();
-                if let Err(reason) = crate::deletes::can_receive_as_admin(&message, group, is_admin, sent_at) {
-                    tracing::info!(reason, "ignoring an admin delete");
-                    return;
-                }
-                let target = message.id;
-                match self.db.mark_deleted_by_admin(target, &signal_store::DeletedByAdmin { by }).await {
-                    Ok(true) => {
-                        self.emit(Event::MessageChanged { conversation, message_id: target });
-                        self.emit(Event::ConversationsChanged);
-                    }
-                    Ok(false) => {}
-                    Err(error) => self.error("failed to delete message", error),
-                }
-            }
-            Action::Edit { conversation, target_author, target_sent_at, sent_at, body, mentions, styles, long_text } => {
-                let Some(target) = self.find(&conversation, target_author.as_deref(), target_sent_at).await else {
-                    return;
-                };
-                let (body, spans, style_spans) = self.render_body(&body, &mentions, &styles).await;
-                match self.db.edit_message(target, &body, sent_at).await {
-                    Ok(()) => {
-                        let _ = self.db.set_mentions(target, &spans).await;
-                        let _ = self.db.set_styles(target, &style_spans).await;
-                        if let Some(pointer) = &long_text {
-                            self.expect_long_text(manager, target, pointer, mentions, styles).await;
-                        }
-                        // A read sync can name the edit, and come before it.
-                        if let Some(author) = &target_author {
-                            self.apply_early_read(author, sent_at).await;
-                        }
-                        self.emit(Event::MessageChanged { conversation, message_id: target });
-                        self.emit(Event::ConversationsChanged);
-                    }
-                    Err(error) => self.error("failed to edit message", error),
-                }
+            Action::React { .. } | Action::Delete { .. } | Action::AdminDelete { .. } | Action::Edit { .. } => {
+                self.modify(manager, action).await;
             }
             Action::Receipt { sent_at, status } => {
                 for ts in sent_at {
-                    match self.db.update_status_by_sent_at(ts, status).await {
-                        Ok(changed) => {
-                            for (conversation, message_id) in changed {
-                                self.emit(Event::MessageChanged { conversation, message_id });
-                            }
-                        }
-                        Err(error) => self.error("failed to apply receipt", error),
-                    }
+                    self.modify(manager, Action::Receipt { sent_at: vec![ts], status }).await;
                 }
             }
             Action::Typing { sender, group_id, started } => {
@@ -1140,32 +1056,16 @@ impl Actor {
             Action::ViewedSync(viewed) => self.apply_viewed_sync(viewed).await,
             Action::ReadSync(entries) => {
                 let mut changed = false;
-                for (author, sent_at) in entries {
-                    match self.db.apply_read_sync(&author, sent_at).await {
-                        Ok(signal_store::ReadSync::Read(_)) => changed = true,
-                        Ok(signal_store::ReadSync::AlreadyRead) => {}
-                        Ok(signal_store::ReadSync::NotFound) => {
-                            let mut early = self.early_reads.borrow_mut();
-                            if early.len() >= MAX_EARLY_READS {
-                                early.pop_front();
-                            }
-                            early.push_back((author, sent_at));
-                        }
-                        Err(error) => self.error("failed to apply read sync", error),
-                    }
+                for entry in entries {
+                    changed |= self.modify(manager, Action::ReadSync(vec![entry])).await == early::Outcome::Applied;
                 }
                 if changed {
-                    self.expiry.notify_one();
                     self.emit(Event::ConversationsChanged);
                 }
             }
-            // Before the first sync (which runs once the queue drains) there
-            // is nothing to refresh.
             Action::DeleteForMe { messages, conversations } => {
-                for (thread, author, sent_at) in messages {
-                    let Some(conversation) = self.resolve_thread(manager, &thread).await else { continue };
-                    let Some(id) = self.find(&conversation, author.as_deref(), sent_at).await else { continue };
-                    self.remove_message(&conversation, id).await;
+                for message in messages {
+                    self.modify(manager, Action::DeleteForMe { messages: vec![message], conversations: Vec::new() }).await;
                 }
                 for chat in conversations {
                     if let Some(conversation) = self.resolve_thread(manager, &chat.thread).await {
@@ -1173,6 +1073,8 @@ impl Actor {
                     }
                 }
             }
+            // Before the first sync (which runs once the queue drains) there
+            // is nothing to refresh.
             Action::StorageChanged if *self.storage_synced.borrow() => self.spawn_storage_sync(manager),
             Action::StorageChanged => {}
             Action::ExpireTimer { conversation, seconds, version, by, at } => {
@@ -1188,8 +1090,9 @@ impl Actor {
                     self.emit(Event::PinsChanged(conversation));
                 }
             }
-            Action::PollVote { .. } => self.apply_poll_vote(action).await,
-            Action::PollEnd { .. } => self.apply_poll_end(action).await,
+            Action::PollVote { .. } | Action::PollEnd { .. } => {
+                self.modify(manager, action).await;
+            }
         }
     }
 
@@ -3762,31 +3665,6 @@ impl Actor {
             self.error("failed to update message status", error);
         }
         self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id: id });
-    }
-
-    /// Applies a read sync that came before this message (or edit), if one
-    /// did; `true` when it's now read. Kept for later if applying fails.
-    async fn apply_early_read(&self, author: &str, sent_at: i64) -> bool {
-        let position = |early: &std::collections::VecDeque<(String, i64)>| {
-            early.iter().position(|(a, at)| a == author && *at == sent_at)
-        };
-        if position(&self.early_reads.borrow()).is_none() {
-            return false;
-        }
-        match self.db.apply_read_sync(author, sent_at).await {
-            Ok(_) => {
-                let mut early = self.early_reads.borrow_mut();
-                if let Some(ix) = position(&early) {
-                    early.remove(ix);
-                }
-                self.expiry.notify_one();
-                true
-            }
-            Err(error) => {
-                self.error("failed to apply read sync", error);
-                false
-            }
-        }
     }
 
     // --------------------------------------------------------- safety numbers

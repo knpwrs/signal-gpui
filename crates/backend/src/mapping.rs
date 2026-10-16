@@ -17,10 +17,13 @@ use signal_store::{
 /// Object replacement character Signal uses as the placeholder for mentions.
 pub const MENTION_PLACEHOLDER: char = '\u{FFFC}';
 
-#[derive(Debug, Clone, PartialEq)]
+// The variants that change a message already here are kept as JSON when
+// they come first (`crate::actor::early`); the rest are never stored.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 // One short-lived value per received message; boxing `Insert` buys nothing.
 #[allow(clippy::large_enum_variant)]
 pub enum Action {
+    #[serde(skip)]
     Insert {
         message: NewMessage,
         /// ACIs of mentions, in body order; each replaces one [`MENTION_PLACEHOLDER`].
@@ -79,12 +82,14 @@ pub enum Action {
         mentions: Vec<String>,
         styles: Vec<WireStyle>,
         /// The edit's whole text, when it came as an attachment.
+        #[serde(with = "pointer_bytes")]
         long_text: Option<AttachmentPointer>,
     },
     Receipt {
         sent_at: Vec<i64>,
         status: DeliveryStatus,
     },
+    #[serde(skip)]
     Typing {
         sender: String,
         group_id: Option<Vec<u8>>,
@@ -92,12 +97,14 @@ pub enum Action {
     },
     /// Our other device read these incoming messages: `(author, sent_at)`.
     ReadSync(Vec<(String, i64)>),
+    #[serde(skip)]
     /// A story, someone's or ours (posted from another device).
     Story {
         story: signal_store::NewStory,
         /// Its photo or video, to download.
         pointer: Option<AttachmentPointer>,
     },
+    #[serde(skip)]
     /// A reply or reaction to a group story, or one to one to our story,
     /// kept with the story.
     StoryReply {
@@ -108,27 +115,37 @@ pub enum Action {
         story_sent_at: i64,
         reply: signal_store::StoryReply,
     },
+    #[serde(skip)]
     /// `viewer` viewed our stories sent at these times (a VIEWED receipt).
     StoryViewed { viewer: String, sent_at: Vec<i64> },
+    #[serde(skip)]
     /// Who our story sent at `sent_at` goes to now, from another device.
     StoryRecipientUpdate { sent_at: i64, recipients: Vec<signal_store::StoryRecipient> },
+    #[serde(skip)]
     /// We viewed these on another device: `(author, sent_at)`.
     ViewedSync(Vec<(Option<String>, i64)>),
+    #[serde(skip)]
     /// Someone (`None`: us, on another device) started a group call.
     GroupCallStarted { conversation: ConversationId, by: Option<String>, era: Option<String>, at: i64 },
+    #[serde(skip)]
     /// Another of our devices' record of a 1:1 call.
     CallEvent(CallEventSync),
+    #[serde(skip)]
     /// Another of our devices' record of a group call.
     GroupCallEvent(GroupCallEventSync),
+    #[serde(skip)]
     /// Another of our devices cleared or read its call history.
     CallLogEvent(CallLogEventSync),
+    #[serde(skip)]
     /// Our other device marked a contact's identity key verified (or not).
     Verified { aci: String, identity_key: Vec<u8>, verified: bool },
+    #[serde(skip)]
     /// Our primary device changed the Storage Service (pins, names, ...).
     StorageChanged,
     /// "Delete for me" on another of our devices: these messages
     /// `(chat, author or None for us, sent at)` and whole chats.
     DeleteForMe { messages: Vec<(ThreadRef, Option<String>, i64)>, conversations: Vec<ChatDelete> },
+    #[serde(skip)]
     /// An explicit timer change ("X set the disappearing message time").
     ExpireTimer {
         conversation: ConversationId,
@@ -138,6 +155,7 @@ pub enum Action {
         by: Option<String>,
         at: i64,
     },
+    #[serde(skip)]
     /// A message was pinned. `target_author` `None`: one of ours.
     Pin {
         conversation: ConversationId,
@@ -148,6 +166,7 @@ pub enum Action {
         duration: Option<u32>,
         at: i64,
     },
+    #[serde(skip)]
     Unpin {
         conversation: ConversationId,
         target_author: Option<String>,
@@ -173,6 +192,26 @@ pub enum Action {
         target_sent_at: i64,
         sent_at: i64,
     },
+}
+
+/// An attachment pointer as its protobuf bytes, to keep an early edit.
+mod pointer_bytes {
+    use prost::Message as _;
+    use presage::proto::AttachmentPointer;
+    use serde::{Deserialize as _, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(pointer: &Option<AttachmentPointer>, s: S) -> Result<S::Ok, S::Error> {
+        match pointer {
+            Some(pointer) => s.serialize_some(&pointer.encode_to_vec()),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<AttachmentPointer>, D::Error> {
+        Option::<Vec<u8>>::deserialize(d)?
+            .map(|bytes| AttachmentPointer::decode(bytes.as_slice()).map_err(serde::de::Error::custom))
+            .transpose()
+    }
 }
 
 /// What a group change means here: a notice per change (`by`: who made
@@ -297,7 +336,7 @@ pub fn timer_update(current: (u32, u32), seconds: u32, version: Option<u32>, exp
 
 /// A chat as sync messages name it: by service id, or by group id (not the
 /// master key we key groups by, so the actor resolves it).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ThreadRef {
     Direct(String),
     GroupId(Vec<u8>),
@@ -320,7 +359,7 @@ fn thread_ref(id: Option<&presage::proto::ConversationIdentifier>) -> Option<Thr
 /// newest one that device named go (newer ones arrived after it deleted),
 /// and the chat itself only if nothing is left. A local-only delete (a chat
 /// with nothing addressable in it) names no messages.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChatDelete {
     pub thread: ThreadRef,
     /// `(author or None for us, sent at)`, newest first.

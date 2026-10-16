@@ -58,13 +58,6 @@ digest or plaintext hash), which is what the phone fills for link and sync.
 Attachments only in the backup (media) tier need backup-tier credentials
 and aren't downloaded.
 
-## Deletes that arrive before their message
-
-Desktop keeps a delete for everyone (the author's or an admin's) whose
-message hasn't arrived yet and applies it when the message does
-(`ts/messageModifiers/Deletes.preload.ts`, `forMessage`). We drop it, so
-the message shows when it comes.
-
 ## Polls
 
 Receiving, voting, making (in groups) and ending polls work, following

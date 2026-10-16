@@ -8,10 +8,7 @@ use presage::proto::data_message::{PollCreate, PollTerminate, PollVote as WirePo
 use signal_store::{Notice, Poll, PollVote, VoteSource};
 
 use super::*;
-
-/// Votes and ends that came before their poll, kept (in memory, as
-/// Desktop's `pollVoteCache`) until it arrives. Oldest go first.
-const MAX_EARLY_POLL_EVENTS: usize = 200;
+use super::early::Outcome;
 
 impl Actor {
     /// Whether a vote or end from `voter` (`None`: us) may change `poll`
@@ -38,62 +35,29 @@ impl Actor {
         }
     }
 
-    fn keep_early_poll_event(&self, action: Action) {
-        let mut early = self.early_polls.borrow_mut();
-        if early.len() >= MAX_EARLY_POLL_EVENTS {
-            early.pop_front();
-        }
-        early.push_back(action);
-    }
-
-    /// A poll arrived: applies the votes and ends that came before it
-    /// (Desktop's `drainCachedVotesForMessage`).
-    /// Only ones from the poll's chat count, so a vote sent in another
-    /// chat can't land on a poll that shares its author and timestamp.
-    pub(super) async fn apply_early_poll_events(
-        self: &Rc<Self>,
-        chat: &ConversationId,
-        author: Option<&str>,
-        sent_at: i64,
-    ) {
-        let matching: Vec<Action> = {
-            let mut early = self.early_polls.borrow_mut();
-            let (matching, rest): (std::collections::VecDeque<Action>, _) = early.drain(..).partition(|action| match action {
-                Action::PollVote { conversation, target_author, target_sent_at, .. } => {
-                    conversation == chat && target_author.as_deref() == author && *target_sent_at == sent_at
-                }
-                Action::PollEnd { conversation, by, target_sent_at, .. } => {
-                    conversation == chat && by.as_deref() == author && *target_sent_at == sent_at
-                }
-                _ => false,
-            });
-            *early = rest;
-            Vec::from(matching)
-        };
-        for action in matching {
-            match action {
-                Action::PollVote { .. } => self.apply_poll_vote(action).await,
-                Action::PollEnd { .. } => self.apply_poll_end(action).await,
-                _ => {}
-            }
-        }
-    }
-
     /// Someone's vote, or ours from another device (Desktop's
     /// `onPollVote` and `handlePollVote`).
-    pub(super) async fn apply_poll_vote(self: &Rc<Self>, action: Action) {
-        let Action::PollVote { conversation, voter, target_author, target_sent_at, options, vote_count, sent_at } = &action else {
-            return;
+    /// One that comes before its poll is kept (Desktop's `pollVoteCache`,
+    /// here `early.rs`).
+    pub(super) async fn apply_poll_vote(self: &Rc<Self>, action: &Action) -> Outcome {
+        let Action::PollVote { conversation, voter, target_author, target_sent_at, options, vote_count, sent_at } = action else {
+            return Outcome::Refused;
         };
-        let Some(message) = self.db.find_poll(target_author.as_deref(), *target_sent_at).await.ok().flatten() else {
-            debug!("no poll for this vote yet");
-            self.keep_early_poll_event(action);
-            return;
+        let message = match self.db.find_poll(target_author.as_deref(), *target_sent_at).await {
+            Ok(Some(message)) => message,
+            Ok(None) => {
+                debug!("no poll for this vote yet");
+                return Outcome::Missing;
+            }
+            Err(error) => {
+                self.error("failed to look up poll", error);
+                return Outcome::Failed;
+            }
         };
         // It must come in the poll's own chat, as a real one does.
         if message.conversation_id != *conversation || !self.may_change_poll(&message, voter.as_deref()).await {
             debug!("ignoring a vote from outside the poll's chat");
-            return;
+            return Outcome::Refused;
         }
         let source = if voter.is_none() { VoteSource::Sync } else { VoteSource::Other };
         let vote = PollVote { author: voter.clone(), options: options.clone(), vote_count: *vote_count, sent_at: *sent_at, pending: false };
@@ -112,26 +76,39 @@ impl Actor {
                         ended: false,
                     });
                 }
+                Outcome::Applied
             }
             // Ended, an option it doesn't have, or older than their last.
-            Ok(false) => debug!("poll vote not applied"),
-            Err(error) => self.error("failed to store poll vote", error),
+            Ok(false) => {
+                debug!("poll vote not applied");
+                Outcome::Refused
+            }
+            Err(error) => {
+                self.error("failed to store poll vote", error);
+                Outcome::Failed
+            }
         }
     }
 
     /// A poll's creator ended it (Desktop's `onPollTerminate` and
     /// `handlePollTerminate`). Only its creator can: the poll is looked up
     /// with them as its author.
-    pub(super) async fn apply_poll_end(self: &Rc<Self>, action: Action) {
-        let Action::PollEnd { conversation, by, target_sent_at, sent_at } = &action else { return };
-        let Some(message) = self.db.find_poll(by.as_deref(), *target_sent_at).await.ok().flatten() else {
-            debug!("no poll for this end yet");
-            self.keep_early_poll_event(action);
-            return;
+    pub(super) async fn apply_poll_end(self: &Rc<Self>, action: &Action) -> Outcome {
+        let Action::PollEnd { conversation, by, target_sent_at, sent_at } = action else { return Outcome::Refused };
+        let message = match self.db.find_poll(by.as_deref(), *target_sent_at).await {
+            Ok(Some(message)) => message,
+            Ok(None) => {
+                debug!("no poll for this end yet");
+                return Outcome::Missing;
+            }
+            Err(error) => {
+                self.error("failed to look up poll", error);
+                return Outcome::Failed;
+            }
         };
         if message.conversation_id != *conversation || !self.may_change_poll(&message, by.as_deref()).await {
             debug!("ignoring a poll end from outside the poll's chat");
-            return;
+            return Outcome::Refused;
         }
         if self.end_poll_locally(&message, *sent_at).await
             && let Some(by) = by
@@ -139,6 +116,7 @@ impl Actor {
             let sender = self.name_of(by).await.unwrap_or_else(|| short_id(by));
             self.emit(Event::PollActivity { conversation: message.conversation_id.clone(), message_id: message.id, sender, ended: true });
         }
+        Outcome::Applied
     }
 
     /// Ends `message`'s poll and adds Desktop's "… ended the poll" notice

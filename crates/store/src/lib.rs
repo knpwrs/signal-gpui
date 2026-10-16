@@ -13,10 +13,12 @@ use sqlx::{
 };
 
 mod call_history;
+mod early;
 mod nickname;
 mod poll;
 mod stories;
 pub use call_history::*;
+pub use early::*;
 pub use nickname::*;
 pub use poll::*;
 pub use stories::*;
@@ -2505,6 +2507,7 @@ impl AppDb {
         sqlx::query("DELETE FROM person_avatars").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM pinned_messages").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM emoji_usage").execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM early_events").execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
     }

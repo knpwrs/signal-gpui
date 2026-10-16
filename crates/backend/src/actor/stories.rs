@@ -51,7 +51,7 @@ impl Actor {
         }
     }
 
-    pub(super) async fn apply_story(&self, manager: &SignalManager, mut story: NewStory, pointer: Option<AttachmentPointer>) {
+    pub(super) async fn apply_story(self: &Rc<Self>, manager: &SignalManager, mut story: NewStory, pointer: Option<AttachmentPointer>) {
         if self.stories_disabled().await {
             return;
         }
@@ -70,6 +70,8 @@ impl Actor {
         };
         self.story_expiry.notify_one();
         self.emit(Event::StoriesChanged);
+        // A delete for everyone can come first (`early.rs`).
+        self.apply_early_for(manager, story.author.as_deref(), story.sent_at).await;
         // Desktop's `shouldDownloadStory`: ours always; theirs while they
         // have only a few up.
         if let Some(pointer) = pointer {

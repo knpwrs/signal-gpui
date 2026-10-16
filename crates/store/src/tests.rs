@@ -842,6 +842,7 @@ async fn drop_later_migrations(db: &AppDb) {
     sqlx::query("ALTER TABLE messages DROP COLUMN long_text").execute(&db.writer).await.unwrap();
     sqlx::query("ALTER TABLE messages DROP COLUMN poll").execute(&db.writer).await.unwrap();
     sqlx::query("DROP TABLE contact_nicknames").execute(&db.writer).await.unwrap();
+    sqlx::query("DROP TABLE early_events").execute(&db.writer).await.unwrap();
 }
 
 /// Rewrites the migration history to look like a pre-squash database that
@@ -1642,4 +1643,36 @@ async fn polls_are_stored_with_their_votes() {
     // A plain message isn't one.
     let plain = db.insert_message(&incoming("g:aa", "bob", 30, "hi")).await.unwrap();
     assert!(!db.update_poll(plain, |p| p.end()).await.unwrap());
+}
+
+#[tokio::test]
+async fn early_events_wait_for_their_message_and_expire_as_desktops_do() {
+    const DAY: i64 = 24 * 60 * 60 * 1000;
+    let db = test_db().await;
+    let now = 100 * DAY;
+    db.keep_early_event(Some("bob"), 10, EarlyKeep::Envelope, "delete", now).await.unwrap();
+    db.keep_early_event(Some("bob"), 10, EarlyKeep::Envelope, "delete", now).await.unwrap();
+    db.keep_early_event(Some("bob"), 10, EarlyKeep::Envelope, "react", now).await.unwrap();
+    db.keep_early_event(None, 10, EarlyKeep::SyncTask, "receipt", now).await.unwrap();
+    let actions = |events: Vec<EarlyEvent>| events.into_iter().map(|e| e.action).collect::<Vec<_>>();
+    assert_eq!(actions(db.early_events_for(Some("bob"), 10).await.unwrap()), ["delete", "react"], "kept once, oldest first");
+    assert_eq!(actions(db.early_events_for(None, 10).await.unwrap()), ["receipt"]);
+    assert!(db.early_events_for(Some("bob"), 11).await.unwrap().is_empty());
+
+    let delete = db.early_events_for(Some("bob"), 10).await.unwrap()[0].id;
+    db.remove_early_event(delete).await.unwrap();
+    assert_eq!(actions(db.early_events().await.unwrap()), ["react", "receipt"]);
+
+    // Envelopes: read at 10 starts at most, and kept 45 days.
+    for _ in 0..10 {
+        assert_eq!(db.load_early_events(now).await.unwrap().len(), 2);
+    }
+    assert_eq!(actions(db.load_early_events(now).await.unwrap()), ["receipt"], "the reaction had its 10 tries");
+    // Sync tasks: dropped once tried 5 times and 2 days old, not before.
+    assert_eq!(db.load_early_events(now + 2 * DAY - 1).await.unwrap().len(), 1);
+    assert!(db.load_early_events(now + 2 * DAY + 1).await.unwrap().is_empty());
+
+    db.keep_early_event(Some("carol"), 5, EarlyKeep::Envelope, "edit", now).await.unwrap();
+    assert_eq!(db.load_early_events(now + 45 * DAY).await.unwrap().len(), 1);
+    assert!(db.load_early_events(now + 45 * DAY + 1).await.unwrap().is_empty(), "45 days at most");
 }
