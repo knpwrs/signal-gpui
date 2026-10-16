@@ -325,8 +325,14 @@ impl Render for RootView {
                         .gap_2()
                         .bg(palette.background)
                         .text_color(palette.text_secondary)
-                        .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).text_color(palette.text).child("Welcome to Signal"))
+                        .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).text_color(palette.text).child("Welcome to Signal GPUI"))
                         .child("Select a chat to start messaging")
+                        .child(
+                            div()
+                                .mt_4()
+                                .text_xs()
+                                .child("An unofficial client, not affiliated with or endorsed by Signal Messenger."),
+                        )
                         .into_any_element(),
                 }))
                 .into_any_element(),
