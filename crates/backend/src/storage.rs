@@ -101,6 +101,8 @@ pub(crate) struct StorageSnapshot {
     pub identifiers: Option<AccountIdentifiers>,
     /// Our profile as the account record has it.
     pub own_profile: Option<OwnProfileRecord>,
+    /// Chat folders, deleted ones too.
+    pub chat_folders: Vec<signal_store::ChatFolder>,
 }
 
 /// What the account record says about our profile and username (Desktop's
@@ -210,6 +212,7 @@ pub(crate) async fn fetch(manager: &SignalManager) -> anyhow::Result<StorageSnap
                     | IdentifierType::Account
                     | IdentifierType::StoryDistributionList
                     | IdentifierType::CallLink
+                    | IdentifierType::ChatFolder
             )
         })
         .map(|id| id.raw.clone())
@@ -261,6 +264,7 @@ pub(crate) async fn fetch(manager: &SignalManager) -> anyhow::Result<StorageSnap
                 }
                 Some(Record::StoryDistributionList(list)) => snapshot.story_lists.extend(story_list(&list)),
                 Some(Record::CallLink(link)) => snapshot.call_links.extend(call_link(&link)),
+                Some(Record::ChatFolder(folder)) => snapshot.chat_folders.extend(chat_folder(&folder)),
                 _ => {}
             }
         }
@@ -868,6 +872,137 @@ pub(crate) async fn write_call_link(
             None => (None, new_call_link_record(root_key)),
         };
         let Some(record) = edit_call_link(&record, admin_key, deleted_at)? else { return Ok(()) };
+        if session.commit(manager, &manifest, old_key.as_deref(), kind, &record).await? {
+            return Ok(());
+        }
+    }
+    bail!("storage kept changing on another device; try again")
+}
+
+const RECORD_CHAT_FOLDER: u32 = 8; // StorageRecord.chatFolder
+/// ChatFolderRecord's fields after its id (1): name (2) to
+/// deletedAtTimestampMs (11).
+const FOLDER_FIELDS: std::ops::RangeInclusive<u32> = 2..=11;
+
+/// A Storage Service recipient as one of our chats: an ACI or a group's
+/// master key (Desktop's `recipientsToConversationIds`, which finds the
+/// conversation; others are left out).
+fn recipient_chat(recipient: &presage::proto::Recipient) -> Option<ConversationId> {
+    use presage::proto::recipient::Identifier;
+    match recipient.identifier.as_ref()? {
+        Identifier::Contact(contact) => {
+            let aci = Aci::parse_from_service_id_binary(&contact.service_id_binary)
+                .or_else(|| Aci::parse_from_service_id_string(&contact.service_id))?;
+            Some(ConversationId::direct(&aci.service_id_string()))
+        }
+        Identifier::GroupMasterKey(key) if key.len() == 32 => Some(ConversationId::group(key)),
+        _ => None,
+    }
+}
+
+/// A chat as a Storage Service recipient (Desktop's `toRecipient`): its
+/// service id in both forms, or its group's master key.
+fn chat_recipient(chat: &ConversationId) -> Option<presage::proto::Recipient> {
+    use presage::proto::recipient::{Contact, Identifier};
+    let identifier = match chat.as_group() {
+        Some(key) => Identifier::GroupMasterKey(key),
+        None => {
+            let sid = ServiceId::parse_from_service_id_string(chat.as_direct()?)?;
+            Identifier::Contact(Contact {
+                service_id: sid.service_id_string(),
+                e164: String::new(),
+                service_id_binary: sid.service_id_binary(),
+            })
+        }
+    };
+    Some(presage::proto::Recipient { identifier: Some(identifier) })
+}
+
+/// A chat folder record (Desktop's `mergeChatFolderRecord`); none without
+/// a 16-byte id.
+pub(crate) fn chat_folder(record: &presage::proto::ChatFolderRecord) -> Option<signal_store::ChatFolder> {
+    let id = Uuid::from_slice(&record.identifier).ok()?;
+    Some(signal_store::ChatFolder {
+        id: id.to_string(),
+        folder_type: signal_store::ChatFolderType::from_wire(record.folder_type),
+        name: record.name.clone(),
+        position: record.position,
+        show_only_unread: record.show_only_unread,
+        show_muted_chats: record.show_muted_chats,
+        include_all_individual_chats: record.include_all_individual_chats,
+        include_all_group_chats: record.include_all_group_chats,
+        included: record.included_recipients.iter().filter_map(recipient_chat).collect(),
+        excluded: record.excluded_recipients.iter().filter_map(recipient_chat).collect(),
+        deleted_at: record.deleted_at_timestamp_ms,
+    })
+}
+
+/// Sets a chat folder record's fields to `folder`'s (Desktop's
+/// `toChatFolderRecord`), keeping its id and any fields this client
+/// doesn't know. `Ok(None)` when nothing changes.
+pub(crate) fn edit_chat_folder(record: &[u8], folder: &signal_store::ChatFolder) -> anyhow::Result<Option<Vec<u8>>> {
+    edit_inner(record, RECORD_CHAT_FOLDER, |inner| {
+        let fields = wire::fields(inner).context("malformed chat folder record")?;
+        let mut out = Vec::with_capacity(inner.len() + 64);
+        for field in fields.iter().filter(|f| !FOLDER_FIELDS.contains(&f.number)) {
+            out.extend_from_slice(field.raw);
+        }
+        let known = presage::proto::ChatFolderRecord {
+            identifier: Vec::new(),
+            name: folder.name.clone(),
+            position: folder.position,
+            show_only_unread: folder.show_only_unread,
+            show_muted_chats: folder.show_muted_chats,
+            include_all_individual_chats: folder.include_all_individual_chats,
+            include_all_group_chats: folder.include_all_group_chats,
+            folder_type: folder.folder_type.to_wire(),
+            included_recipients: folder.included.iter().filter_map(chat_recipient).collect(),
+            excluded_recipients: folder.excluded.iter().filter_map(chat_recipient).collect(),
+            deleted_at_timestamp_ms: folder.deleted_at,
+        };
+        out.extend_from_slice(&known.encode_to_vec());
+        let decode = |bytes: &[u8]| presage::proto::ChatFolderRecord::decode(bytes).ok().and_then(|r| chat_folder(&r));
+        let same = decode(inner).is_some_and(|old| old == *folder);
+        Ok((!same).then_some(out))
+    })
+}
+
+fn new_chat_folder_record(id: &Uuid) -> Vec<u8> {
+    let folder = presage::proto::ChatFolderRecord { identifier: id.as_bytes().to_vec(), ..Default::default() };
+    StorageRecord { record: Some(Record::ChatFolder(folder)) }.encode_to_vec()
+}
+
+fn is_chat_folder(record: &StorageRecord, id: &Uuid) -> bool {
+    matches!(&record.record, Some(Record::ChatFolder(folder)) if folder.identifier == id.as_bytes())
+}
+
+/// Saves a chat folder for the whole account (Desktop's `ChatFolderRecord`),
+/// adding it if Storage Service doesn't have it.
+pub(crate) async fn write_chat_folder(manager: &SignalManager, folder: &signal_store::ChatFolder) -> anyhow::Result<()> {
+    let id = Uuid::parse_str(&folder.id).context("not a chat folder id")?;
+    let session = Session::new(manager).await?;
+    let kind = IdentifierType::ChatFolder;
+    for _ in 0..3 {
+        let manifest = session.manifest().await?;
+        let ikm = manifest_ikm(&manifest);
+        let keys: Vec<Vec<u8>> =
+            manifest.identifiers.iter().filter(|key| key.r#type() == kind).map(|key| key.raw.clone()).collect();
+        let mut existing = None;
+        for batch in keys.chunks(READ_BATCH) {
+            existing = session
+                .read_many(batch, ikm)
+                .await?
+                .into_iter()
+                .find(|(_, raw)| StorageRecord::decode(raw.as_slice()).is_ok_and(|record| is_chat_folder(&record, &id)));
+            if existing.is_some() {
+                break;
+            }
+        }
+        let (old_key, record) = match existing {
+            Some((key, raw)) => (Some(key), raw),
+            None => (None, new_chat_folder_record(&id)),
+        };
+        let Some(record) = edit_chat_folder(&record, folder)? else { return Ok(()) };
         if session.commit(manager, &manifest, old_key.as_deref(), kind, &record).await? {
             return Ok(());
         }
@@ -1888,6 +2023,41 @@ mod tests {
         assert!(is_story_list(&StorageRecord::decode(fresh.as_slice()).unwrap(), &Uuid::nil()));
         let saved = decode(&edit_story_list(&fresh, &my_story, 0).unwrap().unwrap());
         assert_eq!(story_list(&saved).unwrap(), my_story);
+    }
+
+    #[test]
+    fn chat_folder_records_read_and_write_as_desktops() {
+        let id = Uuid::parse_str("8f2c6d4e-1b3a-4c5d-9e7f-0a1b2c3d4e5f").unwrap();
+        let aci = "22222222-2222-4222-8222-222222222222";
+        let folder = signal_store::ChatFolder {
+            id: id.to_string(),
+            folder_type: signal_store::ChatFolderType::Custom,
+            name: "Hikers".into(),
+            position: 2,
+            show_only_unread: true,
+            show_muted_chats: false,
+            include_all_individual_chats: false,
+            include_all_group_chats: true,
+            included: vec![ConversationId::direct(aci)],
+            excluded: vec![ConversationId::group(&[9; 32])],
+            deleted_at: 0,
+        };
+        // A record with a field this client doesn't know (99).
+        let mut inner = presage::proto::ChatFolderRecord { identifier: id.as_bytes().to_vec(), ..Default::default() }.encode_to_vec();
+        wire::put_varint_field(&mut inner, 99, 5);
+        let mut record = Vec::new();
+        wire::put_len(&mut record, RECORD_CHAT_FOLDER, &inner);
+        let edited = edit_chat_folder(&record, &folder).unwrap().expect("changed");
+        assert!(edit_chat_folder(&edited, &folder).unwrap().is_none(), "already so");
+        let Some(Record::ChatFolder(written)) = StorageRecord::decode(edited.as_slice()).unwrap().record else { panic!() };
+        assert_eq!(chat_folder(&written), Some(folder));
+        // Desktop's recipients: the service id in both forms, or the key.
+        let contact = written.included_recipients[0].identifier.clone();
+        assert!(matches!(contact, Some(presage::proto::recipient::Identifier::Contact(c)) if c.service_id == aci && c.service_id_binary.len() == 16));
+        let inner = wire::fields(&edited).unwrap()[0].payload.unwrap().to_vec();
+        assert!(wire::fields(&inner).unwrap().iter().any(|f| f.number == 99 && f.varint == Some(5)), "unknown field kept");
+        // Without a 16-byte id it isn't a folder.
+        assert_eq!(chat_folder(&presage::proto::ChatFolderRecord::default()), None);
     }
 
     #[test]

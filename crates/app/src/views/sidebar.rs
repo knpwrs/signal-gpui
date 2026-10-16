@@ -468,8 +468,14 @@ impl Sidebar {
         let state = self.state.read(cx);
         let query = self.query.to_lowercase();
         let source = if self.archive_open { &state.archived } else { &state.conversations };
+        // The chosen folder's chats (Desktop's `LeftPaneInboxHelper`): the
+        // inbox only, and the open chat stays while it's open.
+        let folder = state.selected_folder().filter(|_| query.is_empty() && !self.archive_open);
         source
             .iter()
+            .filter(|c| {
+                folder.is_none_or(|f| AppState::in_folder(f, c) || state.selected.as_ref() == Some(&c.id))
+            })
             .filter(|c| {
                 query.is_empty()
                     || c.title.to_lowercase().contains(&query)
@@ -1072,6 +1078,14 @@ impl Render for Sidebar {
                         .child(text),
                 )
             })
+            // Desktop's folders above the chats (not while searching, in
+            // the archive, or narrow).
+            .when_some(
+                (!searching && !narrow && !self.archive_open)
+                    .then(|| crate::views::chat_folders::tabs(&self.state, palette, cx))
+                    .flatten(),
+                |d, tabs| d.child(tabs),
+            )
             .child(
                 div()
                     .relative()

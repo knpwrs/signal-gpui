@@ -13,7 +13,7 @@ use crate::state::AppState;
 
 const HOUR_MS: i64 = 60 * 60 * 1000;
 /// Desktop's mute choices ("Until…" with a date picker isn't here yet).
-const MUTE_FOR: [(&str, i64); 4] =
+pub(crate) const MUTE_FOR: [(&str, i64); 4] =
     [("1 hour", HOUR_MS), ("8 hours", 8 * HOUR_MS), ("1 day", 24 * HOUR_MS), ("1 week", 7 * 24 * HOUR_MS)];
 
 /// Desktop's timer choices (`DEFAULT_DURATIONS_IN_SECONDS`).
@@ -163,6 +163,7 @@ pub fn build(
     cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
     let id = conversation.id.clone();
+    let in_list = header.select_messages.is_none();
     let note_to_self = conversation.kind == ConversationKind::NoteToSelf;
     let group = conversation.kind == ConversationKind::Group;
     let change = |change: ChatChange| {
@@ -261,6 +262,11 @@ pub fn build(
                 .disabled(full)
                 .on_click(move |_, _, cx| state.read(cx).set_pinned(id.clone(), true)),
         );
+    }
+    // The chat list's folder items (Desktop's
+    // `LeftPaneConversationListItemContextMenu`).
+    if in_list {
+        menu = crate::views::chat_folders::chat_menu_items(menu, conversation, state, window, cx);
     }
     menu = if conversation.archived {
         menu.item(PopupMenuItem::new("Unarchive").icon(IconName::ArchiveRestore).on_click(change(ChatChange::Archived(false))))

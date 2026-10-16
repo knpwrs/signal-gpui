@@ -76,7 +76,7 @@ checked:
 - **Missed call notifications:** Desktop 8.34 has none (only the incoming
   call notification), so there are none here either.
 - **Not here from Desktop's pages:** language, spell check,
-  text formatting, the default skin tone, chat folders, chat export, the
+  text formatting, the default skin tone, chat export, the
   badge count settings, notification profiles, "Reset" notification
   settings, sent media quality, the device name, and the Account page.
 - **Sounds:** only pop, whoosh and the ringtone; Desktop's hang-up and
@@ -606,4 +606,35 @@ and color unit tests and a demo-mode Settings test. Left:
   slider turns it.
 - **A custom color's menu** opens on right-click; Desktop opens it on a
   click of the chosen color.
+
+## Chat folders
+
+Desktop's chat folders: Settings, Chats, "Chat folders" (the list, the
+suggested Unread, 1:1 chats and Groups, a folder's editor with its chats,
+chat types, exceptions, only unread and muted switches, and the Save
+changes and Delete dialogs), the folders above the chat list with unread
+counts and their menu (Mark all read, mute or unmute all, Edit folder), and
+a chat's "Add to folder" and "Remove from folder". Synced as Desktop syncs
+them: each change writes the folder's `ChatFolderRecord` (unknown fields
+kept), records read back with `mergeChatFolderRecord`'s rules, and an "All
+chats" folder made after a sync that finds none; the link-time history
+brings the phone's (`ChatFolder` frames). Kept in one settings row.
+Tested with store, Storage Service wire-format and history-import tests
+and a demo-mode Settings test; nothing was written to a real account's
+Storage Service. Left:
+
+- **Reordering:** Desktop drags folders; here a folder's right-click menu
+  moves it up or down.
+- **A failed upload** is reported and not retried until the folder changes
+  again (Desktop keeps `storageNeedsSync` and retries).
+- **Deleted folders** stay in the list (out of sight) for good; Desktop
+  drops them once older than the message queue time
+  (`chatFolderCleanupService`).
+- **Recipients:** a contact goes in by service id only, without the e164
+  Desktop also writes; one that's only a PNI or a phone number isn't kept.
+- **The narrow chat list** (Desktop's folder select) and the folder's emoji
+  picker for names aren't there.
+- **Following the open chat:** Desktop switches to "All chats" when a chat
+  outside the shown folder is opened from elsewhere; here the open chat
+  just stays listed.
 

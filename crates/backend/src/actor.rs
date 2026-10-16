@@ -2,6 +2,7 @@
 //! the app database. Runs on a `LocalSet` because presage's futures are `!Send`.
 
 mod call_log;
+mod chat_folders;
 mod content;
 mod call_links;
 mod calls;
@@ -1062,6 +1063,7 @@ impl Actor {
                 Command::DeleteUsername => self.delete_username().await,
                 Command::ResetUsernameLink => self.reset_username_link().await,
                 Command::SetUsernameLinkColor(color) => self.set_username_link_color(color).await,
+                Command::EditChatFolders(edit) => self.edit_chat_folders(edit).await,
             }
         });
     }
@@ -2603,6 +2605,7 @@ impl Actor {
             backup_tier,
             identifiers,
             own_profile,
+            chat_folders,
         } = match storage::fetch(manager).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -2637,6 +2640,7 @@ impl Actor {
             .await;
         }
         self.apply_storage_call_links(call_links).await;
+        self.apply_storage_chat_folders(chat_folders).await;
         if let Err(error) = self.db.apply_profile_sharing(&profile_sharing).await {
             warn!(error = %format!("{error:#}"), "failed to save profile sharing");
         }

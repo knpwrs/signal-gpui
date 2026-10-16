@@ -284,6 +284,11 @@ pub struct AppState {
     pub sticker_packs: Vec<std::sync::Arc<signal_backend::StickerPackView>>,
     /// Chat colors: the default, custom colors, and each chat's own.
     pub chat_colors: signal_store::ChatColors,
+    /// Chat folders, deleted ones too (see [`Self::current_folders`]).
+    pub chat_folders: Vec<signal_store::ChatFolder>,
+    /// The folder the chat list shows (Desktop's `selectedChatFolderId`);
+    /// `None` is "All chats".
+    pub selected_folder: Option<String>,
     /// Whether a Giphy API key is saved (GIF search needs one).
     pub has_giphy_key: bool,
     /// Decoded looping videos (GIFs), by file and width.
@@ -502,6 +507,8 @@ impl AppState {
             login_item: Default::default(),
             sticker_packs: Vec::new(),
             chat_colors: Default::default(),
+            chat_folders: Vec::new(),
+            selected_folder: None,
             has_giphy_key: std::env::var_os("GIPHY_API_KEY").is_some(),
             loops: Default::default(),
             audio: None,
@@ -975,8 +982,9 @@ impl AppState {
             }
             HistoryProgress::Skipped => self.history = None,
             HistoryProgress::Done { .. } => {
-                // The transfer brings the phone's chat colors.
+                // The transfer brings the phone's chat colors and folders.
                 self.reload_chat_colors(cx);
+                self.reload_chat_folders(cx);
                 self.history = Some(progress);
                 // Shown for a moment, then out of the way.
                 cx.spawn(async move |this, cx| {
@@ -1228,6 +1236,7 @@ impl AppState {
                 cx.emit(AppEvent::LinkPreview { url, preview: preview.map(std::rc::Rc::new) })
             }
             Event::AuthorNamesChanged(names) => cx.emit(AppEvent::AuthorNamesChanged(names.into())),
+            Event::ChatFoldersChanged => self.reload_chat_folders(cx),
             // Limits and features read it when drawn: just redraw.
             Event::RemoteConfigChanged => cx.emit(AppEvent::ConversationsChanged),
             Event::ProfileChanged(service_id) => {
@@ -1448,6 +1457,75 @@ impl AppState {
         .detach();
         self.load_prefs(cx);
         self.reload_chat_colors(cx);
+        self.reload_chat_folders(cx);
+    }
+
+    /// Reads the chat folders again.
+    pub fn reload_chat_folders(&mut self, cx: &mut Context<Self>) {
+        let db = self.backend.db().clone();
+        let read = self.backend.spawn(async move { db.chat_folders().await });
+        cx.spawn(async move |this, cx| {
+            let Ok(folders) = read.await else { return };
+            let _ = this.update(cx, |this, cx| {
+                this.chat_folders = folders;
+                // A folder deleted elsewhere: back to all chats.
+                if this.selected_folder().is_none() {
+                    this.selected_folder = None;
+                }
+                cx.emit(AppEvent::ConversationsChanged);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The current folders, in order.
+    pub fn current_folders(&self) -> Vec<signal_store::ChatFolder> {
+        signal_store::current_folders(&self.chat_folders)
+    }
+
+    /// Desktop shows the folders above the chats once there's a custom one
+    /// (`hasAnyCurrentCustomChatFolders`).
+    pub fn has_custom_folders(&self) -> bool {
+        self.chat_folders.iter().any(|f| f.is_current() && f.folder_type == signal_store::ChatFolderType::Custom)
+    }
+
+    /// The selected folder, while it's current.
+    pub fn selected_folder(&self) -> Option<&signal_store::ChatFolder> {
+        let id = self.selected_folder.as_ref()?;
+        self.chat_folders.iter().find(|f| &f.id == id && f.is_current())
+    }
+
+    /// Shows a folder's chats (`None`: all).
+    pub fn select_folder(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        self.selected_folder = id;
+        cx.emit(AppEvent::ConversationsChanged);
+        cx.notify();
+    }
+
+    /// Whether `chat` is in `folder` (Desktop's `isConversationInChatFolder`).
+    pub fn in_folder(folder: &signal_store::ChatFolder, chat: &Conversation) -> bool {
+        folder.contains(&Self::folder_chat(chat))
+    }
+
+    /// What a folder asks of `chat`. Muted is `Conversation::muted`, which
+    /// an ended mute's past `muted_until` doesn't set.
+    pub fn folder_chat(chat: &Conversation) -> signal_store::FolderChat<'_> {
+        signal_store::FolderChat {
+            id: &chat.id,
+            kind: chat.kind,
+            unread: chat.unread_count > 0 || chat.marked_unread,
+            muted: chat.muted,
+        }
+    }
+
+    /// Changes the folders: here at once, then saved and synced by the backend.
+    pub fn edit_chat_folders(&mut self, edit: signal_store::ChatFolderEdit, cx: &mut Context<Self>) {
+        if !signal_store::apply_folder_edit(&mut self.chat_folders, edit.clone()).is_empty() {
+            cx.emit(AppEvent::ConversationsChanged);
+            cx.notify();
+        }
+        self.send(Command::EditChatFolders(edit));
     }
 
     /// Reads the chat colors again.
@@ -2694,10 +2772,11 @@ impl AppState {
     /// unread chats only): the chat above or below the open one in the
     /// list, wrapping around.
     pub fn select_in_direction(&mut self, up: bool, unread_only: bool, cx: &mut Context<Self>) {
-        let unread: Vec<bool> = self.conversations.iter().map(|c| c.unread_count > 0 || c.marked_unread).collect();
-        let current = self.selected.as_ref().and_then(|id| self.conversations.iter().position(|c| &c.id == id));
+        let listed = self.listed_inbox();
+        let unread: Vec<bool> = listed.iter().map(|c| c.unread_count > 0 || c.marked_unread).collect();
+        let current = self.selected.as_ref().and_then(|id| listed.iter().position(|c| &c.id == id));
         if let Some(next) = conversation_in_direction(&unread, current, up, unread_only) {
-            let id = self.conversations[next].id.clone();
+            let id = listed[next].id.clone();
             self.select(Some(id), cx);
         }
     }
@@ -2705,10 +2784,23 @@ impl AppState {
     /// Desktop's ⌘1 to ⌘9 (`getConversationAndMessageAtIndex`): the chat
     /// at that place in the list (pinned ones first), or the last one.
     pub fn select_index(&mut self, index: usize, cx: &mut Context<Self>) {
-        if let Some(chat) = self.conversations.get(index).or(self.conversations.last()) {
+        let listed = self.listed_inbox();
+        if let Some(chat) = listed.get(index).or(listed.last()) {
             let id = chat.id.clone();
             self.select(Some(id), cx);
         }
+    }
+
+    /// The inbox as the chat list shows it with no search: the selected
+    /// folder's chats, and the open chat while it's open (Desktop's
+    /// `LeftPaneInboxHelper`), so the shortcuts above move through what's
+    /// on screen.
+    pub fn listed_inbox(&self) -> Vec<&Conversation> {
+        let folder = self.selected_folder();
+        self.conversations
+            .iter()
+            .filter(|c| folder.is_none_or(|f| Self::in_folder(f, c) || self.selected.as_ref() == Some(&c.id)))
+            .collect()
     }
 
     pub fn send(&self, command: Command) {

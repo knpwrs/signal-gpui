@@ -617,6 +617,10 @@ pub enum Command {
     /// A server alert closed: the idle warning (for a week), or the
     /// critical one's modal (for a day).
     DismissServerAlert(server_alerts::ServerAlert),
+    /// Changes the chat folders (Desktop's chat folder settings and left
+    /// pane), here and for the whole account (`ChatFolderRecord`s).
+    /// Answered with `Event::ChatFoldersChanged`.
+    EditChatFolders(signal_store::ChatFolderEdit),
 }
 
 /// A per-chat setting kept in the Storage Service.
@@ -1128,6 +1132,8 @@ pub enum Event {
     CriticalAlertModal,
     /// Our clock is too far from the server's (`true`), or not any more.
     ClockSkew(bool),
+    /// The chat folders changed, here or on another device: read them again.
+    ChatFoldersChanged,
     Error(String),
     Unlinked,
 }

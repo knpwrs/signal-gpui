@@ -159,6 +159,67 @@ fn appearance_chooses_the_default_chat_color(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn chat_folders_are_made_from_suggestions_and_the_editor(cx: &mut TestAppContext) {
+    use signal_store::ChatFolderType;
+    let h = Harness::open(cx, Page::Chats);
+    // The demo's sync made "All chats"; no custom folder yet.
+    assert!(wait(cx, |cx| h.state.read_with(cx, |s, _| !s.current_folders().is_empty())));
+    assert_eq!(h.value(cx, "chat-folders-settings"), None);
+    h.click(cx, "chat-folders-settings");
+    assert_eq!(cx.read(|cx| h.settings.read(cx).page), Page::ChatFolders);
+    assert!(h.shown(cx, "chat-folder-suggest-groups") && h.shown(cx, "chat-folder-0"));
+
+    // A suggestion: added, then no longer suggested; the folders show above
+    // the chats.
+    h.click(cx, "chat-folder-suggest-groups");
+    let customs = |cx: &mut TestAppContext| {
+        h.state.read_with(cx, |s, _| {
+            s.current_folders().into_iter().filter(|f| f.folder_type == ChatFolderType::Custom).map(|f| f.name).collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(customs(cx), ["Groups"]);
+    assert!(!h.shown(cx, "chat-folder-suggest-groups"));
+    assert!(h.state.read_with(cx, |s, _| s.has_custom_folders()));
+    // Saved by the backend too.
+    assert!(wait(cx, |_| h.stored(signal_store::CHAT_FOLDERS).is_some_and(|json| json.contains("Groups"))));
+
+    // The editor: a name makes it savable; Save adds it.
+    h.click(cx, "chat-folder-create");
+    assert_eq!(cx.read(|cx| h.settings.read(cx).page), Page::EditChatFolder);
+    let editor = cx.read(|cx| h.settings.read(cx).folder_editor.clone().unwrap());
+    cx.update(|cx| {
+        editor.update(cx, |e, cx| {
+            e.params.name = "Trip".into();
+            e.params.include_all_individual_chats = true;
+            cx.notify();
+        })
+    });
+    cx.update_window(h.window, |_, window, _| window.refresh()).unwrap();
+    h.scroll_down(cx);
+    h.click(cx, "chat-folder-save");
+    assert_eq!(cx.read(|cx| h.settings.read(cx).page), Page::ChatFolders);
+    assert_eq!(customs(cx), ["Groups", "Trip"]);
+
+    // Showing the Groups folder lists only groups.
+    let groups = h.state.read_with(cx, |s, _| s.current_folders().into_iter().find(|f| f.name == "Groups").unwrap());
+    h.state.update(cx, |s, cx| s.select_folder(Some(groups.id.clone()), cx));
+    let shown: Vec<_> = h.state.read_with(cx, |s, _| {
+        s.conversations.iter().filter(|c| crate::state::AppState::in_folder(&groups, c)).map(|c| c.kind).collect()
+    });
+    assert!(!shown.is_empty() && shown.iter().all(|k| *k == signal_store::ConversationKind::Group));
+    // ⌘1 and the next chat shortcut move through the folder's chats only.
+    let selected_kind = |cx: &mut TestAppContext| {
+        h.state.read_with(cx, |s, _| s.selected.as_ref().and_then(|id| s.conversation(id)).map(|c| c.kind))
+    };
+    h.state.update(cx, |s, cx| s.select_index(0, cx));
+    assert_eq!(selected_kind(cx), Some(signal_store::ConversationKind::Group));
+    for _ in 0..shown.len() + 1 {
+        h.state.update(cx, |s, cx| s.select_in_direction(false, false, cx));
+        assert_eq!(selected_kind(cx), Some(signal_store::ConversationKind::Group));
+    }
+}
+
+#[gpui_kit::test]
 fn general_shows_the_account_and_opens_at_login(cx: &mut TestAppContext) {
     use std::sync::atomic::{AtomicBool, Ordering};
     // A stand-in login item: nothing is registered with the system.
@@ -301,6 +362,8 @@ fn chats_toggles_save_and_contacts_import(cx: &mut TestAppContext) {
 
     // "Import now": the demo phone answers at once, and the time shows.
     assert_eq!(cx.read(|cx| h.state.read(cx).prefs.contacts_synced_at), None);
+    // Below the chat folders row.
+    h.scroll_down(cx);
     h.click(cx, "import-contacts");
     assert!(wait(cx, |cx| h.state.read_with(cx, |s, _| s.contact_sync == ContactSync::Idle && s.prefs.contacts_synced_at.is_some())));
 }

@@ -1,6 +1,6 @@
 //! Desktop's Chats page: address book photos, keeping muted chats
-//! archived, link previews, emoticons, and importing the phone's contacts.
-//! (Its spell check, text formatting, skin tone, chat folders and chat
+//! archived, link previews, emoticons, chat folders, and importing the
+//! phone's contacts. (Its spell check, text formatting, skin tone and chat
 //! export aren't here.)
 
 use gpui_kit::component::button::Button;
@@ -73,6 +73,7 @@ pub(super) fn render(settings: &Entity<Settings>, palette: Palette, cx: &mut App
             ],
             palette,
         ))
+        .child(list(Some("Chat folders"), None, [super::chat_folders::row(settings, palette, cx)], palette))
         .child(list(
             None,
             None,

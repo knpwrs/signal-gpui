@@ -541,6 +541,9 @@ pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: imp
     // custom colors by their backup id, then the default and each chat's.
     let mut colors = signal_store::ChatColors::default();
     let mut custom_by_id: HashMap<u64, (String, signal_store::CustomColor)> = HashMap::new();
+    // Chat folders take their order from the backup's (Desktop's
+    // `#chatFolderPositionCursor`).
+    let mut folder_position = 0u32;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64;
     let mut frames = delimited(plain);
     // First comes the BackupInfo.
@@ -643,6 +646,12 @@ pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: imp
                     }
                 }
             }
+            Some(proto::frame::Item::ChatFolder(folder)) => {
+                if let Some(folder) = chat_folder(&folder, &people, me, folder_position) {
+                    folder_position += 1;
+                    db.edit_chat_folders(signal_store::ChatFolderEdit::Merge(folder)).await?;
+                }
+            }
             Some(proto::frame::Item::StickerPack(pack)) => {
                 imported.sticker_packs.push((pack.packId.clone(), pack.packKey.clone()));
             }
@@ -665,6 +674,37 @@ pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: imp
         db.replace_pinned(&pinned.into_iter().map(|(_, id)| id).collect::<Vec<_>>()).await?;
     }
     Ok(imported)
+}
+
+/// A backup's chat folder (Desktop's `#fromChatFolder`): one without a
+/// UUID or of a type it doesn't know is dropped; recipients become chats.
+fn chat_folder(folder: &proto::ChatFolder, people: &HashMap<u64, Who>, me: &str, position: u32) -> Option<signal_store::ChatFolder> {
+    use proto::chat_folder::FolderType;
+    let id = uuid::Uuid::from_slice(&folder.id).ok()?;
+    let folder_type = match folder.folderType.enum_value() {
+        Ok(FolderType::ALL) => signal_store::ChatFolderType::All,
+        Ok(FolderType::CUSTOM) => signal_store::ChatFolderType::Custom,
+        _ => return None,
+    };
+    let chat = |recipient: &u64| match people.get(recipient)? {
+        Who::Me => Some(ConversationId::direct(me)),
+        Who::Contact { sid, .. } => Some(ConversationId::direct(sid)),
+        Who::Group { key, .. } => Some(ConversationId::group(key)),
+        Who::Other => None,
+    };
+    Some(signal_store::ChatFolder {
+        id: id.to_string(),
+        folder_type,
+        name: folder.name.clone(),
+        position,
+        show_only_unread: folder.showOnlyUnread,
+        show_muted_chats: folder.showMutedChats,
+        include_all_individual_chats: folder.includeAllIndividualChats,
+        include_all_group_chats: folder.includeAllGroupChats,
+        included: folder.includedRecipientIds.iter().filter_map(chat).collect(),
+        excluded: folder.excludedRecipientIds.iter().filter_map(chat).collect(),
+        deleted_at: 0,
+    })
 }
 
 /// Desktop's `rgbIntToDesktopHSL`: a backup's `0xAARRGGBB` as Desktop's
@@ -1726,6 +1766,31 @@ mod tests {
         assert_eq!(system_contact(&recipient(contact.clone())), None, "a profile name isn't the address book's");
         contact.systemGivenName = "Alice".into();
         assert_eq!(system_contact(&recipient(contact)), Some(Aci::from_uuid_bytes([0xa1; 16]).service_id_string()));
+    }
+
+    #[test]
+    fn backup_chat_folders_read_as_desktops_import_reads_them() {
+        let people = HashMap::from([
+            (1u64, Who::Me),
+            (2, Who::Contact { sid: "a".into(), name: "A".into(), e164: None, blocked: false }),
+            (3, Who::Group { key: vec![7; 32], title: String::new(), members: Vec::new(), blocked: false, ended: false }),
+        ]);
+        let folder = proto::ChatFolder {
+            id: vec![0x11; 16],
+            name: "Hikers".into(),
+            folderType: protobuf::EnumOrUnknown::new(proto::chat_folder::FolderType::CUSTOM),
+            includedRecipientIds: vec![1, 2, 9],
+            excludedRecipientIds: vec![3],
+            showMutedChats: true,
+            ..Default::default()
+        };
+        let read = chat_folder(&folder, &people, "me", 4).unwrap();
+        assert_eq!((read.name.as_str(), read.position, read.show_muted_chats), ("Hikers", 4, true));
+        assert_eq!(read.included, [ConversationId::direct("me"), ConversationId::direct("a")]);
+        assert_eq!(read.excluded, [ConversationId::group(&[7; 32])]);
+        let unknown = proto::ChatFolder { folderType: protobuf::EnumOrUnknown::new(proto::chat_folder::FolderType::UNKNOWN), ..folder.clone() };
+        assert!(chat_folder(&unknown, &people, "me", 0).is_none());
+        assert!(chat_folder(&proto::ChatFolder { id: vec![1; 3], ..folder }, &people, "me", 0).is_none());
     }
 
     #[test]

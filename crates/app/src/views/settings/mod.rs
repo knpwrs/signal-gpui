@@ -4,6 +4,7 @@
 
 mod appearance;
 mod calls;
+mod chat_folders;
 mod chats;
 mod data_usage;
 mod general;
@@ -22,6 +23,7 @@ use gpui_kit::{AnyElement, App, Entity, FontWeight, SharedString, TestSupportExt
 use crate::state::AppState;
 use crate::theme::Palette;
 
+pub use chat_folders::edit_folder;
 pub use privacy::confirm_stories_off;
 
 /// Desktop's pages (`SettingsPage`); the last ones open from another page.
@@ -43,6 +45,10 @@ pub enum Page {
     Blocked,
     /// Appearance's "Chat color" (Desktop's `ChatColorPicker`).
     ChatColor,
+    /// Chats' "Chat folders".
+    ChatFolders,
+    /// A folder's editor (the folder in `Settings::folder_editor`).
+    EditChatFolder,
 }
 
 impl Page {
@@ -64,6 +70,8 @@ impl Page {
             Page::PhoneNumber => "Phone Number",
             Page::Blocked => "Blocked",
             Page::ChatColor => "Chat Color",
+            Page::ChatFolders => "Chat folders",
+            Page::EditChatFolder => "Edit folder",
         }
     }
 
@@ -80,6 +88,8 @@ impl Page {
             Page::PhoneNumber => "settings-page-phone-number",
             Page::Blocked => "settings-page-blocked",
             Page::ChatColor => "settings-page-chat-color",
+            Page::ChatFolders => "settings-page-chat-folders",
+            Page::EditChatFolder => "settings-page-edit-chat-folder",
         }
     }
 
@@ -89,13 +99,18 @@ impl Page {
             Page::WhileMuted => Some(Page::Notifications),
             Page::PhoneNumber | Page::Blocked => Some(Page::Privacy),
             Page::ChatColor => Some(Page::Appearance),
+            Page::ChatFolders => Some(Page::Chats),
+            Page::EditChatFolder => Some(Page::ChatFolders),
             _ => None,
         }
     }
 
     /// Which page in the list shows as chosen.
     fn in_list(self) -> Page {
-        self.parent().unwrap_or(self)
+        match self.parent() {
+            Some(parent) => parent.in_list(),
+            None => self,
+        }
     }
 }
 
@@ -103,6 +118,8 @@ impl Page {
 pub struct Settings {
     pub(crate) state: Entity<AppState>,
     pub(crate) page: Page,
+    /// The folder being made or edited, on [`Page::EditChatFolder`].
+    pub(crate) folder_editor: Option<Entity<chat_folders::FolderEditor>>,
 }
 
 pub fn open(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
@@ -116,7 +133,7 @@ pub(crate) fn show(state: Entity<AppState>, page: Page, window: &mut Window, cx:
     }
     state.read(cx).send(signal_backend::Command::LoadCallDevices);
     state.update(cx, |s, cx| s.refresh_open_at_login(cx));
-    let settings = cx.new(|_| Settings { state, page });
+    let settings = cx.new(|_| Settings { state, page, folder_editor: None });
     let shown = settings.clone();
     window.open_dialog(cx, move |dialog, window, cx| {
         dialog.title("Settings").w(px(780.)).child(render(&settings, window, cx))
@@ -152,6 +169,8 @@ fn render(settings: &Entity<Settings>, window: &mut Window, cx: &mut App) -> Any
     let body = match page {
         Page::General => general::render(settings, palette, window, cx),
         Page::Appearance => appearance::render(settings, palette, cx),
+        Page::ChatFolders => chat_folders::render_list(settings, palette, cx),
+        Page::EditChatFolder => chat_folders::render_edit(settings, palette, cx),
         Page::ChatColor => {
             let state = settings.read(cx).state.clone();
             crate::views::chat_colors::render(&state, None, palette, cx)
@@ -177,7 +196,11 @@ fn render(settings: &Entity<Settings>, window: &mut Window, cx: &mut App) -> Any
                     .small()
                     .icon(gpui_kit::assets::IconName::ArrowLeft)
                     .tooltip("Go back")
-                    .on_click(move |_, window, cx| go(&settings, parent, window, cx)),
+                    .on_click(move |_, window, cx| match page {
+                        // Desktop asks first when the folder has changes.
+                        Page::EditChatFolder => chat_folders::leave_editor(&settings, window, cx),
+                        _ => go(&settings, parent, window, cx),
+                    }),
             )
         })
         .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(title_of(settings, cx)));
@@ -242,7 +265,14 @@ fn profile_row(settings: &Entity<Settings>, palette: Palette, cx: &App) -> AnyEl
 }
 
 fn title_of(settings: &Entity<Settings>, cx: &App) -> SharedString {
-    settings.read(cx).page.title().into()
+    let settings = settings.read(cx);
+    // Desktop's "Create a folder" for a new one.
+    if settings.page == Page::EditChatFolder
+        && settings.folder_editor.as_ref().is_some_and(|e| e.read(cx).existing.is_none())
+    {
+        return "Create a folder".into();
+    }
+    settings.page.title().into()
 }
 
 /// One of Desktop's lists (`AxoList`): an optional label above, rows in a

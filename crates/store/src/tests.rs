@@ -2511,3 +2511,80 @@ async fn chat_colors_change_as_desktops_picker_changes_them() {
     db.edit_chat_colors(ChatColorEdit::Chat(conv("g:b"), None)).await.unwrap();
     assert!(db.chat_colors().await.unwrap().chats.is_empty());
 }
+
+#[tokio::test]
+async fn chat_folders_change_as_desktops_do() {
+    let db = test_db().await;
+    let ids = |folders: &[ChatFolder]| current_folders(folders).into_iter().map(|f| f.id).collect::<Vec<_>>();
+    let custom = |name: &str| ChatFolderParams { name: name.into(), ..ChatFolderParams::groups() };
+
+    db.edit_chat_folders(ChatFolderEdit::Create { id: "a".into(), params: custom("Hikers") }).await.unwrap();
+    // The All folder goes first, the others along one.
+    assert_eq!(db.edit_chat_folders(ChatFolderEdit::EnsureAll { id: "all".into() }).await.unwrap().len(), 2);
+    assert!(db.edit_chat_folders(ChatFolderEdit::EnsureAll { id: "all2".into() }).await.unwrap().is_empty());
+    db.edit_chat_folders(ChatFolderEdit::Create { id: "b".into(), params: custom("Work") }).await.unwrap();
+    let folders = db.chat_folders().await.unwrap();
+    assert_eq!(ids(&folders), ["all", "a", "b"]);
+
+    db.edit_chat_folders(ChatFolderEdit::Reorder(vec!["all".into(), "b".into(), "a".into()])).await.unwrap();
+    assert_eq!(ids(&db.chat_folders().await.unwrap()), ["all", "b", "a"]);
+    // Numbered from 0, as EnsureAll numbers them, and a new one goes last.
+    let positions = |folders: &[ChatFolder]| current_folders(folders).into_iter().map(|f| f.position).collect::<Vec<_>>();
+    assert_eq!(positions(&db.chat_folders().await.unwrap()), [0, 1, 2]);
+    db.edit_chat_folders(ChatFolderEdit::Create { id: "c".into(), params: custom("Family") }).await.unwrap();
+    let folders = db.chat_folders().await.unwrap();
+    assert_eq!((ids(&folders), positions(&folders)), (vec!["all".to_owned(), "b".into(), "a".into(), "c".into()], vec![0, 1, 2, 3]));
+    db.edit_chat_folders(ChatFolderEdit::Delete { id: "c".into(), at: 50 }).await.unwrap();
+
+    // A chat added, then taken out (Desktop's toggle excludes it).
+    let chat = conv("d:x");
+    db.edit_chat_folders(ChatFolderEdit::ToggleChat { id: "a".into(), chat: chat.clone(), add: true }).await.unwrap();
+    db.edit_chat_folders(ChatFolderEdit::ToggleChat { id: "a".into(), chat: chat.clone(), add: false }).await.unwrap();
+    let a = db.chat_folders().await.unwrap().into_iter().find(|f| f.id == "a").unwrap();
+    assert_eq!((a.included.len(), a.excluded.clone()), (0, vec![chat.clone()]));
+
+    // Deleting keeps it, with when, out of the order.
+    db.edit_chat_folders(ChatFolderEdit::Delete { id: "b".into(), at: 77 }).await.unwrap();
+    let folders = db.chat_folders().await.unwrap();
+    assert_eq!(ids(&folders), ["all", "a"]);
+    let b = folders.iter().find(|f| f.id == "b").unwrap();
+    assert_eq!((b.deleted_at, b.position), (77, CHAT_FOLDER_DELETED_POSITION));
+    assert_eq!(folders.iter().find(|f| f.id == "a").unwrap().position, 1);
+
+    // Storage Service's: the All folder takes the remote's id, a deletion
+    // keeps the earlier time, a new folder is added.
+    let remote_all = ChatFolder { id: "remote-all".into(), folder_type: ChatFolderType::All, position: 0, ..b.clone() };
+    db.edit_chat_folders(ChatFolderEdit::Merge(remote_all)).await.unwrap();
+    db.edit_chat_folders(ChatFolderEdit::Merge(ChatFolder { deleted_at: 99, ..b.clone() })).await.unwrap();
+    let folders = db.chat_folders().await.unwrap();
+    assert!(folders.iter().any(|f| f.id == "remote-all" && f.folder_type == ChatFolderType::All));
+    assert!(!folders.iter().any(|f| f.id == "all"));
+    assert_eq!(folders.iter().find(|f| f.id == "b").unwrap().deleted_at, 77);
+}
+
+#[test]
+fn folders_hold_chats_as_desktops_do() {
+    let folder = |params: ChatFolderParams| {
+        let mut folders = Vec::new();
+        apply_folder_edit(&mut folders, ChatFolderEdit::Create { id: "f".into(), params });
+        folders.remove(0)
+    };
+    let (alice, group, me) = (conv("d:alice"), conv("g:hikers"), conv("d:me"));
+    let direct = FolderChat { id: &alice, kind: ConversationKind::Direct, unread: false, muted: false };
+    let unread_group = FolderChat { id: &group, kind: ConversationKind::Group, unread: true, muted: true };
+    let note = FolderChat { id: &me, kind: ConversationKind::NoteToSelf, unread: false, muted: false };
+
+    let unread = folder(ChatFolderParams::unread());
+    assert!(!unread.contains(&direct) && unread.contains(&unread_group));
+    let ones = folder(ChatFolderParams::individual());
+    assert!(ones.contains(&direct) && ones.contains(&note) && !ones.contains(&unread_group));
+    // Muted chats left out, unless the menu asks without the filters.
+    let groups = folder(ChatFolderParams { show_muted_chats: false, ..ChatFolderParams::groups() });
+    assert!(!groups.contains(&unread_group) && groups.contains_with(&unread_group, true));
+    let picked = folder(ChatFolderParams { included: vec![alice.clone()], ..ChatFolderParams::defaults() });
+    assert!(picked.contains(&direct) && !picked.contains(&note));
+    assert!(ChatFolderParams::unread().matches(&unread) && !ChatFolderParams::groups().matches(&unread));
+    assert!(!ChatFolderParams::defaults().valid());
+    assert!(ChatFolderParams { name: "x".repeat(32), ..Default::default() }.valid());
+    assert!(!ChatFolderParams { name: "x".repeat(33), ..Default::default() }.valid());
+}

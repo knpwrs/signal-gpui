@@ -508,6 +508,9 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
     ])
     .await?;
     seed_message_requests(db, now).await?;
+    // Desktop's "All chats" folder, as a sync would make it; no custom
+    // folder, so the chat list shows none until one is made.
+    db.edit_chat_folders(signal_store::ChatFolderEdit::EnsureAll { id: "00000000-0000-4000-8000-00000000f01d".into() }).await?;
     seed_calls(db, now).await?;
     Ok(())
 }
@@ -2138,6 +2141,14 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 demo_save_username(&db, username.as_deref(), Some(link)).await;
                 emit(Event::OwnProfileChanged);
                 emit(Event::UsernameLinkReset(Ok(())));
+            }
+            Command::EditChatFolders(edit) => {
+                // As here, without Storage Service.
+                if let Ok(changed) = db.edit_chat_folders(edit).await
+                    && !changed.is_empty()
+                {
+                    emit(Event::ChatFoldersChanged);
+                }
             }
             Command::SetUsernameLinkColor(color) => {
                 if let Some(mut link) = demo_username_link(&db).await {
