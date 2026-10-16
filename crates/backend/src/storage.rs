@@ -328,10 +328,13 @@ pub(crate) fn account_settings(account: &AccountRecord) -> crate::AccountSetting
     // `PhoneNumberSharingMode`: unset (0 is never written) and EVERYBODY
     // are everybody, NOBODY nobody.
     let sharing = account.phone_number_sharing_mode != presage::proto::account_record::PhoneNumberSharingMode::Nobody as i32;
+    // Desktop takes the list whenever it `canBeSynced` (empty: defaults).
+    let reactions = &account.preferred_reaction_emoji;
     crate::AccountSettings {
         flags: flags.into_iter().collect(),
         universal_expire_timer: Some(account.universal_expire_timer),
         phone_number_sharing: Some(sharing),
+        preferred_reactions: crate::preferred_reactions_syncable(reactions).then(|| reactions.clone()),
     }
 }
 
@@ -696,6 +699,35 @@ pub(crate) fn edit_account_fields(record: &[u8], edits: &[AccountFieldEdit]) -> 
         }
         Ok(changed.then_some(current))
     })
+}
+
+/// `AccountRecord.preferredReactionEmoji` (a repeated string).
+const ACCOUNT_PREFERRED_REACTIONS: u32 = 20;
+
+/// Sets the account record's preferred reactions, keeping every other
+/// field (unknown ones too). `Ok(None)` when they're already those.
+pub(crate) fn edit_account_reactions(record: &[u8], reactions: &[String]) -> anyhow::Result<Option<Vec<u8>>> {
+    edit_inner(record, RECORD_ACCOUNT, |account| {
+        let fields = wire::fields(account).context("malformed account record")?;
+        let current: Vec<&[u8]> =
+            fields.iter().filter(|f| f.number == ACCOUNT_PREFERRED_REACTIONS).filter_map(|f| f.payload).collect();
+        if current.iter().copied().eq(reactions.iter().map(|r| r.as_bytes())) {
+            return Ok(None);
+        }
+        let mut out = Vec::with_capacity(account.len() + reactions.len() * 8);
+        for field in fields.iter().filter(|f| f.number != ACCOUNT_PREFERRED_REACTIONS) {
+            out.extend_from_slice(field.raw);
+        }
+        for reaction in reactions {
+            wire::put_len(&mut out, ACCOUNT_PREFERRED_REACTIONS, reaction.as_bytes());
+        }
+        Ok(Some(out))
+    })
+}
+
+/// Sets the preferred reactions for the whole account.
+pub(crate) async fn write_account_reactions(manager: &SignalManager, reactions: &[String]) -> anyhow::Result<()> {
+    write_account_with(manager, |record| edit_account_reactions(record, reactions)).await
 }
 
 /// Changes our profile's fields in the account record, for the whole account.
@@ -1937,6 +1969,31 @@ mod tests {
         let decoded = decode_account(&edited);
         assert!(decoded.automatic_key_verification_disabled && decoded.stories_disabled);
         assert!(edited.windows(20).any(|w| w == b"future account field"));
+    }
+
+    #[test]
+    fn preferred_reactions_read_and_write_the_account_record() {
+        let account = AccountRecord {
+            given_name: "Ken".into(),
+            read_receipts: true,
+            preferred_reaction_emoji: vec!["🔥".into(), "👍".into()],
+            ..Default::default()
+        };
+        assert_eq!(account_settings(&account).preferred_reactions, Some(vec!["🔥".to_owned(), "👍".to_owned()]));
+        let too_many = AccountRecord { preferred_reaction_emoji: vec!["👍".into(); 21], ..Default::default() };
+        assert_eq!(account_settings(&too_many).preferred_reactions, None, "Desktop's canBeSynced");
+
+        let mut account_bytes = account.encode_to_vec();
+        wire::put_len(&mut account_bytes, 999, b"future account field");
+        let mut record = Vec::new();
+        wire::put_len(&mut record, RECORD_ACCOUNT, &account_bytes);
+        let mine: Vec<String> = ["❤️", "👍", "👎", "😂", "😮", "🎉"].map(String::from).to_vec();
+        let edited = edit_account_reactions(&record, &mine).unwrap().unwrap();
+        let decoded = decode_account(&edited);
+        assert_eq!(decoded.preferred_reaction_emoji, mine);
+        assert!(decoded.read_receipts && decoded.given_name == "Ken", "the rest is kept");
+        assert!(edited.windows(20).any(|w| w == b"future account field"));
+        assert_eq!(edit_account_reactions(&edited, &mine).unwrap(), None, "already so");
     }
 
     #[test]

@@ -2862,6 +2862,17 @@ impl AppState {
     }
 
     /// Desktop's "Convert typed emoticons to emoji".
+    /// Desktop's `savePreferredReactions`: the reaction bar's six, for the
+    /// whole account.
+    pub fn set_preferred_reactions(&mut self, reactions: Vec<String>, cx: &mut Context<Self>) {
+        if let Ok(json) = serde_json::to_string(&reactions) {
+            self.pending_prefs.insert(signal_backend::SETTING_PREFERRED_REACTIONS, (json, std::time::Instant::now()));
+        }
+        self.prefs.reactions = reactions.clone();
+        self.send(Command::SetPreferredReactions(reactions));
+        cx.notify();
+    }
+
     pub fn set_auto_convert_emoji(&mut self, on: bool, cx: &mut Context<Self>) {
         self.prefs.auto_convert_emoji = on;
         self.save_pref(crate::prefs::AUTO_CONVERT_EMOJI_KEY, on.to_string(), cx);

@@ -191,6 +191,19 @@ pub struct AccountSettings {
     pub universal_expire_timer: Option<u32>,
     /// Everybody can see our number (`true`) or nobody can.
     pub phone_number_sharing: Option<bool>,
+    /// The reaction bar's emoji as the account keeps them (Desktop's
+    /// `preferredReactionEmoji`; missing ones are the defaults).
+    pub preferred_reactions: Option<Vec<String>>,
+}
+
+/// Settings key: the account's preferred reactions, a JSON list of emoji
+/// ([`AccountSettings::preferred_reactions`]).
+pub const SETTING_PREFERRED_REACTIONS: &str = "preferred_reaction_emoji";
+
+/// Desktop's `canBeSynced` for preferred reactions: at most 20, each at
+/// most 20 UTF-16 units.
+pub fn preferred_reactions_syncable(list: &[String]) -> bool {
+    list.len() <= 20 && list.iter().all(|e| e.encode_utf16().count() <= 20)
 }
 
 impl AccountSettings {
@@ -515,6 +528,10 @@ pub enum Command {
     /// The default disappearing timer for chats we start, in seconds (0:
     /// off), for the whole account (`AccountRecord.universalExpireTimer`).
     SetUniversalExpireTimer(u32),
+    /// The reaction bar's six emoji, for the whole account
+    /// (`AccountRecord.preferredReactionEmoji`, Desktop's
+    /// `savePreferredReactions`).
+    SetPreferredReactions(Vec<String>),
     /// Who can see our number: everybody (`true`) or nobody, for the whole
     /// account and in our profile (Desktop's "Who can see my number").
     SetPhoneNumberSharing(bool),

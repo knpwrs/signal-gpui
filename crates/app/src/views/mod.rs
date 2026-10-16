@@ -28,6 +28,7 @@ pub mod new_group;
 pub mod nickname;
 pub mod notices;
 pub mod poll;
+pub mod preferred_reactions;
 pub mod profile_editor;
 pub mod root;
 pub mod safety_number;

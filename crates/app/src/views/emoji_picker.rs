@@ -31,6 +31,9 @@ pub enum PickerEvent {
     Sticker(Arc<StickerPackView>, StickerView),
     Gif(signal_backend::giphy::Gif),
     Dismissed,
+    /// Desktop's "Customize reactions" button, offered when picking a
+    /// reaction.
+    Customize,
 }
 
 /// The picker's panels (Signal Desktop's "Fun" picker).
@@ -73,6 +76,8 @@ pub struct EmojiPicker {
     tab: Tab,
     /// Stickers and GIFs are offered from the composer, not for reactions.
     media: bool,
+    /// Offers "Customize reactions".
+    customizable: bool,
     /// GIF results for `gif_query` (this page and earlier ones).
     gifs: Vec<(signal_backend::giphy::Gif, std::path::PathBuf)>,
     gif_query: Option<String>,
@@ -147,6 +152,7 @@ impl EmojiPicker {
             choosing_tone: false,
             tab: Tab::Emoji,
             media: false,
+            customizable: false,
             gifs: Vec::new(),
             gif_query: None,
             gif_next: None,
@@ -173,6 +179,7 @@ impl EmojiPicker {
     /// Whether the Stickers and GIFs tabs are offered (from the composer).
     pub fn set_media(&mut self, media: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.media = media;
+        self.customizable = false;
         if !media && self.tab != Tab::Emoji {
             self.set_tab(Tab::Emoji, window, cx);
         }
@@ -180,6 +187,13 @@ impl EmojiPicker {
             // Packs installed on the phone since last time.
             self.state.read(cx).send(signal_backend::Command::LoadStickers);
         }
+        cx.notify();
+    }
+
+    /// Offers "Customize reactions" (picking a reaction; Desktop's
+    /// `showCustomizePreferredReactionsButton`).
+    pub fn set_customizable(&mut self, customizable: bool, cx: &mut Context<Self>) {
+        self.customizable = customizable;
         cx.notify();
     }
 
@@ -791,11 +805,38 @@ impl Render for EmojiPicker {
             }))
             .when(self.media, |d| d.child(self.render_tab_bar(palette, cx)))
             .child(
-                div().p_2().child(
-                    Input::new(&self.search)
-                        .cleanable(true)
-                        .prefix(Icon::new(IconName::Search).size_4().text_color(palette.text_secondary)),
-                ),
+                div()
+                    .p_2()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div().flex_1().child(
+                            Input::new(&self.search)
+                                .cleanable(true)
+                                .prefix(Icon::new(IconName::Search).size_4().text_color(palette.text_secondary)),
+                        ),
+                    )
+                    .when(self.customizable, |d| {
+                        d.child(
+                            div()
+                                .id("customize-reactions")
+                                .debug_selector(|| "customize-reactions".into())
+                                .size(px(32.))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .hover(|d| d.bg(palette.row_hover))
+                                .tooltip(|window, cx| {
+                                    gpui_kit::component::tooltip::Tooltip::new("Customize reactions").build(window, cx)
+                                })
+                                .on_click(cx.listener(|_, _, _, cx| cx.emit(PickerEvent::Customize)))
+                                .child(Icon::new(IconName::Pencil).size_4().text_color(palette.text_secondary)),
+                        )
+                    }),
             )
             .when(self.tab == Tab::Stickers, |d| d.child(self.render_stickers(palette, cx)))
             .when(self.tab == Tab::Gifs, |d| d.child(self.render_gifs(palette, cx)))

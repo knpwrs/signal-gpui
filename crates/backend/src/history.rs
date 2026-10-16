@@ -1154,10 +1154,13 @@ fn account_settings(account: &proto::AccountData) -> crate::AccountSettings {
     // but EVERYBODY as nobody.
     let timer = settings.map_or(0, |s| s.universalExpireTimerSeconds);
     let everybody = settings.is_some_and(|s| s.phoneNumberSharingMode.enum_value_or_default() == PhoneNumberSharingMode::EVERYBODY);
+    // Desktop's import takes the list as it is.
+    let reactions = settings.map(|s| s.preferredReactionEmoji.clone()).filter(|r| crate::preferred_reactions_syncable(r));
     crate::AccountSettings {
         flags: flags.into_iter().collect(),
         universal_expire_timer: (timer > 0).then_some(timer),
         phone_number_sharing: Some(everybody),
+        preferred_reactions: reactions,
     }
 }
 

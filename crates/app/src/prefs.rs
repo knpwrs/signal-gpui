@@ -169,7 +169,30 @@ pub const KEYS: &[&str] = &[
     signal_backend::SETTING_PHONE_NUMBER_SHARING,
     signal_backend::SETTING_PHONE_NUMBER_DISCOVERABLE,
     signal_backend::auto_download::SETTING_AUTO_DOWNLOAD,
+    signal_backend::SETTING_PREFERRED_REACTIONS,
 ];
+
+/// Signal's reaction set (Desktop's `DEFAULT_PREFERRED_REACTION_EMOJI`).
+pub const DEFAULT_REACTIONS: [&str; 6] = ["❤️", "👍", "👎", "😂", "😮", "😢"];
+
+/// The defaults in the chosen skin tone (`getDefaultPreferredReactionEmojis`).
+pub fn default_reactions(tone: Option<signal_emoji::SkinTone>) -> Vec<String> {
+    DEFAULT_REACTIONS
+        .iter()
+        .map(|base| signal_emoji::by_glyph(base).map_or(*base, |(e, _)| e.glyph_with(tone)).to_owned())
+        .collect()
+}
+
+/// The reaction bar's six (Desktop's `getPreferredReactionEmoji`): each
+/// stored one that's an emoji, as stored, else the default in the skin
+/// tone.
+pub fn preferred_reactions(stored: &[String], tone: Option<signal_emoji::SkinTone>) -> Vec<String> {
+    default_reactions(tone)
+        .into_iter()
+        .enumerate()
+        .map(|(ix, default)| stored.get(ix).filter(|e| signal_emoji::by_glyph(e).is_some()).cloned().unwrap_or(default))
+        .collect()
+}
 
 /// The settings as stored.
 #[derive(Debug, Clone, PartialEq)]
@@ -192,6 +215,9 @@ pub struct Prefs {
     pub number_discoverable: bool,
     /// Which media download as it arrives.
     pub auto_download: signal_backend::auto_download::AutoDownload,
+    /// The reaction bar's emoji as the account keeps them (see
+    /// [`preferred_reactions`]).
+    pub reactions: Vec<String>,
 }
 
 impl Default for Prefs {
@@ -201,6 +227,7 @@ impl Default for Prefs {
             number_shared: false,
             number_discoverable: false,
             auto_download: Default::default(),
+            reactions: Vec::new(),
         }
     }
 }
@@ -233,6 +260,9 @@ impl Prefs {
             auto_download: signal_backend::auto_download::AutoDownload::from_setting(get(
                 signal_backend::auto_download::SETTING_AUTO_DOWNLOAD,
             )),
+            reactions: get(signal_backend::SETTING_PREFERRED_REACTIONS)
+                .and_then(|json| serde_json::from_str(json).ok())
+                .unwrap_or_default(),
         }
     }
 
@@ -293,5 +323,21 @@ mod tests {
         assert_eq!(zoom_step(2.5, 1), 3., "no further than 300%");
         assert_eq!(zoom_step(0.55, -1), 0.5);
         assert_eq!(zoom_step(f32::NAN, 1), 1.2);
+    }
+
+    #[test]
+    fn preferred_reactions_fill_in_desktops_defaults() {
+        let defaults = default_reactions(None);
+        assert_eq!(preferred_reactions(&[], None), defaults);
+        let stored = ["🔥".to_owned(), "not an emoji".to_owned()];
+        let shown = preferred_reactions(&stored, None);
+        assert_eq!(shown[..3], ["🔥".to_owned(), defaults[1].clone(), defaults[2].clone()]);
+        // The defaults take the skin tone; stored ones stay as they are.
+        let dark = preferred_reactions(&stored, Some(signal_emoji::SkinTone::ALL[4]));
+        assert_eq!(dark[0], "🔥");
+        assert_ne!(dark[1], defaults[1]);
+        let values: HashMap<String, Option<String>> =
+            [(signal_backend::SETTING_PREFERRED_REACTIONS.to_owned(), Some(r#"["🔥","🎉"]"#.to_owned()))].into();
+        assert_eq!(Prefs::from_values(&values).reactions, ["🔥", "🎉"]);
     }
 }

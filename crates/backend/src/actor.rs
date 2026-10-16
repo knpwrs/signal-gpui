@@ -1025,6 +1025,7 @@ impl Actor {
                 Command::SetStoryViewReceipts(on) => self.set_story_view_receipts(on).await,
                 Command::SetAccountSetting { setting, on } => self.set_account_setting(setting, on).await,
                 Command::SetUniversalExpireTimer(seconds) => self.set_universal_expire_timer(seconds).await,
+                Command::SetPreferredReactions(reactions) => self.set_preferred_reactions(reactions).await,
                 Command::SetPhoneNumberSharing(everybody) => self.set_phone_number_sharing(everybody).await,
                 Command::SetPhoneNumberDiscoverable(on) => self.set_phone_number_discoverable(on).await,
                 Command::SyncContacts => self.request_syncs(),
@@ -4557,8 +4558,13 @@ impl Actor {
         let sharing = settings
             .phone_number_sharing
             .map(|everybody| (crate::SETTING_PHONE_NUMBER_SHARING, everybody.to_string()));
+        let reactions = settings
+            .preferred_reactions
+            .as_ref()
+            .and_then(|list| serde_json::to_string(list).ok())
+            .map(|json| (crate::SETTING_PREFERRED_REACTIONS, json));
         let mut changed = false;
-        for (key, value) in flags.chain(timer).chain(sharing) {
+        for (key, value) in flags.chain(timer).chain(sharing).chain(reactions) {
             if self.db.setting(key).await.ok().flatten().as_deref() == Some(value.as_str()) {
                 continue;
             }

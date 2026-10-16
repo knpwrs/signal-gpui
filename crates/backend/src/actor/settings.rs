@@ -15,6 +15,24 @@ impl Actor {
         self.write_account(&[storage::AccountEdit::UniversalExpireTimer(seconds)]).await;
     }
 
+    /// Desktop's `savePreferredReactions`: here, then the account record
+    /// (`captureChange`), only that field changing.
+    pub(super) async fn set_preferred_reactions(self: Rc<Self>, reactions: Vec<String>) {
+        if !crate::preferred_reactions_syncable(&reactions) {
+            return self.error("couldn't save your reactions", "too many, or too long");
+        }
+        let settings = crate::AccountSettings { preferred_reactions: Some(reactions.clone()), ..Default::default() };
+        self.save_account_settings(settings).await;
+        let Some(manager) = self.manager() else { return };
+        match storage::write_account_reactions(&manager, &reactions).await {
+            Ok(()) => self.storage_written(),
+            Err(error) => {
+                self.error("couldn't update your other devices", format!("{error:#}"));
+                self.sync_storage(&manager).await;
+            }
+        }
+    }
+
     /// The default timer, if one is set.
     pub(super) async fn universal_expire_timer(&self) -> u32 {
         let value = self.db.setting(crate::SETTING_UNIVERSAL_EXPIRE_TIMER).await.ok().flatten();

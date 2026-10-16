@@ -27,8 +27,6 @@ use crate::shortcuts::timeline;
 const PAGE: u32 = 60;
 /// Consecutive messages from one author within this window are grouped.
 const GROUP_WINDOW_MS: i64 = 3 * 60 * 1000;
-/// Signal's default reaction set.
-const QUICK_REACTIONS: [&str; 6] = ["❤️", "👍", "👎", "😂", "😮", "😢"];
 /// The reactions viewer's size (Desktop's `ReactionViewer`: fixed, the
 /// list scrolling).
 const REACTION_VIEWER_WIDTH: f32 = 320.;
@@ -304,6 +302,12 @@ impl ConversationView {
                     }
                     PickerEvent::Dismissed | PickerEvent::Sticker(..) | PickerEvent::Gif(_) => {
                         this.reaction_picker_for = None
+                    }
+                    // Desktop's `CustomizingPreferredReactionsModal`.
+                    PickerEvent::Customize => {
+                        this.reaction_picker_for = None;
+                        let tone = this.picker.read(cx).skin_tone();
+                        crate::views::preferred_reactions::open(this.state.clone(), tone, window, cx);
                     }
                 }
                 let handle = this.composer.read(cx).focus_handle(cx);
@@ -2778,6 +2782,8 @@ impl ConversationView {
         };
         let mine = message.reactions.iter().find(|r| r.author.is_none()).map(|r| r.emoji.clone());
         let tone = self.picker.read(cx).skin_tone();
+        let reactions = crate::prefs::preferred_reactions(&self.state.read(cx).prefs.reactions, tone);
+        let count = reactions.len();
         div()
             .flex()
             .items_center()
@@ -2795,10 +2801,7 @@ impl ConversationView {
                 this.reaction_bar_for = None;
                 cx.notify();
             }))
-            .children(QUICK_REACTIONS.iter().enumerate().map(|(ix, base)| {
-                let glyph = signal_emoji::by_glyph(base)
-                    .map_or(*base, |(e, _)| e.glyph_with(tone))
-                    .to_owned();
+            .children(reactions.into_iter().enumerate().map(|(ix, glyph)| {
                 let selected = mine.as_deref() == Some(glyph.as_str());
                 let emoji = glyph.clone();
                 let button = div()
@@ -2834,11 +2837,12 @@ impl ConversationView {
                         this.picker.update(cx, |picker, cx| {
                             picker.reset(window, cx);
                             picker.set_media(false, window, cx);
+                            picker.set_customizable(true, cx);
                         });
                         cx.notify();
                     }))
                     .child(Icon::new(IconName::Plus).size_4().text_color(palette.text_secondary)),
-                QUICK_REACTIONS.len(),
+                count,
             ))
             // Keyed by message so moving the bar to another message replays it.
             .with_animation(

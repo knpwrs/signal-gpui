@@ -2087,6 +2087,12 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 let _ = db.set_setting(crate::SETTING_STORY_VIEW_RECEIPTS, if on { "true" } else { "false" }).await;
                 emit(Event::StorySettingsChanged);
             }
+            Command::SetPreferredReactions(reactions) => {
+                if let Ok(json) = serde_json::to_string(&reactions) {
+                    let _ = db.set_setting(crate::SETTING_PREFERRED_REACTIONS, &json).await;
+                }
+                emit(Event::AccountSettingsChanged);
+            }
             Command::SetUniversalExpireTimer(seconds) => {
                 let _ = db.set_setting(crate::SETTING_UNIVERSAL_EXPIRE_TIMER, &seconds.to_string()).await;
                 emit(Event::AccountSettingsChanged);

@@ -285,7 +285,7 @@ impl Composer {
                         this.close_picker(window, cx);
                         cx.emit(ComposerEvent::Sent);
                     }
-                    PickerEvent::Dismissed => this.close_picker(window, cx),
+                    PickerEvent::Dismissed | PickerEvent::Customize => this.close_picker(window, cx),
                 }
             }),
         ];
