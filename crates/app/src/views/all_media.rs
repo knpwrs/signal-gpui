@@ -103,6 +103,7 @@ fn media_grid(messages: &[Message], state: &Entity<AppState>, palette: Palette) 
                 path: path.clone().into(),
                 size: meta.width.zip(meta.height),
                 file_name: meta.file_name.clone(),
+                view_once: false,
             };
             div()
                 .id(("media-tile", ix))

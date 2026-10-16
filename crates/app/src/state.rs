@@ -659,10 +659,7 @@ impl AppState {
                 }
             }
             Event::History(progress) => self.on_history(progress, cx),
-            // Nothing shows view-once media yet: its copy goes.
-            Event::ViewOnceOpened(opened) => {
-                let _ = std::fs::remove_file(opened.path);
-            }
+            Event::ViewOnceOpened(opened) => self.view_once(opened, cx),
             Event::GroupCreated(conversation) => {
                 self.reload_conversations(cx);
                 self.select(Some(conversation), cx);
@@ -1417,6 +1414,19 @@ impl AppState {
         }
     }
 
+    /// A view-once message we opened: its copy in the viewer, deleted when
+    /// the viewer closes.
+    fn view_once(&mut self, opened: signal_backend::OpenedViewOnce, cx: &mut Context<Self>) {
+        if opened.content_type.starts_with("video/") {
+            let video = crate::views::video_viewer::ViewedVideo { path: opened.path, file_name: None, view_once: true };
+            self.view_video(video, cx);
+        } else {
+            let size = opened.size.filter(|(w, h)| *w > 0 && *h > 0);
+            let image = crate::views::image_viewer::ViewedImage { path: opened.path, size, file_name: None, view_once: true };
+            self.view_image(image, cx);
+        }
+    }
+
     pub fn view_image(&self, image: crate::views::image_viewer::ViewedImage, cx: &mut Context<Self>) {
         cx.emit(AppEvent::ViewImage(image));
     }
@@ -1696,6 +1706,9 @@ fn notification_preview(message: &signal_store::Message) -> String {
     // Desktop's "📊 Poll: …" (`getNotificationDataForMessage`).
     if let Some(poll) = &message.poll {
         return signal_store::poll_preview(&poll.question);
+    }
+    if let Some(view_once) = message.view_once {
+        return signal_store::view_once_preview(view_once, message.attachments.first()).into();
     }
     if !message.body.is_empty() {
         // Spoilers stay hidden (Desktop shows "■■■■").

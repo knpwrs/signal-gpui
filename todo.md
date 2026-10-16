@@ -43,7 +43,7 @@ number.
 | `textAttachmentLimitBytes` | Size of a long-text attachment | Desktop's built-in limits, hard-coded (`crates/backend/src/long_text.rs`): bodies over 2 KiB go as a `text/x-signal-plain` attachment (group story replies too), received ones download and replace the body, a failed download is retried after 30 s, 5 min, 50 min and 6 h as Desktop's download job does, received messages and edits whose inline body is over 2 KiB are dropped and logged, the composer stops at 64 KiB, and a bubble shows 800 characters with "Read more" adding 3,000. Retries and the drop were unit tested; the downloads themselves weren't tried against Signal's CDN. |
 | `groupsv2.maxGroupSize` / `groupSizeHardLimit` | 151 / 1001 | Follows the config in New group and Add members, with Desktop's alerts; the backend refuses to go past the hard limit. Not tried against Signal's group server. |
 | `nicknames.min` / `.max` | 3 / 32 | Username nickname limits (`ts/util/Username.dom.ts`), not contact nicknames. Read (`username_nickname_min` / `_max`) but unused: usernames can't be set here. Contact nicknames and notes use Desktop's built-in limits (`signal_store::NICKNAME_LIMITS`), which no config key sets. |
-| `messageQueueTimeInSeconds` | 30 days (never less) | How long the server keeps undelivered messages. Not used. |
+| `messageQueueTimeInSeconds` | 30 days (never less) | How long the server keeps undelivered messages. Follows the config, never under 30 days, for erasing view-once messages left unviewed (Desktop's `getMessageQueueTime`). |
 | `videoAttachments.transcodeTargetBytes`, `mediaQuality.levels`, `calling.*`, `clientExpiration`, `maxAllowedClockSkewSeconds` | n/a | Not applicable for now. |
 
 ## Attachments in transferred history
@@ -52,6 +52,27 @@ Done for the transit tier (`FilePointer.locatorInfo`: CDN number, key, and
 digest or plaintext hash), which is what the phone fills for link and sync.
 Attachments only in the backup (media) tier need backup-tier credentials
 and aren't downloaded.
+
+## View-once messages
+
+Receiving, opening once, our other devices' opens (kept with the early
+events when they come first, so they survive a restart), sending a photo
+or video view-once (the composer's "View once" toggle), erasing ours
+once sent and anything left unviewed past the server's message queue
+time (at least 30 days) follow Desktop. Tested with store, mapping and
+demo-mode UI tests; not tried with a real account or against phones. Not
+done:
+
+- **The composer's text:** Desktop hides the text box while view-once is
+  on. Here it stays, and what was typed stays in the composer after the
+  photo goes, since a view-once message carries no text.
+- **Opening:** the photo or video is copied to `view-once/` in the data
+  directory for the viewer and deleted when the viewer closes (or at the
+  next start, if the app quit with it open). The viewer's own handling
+  (deleting on close) is tested; opening one from a real message is
+  tested only in the demo.
+- **Viewed receipts** for one we open go only with read receipts on, as
+  Desktop's `sendReceipts`; not checked against a phone.
 
 ## Polls
 

@@ -12,7 +12,7 @@ use gpui_kit::{
 };
 use signal_backend::Command;
 use signal_store::{
-    AttachmentMeta, ConversationId, ConversationKind, DeliveryStatus, Direction, Message, Reaction,
+    AttachmentMeta, ConversationId, ConversationKind, DeliveryStatus, Direction, Message, Reaction, ViewOnce,
 };
 
 use crate::state::{AppEvent, AppState};
@@ -441,7 +441,10 @@ impl ConversationView {
         let pin = &self.pins[ix];
         let id = pin.id;
         let author = self.reactor_name(pin.author.as_deref(), cx);
-        let preview = if !pin.body.is_empty() {
+        let preview = if pin.view_once.is_some() {
+            // Desktop's `PinnedMessagesBar__MessagePreview__Text--ViewOnceMedia`.
+            "View-once media".into()
+        } else if !pin.body.is_empty() {
             collapse_whitespace(&signal_store::hide_spoilers(&pin.body, &pin.styles))
         } else {
             match pin.attachments.first() {
@@ -1203,6 +1206,10 @@ impl ConversationView {
                 .into_any_element();
         }
 
+        if let Some(view_once) = message.view_once.filter(|_| !message.deleted) {
+            return self.render_view_once(message, view_once, show_author, corners, (bg, fg, meta_color), meta.map(IntoElement::into_any_element), palette, cx);
+        }
+
         // Stickers stand alone, without a bubble, at Desktop's size.
         if let Some(sticker) = message.attachments.first().filter(|a| a.sticker && !message.deleted) {
             let meta = show_meta.then(|| render_meta(message, palette.text_secondary, palette));
@@ -1460,6 +1467,82 @@ impl ConversationView {
             .into_any_element()
     }
 
+    /// A view-once message (Desktop's `renderTapToView`): what it is and
+    /// where it is in its one viewing, never the media itself. Theirs,
+    /// downloaded and not yet viewed, opens on click; not downloaded, the
+    /// click downloads it.
+    #[allow(clippy::too_many_arguments)]
+    fn render_view_once(
+        &self,
+        message: &Message,
+        view_once: ViewOnce,
+        show_author: bool,
+        corners: Corners,
+        (bg, fg, meta_color): (Hsla, Hsla, Hsla),
+        meta: Option<AnyElement>,
+        palette: Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let outgoing = message.direction == Direction::Outgoing;
+        let first = message.attachments.first();
+        let (icon, title, detail) = view_once_label(view_once, outgoing, first);
+        let id = message.id;
+        let click = match (view_once, outgoing, first) {
+            (ViewOnce::Ready, false, Some(a)) if a.local_path.is_some() => Some(Command::OpenViewOnce { message_id: id }),
+            (ViewOnce::Ready, false, Some(_)) => Some(Command::FetchAttachment { message_id: id, index: 0 }),
+            _ => None,
+        };
+        let author_name = message.author_name.clone().unwrap_or_else(|| "Unknown".into());
+        let author_color = {
+            let members = self.state.read(cx).conversation(&self.id).map(|c| c.members.clone()).unwrap_or_default();
+            crate::theme::name_color(&members, message.author.as_deref().unwrap_or(""), gpui_kit::component::ActiveTheme::theme(&**cx).is_dark())
+        };
+        let author_label = message
+            .author
+            .as_deref()
+            .and_then(|author| self.state.read(cx).conversation(&self.id)?.member_labels.get(author).cloned());
+        let secondary = if outgoing { meta_color } else { palette.text_secondary };
+        corners
+            .apply(div())
+            .id(SharedString::from(format!("view-once-{id}")))
+            .debug_selector(move || format!("bubble-{id}"))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .bg(bg)
+            .text_color(fg)
+            .when(show_author && !outgoing, |d| d.child(author_line(author_name, author_color, author_label)))
+            .child(
+                div()
+                    .debug_selector(move || format!("view-once-label-{id}"))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Icon::new(icon).size_5().text_color(if click.is_some() { fg } else { secondary }))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title))
+                            .when_some(detail, |d, detail| d.child(div().text_xs().text_color(secondary).child(detail))),
+                    ),
+            )
+            .when_some(meta, |d, m| d.child(m))
+            .when_some(click, |d, command| {
+                d.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| this.state.read(cx).send(command.clone())))
+            })
+            // Desktop's toasts for one that can't open again.
+            .when_some(view_once_toast(view_once, outgoing), |d, toast| {
+                d.on_click(move |_, window, cx| {
+                    use gpui_kit::component::WindowExt as _;
+                    window.push_notification(gpui_kit::component::notification::Notification::new().message(toast), cx);
+                })
+            })
+            .into_any_element()
+    }
+
     /// A release note's button (Desktop's `MessageCta`), under it. Desktop's
     /// "donate" opens its donation screen, which this app doesn't have, so
     /// it opens Signal's donation page instead. Other buttons aren't shown,
@@ -1493,8 +1576,13 @@ impl ConversationView {
         // Desktop's `canReply` and `canReact`: not in an ended group.
         let ended = self.ended(cx);
         let for_reply = message.clone();
-        let downloadable: Vec<AttachmentMeta> =
-            message.attachments.iter().filter(|a| a.local_path.is_some() && !a.sticker).cloned().collect();
+        // View-once media can't be saved (Desktop's `canDownload`).
+        let downloadable: Vec<AttachmentMeta> = message
+            .attachments
+            .iter()
+            .filter(|a| a.local_path.is_some() && !a.sticker && message.view_once.is_none())
+            .cloned()
+            .collect();
         let button = |name: &'static str, icon: IconName| {
             div()
                 .id(SharedString::from(format!("{name}-{id}")))
@@ -2815,12 +2903,45 @@ fn render_quote(quote: signal_store::Quote, fg: Hsla, palette: Palette) -> impl 
         })
 }
 
+/// A view-once bubble's icon, title and detail, in Desktop's words
+/// (`renderTapToViewText`, `renderSimpleAttachmentNotAvailable`).
+fn view_once_label(view_once: ViewOnce, outgoing: bool, first: Option<&AttachmentMeta>) -> (IconName, &'static str, Option<String>) {
+    if outgoing {
+        return (IconName::CircleDashed, "View Once Media", None);
+    }
+    match (view_once, first) {
+        (ViewOnce::Viewed, _) => (IconName::CircleDashed, "Viewed", None),
+        (ViewOnce::Ready, Some(a)) => {
+            let video = a.content_type.starts_with("video/") || a.gif;
+            let detail = match &a.local_path {
+                Some(_) => "Click to view".to_owned(),
+                None => crate::views::common::format_size(a.size),
+            };
+            (if video { IconName::Video } else { IconName::Image }, if video { "View Once Video" } else { "View Once Photo" }, Some(detail))
+        }
+        (ViewOnce::Gone, _) => (IconName::Ban, "View once media is not available", None),
+        // Invalid, or ready with nothing to show.
+        _ => (IconName::Ban, "Can't download view once media", None),
+    }
+}
+
+/// What clicking a view-once message that can't open says
+/// (`Message--tap-to-view--incoming--expired-toast`, `--outgoing--expired-toast-2`).
+fn view_once_toast(view_once: ViewOnce, outgoing: bool) -> Option<&'static str> {
+    match (view_once, outgoing) {
+        (_, true) => Some("View-once media is deleted after sending"),
+        (ViewOnce::Viewed, false) => Some("You already viewed this message."),
+        _ => None,
+    }
+}
+
 /// What the image viewer needs to show a downloaded image.
 fn viewed_image(attachment: &AttachmentMeta) -> Option<ViewedImage> {
     Some(ViewedImage {
         path: std::path::PathBuf::from(attachment.local_path.as_ref()?),
         size: attachment.width.zip(attachment.height).filter(|(w, h)| *w > 0 && *h > 0),
         file_name: attachment.file_name.clone(),
+        view_once: false,
     })
 }
 
@@ -3001,7 +3122,7 @@ fn render_video(
             let state = state.clone();
             move |_, _, cx| match &path {
                 Some(path) => state.update(cx, |state, cx| {
-                    let video = crate::views::video_viewer::ViewedVideo { path: path.clone(), file_name: file_name.clone() };
+                    let video = crate::views::video_viewer::ViewedVideo { path: path.clone(), file_name: file_name.clone(), view_once: false };
                     state.view_video(video, cx);
                 }),
                 None => state.read(cx).send(Command::FetchAttachment { message_id, index }),
@@ -3352,8 +3473,8 @@ fn message_menu(
         }
     };
     let mut menu = menu;
-    // Desktop doesn't forward polls (`canForward`).
-    if !message.deleted && message.poll.is_none() {
+    // Desktop doesn't forward polls or view-once messages (`canForward`).
+    if !message.deleted && message.poll.is_none() && message.view_once.is_none() {
         let state = state.clone();
         menu = menu.item(
             PopupMenuItem::new("Forward")
@@ -4089,6 +4210,9 @@ mod tests {
     }
 
     const MAYA: &str = "d:00000000-0000-4000-8000-00000000a11c";
+    /// The last message the demo seeds in Maya's chat: once it's there, her
+    /// chat is all there (waiting for less raced the seeding).
+    const MAYA_LAST: &str = "Let me know what you think!";
 
     #[test]
     fn grouped_bubbles_tighten_the_senders_side() {
@@ -4163,7 +4287,7 @@ mod tests {
     #[gpui_kit::test]
     fn messages_are_read_only_once_scrolled_into_view(cx: &mut TestAppContext) {
         let (backend, _dir) = demo_backend(cx);
-        wait_for_messages(&backend, MAYA, 3, |_| true);
+        wait_for_messages(&backend, MAYA, 1, |m| m.body == MAYA_LAST);
         // Short, so the chat always overflows (images still loading change
         // its height).
         let (mut cx, view) = open_view_sized(cx, &backend, MAYA, 260.);
@@ -4339,7 +4463,7 @@ mod tests {
     #[gpui_kit::test]
     fn clicking_a_quote_shows_the_quoted_message(cx: &mut TestAppContext) {
         let (backend, _dir) = demo_backend(cx);
-        wait_for_messages(&backend, MAYA, 3, |_| true);
+        wait_for_messages(&backend, MAYA, 1, |m| m.body == MAYA_LAST);
         // An old message far up the chat, and today's reply to it.
         let db = backend.db().clone();
         let (quoted, reply) = futures::executor::block_on(backend.spawn(async move {
@@ -4397,7 +4521,7 @@ mod tests {
     #[gpui_kit::test]
     fn jumping_to_a_search_result_and_back(cx: &mut TestAppContext) {
         let (backend, _dir) = demo_backend(cx);
-        wait_for_messages(&backend, MAYA, 3, |_| true);
+        wait_for_messages(&backend, MAYA, 1, |m| m.body == MAYA_LAST);
         // A long chat: 100 more messages, a minute apart.
         let db = backend.db().clone();
         let ids: Vec<i64> = futures::executor::block_on(backend.spawn(async move {
@@ -4953,6 +5077,60 @@ mod tests {
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
         assert!(cx.debug_bounds(Box::leak(format!("poll-{id}-option-0").into_boxed_str())).is_none());
+        backend.shutdown();
+    }
+
+    #[test]
+    fn view_once_bubbles_say_what_desktops_do() {
+        let photo = |local: bool| AttachmentMeta {
+            content_type: "image/jpeg".into(),
+            file_name: None,
+            size: 2048,
+            width: None,
+            height: None,
+            local_path: local.then(|| "/x.jpg".into()),
+            sticker: false,
+            gif: false,
+            voice: false,
+            remote: None,
+        };
+        let label = |v, outgoing, a: Option<&AttachmentMeta>| {
+            let (_, title, detail) = view_once_label(v, outgoing, a);
+            (title, detail)
+        };
+        assert_eq!(label(ViewOnce::Ready, false, Some(&photo(true))), ("View Once Photo", Some("Click to view".into())));
+        assert_eq!(label(ViewOnce::Ready, false, Some(&photo(false))).1, Some(crate::views::common::format_size(2048)));
+        let video = AttachmentMeta { content_type: "video/mp4".into(), ..photo(true) };
+        assert_eq!(label(ViewOnce::Ready, false, Some(&video)).0, "View Once Video");
+        assert_eq!(label(ViewOnce::Viewed, false, None), ("Viewed", None));
+        assert_eq!(label(ViewOnce::Gone, false, None), ("View once media is not available", None));
+        assert_eq!(label(ViewOnce::Invalid, false, None), ("Can't download view once media", None));
+        // Ours, whatever became of it.
+        assert_eq!(label(ViewOnce::Gone, true, None), ("View Once Media", None));
+    }
+
+    #[gpui_kit::test]
+    fn a_view_once_photo_opens_once(cx: &mut TestAppContext) {
+        let (backend, dir) = demo_backend(cx);
+        let once = wait_for_messages(&backend, MAYA, 1, |m| m.view_once.is_some()).remove(0);
+        assert_eq!(once.view_once, Some(ViewOnce::Ready));
+        let original = std::path::PathBuf::from(once.attachments[0].local_path.clone().unwrap());
+        assert!(original.exists());
+        let (mut cx, view) = open_view(cx, &backend, MAYA);
+        let bubble = bounds(&mut cx, format!("bubble-{}", once.id));
+        bounds(&mut cx, format!("view-once-label-{}", once.id));
+        cx.simulate_click(bubble.center(), gpui_kit::Modifiers::none());
+        let viewed = changed(&mut cx, &view, &backend, MAYA, |m| m.id == once.id && m.view_once == Some(ViewOnce::Viewed));
+        // Erased: the media is gone, and only the viewer's copy is left.
+        assert!(viewed.attachments.is_empty());
+        assert!(!original.exists());
+        let copies: Vec<_> = std::fs::read_dir(dir.path().join("view-once")).unwrap().collect();
+        assert_eq!(copies.len(), 1);
+        // A second click does nothing: there's nothing left to open.
+        let bubble = bounds(&mut cx, format!("bubble-{}", once.id));
+        cx.simulate_click(bubble.center(), gpui_kit::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(std::fs::read_dir(dir.path().join("view-once")).unwrap().count(), 1);
         backend.shutdown();
     }
 }

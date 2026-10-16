@@ -29,6 +29,8 @@ const SEEK_STEPS: usize = 100;
 pub struct ViewedVideo {
     pub path: PathBuf,
     pub file_name: Option<String>,
+    /// A view-once message's copy: deleted when the viewer closes.
+    pub view_once: bool,
 }
 
 pub struct VideoViewer {
@@ -51,6 +53,9 @@ impl Focusable for VideoViewer {
 impl VideoViewer {
     /// Opens the video and starts it playing.
     pub fn new(video: ViewedVideo, cx: &mut Context<Self>) -> Self {
+        if video.view_once {
+            crate::views::image_viewer::delete_on_release(video.path.clone(), cx);
+        }
         let (player, error) = match VideoPlayer::open(&video.path) {
             Ok(player) => {
                 player.play();

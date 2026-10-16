@@ -15,7 +15,7 @@ use gpui_kit::{
     App, ClipboardEntry, Context, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, FontWeight, Image,
     ImageFormat, ObjectFit, PathPromptOptions, SharedString, Subscription, Task, Window, deferred, div, img, px,
 };
-use signal_backend::{Command, LinkPreviewDraft, OutgoingFile, OutgoingImage};
+use signal_backend::{Command, LinkPreviewDraft, OutgoingFile, OutgoingImage, OutgoingViewOnce};
 use signal_emoji::{Emoji, SearchOptions};
 use signal_store::{ConversationId, ConversationKind, Message};
 
@@ -161,6 +161,9 @@ pub struct Composer {
     mentions: Vec<(String, String)>,
     images: Vec<PendingImage>,
     files: Vec<PendingFile>,
+    /// Desktop's view-once toggle: the one photo or video staged goes to
+    /// be viewed once, while [`Self::view_once_eligible`] holds.
+    view_once: bool,
     link_preview: Option<StagedPreview>,
     /// Links whose preview was dismissed in this draft.
     dismissed_previews: std::collections::HashSet<String>,
@@ -287,6 +290,7 @@ impl Composer {
             mentions: Vec::new(),
             images: Vec::new(),
             files: Vec::new(),
+            view_once: false,
             link_preview: None,
             dismissed_previews: Default::default(),
             preview_task: None,
@@ -798,6 +802,9 @@ impl Composer {
         if text.is_empty() && self.images.is_empty() && self.files.is_empty() {
             return;
         }
+        if self.view_once && self.view_once_eligible() {
+            return self.send_view_once(cx);
+        }
         let quote = self.reply_to.take().map(|m| m.id);
         let preview = match self.link_preview.take() {
             Some(staged) => {
@@ -938,6 +945,71 @@ impl Composer {
                         .child(Icon::new(IconName::X).size_4().text_color(palette.text_secondary)),
                 ),
         )
+    }
+
+    /// Whether what's staged can go view-once (Desktop's
+    /// `isViewOnceEligible`): one photo or video, not a reply (and not
+    /// while editing).
+    fn view_once_eligible(&self) -> bool {
+        let one_video = || {
+            self.files.first().is_some_and(|f| {
+                let content_type = signal_backend::media::content_type_for_file(&f.file_name);
+                content_type.starts_with("video/") && signal_backend::mapping::can_view_once(content_type)
+            })
+        };
+        self.reply_to.is_none()
+            && self.editing.is_none()
+            && self.images.len() + self.files.len() == 1
+            && (self.images.len() == 1 || one_video())
+    }
+
+    /// Sends the one photo or video staged view-once; the text typed stays
+    /// in the composer, since a view-once message carries none.
+    fn send_view_once(&mut self, cx: &mut Context<Self>) {
+        let media = if let Some(image) = self.images.pop() {
+            image.release(cx);
+            OutgoingViewOnce::Image(OutgoingImage { bytes: image.bytes, file_name: image.file_name })
+        } else if let Some(file) = self.files.pop() {
+            OutgoingViewOnce::Video(OutgoingFile { bytes: file.bytes, file_name: file.file_name, voice: false })
+        } else {
+            return;
+        };
+        self.view_once = false;
+        self.state.read(cx).send(Command::SendViewOnce { conversation: self.conversation.clone(), media });
+        cx.emit(ComposerEvent::Sent);
+        cx.notify();
+    }
+
+    fn render_view_once_toggle(&self, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let on = self.view_once;
+        div()
+            .id("view-once-toggle")
+            .debug_selector(|| "view-once-toggle".into())
+            .mx_3()
+            .mt_2()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .w_auto()
+            .self_start()
+            .px_2()
+            .py_1()
+            .rounded_full()
+            .cursor_pointer()
+            .text_xs()
+            .when(on, |d| d.bg(palette.accent).text_color(palette.on_accent))
+            .when(!on, |d| d.border_1().border_color(palette.panel_border).text_color(palette.text_secondary))
+            .child(Icon::new(IconName::CircleDashed).size_3p5())
+            .child("View once")
+            .on_click(cx.listener(|this, _, window, cx| {
+                use gpui_kit::component::WindowExt as _;
+                use gpui_kit::component::notification::Notification;
+                this.view_once = !this.view_once;
+                // Desktop's toast (`Toast--viewOnceEnabled` / `Disabled`).
+                let note = if this.view_once { "View once enabled" } else { "View once disabled" };
+                window.push_notification(Notification::new().message(note), cx);
+                cx.notify();
+            }))
     }
 
     /// Queues an image to send; `false` if it isn't one.
@@ -1521,6 +1593,7 @@ impl Render for Composer {
             .when_some(self.render_link_preview(palette, cx), |d, card| d.child(card))
             .when(!self.images.is_empty(), |d| d.child(self.render_images(palette, cx)))
             .when(!self.files.is_empty(), |d| d.child(self.render_files(palette, cx)))
+            .when(self.view_once_eligible(), |d| d.child(self.render_view_once_toggle(palette, cx)))
             .when_some(self.recording.as_ref().filter(|_| self.voice_draft.is_none()), |d, recording| {
                 d.child(self.render_recording(recording, palette, cx))
             })
@@ -2323,5 +2396,62 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(sent.get(), 1);
         assert_eq!(text(&f, cx), "");
+    }
+
+    fn png() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::RgbaImage::new(8, 8).write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png).unwrap();
+        bytes
+    }
+
+    #[gpui_kit::test]
+    fn view_once_is_offered_for_one_photo_or_video_only(cx: &mut TestAppContext) {
+        let f = mount(cx);
+        let eligible = |cx: &mut TestAppContext| cx.update(|cx| f.composer.read(cx).view_once_eligible());
+        assert!(!eligible(cx));
+        f.composer.update(cx, |c, cx| assert!(c.add_image(png(), None, cx)));
+        assert!(eligible(cx));
+        // Two photos: no (Desktop's `isViewOnceEligible`).
+        f.composer.update(cx, |c, cx| assert!(c.add_image(png(), None, cx)));
+        assert!(!eligible(cx));
+        f.composer.update(cx, |c, cx| {
+            c.images.drain(..).for_each(|i| i.release(cx));
+            assert!(c.add_file(b"not really".to_vec(), Some("clip.mp4".into()), cx));
+        });
+        assert!(eligible(cx), "a video");
+        f.composer.update(cx, |c, cx| {
+            c.files.clear();
+            assert!(c.add_file(b"%PDF-1.7".to_vec(), Some("notes.pdf".into()), cx));
+        });
+        assert!(!eligible(cx), "not a photo or video");
+    }
+
+    #[gpui_kit::test]
+    fn a_view_once_photo_goes_without_the_text(cx: &mut TestAppContext) {
+        let f = mount(cx);
+        let target = input_id(&f, cx);
+        let mut cx = gpui_kit::VisualTestContext::from_window(f.window, cx);
+        cx.update(|window, cx| {
+            window.click(target, cx);
+            window.input("keep this", cx);
+        });
+        f.composer.update(&mut cx, |c, cx| assert!(c.add_image(png(), Some("dot.png".into()), cx)));
+        cx.run_until_parked();
+        let toggle = cx.debug_bounds("view-once-toggle").expect("offered for one photo");
+        cx.simulate_click(toggle.center(), gpui_kit::Modifiers::none());
+        assert!(cx.update(|_, cx| f.composer.read(cx).view_once));
+        cx.update(|window, cx| f.composer.update(cx, |c, cx| c.submit(window, cx)));
+
+        let messages = sent(&f, |m| m.view_once.is_some());
+        let once = messages.iter().find(|m| m.view_once.is_some()).unwrap();
+        // The demo sends at once, and ours is erased once sent.
+        assert_eq!(once.view_once, Some(signal_store::ViewOnce::Gone));
+        assert!(once.body.is_empty() && once.attachments.is_empty());
+        // The text stays for the next message; the toggle is off again.
+        let (text, view_once, images) = cx.update(|_, cx| {
+            let c = f.composer.read(cx);
+            (c.input.read(cx).value().to_string(), c.view_once, c.images.len())
+        });
+        assert_eq!((text.as_str(), view_once, images), ("keep this", false, 0));
     }
 }

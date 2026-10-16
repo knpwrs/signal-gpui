@@ -278,6 +278,11 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
         }];
         db.insert_message(&voice).await?;
     }
+    // A view-once photo, still to be opened (its own drawn file, since
+    // opening it deletes it).
+    let mut once = incoming(MAYA, MAYA, now - 2 * DAY - 3 * HOUR + 11 * MINUTE, "");
+    once.attachments = image("demo-view-once.png", PHOTO_WIDTH, PHOTO_HEIGHT).into_iter().collect();
+    db.insert_message_view_once(&once, Some(signal_store::ViewOnce::Ready)).await?;
     db.set_reaction(home_id, react("❤️", None)).await?;
     let mut article = incoming(MAYA, MAYA, now - 50 * MINUTE, "This is the post I was telling you about: https://signal.org/blog/");
     let article_image = image("demo-preview-square.png", 160, 160);

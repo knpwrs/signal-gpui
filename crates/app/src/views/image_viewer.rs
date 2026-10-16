@@ -25,6 +25,9 @@ pub struct ViewedImage {
     /// Pixel size, when known; without it the image can only be fitted.
     pub size: Option<(u32, u32)>,
     pub file_name: Option<String>,
+    /// A view-once message's copy (`Event::ViewOnceOpened`): it can't be
+    /// saved, and the file is deleted when the viewer closes.
+    pub view_once: bool,
 }
 
 pub enum ViewerEvent {
@@ -48,6 +51,9 @@ impl Focusable for ImageViewer {
 
 impl ImageViewer {
     pub fn new(image: ViewedImage, cx: &mut Context<Self>) -> Self {
+        if image.view_once {
+            delete_on_release(image.path.clone(), cx);
+        }
         Self { image, zoom: None, focus: cx.focus_handle() }
     }
 
@@ -114,6 +120,17 @@ impl ImageViewer {
         }
         cx.stop_propagation();
     }
+}
+
+/// Deletes a view-once copy once its viewer is gone, as Desktop's lightbox
+/// deletes its temporary file on close (`ts/state/ducks/lightbox.preload.ts`).
+pub fn delete_on_release<V: 'static>(path: PathBuf, cx: &mut Context<V>) {
+    cx.on_release(move |_, _| {
+        if let Err(error) = std::fs::remove_file(&path) {
+            tracing::warn!(%error, "couldn't delete a view-once copy");
+        }
+    })
+    .detach();
 }
 
 /// The scale that fits an image in `area`, never above 100%.
@@ -261,14 +278,16 @@ impl gpui_kit::Render for ImageViewer {
                             .disabled(!can_zoom || scale >= 0.999)
                             .on_click(cx.listener(|this, _, _, cx| this.actual_size(cx))),
                     )
-                    .child(
+                    // A view-once photo can't be saved (Desktop's lightbox
+                    // hides its save button for one).
+                    .when(!self.image.view_once, |d| d.child(
                         Button::new("download-image")
                             .ghost()
                             .small()
                             .icon(IconName::Download)
                             .tooltip("Save to Downloads")
                             .on_click(cx.listener(|this, _, window, cx| this.download(window, cx))),
-                    )
+                    ))
                     .child(
                         Button::new("close-image")
                             .ghost()
@@ -325,6 +344,7 @@ mod tests {
             path: PathBuf::from("/x/123-0.png"),
             size: None,
             file_name: name.map(Into::into),
+            view_once: false,
         };
         assert_eq!(download_name(&image(Some("../../etc/passwd"))), "etcpasswd");
         assert!(download_name(&image(None)).starts_with("signal-") && download_name(&image(None)).ends_with(".png"));
@@ -339,7 +359,7 @@ mod tests {
     fn opens_fitted_and_zooms_to_actual_size(cx: &mut gpui_kit::TestAppContext) {
         use gpui_kit::{AppContext as _, VisualTestContext, WindowBounds, WindowOptions, size};
         cx.update(gpui_kit::init);
-        let image = ViewedImage { path: PathBuf::from("/nonexistent.png"), size: Some((4000, 3000)), file_name: None };
+        let image = ViewedImage { path: PathBuf::from("/nonexistent.png"), size: Some((4000, 3000)), file_name: None, view_once: false };
         let (window, viewer) = cx.update(|cx| {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(gpui_kit::Bounds {
@@ -377,5 +397,28 @@ mod tests {
         // A small image shows at 100%, not blown up.
         assert_eq!(fit_scale(Some((200, 100)), (1000., 600.)), 1.);
         assert_eq!(fit_scale(None, (1000., 600.)), 1.);
+    }
+
+    #[gpui_kit::test]
+    fn a_view_once_copy_goes_when_the_viewer_closes(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::{AppContext as _, VisualTestContext};
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("copy.png");
+        std::fs::write(&path, b"").unwrap();
+        let image = ViewedImage { path: path.clone(), size: Some((10, 10)), file_name: None, view_once: true };
+        let (window, viewer) = cx.update(|cx| {
+            gpui_kit::open_window(Default::default(), cx, |_, cx| cx.new(|cx| ImageViewer::new(image, cx))).unwrap()
+        });
+        // Only the window holds it now.
+        drop(viewer);
+        let mut vcx = VisualTestContext::from_window(window, cx);
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("viewed-image").is_some());
+        assert!(path.exists());
+        vcx.update(|window, _| window.remove_window());
+        vcx.run_until_parked();
+        assert!(!path.exists(), "deleted with the viewer");
     }
 }
