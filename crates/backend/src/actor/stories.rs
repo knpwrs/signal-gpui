@@ -433,6 +433,22 @@ impl Actor {
             }),
             ..Default::default()
         };
+        // A long one goes as Desktop's `sendNormalMessage` sends any long
+        // body: the whole text uploaded once, as an attachment, for every
+        // member alike.
+        let data = if data.body.as_deref().is_some_and(crate::long_text::is_too_long) {
+            let Some(manager) = self.manager() else {
+                return self.error("failed to send the reply", "not connected");
+            };
+            let mut body = ContentBody::DataMessage(data);
+            if let Err(error) = self.attach_long_text(&manager, &mut body).await {
+                return self.error("failed to send the reply", format!("{error:#}"));
+            }
+            let ContentBody::DataMessage(data) = body else { return };
+            data
+        } else {
+            data
+        };
         let members = self.group_story_members(&group).await;
         let parts = members.into_iter().map(|m| (m, ContentBody::DataMessage(data.clone()))).collect();
         self.start_story_job(parts, timestamp as u64, StoryJobSync::Reply(Box::new(data)), "reply");
