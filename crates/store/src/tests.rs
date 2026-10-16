@@ -321,6 +321,38 @@ async fn delete_edit_attachments_and_search() {
 }
 
 #[tokio::test]
+async fn the_next_audio_is_the_chats_next_message_with_audio() {
+    let db = test_db().await;
+    let with = |mut m: NewMessage, content_type: &str| {
+        m.attachments = vec![AttachmentMeta {
+            content_type: content_type.into(),
+            file_name: None,
+            size: 10,
+            width: None,
+            height: None,
+            local_path: Some("/x".into()),
+            sticker: false,
+            gif: false,
+            voice: content_type == "audio/aac",
+            remote: None,
+            thumbnail_path: None,
+        }];
+        m
+    };
+    let first = db.insert_message(&with(incoming("d:a", "a", 10, ""), "audio/aac")).await.unwrap();
+    db.insert_message(&incoming("d:a", "a", 20, "words")).await.unwrap();
+    db.insert_message(&with(incoming("d:a", "a", 25, ""), "image/png")).await.unwrap();
+    // Another chat's audio in between doesn't count.
+    db.insert_message(&with(incoming("d:b", "b", 27, ""), "audio/aac")).await.unwrap();
+    let song = db.insert_message(&with(outgoing("d:a", 30, ""), "audio/mpeg")).await.unwrap();
+    let last = db.insert_message(&with(incoming("d:a", "a", 40, ""), "audio/aac")).await.unwrap();
+    assert_eq!(db.next_audio(first).await.unwrap().map(|m| m.id), Some(song), "voice messages and audio files alike");
+    assert_eq!(db.next_audio(song).await.unwrap().map(|m| m.id), Some(last));
+    db.mark_deleted(last).await.unwrap();
+    assert_eq!(db.next_audio(song).await.unwrap(), None, "deleted ones are skipped");
+}
+
+#[tokio::test]
 async fn the_first_unread_message_and_unread_mentions_of_us() {
     let db = test_db().await;
     let chat = conv("g:x");

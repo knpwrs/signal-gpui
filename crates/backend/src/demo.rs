@@ -321,6 +321,11 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
             thumbnail_path: None,
         }];
         db.insert_message(&voice).await?;
+        // A second one straight after: Desktop plays it when the first ends.
+        let mut more = voice.clone();
+        more.sent_at += 30_000;
+        more.received_at = more.sent_at;
+        db.insert_message(&more).await?;
     }
     // A view-once photo, still to be opened (its own drawn file, since
     // opening it deletes it).

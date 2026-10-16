@@ -43,6 +43,94 @@ pub fn peaks(samples: impl IntoIterator<Item = f32>, total: usize, bars: usize) 
     peaks
 }
 
+/// Something playing an audio file: [`Player`], or in tests a silent
+/// stand-in (tests never play sound).
+pub trait Playback {
+    fn play(&self);
+    fn pause(&self);
+    fn is_playing(&self) -> bool;
+    /// Where it is, in seconds.
+    fn position(&self) -> f64;
+    fn duration(&self) -> f64;
+    fn seek(&self, seconds: f64);
+    fn set_rate(&self, rate: f32);
+}
+
+/// Opens a file to play.
+pub type Opener = fn(&Path) -> anyhow::Result<Box<dyn Playback>>;
+
+/// The real player.
+pub fn open(path: &Path) -> anyhow::Result<Box<dyn Playback>> {
+    Ok(Box::new(Player::open(path)?))
+}
+
+impl Playback for Player {
+    fn play(&self) {
+        Player::play(self)
+    }
+    fn pause(&self) {
+        Player::pause(self)
+    }
+    fn is_playing(&self) -> bool {
+        Player::is_playing(self)
+    }
+    fn position(&self) -> f64 {
+        Player::position(self)
+    }
+    fn duration(&self) -> f64 {
+        Player::duration(self)
+    }
+    fn seek(&self, seconds: f64) {
+        Player::seek(self, seconds)
+    }
+    fn set_rate(&self, rate: f32) {
+        Player::set_rate(self, rate)
+    }
+}
+
+/// A silent player for tests: it "plays" for a moment of real time, at its
+/// last second, then stops and rewinds as `AVAudioPlayer` does at the end.
+#[cfg(test)]
+pub mod silent {
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    #[derive(Default)]
+    pub struct Silent {
+        started: Cell<Option<Instant>>,
+    }
+
+    pub const LENGTH: f64 = 2.;
+    /// How long it plays, in real time.
+    const PLAYS_FOR: Duration = Duration::from_millis(300);
+
+    pub fn open(_: &std::path::Path) -> anyhow::Result<Box<dyn super::Playback>> {
+        Ok(Box::new(Silent::default()))
+    }
+
+    impl super::Playback for Silent {
+        fn play(&self) {
+            if self.started.get().is_none() {
+                self.started.set(Some(Instant::now()));
+            }
+        }
+        fn pause(&self) {
+            self.started.set(None);
+        }
+        fn is_playing(&self) -> bool {
+            self.started.get().is_some_and(|at| at.elapsed() < PLAYS_FOR)
+        }
+        fn position(&self) -> f64 {
+            if self.is_playing() { LENGTH - 0.1 } else { 0. }
+        }
+        fn duration(&self) -> f64 {
+            LENGTH
+        }
+        fn seek(&self, _: f64) {}
+        fn set_rate(&self, _: f32) {}
+    }
+}
+
 /// An audio file being played (or paused); dropping it stops it.
 pub struct Player {
     #[cfg(target_os = "macos")]

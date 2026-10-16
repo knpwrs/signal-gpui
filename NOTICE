@@ -60,9 +60,10 @@ Bundled data and assets:
   - The preset profile photos from Signal Desktop (images/avatars,
     AGPL-3.0-only), Copyright Signal Messenger, LLC. See
     crates/app/assets/avatars.
-  - The ringtone from Signal Desktop (sounds/ringtone_minimal.ogg,
-    AGPL-3.0-only), Copyright Signal Messenger, LLC, converted to AAC. See
-    crates/app/assets/sounds.
+  - The ringtone, the in-chat sounds and the end of consecutive voice
+    messages from Signal Desktop (sounds/ringtone_minimal.ogg, pop.ogg,
+    whoosh.ogg, state-change_confirm-up.ogg, AGPL-3.0-only), Copyright
+    Signal Messenger, LLC, converted to AAC. See crates/app/assets/sounds.
   - The text story fonts Signal Desktop uses, under the SIL Open Font
     License 1.1, each with its notice in crates/app/assets/fonts:
     Inter 3.19 (Regular, Bold), Copyright (c) 2016-2020 The Inter Project

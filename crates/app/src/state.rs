@@ -221,8 +221,11 @@ pub struct AudioPlaying {
     pub index: usize,
     /// Who sent it ("You" for ours), for the mini player.
     pub title: String,
-    player: crate::audio::Player,
+    player: Box<dyn crate::audio::Playback>,
     pub rate: f32,
+    /// When it ends, the chat's next audio plays (Desktop's consecutive
+    /// playback; not from All media).
+    consecutive: bool,
     /// Where it was when last seen playing: near the end, a stop is the end.
     last_position: f64,
     /// Redraws while it plays, and notices when it ends.
@@ -238,6 +241,17 @@ impl AudioPlaying {
     pub fn progress(&self) -> (f64, f64) {
         (self.player.position(), self.player.duration())
     }
+}
+
+/// What plays next from a message: its first audio attachment, if it's
+/// downloaded, with who sent it for the mini player.
+fn next_playable(message: &signal_store::Message) -> Option<(i64, usize, std::path::PathBuf, String)> {
+    let (index, attachment) = message.attachments.iter().enumerate().find(|(_, a)| a.content_type.starts_with("audio/"))?;
+    let title = match message.direction {
+        signal_store::Direction::Outgoing => "You".to_owned(),
+        signal_store::Direction::Incoming => message.author_name.clone().unwrap_or_else(|| "Unknown".into()),
+    };
+    Some((message.id, index, std::path::PathBuf::from(attachment.local_path.clone()?), title))
 }
 
 /// An audio file's waveform peaks (0 to 1) and its length in seconds.
@@ -303,6 +317,8 @@ pub struct AppState {
     /// The audio attachment or voice message playing (or paused), as
     /// Desktop plays one at a time, whichever chat is open.
     pub audio: Option<AudioPlaying>,
+    /// Opens audio to play (a silent stand-in in tests).
+    pub open_audio: crate::audio::Opener,
     /// Signal's megaphones to show, highest priority first.
     pub megaphones: Vec<signal_backend::megaphones::MegaphoneView>,
     /// The navigation tab showing.
@@ -521,6 +537,7 @@ impl AppState {
             has_giphy_key: std::env::var_os("GIPHY_API_KEY").is_some(),
             loops: Default::default(),
             audio: None,
+            open_audio: crate::audio::open,
             start_recorder: crate::recorder::start_microphone,
             megaphones: Vec::new(),
             tab: NavTab::default(),
@@ -2342,14 +2359,32 @@ impl AppState {
         title: String,
         cx: &mut Context<Self>,
     ) {
+        self.start_audio_as(message_id, index, path, fraction, title, true, 1., cx);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_audio_as(
+        &mut self,
+        message_id: i64,
+        index: usize,
+        path: &std::path::Path,
+        fraction: f64,
+        title: String,
+        consecutive: bool,
+        rate: f32,
+        cx: &mut Context<Self>,
+    ) {
         // The one playing stops first.
         self.audio = None;
-        let player = match crate::audio::Player::open(path) {
+        let player = match (self.open_audio)(path) {
             Ok(player) => player,
             Err(error) => return self.report_error(format!("Couldn't play it: {error:#}"), cx),
         };
         if fraction > 0. {
             player.seek(fraction * player.duration());
+        }
+        if rate != 1. {
+            player.set_rate(rate);
         }
         player.play();
         // A voice message played is viewed (Desktop's `markViewed` from
@@ -2370,7 +2405,11 @@ impl AppState {
                     let ended = audio.player.position() <= 0.
                         && audio.last_position >= audio.player.duration() - END_SLACK;
                     if ended {
+                        let (message_id, rate, consecutive) = (audio.message_id, audio.rate, audio.consecutive);
                         this.audio = None;
+                        if consecutive {
+                            this.play_next_audio(message_id, rate, cx);
+                        }
                         cx.notify();
                     }
                     ended
@@ -2380,8 +2419,36 @@ impl AppState {
                 }
             }
         });
-        self.audio = Some(AudioPlaying { message_id, index, title, player, rate: 1., last_position: 0., _poll: poll });
+        self.audio = Some(AudioPlaying { message_id, index, title, player, rate, consecutive, last_position: 0., _poll: poll });
         cx.notify();
+    }
+
+    /// Desktop's consecutive playback (`messageAudioEnded`): the chat's next
+    /// audio after the one that ended plays at the same rate, if it's
+    /// downloaded; with none, Desktop's "confirm up" sound plays instead.
+    fn play_next_audio(&mut self, after: i64, rate: f32, cx: &mut Context<Self>) {
+        let db = self.backend.db().clone();
+        let query = self.backend.spawn(async move { db.next_audio(after).await });
+        cx.spawn(async move |this, cx| {
+            let next = match query.await {
+                Ok(next) => next,
+                Err(error) => {
+                    tracing::warn!(%error, "couldn't find the next audio");
+                    None
+                }
+            };
+            let _ = this.update(cx, |this, cx| {
+                // Something else started meanwhile: it stays.
+                if this.audio.is_some() {
+                    return;
+                }
+                match next.as_ref().and_then(next_playable) {
+                    Some((message_id, index, path, title)) => this.start_audio_as(message_id, index, &path, 0., title, true, rate, cx),
+                    None => crate::sounds::play(crate::sounds::Sound::ConfirmUp),
+                }
+            });
+        })
+        .detach();
     }
 
     /// A downloaded audio file's waveform and length, decoding it (once, in

@@ -4404,8 +4404,11 @@ impl Render for ConversationView {
         let palette = Palette::get(cx);
         let entity = cx.entity();
         let typing = self.render_typing(palette, cx);
-        let scrolled_up =
-            self.has_newer || (!self.list.is_following_tail() && !self.list.is_scrolled_to_end().unwrap_or(true));
+        // Messages that arrived while scrolled up wait below, even when the
+        // list hasn't measured them yet (it can't tell where its end is then).
+        let scrolled_up = self.has_newer
+            || self.unseen > 0
+            || (!self.list.is_following_tail() && !self.list.is_scrolled_to_end().unwrap_or(true));
 
         div()
             .size_full()
@@ -6295,6 +6298,46 @@ mod tests {
         assert_eq!(peaks.len(), crate::audio::BARS);
         assert!((seconds - 6.).abs() < 0.1, "{seconds}");
         assert!(peaks.contains(&1.) && peaks.iter().any(|p| *p < 0.5), "it rises and falls");
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn the_next_voice_message_plays_when_one_ends(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        // Maya's two voice messages, one after the other.
+        let voices = wait_for_messages(&backend, MAYA, 2, |m| m.attachments.first().is_some_and(|a| a.voice));
+        let (mut cx, view) = open_view(cx, &backend, MAYA);
+        let state = view.read_with(&cx, |v, _| v.state.clone());
+        // A silent player that reaches its end at once.
+        state.update(&mut cx, |s, _| s.open_audio = crate::audio::silent::open);
+        let path = std::path::PathBuf::from(voices[0].attachments[0].local_path.clone().unwrap());
+        state.update(&mut cx, |s, cx| {
+            s.toggle_audio(voices[0].id, 0, path.clone(), "Maya".into(), cx);
+            s.cycle_audio_rate(cx);
+        });
+        let playing = |cx: &mut VisualTestContext| state.read_with(cx, |s, _| s.audio.as_ref().map(|a| (a.message_id, a.rate)));
+        let mut next = None;
+        for _ in 0..400 {
+            cx.executor().advance_clock(std::time::Duration::from_millis(60));
+            cx.run_until_parked();
+            next = playing(&mut cx).filter(|(id, _)| *id == voices[1].id);
+            if next.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let (_, rate) = next.expect("the second one plays next");
+        assert_eq!(rate, 1.5, "at the same rate");
+        // Nothing after it: it stops.
+        for _ in 0..400 {
+            cx.executor().advance_clock(std::time::Duration::from_millis(60));
+            cx.run_until_parked();
+            if playing(&mut cx).is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(playing(&mut cx), None);
         backend.shutdown();
     }
 

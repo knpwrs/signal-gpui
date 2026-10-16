@@ -1,22 +1,28 @@
 //! Signal Desktop's in-chat sounds (`ts/util/Sound.std.ts`): `pop` when a
-//! message arrives in the open chat, `whoosh` when we send one. Desktop's
-//! `sounds/pop.ogg` and `sounds/whoosh.ogg` (AGPL-3.0-only like this app),
-//! converted to AAC, which macOS plays. Tests never play sound.
+//! message arrives in the open chat, `whoosh` when we send one, and
+//! `state-change_confirm-up` when consecutive voice messages run out.
+//! Desktop's `sounds/*.ogg` (AGPL-3.0-only like this app), converted to
+//! AAC, which macOS plays. Tests never play sound.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sound {
     Pop,
     Whoosh,
+    /// The end of consecutive voice messages (Desktop's
+    /// `state-change_confirm-up`).
+    ConfirmUp,
 }
 
 const POP: &[u8] = include_bytes!("../assets/sounds/pop.m4a");
 const WHOOSH: &[u8] = include_bytes!("../assets/sounds/whoosh.m4a");
+const CONFIRM_UP: &[u8] = include_bytes!("../assets/sounds/confirm-up.m4a");
 
 impl Sound {
     fn bytes(self) -> &'static [u8] {
         match self {
             Sound::Pop => POP,
             Sound::Whoosh => WHOOSH,
+            Sound::ConfirmUp => CONFIRM_UP,
         }
     }
 }
@@ -61,7 +67,7 @@ mod tests {
     fn macos_can_decode_the_sounds() {
         use objc2::AnyThread as _;
         use objc2_app_kit::NSSound;
-        for sound in [super::Sound::Pop, super::Sound::Whoosh] {
+        for sound in [super::Sound::Pop, super::Sound::Whoosh, super::Sound::ConfirmUp] {
             let data = objc2_foundation::NSData::with_bytes(sound.bytes());
             let decoded = NSSound::initWithData(NSSound::alloc(), &data).expect("decodable");
             assert!(decoded.duration() > 0.05, "{sound:?}: {}", decoded.duration());

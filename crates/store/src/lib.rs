@@ -2218,6 +2218,24 @@ impl AppDb {
         rows.iter().map(message_from_row).collect()
     }
 
+    /// The next message after `after_id` in its chat with audio (a voice
+    /// message or an audio file), for Desktop's consecutive playback
+    /// (`getNextVoiceNote`: the chat's next audio attachment, newer).
+    pub async fn next_audio(&self, after_id: i64) -> Result<Option<Message>> {
+        let row = sqlx::query(AssertSqlSafe(format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages \
+             WHERE conversation_id = (SELECT conversation_id FROM messages WHERE id = ?1) \
+               AND (sent_at, id) > (SELECT sent_at, id FROM messages WHERE id = ?1) \
+               AND deleted = 0 AND view_once IS NULL AND attachments != '[]' \
+               AND EXISTS (SELECT 1 FROM json_each(attachments) WHERE json_extract(value, '$.content_type') LIKE 'audio/%') \
+             ORDER BY sent_at, id LIMIT 1"
+        )))
+        .bind(after_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(message_from_row).transpose()
+    }
+
     /// Up to `limit` messages after `after_id`, oldest first.
     pub async fn messages_after(&self, conversation: &ConversationId, after_id: i64, limit: u32) -> Result<Vec<Message>> {
         let rows = sqlx::query(AssertSqlSafe(format!(
