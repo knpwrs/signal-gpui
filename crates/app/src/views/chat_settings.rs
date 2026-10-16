@@ -7,7 +7,8 @@ use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::prelude::*;
 use gpui_kit::{App, Entity, FontWeight, SharedString, Window, div, px};
 use signal_backend::Command;
-use signal_store::{Conversation, ConversationKind};
+use gpui_kit::component::tooltip::Tooltip;
+use signal_store::{ContactNickname, Conversation, ConversationKind};
 
 use crate::state::AppState;
 use crate::theme::{Palette, color_for};
@@ -53,9 +54,34 @@ pub fn open(state: Entity<AppState>, conversation: Conversation, window: &mut Wi
         })
         .detach();
     }
+    // The nickname and note we gave them, from the database.
+    let nickname: Entity<Option<ContactNickname>> = cx.new(|_| None);
+    if crate::views::nickname::can_have_nickname(&conversation)
+        && let Some(sid) = conversation.id.as_direct().map(str::to_owned)
+    {
+        let backend = state.read(cx).backend.clone();
+        let db = backend.db().clone();
+        let query = backend.spawn(async move { db.contact_nickname(&sid).await });
+        let nickname = nickname.clone();
+        cx.spawn(async move |cx| {
+            let found = query.await.ok().flatten().unwrap_or_default();
+            nickname.update(cx, |nickname, cx| {
+                *nickname = Some(found);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
     window.open_dialog(cx, move |dialog, _, cx| {
         let palette = Palette::get(cx);
         let editable = group && conversation.can_edit_info && !conversation.left;
+        let nickname = nickname.read(cx).clone();
+        // Desktop's "Nickname (profile name)", when a nickname is what shows.
+        let plain_name = nickname
+            .as_ref()
+            .filter(|n| n.nickname().is_some())
+            .and_then(|n| n.plain_name.clone())
+            .filter(|plain| *plain != conversation.title);
         let me = state.read(cx).account.as_ref().map(|a| a.aci.clone()).unwrap_or_default();
         let field = |label: &'static str| div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(palette.text_secondary).child(label);
         let header = div()
@@ -67,7 +93,25 @@ pub fn open(state: Entity<AppState>, conversation: Conversation, window: &mut Wi
                 div()
                     .flex()
                     .flex_col()
-                    .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(conversation.title.clone()))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_1()
+                            .text_lg()
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child(conversation.title.clone()))
+                            .when_some(plain_name, |d, plain| {
+                                let tip = format!("“{plain}” is the profile name this person set for themselves in Signal.");
+                                d.child(
+                                    div()
+                                        .id("nickname-plain-name")
+                                        .debug_selector(|| "nickname-plain-name".into())
+                                        .text_color(palette.text_secondary)
+                                        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                                        .child(format!("({plain})")),
+                                )
+                            }),
+                    )
                     .when_some(conversation.phone.clone().filter(|_| !group), |d, phone| {
                         d.child(div().text_sm().text_color(palette.text_secondary).child(phone))
                     }),
@@ -75,12 +119,18 @@ pub fn open(state: Entity<AppState>, conversation: Conversation, window: &mut Wi
         let body = div().flex().flex_col().gap_4().child(header);
         if !group {
             let direct = conversation.kind == ConversationKind::Direct;
-            let (state, chat) = (state.clone(), conversation.clone());
+            let (safety_state, chat) = (state.clone(), conversation.clone());
             let safety = Button::new("view-safety-number").label("View safety number").outline().on_click(move |_, window, cx| {
                 window.close_all_dialogs(cx);
-                crate::views::safety_number::open(state.clone(), chat.id.clone(), chat.title.clone(), window, cx);
+                crate::views::safety_number::open(safety_state.clone(), chat.id.clone(), chat.title.clone(), window, cx);
             });
             let body = body.when(direct, |d| d.child(div().child(safety)));
+            let body = match nickname {
+                Some(nickname) if crate::views::nickname::can_have_nickname(&conversation) => {
+                    body.child(nickname_rows(state.clone(), conversation.clone(), nickname, palette))
+                }
+                _ => body,
+            };
             return dialog.title("Chat settings").w(px(420.)).child(body);
         }
         let members = names.read(cx).clone();
@@ -162,6 +212,52 @@ pub fn open(state: Entity<AppState>, conversation: Conversation, window: &mut Wi
             }),
         )
     });
+}
+
+/// Desktop's "Nickname" row (with "Delete" once there's one) and the note,
+/// which opens in full.
+fn nickname_rows(state: Entity<AppState>, conversation: Conversation, nickname: ContactNickname, palette: Palette) -> impl IntoElement {
+    let (edit_state, edit_chat, edit_nickname) = (state.clone(), conversation.clone(), nickname.clone());
+    let (delete_state, delete_id) = (state.clone(), conversation.id.clone());
+    let has_any = !nickname.is_empty();
+    let note = Some(nickname.note.clone()).filter(|n| !n.is_empty());
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .flex()
+                .gap_2()
+                .child(Button::new("nickname-edit").label("Nickname").outline().on_click(move |_, window, cx| {
+                    window.close_all_dialogs(cx);
+                    crate::views::nickname::open_edit(edit_state.clone(), edit_chat.clone(), edit_nickname.clone(), window, cx);
+                }))
+                .when(has_any, |d| {
+                    d.child(Button::new("nickname-delete").label("Delete").ghost().on_click(move |_, window, cx| {
+                        window.close_all_dialogs(cx);
+                        crate::views::nickname::confirm_delete(delete_state.clone(), delete_id.clone(), window, cx);
+                    }))
+                }),
+        )
+        .when_some(note, |d, note| {
+            d.child(
+                div()
+                    .id("nickname-note")
+                    .debug_selector(|| "nickname-note".into())
+                    .text_sm()
+                    .p_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(palette.row_hover))
+                    .child(div().text_xs().text_color(palette.text_secondary).child("Note"))
+                    .child(div().line_clamp(3).child(SharedString::from(note)))
+                    .on_click(move |_, window, cx| {
+                        window.close_all_dialogs(cx);
+                        crate::views::nickname::open_note(state.clone(), conversation.clone(), nickname.clone(), window, cx);
+                    }),
+            )
+        })
 }
 
 /// Desktop's "Do you really want to leave?".

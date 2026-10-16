@@ -46,7 +46,7 @@ flag as on whenever it's set.
 | `attachments.maxAutoDownloadSizeBytes` | 200 MiB | We auto-download up to 25 MiB (`AUTO_DOWNLOAD_MAX`). Raise it, or make it a setting? |
 | `textAttachmentLimitBytes` | Size of a long-text attachment | Desktop's built-in limits, hard-coded (`crates/backend/src/long_text.rs`): bodies over 2 KiB go as a `text/x-signal-plain` attachment, received ones download and replace the body, and the composer stops at 64 KiB. Not done: Desktop's "Read more" past 800 characters, its automatic retries of a failed download (here: a "Download Full Message" button), long text in group story replies we send, and dropping received messages whose inline body is over 2 KiB (Desktop's `MessageReceiver` drops them). |
 | `groupsv2.maxGroupSize` / `groupSizeHardLimit` | From config | New groups don't enforce a size limit yet; the server rejects one that's too big. |
-| `nicknames.min` / `.max` | From config | Not used: nicknames aren't editable. |
+| `nicknames.min` / `.max` | 3 / 32 | The length of a username's nickname part (`ts/util/Username.dom.ts`), not contact nicknames. Same, hard-coded in `recipients::username_in`. Contact nicknames and notes use Desktop's built-in limits (`signal_store::NICKNAME_LIMITS`), which no config key sets. |
 | `messageQueueTimeInSeconds` | 30 days (never less) | How long the server keeps undelivered messages. Not used. |
 | `videoAttachments.transcodeTargetBytes`, `mediaQuality.levels`, `calling.*`, `clientExpiration`, `maxAllowedClockSkewSeconds` | n/a | Not applicable for now. |
 
@@ -83,6 +83,25 @@ UI tests; not yet tried with a real account or against phones. Not done:
   members counts as failed. There's no pending spinner, only a fainter
   checkbox.
 - **New poll dialog:** Desktop's emoji picker beside each option.
+
+## Nicknames and notes
+
+Reading, editing and deleting a contact's nickname and note work, following
+Desktop's `EditNicknameAndNoteModal`, `NotePreviewModal` and the details
+panel's "Nickname" row: written to the contact's Storage Service record
+(only `nickname` and `note` change; unknown fields are kept), and the
+nickname is the name everywhere a contact's name shows (titles, the chat
+list, mentions, message authors, notifications, search). Tested with
+store, wire-format and demo-mode UI tests; not yet tried with a real
+account or checked on a phone. Not done:
+
+- **Group members' details:** Desktop's contact modal (clicking a member in
+  a group) also opens the Nickname dialog. There's no contact modal here,
+  so a nickname is set from the person's 1:1 Chat settings.
+- **Short names:** Desktop uses the nickname's first name where it shows
+  short names (`getTitle` with `isShort`). We show full names everywhere.
+- **Delete menu:** Desktop puts "Delete" in a menu beside the Nickname row,
+  always shown; here it's a button shown once there's a nickname or note.
 
 ## Sticker pack creator
 
