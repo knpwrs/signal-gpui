@@ -3857,11 +3857,11 @@ fn message_menu(
                 .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(body.clone()))),
         );
     }
-    let details = message.clone();
+    let (details, info_state) = (message.clone(), state.clone());
     menu = menu.item(
         PopupMenuItem::new("Info")
             .icon(IconName::Info)
-            .on_click(move |_, window, cx| crate::views::message_info::open(details.clone(), window, cx)),
+            .on_click(move |_, window, cx| crate::views::message_info::open(info_state.clone(), details.clone(), window, cx)),
     );
     let delete_state = state.clone();
     menu = menu.item(PopupMenuItem::new("Delete").icon(IconName::Trash).on_click(move |_, window, cx| {
@@ -4183,6 +4183,7 @@ mod tests {
             long_text: None,
             poll: None,
             view_once: None,
+            sealed_sender: Vec::new(),
         }
     }
 

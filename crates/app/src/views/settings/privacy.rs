@@ -43,7 +43,17 @@ pub(super) fn render(settings: &Entity<Settings>, palette: Palette, cx: &mut App
     };
     let (pnp_settings, blocked_settings) = (settings.clone(), settings.clone());
     let none_blocked = blocked.1;
-    let mut advanced = Vec::new();
+    let sealed_state = state.clone();
+    let sealed_on = state.read(cx).prefs.flag(AccountSetting::SealedSenderIndicators);
+    let mut advanced = vec![switch(
+        "sealed-sender-indicators",
+        "Show status icon",
+        Some("Show an icon in message details when they were delivered using sealed sender.".into()),
+        sealed_on,
+        false,
+        palette,
+        move |on, _, cx| sealed_state.update(cx, |s, cx| s.set_account_setting(AccountSetting::SealedSenderIndicators, on, cx)),
+    )];
     if signal_backend::key_transparency_on() {
         let kt_state = state.clone();
         advanced.push(
@@ -123,7 +133,7 @@ pub(super) fn render(settings: &Entity<Settings>, palette: Palette, cx: &mut App
             )],
             palette,
         ))
-        .when(!advanced.is_empty(), |d| d.child(list(Some("Advanced"), None, advanced, palette)))
+        .child(list(Some("Advanced"), None, advanced, palette))
         .into_any_element()
 }
 

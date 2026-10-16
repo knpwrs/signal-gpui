@@ -1570,3 +1570,40 @@ fn who_added_us_outright_is_kept_for_message_requests() {
     let bob = Aci::parse_from_service_id_string(BOB).unwrap();
     assert_eq!(summarize_group_change(&added(alice, bob), ME, None, &Default::default()).added_by, None);
 }
+
+#[test]
+fn sent_transcripts_say_who_got_them_by_sealed_sender() {
+    use sync_message::sent::UnidentifiedDeliveryStatus;
+    let status = |sid: &str, unidentified: bool| UnidentifiedDeliveryStatus {
+        destination_service_id: Some(sid.into()),
+        unidentified: Some(unidentified),
+        ..Default::default()
+    };
+    let sync = SyncMessage {
+        content: Some(sync_message::Content::Sent(sync_message::Sent {
+            destination_service_id: Some(ALICE.into()),
+            timestamp: Some(700),
+            message: Some(text("hi", 700)),
+            unidentified_status: vec![status(ALICE, true), status(ME, true)],
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let actions = map_content(&content(ME, sync), &ctx());
+    let [Action::Insert { sealed_sender, .. }] = actions.as_slice() else { panic!() };
+    // Us left out (Desktop's `unidentifiedDeliveries` are other people).
+    assert_eq!(*sealed_sender, [ALICE]);
+    let identified = SyncMessage {
+        content: Some(sync_message::Content::Sent(sync_message::Sent {
+            destination_service_id: Some(ALICE.into()),
+            timestamp: Some(701),
+            message: Some(text("hi", 701)),
+            unidentified_status: vec![status(ALICE, false)],
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let actions = map_content(&content(ME, identified), &ctx());
+    let [Action::Insert { sealed_sender, .. }] = actions.as_slice() else { panic!() };
+    assert!(sealed_sender.is_empty());
+}

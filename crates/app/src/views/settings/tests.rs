@@ -77,6 +77,13 @@ impl Harness {
         cx.run_until_parked();
     }
 
+    /// Scrolls the page to its end.
+    pub fn scroll_down(&self, cx: &mut TestAppContext) {
+        let delta = gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-3000.)));
+        cx.update_window(self.window, |_, window, cx| window.scroll("settings-content", delta, cx)).unwrap();
+        cx.run_until_parked();
+    }
+
     pub fn shown(&self, cx: &mut TestAppContext, id: &'static str) -> bool {
         cx.update_window(self.window, |_, window, cx| {
             window.render_frame(cx);
@@ -422,4 +429,50 @@ fn blocked_lists_and_unblocks(cx: &mut TestAppContext) {
     assert_eq!(h.value(cx, ("unblock", 0usize)).as_deref(), Some("Unblock"));
     cx.update_window(h.window, |_, window, cx| window.click(("unblock", 0usize), cx)).unwrap();
     assert!(wait(cx, |cx| h.state.read_with(cx, |s, _| s.blocked().is_empty())));
+}
+
+#[gpui_kit::test]
+fn sealed_sender_shows_in_message_details_when_on(cx: &mut TestAppContext) {
+    let h = Harness::open(cx, Page::Privacy);
+    let message = |direction, sealed: &[&str]| signal_store::Message {
+        id: 1,
+        conversation_id: signal_store::ConversationId("d:made-up".into()),
+        sent_at: 1,
+        received_at: 1,
+        direction,
+        author: None,
+        author_name: None,
+        body: "hi".into(),
+        status: signal_store::DeliveryStatus::Delivered,
+        reactions: Vec::new(),
+        quote: None,
+        attachments: Vec::new(),
+        link_preview: None,
+        deleted: false,
+        edited: false,
+        expires_in: 0,
+        expire_start: None,
+        edit_count: 0,
+        notice: None,
+        mentions: Vec::new(),
+        styles: Vec::new(),
+        cta: None,
+        deleted_by_admin: None,
+        long_text: None,
+        poll: None,
+        view_once: None,
+        sealed_sender: sealed.iter().map(|s| (*s).to_owned()).collect(),
+    };
+    let incoming = message(signal_store::Direction::Incoming, &["made-up"]);
+    let shown = |cx: &mut TestAppContext, m: &signal_store::Message| cx.read(|cx| crate::views::message_info::sealed_sender(h.state.read(cx), m));
+    // Off by default (Desktop's sealedSenderIndicators).
+    h.scroll_down(cx);
+    assert_eq!(h.value(cx, "sealed-sender-indicators").as_deref(), Some("off"));
+    assert_eq!(shown(cx, &incoming), None);
+    h.click(cx, "sealed-sender-indicators");
+    assert!(wait(cx, |_| h.stored(signal_backend::SETTING_SEALED_SENDER_INDICATORS).as_deref() == Some("true")));
+    assert_eq!(shown(cx, &incoming).as_deref(), Some("Received by sealed sender"));
+    let ours = message(signal_store::Direction::Outgoing, &["made-up"]);
+    assert_eq!(shown(cx, &ours).as_deref(), Some("Sent by sealed sender to Unknown contact"));
+    assert_eq!(shown(cx, &message(signal_store::Direction::Incoming, &[])), None);
 }

@@ -48,6 +48,9 @@ pub enum Action {
         /// The server's GUID for an incoming message (a spam report names
         /// it); set by the receive loop, not here.
         server_guid: Option<String>,
+        /// Who it came from, or went to, by sealed sender (Desktop's
+        /// `unidentifiedDeliveryReceived`, `unidentifiedDeliveries`).
+        sealed_sender: Vec<String>,
     },
     React {
         conversation: ConversationId,
@@ -1257,6 +1260,7 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
         poll,
         view_once,
         server_guid: None,
+        sealed_sender: Vec::new(),
     }]
 }
 
@@ -1474,6 +1478,7 @@ fn map_story_reply(
         poll: None,
         view_once: None,
         server_guid: None,
+        sealed_sender: Vec::new(),
     });
     out
 }
@@ -1531,6 +1536,25 @@ fn sent_to(sent: &sync_message::Sent, ctx: &MapContext) -> Vec<String> {
         .collect()
 }
 
+/// Who a message sent from another device went to by sealed sender (its
+/// transcript's `unidentified_status` with `unidentified` set, Desktop's
+/// `unidentifiedDeliveries`).
+fn sealed_to(sent: &sync_message::Sent, ctx: &MapContext) -> Vec<String> {
+    sent.unidentified_status
+        .iter()
+        .filter(|status| status.unidentified == Some(true))
+        .filter_map(|status| {
+            status
+                .destination_service_id_binary
+                .as_deref()
+                .and_then(ServiceId::parse_from_service_id_binary)
+                .or_else(|| status.destination_service_id.as_deref().and_then(ServiceId::parse_from_service_id_string))
+        })
+        .map(|sid| sid.service_id_string())
+        .filter(|sid| sid != ctx.self_aci)
+        .collect()
+}
+
 fn map_sync(sync: &SyncMessage, envelope_ts: i64, ctx: &MapContext) -> Vec<Action> {
     let mut out = Vec::new();
     if let Some(sync_message::Content::Sent(sent)) = &sync.content {
@@ -1538,6 +1562,7 @@ fn map_sync(sync: &SyncMessage, envelope_ts: i64, ctx: &MapContext) -> Vec<Actio
         let ts = sent.timestamp.map(|t| t as i64).unwrap_or(envelope_ts);
         if let Some(dm) = sent.message.as_ref().filter(|dm| !body_too_long(dm, "sent message", ts)) {
             let reached = sent_to(sent, ctx);
+            let sealed = sealed_to(sent, ctx);
             out.extend(map_data_message(dm, Origin::Outgoing { destination: destination.clone() }, ts, ctx).into_iter().map(
                 |mut action| {
                     // Our poll from another device reached whoever its
@@ -1545,6 +1570,9 @@ fn map_sync(sync: &SyncMessage, envelope_ts: i64, ctx: &MapContext) -> Vec<Actio
                     // keeps them (`sendStateByConversationId`).
                     if let Action::Insert { poll: Some(poll), .. } = &mut action {
                         poll.record_reached(reached.iter().cloned());
+                    }
+                    if let Action::Insert { sealed_sender, .. } = &mut action {
+                        sealed_sender.clone_from(&sealed);
                     }
                     action
                 },

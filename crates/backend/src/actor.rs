@@ -1243,6 +1243,14 @@ impl Actor {
                     {
                         *server_guid = content.metadata.server_guid.map(|g| g.to_string());
                     }
+                    // It came by sealed sender (Desktop's
+                    // `unidentifiedDeliveryReceived`).
+                    if let Action::Insert { message, sealed_sender, .. } = &mut action
+                        && message.direction == Direction::Incoming
+                        && content.metadata.unidentified_sender
+                    {
+                        sealed_sender.extend(message.author.clone());
+                    }
                     // Nor from a blocked group (our own sync messages still apply).
                     if let Action::Insert { message, .. } = &action
                         && message.direction == Direction::Incoming
@@ -1279,6 +1287,7 @@ impl Actor {
                 poll,
                 view_once,
                 server_guid,
+                sealed_sender,
             } => {
                 let mut spans = Vec::new();
                 let mut style_spans = Vec::new();
@@ -1378,6 +1387,9 @@ impl Actor {
                         }
                         if !style_spans.is_empty() {
                             let _ = self.db.set_styles(id, &style_spans).await;
+                        }
+                        if !repeat && !sealed_sender.is_empty() {
+                            let _ = self.db.set_sealed_sender(id, &sealed_sender).await;
                         }
                         // Only its start came in the body; the rest follows
                         // (a re-delivery is already on its way).

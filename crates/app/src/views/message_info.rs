@@ -1,15 +1,18 @@
-//! Desktop's message "Info": when it was sent and received, and how far it
-//! got. (Per-recipient receipts aren't tracked yet; this shows the
+//! Desktop's message "Info": when it was sent and received, how far it
+//! got, and (with "Show status icon" on) whether it went by sealed
+//! sender. (Per-recipient receipts aren't tracked yet; this shows the
 //! message's overall status.)
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::prelude::*;
-use gpui_kit::{App, SharedString, Window, div, px};
+use gpui_kit::{App, Entity, SharedString, Window, div, px};
 use signal_store::{DeliveryStatus, Direction, Message};
 
+use crate::state::AppState;
 use crate::theme::Palette;
 
-pub fn open(message: Message, window: &mut Window, cx: &mut App) {
+pub fn open(state: Entity<AppState>, message: Message, window: &mut Window, cx: &mut App) {
+    let sealed = sealed_sender(state.read(cx), &message);
     window.open_dialog(cx, move |dialog, _, cx| {
         let palette = Palette::get(cx);
         let row = |label: &'static str, value: String| {
@@ -40,9 +43,31 @@ pub fn open(message: Message, window: &mut Window, cx: &mut App) {
                 .child(row("Sent", full_time(message.sent_at)))
                 .when(!outgoing, |d| d.child(row("Received", full_time(message.received_at))))
                 .when(outgoing, |d| d.child(row("Status", status.into())))
-                .when_some(disappears, |d, left| d.child(row("Disappears in", left))),
+                .when_some(disappears, |d, left| d.child(row("Disappears in", left)))
+                .when_some(sealed.clone(), |d, sealed| d.child(row("Sealed sender", sealed))),
         )
     });
+}
+
+/// Desktop's sealed sender icon in message details
+/// (`isUnidentifiedDelivery`), shown with "Show status icon" on: theirs
+/// came by sealed sender, or ours went that way to these people. (Ours
+/// sent from this computer aren't known to have.)
+pub(crate) fn sealed_sender(state: &AppState, message: &Message) -> Option<String> {
+    if !state.prefs.flag(signal_backend::AccountSetting::SealedSenderIndicators) || message.sealed_sender.is_empty() {
+        return None;
+    }
+    if message.direction == Direction::Incoming {
+        return Some("Received by sealed sender".into());
+    }
+    let names: Vec<String> = message
+        .sealed_sender
+        .iter()
+        .map(|sid| {
+            state.conversation(&signal_store::ConversationId::direct(sid)).map_or_else(|| "Unknown contact".into(), |c| c.title.clone())
+        })
+        .collect();
+    Some(format!("Sent by sealed sender to {}", names.join(", ")))
 }
 
 /// "Monday, March 3, 2025 at 3:41 PM"

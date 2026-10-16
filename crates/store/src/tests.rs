@@ -938,6 +938,7 @@ async fn drop_later_migrations(db: &AppDb) {
     sqlx::query("DROP TABLE profiles").execute(&db.writer).await.unwrap();
     sqlx::query("DROP TABLE badges").execute(&db.writer).await.unwrap();
     sqlx::query("DROP TABLE badge_image_files").execute(&db.writer).await.unwrap();
+    sqlx::query("ALTER TABLE messages DROP COLUMN sealed_sender").execute(&db.writer).await.unwrap();
 }
 
 /// Rewrites the migration history to look like a pre-squash database that
@@ -2302,4 +2303,13 @@ async fn unread_reminders_find_who_wrote_mentioned_and_replied() {
     assert_eq!((data.unread, data.mentions, data.replies), (4, 1, 1));
     assert_eq!(data.senders, ["dave", "carol", "bob", "alice"]);
     assert_eq!((data.mentioners, data.repliers), (vec!["bob".to_owned()], vec!["carol".to_owned()]));
+}
+
+#[tokio::test]
+async fn sealed_sender_is_kept_per_message() {
+    let db = test_db().await;
+    let id = db.insert_message(&incoming("d:a", "alice", 10, "hi")).await.unwrap();
+    assert!(db.message(id).await.unwrap().unwrap().sealed_sender.is_empty());
+    db.set_sealed_sender(id, &["alice".to_owned()]).await.unwrap();
+    assert_eq!(db.message(id).await.unwrap().unwrap().sealed_sender, ["alice"]);
 }

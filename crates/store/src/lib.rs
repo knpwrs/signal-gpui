@@ -380,6 +380,8 @@ pub struct Message {
     pub poll: Option<Poll>,
     /// A view-once message, and where it is in its one viewing.
     pub view_once: Option<ViewOnce>,
+    /// Who it came from, or went to, by sealed sender (service ids).
+    pub sealed_sender: Vec<String>,
 }
 
 /// The group admin who deleted a message for everyone (Desktop's
@@ -1041,7 +1043,7 @@ const CONVERSATION_COLUMNS: &str = "id, kind, title, phone, color, members, last
                OR EXISTS (SELECT 1 FROM profile_sharing p WHERE p.id = 'd:' || conversations.added_by)))) AS accepted";
 
 const MESSAGE_COLUMNS: &str = "id, conversation_id, sent_at, received_at, direction, author, \
-     author_name, body, status, reactions, quote, attachments, link_preview, deleted, edited, expires_in, expire_start, edit_count, notice, mentions, styles, cta, deleted_by_admin, long_text, poll, view_once";
+     author_name, body, status, reactions, quote, attachments, link_preview, deleted, edited, expires_in, expire_start, edit_count, notice, mentions, styles, cta, deleted_by_admin, long_text, poll, view_once, sealed_sender";
 
 /// SQL matching a message whose own timestamp, or one of its edits', is
 /// the bound parameter `{param}`.
@@ -1263,6 +1265,11 @@ fn message_from_row(row: &SqliteRow) -> Result<Message> {
         long_text: row.try_get::<Option<String>, _>("long_text")?.map(|l| serde_json::from_str(&l)).transpose()?,
         poll: row.try_get::<Option<String>, _>("poll")?.map(|p| serde_json::from_str(&p)).transpose()?,
         view_once: row.try_get::<Option<i64>, _>("view_once")?.map(ViewOnce::from_i64),
+        sealed_sender: row
+            .try_get::<Option<String>, _>("sealed_sender")?
+            .map(|s| serde_json::from_str(&s))
+            .transpose()?
+            .unwrap_or_default(),
     })
 }
 
@@ -2479,6 +2486,13 @@ impl AppDb {
     }
 
     /// Records where a message's @mentions are.
+    /// Records who a message came from or went to by sealed sender.
+    pub async fn set_sealed_sender(&self, message_id: i64, service_ids: &[String]) -> Result<()> {
+        let json = (!service_ids.is_empty()).then(|| serde_json::to_string(service_ids)).transpose()?;
+        sqlx::query("UPDATE messages SET sealed_sender = ? WHERE id = ?").bind(json).bind(message_id).execute(&self.writer).await?;
+        Ok(())
+    }
+
     pub async fn set_mentions(&self, message_id: i64, mentions: &[MentionSpan]) -> Result<()> {
         let json = (!mentions.is_empty()).then(|| serde_json::to_string(mentions)).transpose()?;
         sqlx::query("UPDATE messages SET mentions = ? WHERE id = ?").bind(json).bind(message_id).execute(&self.writer).await?;
