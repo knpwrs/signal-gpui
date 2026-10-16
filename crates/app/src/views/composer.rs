@@ -870,6 +870,10 @@ impl Composer {
         for command in commands {
             self.state.read(cx).send(command);
         }
+        // Desktop's in-chat sound for a message we send (`sendMultiMediaMessage`).
+        if self.state.read(cx).prefs.on(crate::prefs::Toggle::MessageSounds) {
+            crate::sounds::play(crate::sounds::Sound::Whoosh);
+        }
         self.input.update(cx, |input, cx| input.set_value("", window, cx));
         self.typing_sent_at = None; // sending a message implicitly stops typing
         self.save_draft_later(String::new(), cx);

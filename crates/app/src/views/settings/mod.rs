@@ -35,6 +35,8 @@ pub enum Page {
     Notifications,
     Privacy,
     DataUsage,
+    /// Notifications' "While muted".
+    WhileMuted,
 }
 
 impl Page {
@@ -52,6 +54,7 @@ impl Page {
             Page::Notifications => "Notifications",
             Page::Privacy => "Privacy",
             Page::DataUsage => "Data usage",
+            Page::WhileMuted => "While muted",
         }
     }
 
@@ -64,12 +67,16 @@ impl Page {
             Page::Notifications => "settings-page-notifications",
             Page::Privacy => "settings-page-privacy",
             Page::DataUsage => "settings-page-data-usage",
+            Page::WhileMuted => "settings-page-while-muted",
         }
     }
 
     /// The page this one opens from, for its back button.
     fn parent(self) -> Option<Page> {
-        None
+        match self {
+            Page::WhileMuted => Some(Page::Notifications),
+            _ => None,
+        }
     }
 
     /// Which page in the list shows as chosen.
@@ -136,6 +143,7 @@ fn render(settings: &Entity<Settings>, window: &mut Window, cx: &mut App) -> Any
         Page::Notifications => notifications::render(settings, palette, cx),
         Page::Privacy => privacy::render(settings, palette, cx),
         Page::DataUsage => data_usage::render(settings, palette, cx),
+        Page::WhileMuted => notifications::render_while_muted(settings, palette, cx),
     };
     let header = div()
         .flex()
@@ -285,6 +293,31 @@ pub(crate) fn action(
     palette: Palette,
 ) -> AnyElement {
     div().flex().items_center().gap_3().child(label_block(label, description, palette)).child(button.small()).into_any_element()
+}
+
+/// Desktop's row that opens another page (`AxoClickableItem`), with a value
+/// on the right.
+pub(crate) fn link(
+    id: &'static str,
+    label: impl Into<SharedString>,
+    description: Option<SharedString>,
+    value: Option<SharedString>,
+    disabled: bool,
+    palette: Palette,
+    on_click: impl Fn(&mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap_3()
+        .when(!disabled, |d| d.cursor_pointer().on_click(move |_, window, cx| on_click(window, cx)))
+        .when(disabled, |d| d.opacity(0.5))
+        .child(label_block(label, description, palette))
+        .when_some(value, |d, value| d.child(div().text_sm().text_color(palette.text_secondary).child(value)))
+        .child(div().text_color(palette.text_secondary).child("›"))
+        .test_support()
+        .into_any_element()
 }
 
 /// One choice in a [`select`].

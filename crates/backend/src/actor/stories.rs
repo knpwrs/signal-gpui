@@ -113,7 +113,7 @@ impl Actor {
     }
 
     /// A name without the `Rc` (stories come in through `&self`).
-    async fn name_of_plain(&self, service_id: &str) -> Option<String> {
+    pub(super) async fn name_of_plain(&self, service_id: &str) -> Option<String> {
         self.db.conversation(&ConversationId::direct(service_id)).await.ok().flatten().map(|c| c.title).filter(|t| !t.is_empty())
     }
 

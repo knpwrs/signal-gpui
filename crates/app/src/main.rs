@@ -15,6 +15,7 @@ mod platform;
 mod prefs;
 mod recorder;
 mod sidebar_width;
+mod sounds;
 mod ringtone;
 mod state;
 mod sticker_image;

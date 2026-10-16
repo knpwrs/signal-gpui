@@ -71,6 +71,8 @@ pub struct Notification<'a> {
     pub title: &'a str,
     pub subtitle: Option<&'a str>,
     pub body: &'a str,
+    /// With the system's sound (Desktop's "Push notification sounds").
+    pub sound: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -131,6 +133,7 @@ mod macos {
                 _notification: &UNNotification,
                 handler: &block2::DynBlock<dyn Fn(UNNotificationPresentationOptions)>,
             ) {
+                // (A notification without a sound plays none.)
                 handler.call((UNNotificationPresentationOptions::Banner
                     | UNNotificationPresentationOptions::List
                     | UNNotificationPresentationOptions::Sound,));
@@ -234,7 +237,9 @@ mod macos {
             // Groups a chat's notifications, and tells actions which chat.
             content.setThreadIdentifier(&NSString::from_str(&notification.conversation.0));
             content.setCategoryIdentifier(&NSString::from_str(CATEGORY));
-            content.setSound(Some(&UNNotificationSound::defaultSound()));
+            if notification.sound {
+                content.setSound(Some(&UNNotificationSound::defaultSound()));
+            }
             let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
                 &NSString::from_str(notification.id),
                 &content,

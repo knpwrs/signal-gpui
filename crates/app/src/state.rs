@@ -368,7 +368,10 @@ pub struct AppState {
     pub catching_up: Option<CatchUp>,
     /// Like Desktop, notifications wait until the catch-up is done, and then
     /// only the latest is shown.
-    held_notification: Option<(ConversationId, i64, bool)>,
+    held_notification: Option<(ConversationId, i64, Mentions)>,
+    /// Reaction notifications on screen per chat, taken down once it's
+    /// opened (they don't make it unread).
+    reaction_notifications: HashMap<ConversationId, Vec<String>>,
 }
 
 impl EventEmitter<AppEvent> for AppState {}
@@ -385,6 +388,29 @@ pub enum ContactSync {
     Pending(Instant),
     /// They didn't come in time (Desktop's `syncFailed`).
     Failed,
+}
+
+/// What a new message says about us, for notifications in muted chats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Mentions {
+    pub mentions_me: bool,
+    pub replies_to_me: bool,
+}
+
+/// Desktop's `isAllowedByConversation` for a muted chat: never a 1:1
+/// chat; in a group, a mention or a reply to us when those notify while
+/// muted (on by default).
+pub(crate) fn allowed_while_muted(direct: bool, mentions: Mentions, prefs: &crate::prefs::Prefs) -> bool {
+    use signal_backend::AccountSetting;
+    !direct
+        && ((mentions.mentions_me && prefs.flag(AccountSetting::NotifyMentionsIfMuted))
+            || (mentions.replies_to_me && prefs.flag(AccountSetting::NotifyRepliesIfMuted)))
+}
+
+/// Desktop's `notificationReactionMessage`: "{sender} reacted {emoji} to:
+/// {message}".
+pub(crate) fn reaction_text(sender: &str, emoji: &str, message: &str) -> String {
+    format!("{sender} reacted {emoji} to: {message}")
 }
 
 /// Typing indicators expire if no "stopped" arrives (Signal uses 15s).
@@ -460,6 +486,7 @@ impl AppState {
             share_sources: None,
             catching_up: None,
             held_notification: None,
+            reaction_notifications: HashMap::new(),
         };
         this.load_emoji_usage(cx);
         this.start_notifications(cx);
@@ -510,19 +537,26 @@ impl AppState {
     }
 
     /// Notifies about a new message unless you're looking at its chat, it's
-    /// blocked, or it's muted (a mention still notifies, as on Desktop).
-    fn maybe_notify(&mut self, conversation: ConversationId, message_id: i64, mentions_me: bool, cx: &mut Context<Self>) {
+    /// blocked, or it's muted (in a group, a mention or a reply to us still
+    /// notifies when those notify while muted, as Desktop's
+    /// `isAllowedByConversation`). In the open chat, Desktop's in-chat
+    /// sound plays instead, if on.
+    fn maybe_notify(&mut self, conversation: ConversationId, message_id: i64, mentions: Mentions, cx: &mut Context<Self>) {
         if self.catching_up.is_some() {
-            self.held_notification = Some((conversation, message_id, mentions_me));
+            self.held_notification = Some((conversation, message_id, mentions));
+            return;
+        }
+        if self.window_active && self.selected.as_ref() == Some(&conversation) {
+            if self.tab == NavTab::Chats && self.prefs.on(crate::prefs::Toggle::MessageSounds) {
+                crate::sounds::play(crate::sounds::Sound::Pop);
+            }
             return;
         }
         let setting = self.notification_setting;
         if self.notifier.is_none() || setting == crate::notifications::NotificationSetting::Off {
             return;
         }
-        if self.window_active && self.selected.as_ref() == Some(&conversation) {
-            return;
-        }
+        let prefs = self.prefs.clone();
         let db = self.backend.db().clone();
         let id = conversation.clone();
         let query = self.backend.spawn(async move {
@@ -530,9 +564,11 @@ impl AppState {
         });
         cx.spawn(async move |this, cx| {
             let Ok((Some(chat), Some(message))) = query.await else { return };
-            if chat.blocked || (chat.muted && !mentions_me) {
+            let direct = chat.kind != signal_store::ConversationKind::Group;
+            if chat.blocked || (chat.muted && !allowed_while_muted(direct, mentions, &prefs)) {
                 return;
             }
+            let sound = prefs.on(crate::prefs::Toggle::NotificationSounds);
             let _ = this.update(cx, |this, _| {
                 let Some(notifier) = this.notifier.clone() else { return };
                 let sender = message.author_name.clone().unwrap_or_else(|| "Unknown".into());
@@ -549,6 +585,7 @@ impl AppState {
                     title: &title,
                     subtitle: None,
                     body: &body,
+                    sound,
                 });
                 this.shown_notifications.entry(chat.id.clone()).or_default().push(id);
             });
@@ -593,8 +630,80 @@ impl AppState {
                     title: &title,
                     subtitle: None,
                     body: &body,
+                    sound: this.prefs.on(crate::prefs::Toggle::NotificationSounds),
                 });
                 this.shown_notifications.entry(chat.id.clone()).or_default().push(id);
+            });
+        })
+        .detach();
+    }
+
+    /// Desktop's reaction notifications (`maybeNotify`, kind `reaction`):
+    /// someone else reacted to one of our messages ("Alice reacted 👍 to:
+    /// …"), with "Reaction notifications" on, under the same rules as a
+    /// message's (dropped while catching up, as poll votes are). A reaction
+    /// taken back takes its notification down.
+    fn notify_reaction(
+        &mut self,
+        conversation: ConversationId,
+        message_id: i64,
+        author: String,
+        sender: String,
+        emoji: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let id = format!("{}:{message_id}:react-{author}", conversation.0);
+        let Some(emoji) = emoji else {
+            if let Some(ids) = self.reaction_notifications.get_mut(&conversation)
+                && let Some(ix) = ids.iter().position(|shown| *shown == id)
+            {
+                ids.remove(ix);
+                if let Some(notifier) = &self.notifier {
+                    notifier.remove(&[id]);
+                }
+            }
+            return;
+        };
+        let setting = self.notification_setting;
+        if self.catching_up.is_some()
+            || self.notifier.is_none()
+            || setting == crate::notifications::NotificationSetting::Off
+            || !self.prefs.flag(signal_backend::AccountSetting::ReactionNotifications)
+        {
+            return;
+        }
+        if self.window_active && self.selected.as_ref() == Some(&conversation) {
+            return;
+        }
+        let db = self.backend.db().clone();
+        let chat_id = conversation.clone();
+        let query = self.backend.spawn(async move {
+            Ok::<_, signal_store::Error>((db.conversation(&chat_id).await?, db.message(message_id).await?))
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok((Some(chat), Some(message))) = query.await else { return };
+            // Muted: Desktop lets only mentions and replies through.
+            if chat.blocked || chat.muted {
+                return;
+            }
+            let _ = this.update(cx, |this, _| {
+                let Some(notifier) = this.notifier.clone() else { return };
+                let group = (chat.kind == signal_store::ConversationKind::Group).then_some(chat.title.as_str());
+                let sender = if group.is_some() { sender.clone() } else { chat.title.clone() };
+                let preview = reaction_text(&sender, &emoji, &notification_preview(&message));
+                let (title, body) = setting.text(&sender, group, &preview);
+                notifier.post(&crate::notifications::Notification {
+                    id: &id,
+                    conversation: &chat.id,
+                    title: &title,
+                    subtitle: None,
+                    body: &body,
+                    sound: this.prefs.on(crate::prefs::Toggle::NotificationSounds),
+                });
+                let shown = this.reaction_notifications.entry(chat.id.clone()).or_default();
+                if !shown.contains(&id) {
+                    shown.push(id);
+                }
             });
         })
         .detach();
@@ -641,9 +750,9 @@ impl AppState {
 
     fn end_catch_up(&mut self, cx: &mut Context<Self>) {
         if self.catching_up.take().is_some()
-            && let Some((conversation, message_id, mentions_me)) = self.held_notification.take()
+            && let Some((conversation, message_id, mentions)) = self.held_notification.take()
         {
-            self.maybe_notify(conversation, message_id, mentions_me, cx);
+            self.maybe_notify(conversation, message_id, mentions, cx);
         }
     }
 
@@ -827,8 +936,11 @@ impl AppState {
             Event::GroupLinkFailed { title, description } => {
                 cx.emit(AppEvent::Alert { title: title.into(), description: description.into() })
             }
-            Event::Incoming { conversation, message_id, mentions_me } => {
-                self.maybe_notify(conversation, message_id, mentions_me, cx)
+            Event::Incoming { conversation, message_id, mentions_me, replies_to_me } => {
+                self.maybe_notify(conversation, message_id, Mentions { mentions_me, replies_to_me }, cx)
+            }
+            Event::Reacted { conversation, message_id, author, sender, emoji } => {
+                self.notify_reaction(conversation, message_id, author, sender, emoji, cx)
             }
             Event::PollActivity { conversation, message_id, sender, ended } => {
                 self.notify_poll(conversation, message_id, sender, ended, cx)
@@ -918,6 +1030,7 @@ impl AppState {
                 // The old account's notifications and badge go too.
                 if let Some(notifier) = self.notifier.clone() {
                     let mut shown: Vec<String> = self.shown_notifications.drain().flat_map(|(_, ids)| ids).collect();
+                    shown.extend(self.reaction_notifications.drain().flat_map(|(_, ids)| ids));
                     shown.push(INCOMING_CALL_NOTIFICATION.to_owned());
                     notifier.remove(&shown);
                     notifier.set_badge(0);
@@ -1104,7 +1217,9 @@ impl AppState {
         cx.spawn(async move |this, cx| {
             let Ok(mut values) = read.await else { return };
             let _ = this.update(cx, |this, cx| {
-                // A setting still being saved may have been read as it was.
+                // A setting still being saved may have been read as it was;
+                // once it reads back as set, it's saved.
+                this.pending_prefs.retain(|key, value| values.get(*key).and_then(|v| v.as_deref()) != Some(value.as_str()));
                 for (key, value) in &this.pending_prefs {
                     values.insert((*key).to_owned(), Some(value.clone()));
                 }
@@ -1318,6 +1433,8 @@ impl AppState {
     pub fn set_account_setting(&mut self, setting: signal_backend::AccountSetting, on: bool, cx: &mut Context<Self>) {
         use signal_backend::AccountSetting;
         self.prefs.flags.insert(setting, on);
+        // The backend saves it; until then a reload keeps this value.
+        self.pending_prefs.insert(setting.key(), on.to_string());
         match setting {
             AccountSetting::ReadReceipts => self.read_receipts = on,
             AccountSetting::TypingIndicators => {
@@ -1997,13 +2114,14 @@ impl AppState {
         self.call = update;
     }
 
-    /// Desktop's incoming call notification ("Incoming voice call"), which
-    /// goes once the call is answered or over.
+    /// Desktop's incoming call notification ("Incoming voice call"),
+    /// shown when Signal isn't in front (`notifyForCall`), silent (the
+    /// ringtone plays), and gone once the call is answered or over.
     fn notify_incoming_call(&self, call: Option<&signal_backend::CallUpdate>, _cx: &mut Context<Self>) {
         use crate::notifications::NotificationSetting;
         let (Some(notifier), Some(call)) = (&self.notifier, call) else { return };
         let (conversation, video) = (call.conversation.clone(), call.video);
-        if self.notification_setting == NotificationSetting::Off {
+        if self.notification_setting == NotificationSetting::Off || self.window_active {
             return;
         }
         let name = self.conversation(&conversation).map(|c| c.title.clone()).unwrap_or_else(|| "Someone".into());
@@ -2022,6 +2140,7 @@ impl AppState {
             title: &title,
             subtitle: None,
             body,
+            sound: false,
         });
     }
 
@@ -2154,6 +2273,13 @@ impl AppState {
         // Desktop fetches a group as its chat opens (throttled backend-side).
         if let Some(group) = id.as_ref().filter(|id| id.as_group().is_some()) {
             self.send(Command::RefreshGroup { conversation: group.clone() });
+        }
+        // Opening a chat takes its reaction notifications down.
+        if let Some(opened) = &id
+            && let Some(ids) = self.reaction_notifications.remove(opened)
+            && let Some(notifier) = &self.notifier
+        {
+            notifier.remove(&ids);
         }
         self.selected = id;
         cx.emit(AppEvent::SelectionChanged);

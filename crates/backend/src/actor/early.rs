@@ -178,8 +178,8 @@ impl Actor {
         let Action::React { conversation, target_author, target_sent_at, emoji, author, sent_at, remove } = action else {
             return Outcome::Refused;
         };
-        let target = match self.db.find_message(conversation, target_author.as_deref(), *target_sent_at).await {
-            Ok(Some(message)) => message.id,
+        let (target, ours) = match self.db.find_message(conversation, target_author.as_deref(), *target_sent_at).await {
+            Ok(Some(message)) => (message.id, message.direction == Direction::Outgoing),
             Ok(None) => {
                 debug!("reaction target not found");
                 return Outcome::Missing;
@@ -199,6 +199,18 @@ impl Actor {
         match result {
             Ok(()) => {
                 self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id: target });
+                // Desktop's `doesReactionWarrantNotification`: someone
+                // else's reaction to one of ours.
+                if ours && let Some(author) = author {
+                    let sender = self.name_of_plain(author).await.unwrap_or_else(|| short_id(author));
+                    self.emit(Event::Reacted {
+                        conversation: conversation.clone(),
+                        message_id: target,
+                        author: author.clone(),
+                        sender,
+                        emoji: (!remove).then(|| emoji.clone()),
+                    });
+                }
                 Outcome::Applied
             }
             Err(error) => {

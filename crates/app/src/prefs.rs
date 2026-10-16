@@ -106,16 +106,24 @@ pub enum Toggle {
     CallSounds,
     /// "Always relay calls" (the backend tells RingRTC).
     AlwaysRelayCalls,
+    /// "Push notification sounds": notifications play the system's sound.
+    NotificationSounds,
+    /// "In-chat message sounds": a pop as a message arrives in the open
+    /// chat, a whoosh as we send one.
+    MessageSounds,
 }
 
 impl Toggle {
-    pub const ALL: [Toggle; 3] = [Self::IncomingCalls, Self::CallSounds, Self::AlwaysRelayCalls];
+    pub const ALL: [Toggle; 5] =
+        [Self::IncomingCalls, Self::CallSounds, Self::AlwaysRelayCalls, Self::NotificationSounds, Self::MessageSounds];
 
     pub fn key(self) -> &'static str {
         match self {
             Self::IncomingCalls => signal_backend::SETTING_INCOMING_CALLS,
             Self::CallSounds => "call_sounds",
             Self::AlwaysRelayCalls => signal_backend::SETTING_ALWAYS_RELAY_CALLS,
+            Self::NotificationSounds => "notification_sounds",
+            Self::MessageSounds => "message_sounds",
         }
     }
 
@@ -201,6 +209,7 @@ mod tests {
         assert_eq!((prefs.theme, prefs.zoom), (ThemeSetting::System, 1.));
         assert!(prefs.auto_convert_emoji && prefs.contacts_synced_at.is_none());
         assert!(prefs.on(Toggle::IncomingCalls) && prefs.on(Toggle::CallSounds) && !prefs.on(Toggle::AlwaysRelayCalls));
+        assert!(!prefs.on(Toggle::NotificationSounds) && !prefs.on(Toggle::MessageSounds));
         assert!(prefs.flags[&AccountSetting::ReactionNotifications] && !prefs.flags[&AccountSetting::NotifyCallsIfMuted]);
 
         let values: HashMap<String, Option<String>> = [

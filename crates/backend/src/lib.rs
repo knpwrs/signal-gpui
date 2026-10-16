@@ -1051,8 +1051,14 @@ pub enum Event {
     ViewOnceOpened(OpenedViewOnce),
     /// The phone's contacts came (after linking, or "Import now").
     ContactsSynced,
-    /// A new message from someone else arrived (for notifications).
-    Incoming { conversation: ConversationId, message_id: i64, mentions_me: bool },
+    /// A new message from someone else arrived (for notifications): whether
+    /// it mentions us or quotes one of ours (Desktop's `isMention`,
+    /// `isReplyToMe`).
+    Incoming { conversation: ConversationId, message_id: i64, mentions_me: bool, replies_to_me: bool },
+    /// Someone else reacted to one of our messages (`emoji`), or took their
+    /// reaction back (`None`), for Desktop's reaction notifications.
+    /// `sender` is their name.
+    Reacted { conversation: ConversationId, message_id: i64, author: String, sender: String, emoji: Option<String> },
     /// Someone voted in our poll (`ended`: they ended theirs), for
     /// Desktop's notifications. `message_id` is the poll; `sender` their name.
     PollActivity { conversation: ConversationId, message_id: i64, sender: String, ended: bool },

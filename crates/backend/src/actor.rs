@@ -1395,10 +1395,13 @@ impl Actor {
                         let early = self.apply_early_for(manager, message.author.as_deref(), message.sent_at).await;
                         if !repeat && !early.read && !early.deleted && message.direction == Direction::Incoming {
                             let me = self.self_aci();
+                            // A quote of ours has no author (it's us).
+                            let replies_to_me = message.quote.as_ref().is_some_and(|q| q.author.is_none());
                             self.emit(Event::Incoming {
                                 conversation: conversation.clone(),
                                 message_id: id,
                                 mentions_me: spans.iter().any(|s| s.aci == me),
+                                replies_to_me,
                             });
                         }
                         self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id: id });

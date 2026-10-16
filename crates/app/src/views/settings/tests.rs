@@ -274,3 +274,57 @@ fn address_book_photos_come_first_when_preferred(cx: &mut TestAppContext) {
     assert_eq!(photo(cx, "person-a").as_deref(), Some(contact.as_path()));
     assert_eq!(photo(cx, "person-b").as_deref(), Some(contact.as_path()));
 }
+
+#[gpui_kit::test]
+fn notification_sounds_and_reactions_save(cx: &mut TestAppContext) {
+    use crate::prefs::Toggle;
+    let h = Harness::open(cx, Page::Notifications);
+    // Desktop's defaults: reactions notify; no sounds; no reminders.
+    assert_eq!(h.value(cx, "reaction-notifications").as_deref(), Some("on"));
+    assert_eq!(h.value(cx, "unread-reminders").as_deref(), Some("off"));
+    assert_eq!(h.value(cx, "notification-sounds").as_deref(), Some("off"));
+    assert_eq!(h.value(cx, "message-sounds").as_deref(), Some("off"));
+    for id in ["reaction-notifications", "unread-reminders", "notification-sounds", "message-sounds"] {
+        h.click(cx, id);
+    }
+    assert!(wait(cx, |_| h.stored(signal_backend::SETTING_REACTION_NOTIFICATIONS).as_deref() == Some("false")
+        && h.stored(signal_backend::SETTING_SHOW_UNREAD_REMINDERS).as_deref() == Some("true")
+        && h.stored("notification_sounds").as_deref() == Some("true")
+        && h.stored("message_sounds").as_deref() == Some("true")));
+    assert!(cx.read(|cx| h.state.read(cx).prefs.on(Toggle::MessageSounds)));
+}
+
+#[gpui_kit::test]
+fn while_muted_opens_from_notifications_and_saves(cx: &mut TestAppContext) {
+    let h = Harness::open(cx, Page::Notifications);
+    h.click(cx, "while-muted");
+    assert_eq!(cx.read(|cx| h.settings.read(cx).page), Page::WhileMuted);
+    assert_eq!(h.value(cx, "muted-calls").as_deref(), Some("off"));
+    assert_eq!(h.value(cx, "muted-mentions").as_deref(), Some("on"));
+    assert_eq!(h.value(cx, "muted-replies").as_deref(), Some("on"));
+    h.click(cx, "muted-calls");
+    h.click(cx, "muted-replies");
+    assert!(wait(cx, |_| h.stored(signal_backend::SETTING_NOTIFY_CALLS_IF_MUTED).as_deref() == Some("true")
+        && h.stored(signal_backend::SETTING_NOTIFY_REPLIES_IF_MUTED).as_deref() == Some("false")));
+    let summary = cx.read(|cx| super::notifications::while_muted_summary(&h.state.read(cx).prefs));
+    assert_eq!(summary, "Calls, mentions");
+    // Back to Notifications, which the list still shows as chosen.
+    h.click(cx, "settings-back");
+    assert_eq!(cx.read(|cx| h.settings.read(cx).page), Page::Notifications);
+}
+
+#[test]
+fn muted_chats_let_through_what_desktop_does() {
+    use crate::state::{Mentions, allowed_while_muted};
+    let prefs = crate::prefs::Prefs::default();
+    let mention = Mentions { mentions_me: true, replies_to_me: false };
+    let reply = Mentions { mentions_me: false, replies_to_me: true };
+    assert!(allowed_while_muted(false, mention, &prefs) && allowed_while_muted(false, reply, &prefs));
+    assert!(!allowed_while_muted(false, Mentions::default(), &prefs));
+    // Never a muted 1:1 chat.
+    assert!(!allowed_while_muted(true, mention, &prefs));
+    let mut off = prefs.clone();
+    off.flags.insert(signal_backend::AccountSetting::NotifyRepliesIfMuted, false);
+    assert!(!allowed_while_muted(false, reply, &off) && allowed_while_muted(false, mention, &off));
+    assert_eq!(crate::state::reaction_text("Maya", "👍", "See you at 9"), "Maya reacted 👍 to: See you at 9");
+}
