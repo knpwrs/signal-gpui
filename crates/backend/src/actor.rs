@@ -48,7 +48,7 @@ use presage::{
 use presage_store_sqlite::{SqliteConnectOptions, SqliteStore};
 use signal_store::{
     AppDb, AttachmentMeta, ConversationId, ConversationKind, LinkPreview, ConversationUpdate, DeliveryStatus, Direction,
-    Message, NewMessage, Quote, Reaction,
+    Message, NewMessage, Quote, Reaction, RemoteAttachment,
 };
 use tracing::{debug, info, warn};
 
@@ -109,6 +109,13 @@ const SETTING_VERIFIED: &str = "verified.";
 /// `identity.<ACI>`: their identity key (hex) as last seen, to notice a
 /// change.
 const SETTING_IDENTITY: &str = "identity.";
+
+/// Whether an attachment is fetched whole as soon as it arrives: photos,
+/// GIFs and voice messages under the auto-download limit.
+pub(crate) fn downloads_whole(attachment: &AttachmentMeta) -> bool {
+    let photo = attachment.gif || attachment.voice || attachment.content_type.starts_with("image/");
+    photo && crate::remote_config().auto_downloads(attachment.size)
+}
 
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
@@ -379,6 +386,8 @@ struct Actor {
     long_text_retries: RefCell<HashMap<i64, i64>>,
     /// Our poll votes still sending when the app last quit were queued again.
     poll_votes_resumed: RefCell<bool>,
+    /// Reads attachments from the backup (media) tier.
+    backup_media: crate::backup_media::BackupMedia,
     /// Held across a story list edit's read and write of the saved lists,
     /// so two edits at once don't undo each other.
     story_lists_edit: tokio::sync::Mutex<()>,
@@ -464,6 +473,7 @@ pub(crate) async fn run(
         long_texts_resumed: RefCell::new(false),
         long_text_retries: RefCell::default(),
         poll_votes_resumed: RefCell::new(false),
+        backup_media: Default::default(),
         story_lists_edit: tokio::sync::Mutex::new(()),
         expiry: tokio::sync::Notify::new(),
         last_sent_at: std::cell::Cell::new(0),
@@ -581,6 +591,11 @@ impl Actor {
             // Storage Service has the rest once read.
             if let Some(on) = manager.registration_data().read_receipts() {
                 self.save_account_settings(crate::AccountSettings { read_receipts: Some(on), ..Default::default() }).await;
+            }
+            // Desktop keeps the media root key from linking
+            // (`AccountManager`'s `backupMediaRootKey`).
+            if let Some(key) = manager.registration_data().media_root_backup_key() {
+                self.set_media_root_key(Some(key)).await;
             }
             // Desktop's device age, for a donation megaphone's condition.
             let _ = self.db.set_setting(SETTING_DEVICE_CREATED, &now_millis().to_string()).await;
@@ -1047,6 +1062,7 @@ impl Actor {
                 }
                 if !self.storage_synced.replace(true) {
                     self.spawn_storage_sync(manager);
+                    self.request_keys_if_missing().await;
                 }
             }
             Received::Contacts => {
@@ -1064,6 +1080,15 @@ impl Actor {
                 let sender = content.metadata.sender.service_id_string();
                 if sender != self_aci {
                     self.check_identity(&sender).await;
+                }
+                // The phone's keys (Desktop's `onKeysSync`): presage keeps
+                // the account entropy pool; the media root key is ours.
+                if sender == self_aci
+                    && let ContentBody::SynchronizeMessage(SyncMessage { content: Some(sync_message::Content::Keys(keys)), .. }) =
+                        &content.body
+                {
+                    let key = keys.media_root_backup_key.as_deref().and_then(|k| <[u8; 32]>::try_from(k).ok());
+                    self.set_media_root_key(key).await;
                 }
                 if let ContentBody::CallMessage(call) = &content.body {
                     // Nothing from someone you blocked, calls included.
@@ -2188,6 +2213,7 @@ impl Actor {
             call_links,
             profile_sharing,
             story_send_modes,
+            backup_tier,
         } = match storage::fetch(manager).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -2207,6 +2233,9 @@ impl Actor {
             self.account_record_read.set(true);
         }
         self.save_account_settings(settings).await;
+        if let Some(tier) = backup_tier {
+            self.save_backup_tier(tier).await;
+        }
         {
             let _edit = self.story_lists_edit.lock().await;
             self.save_story_settings(
@@ -4494,6 +4523,10 @@ impl Actor {
         if let Some(meta) = message.attachments.get(index).filter(|a| a.remote.is_some()) {
             if let Err(error) = self.download_remote(&manager, &message.conversation_id, message_id, index, meta).await {
                 self.error("couldn't download the attachment", format!("{error:#}"));
+                // Desktop falls back to the backup thumbnail.
+                if let Err(error) = self.fetch_thumbnail(&manager, &message, index, meta).await {
+                    debug!(error = %format!("{error:#}"), "backup thumbnail download failed");
+                }
             }
             return;
         }
@@ -4584,7 +4617,7 @@ impl Actor {
         if long_text.state != LongTextState::Downloading || long_text.retry_at.is_some() || attempts != long_text.attempts {
             set_state(LongTextState::Downloading, attempts, None).await;
         }
-        let bytes = match crate::history::download_attachment(manager, &long_text.remote, long_text.size).await {
+        let bytes = match self.remote_bytes(manager, &long_text.remote, long_text.size).await {
             Ok(bytes) => bytes,
             Err(error) => {
                 let failures = attempts + 1;
@@ -4696,7 +4729,122 @@ impl Actor {
 }
 
 impl Actor {
-    /// Downloads an attachment from its saved transit-tier locator.
+    /// A transferred attachment's file, from the backup (media) tier when
+    /// there's one to read, else (or when that fails) the transit tier, as
+    /// Desktop's `downloadAttachment` tries them
+    /// (`ts/util/downloadAttachment.preload.ts`). A failure gives every
+    /// tier's reason.
+    async fn remote_bytes(&self, manager: &SignalManager, remote: &RemoteAttachment, size: u64) -> anyhow::Result<Vec<u8>> {
+        let mut reasons = Vec::new();
+        if crate::backup_media::media_parts(remote).is_some()
+            && let Some(root) = crate::backup_media::BackupMedia::root_key(&self.db).await
+        {
+            match self.backup_media.download(manager, &self.db, &root, remote, size).await {
+                Ok(bytes) => return Ok(bytes),
+                Err(error) => {
+                    debug!(error = %format!("{error:#}"), "backup tier download failed");
+                    reasons.push(format!("from your backup: {error:#}"));
+                }
+            }
+        }
+        if remote.cdn_key.is_some() {
+            match crate::history::download_attachment(manager, remote, size).await {
+                Ok(bytes) => return Ok(bytes),
+                Err(error) => reasons.push(format!("{error:#}")),
+            }
+        } else {
+            reasons.push("it's only in your backup, which this device can't read".to_owned());
+        }
+        anyhow::bail!("{}", reasons.join("; "))
+    }
+
+    /// A transferred image's or video's thumbnail from the backup tier,
+    /// shown until the file itself is downloaded (Desktop's
+    /// `downloadBackupThumbnail`). `Ok(false)` when there's none to fetch.
+    /// A view-once message's photo isn't previewed.
+    async fn fetch_thumbnail(&self, manager: &SignalManager, message: &Message, index: usize, meta: &AttachmentMeta) -> anyhow::Result<bool> {
+        let (conversation, message_id) = (&message.conversation_id, message.id);
+        let Some(remote) = meta.remote.as_ref() else { return Ok(false) };
+        if message.view_once.is_some()
+            || meta.thumbnail_path.is_some()
+            || !crate::backup_media::can_have_thumbnail(&meta.content_type)
+            || crate::backup_media::media_parts(remote).is_none()
+        {
+            return Ok(false);
+        }
+        let Some(root) = crate::backup_media::BackupMedia::root_key(&self.db).await else { return Ok(false) };
+        let bytes = self.backup_media.download_thumbnail(manager, &self.db, &root, remote).await?;
+        let path = self.config.data_dir.join("attachments").join(format!("{message_id}-{index}-thumbnail.webp"));
+        tokio::fs::write(&path, &bytes).await?;
+        if !self.db.set_attachment_thumbnail(message_id, index, &path.to_string_lossy()).await? {
+            // Erased or deleted while it downloaded.
+            let _ = tokio::fs::remove_file(&path).await;
+            return Ok(false);
+        }
+        self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id });
+        Ok(true)
+    }
+
+    /// Keeps the media root backup key (or forgets it, when a key sync
+    /// comes without one, as Desktop's `onKeysSync` does). A new key means
+    /// a new signing key to upload and new credentials.
+    async fn set_media_root_key(&self, key: Option<[u8; 32]>) {
+        use crate::backup_media::{SETTING_MEDIA_ROOT_KEY, SETTING_SIGNATURE_KEY_SET};
+        let value = key.map(hex::encode).unwrap_or_default();
+        let old = self.db.setting(SETTING_MEDIA_ROOT_KEY).await.ok().flatten().unwrap_or_default();
+        if old == value {
+            return;
+        }
+        info!(present = key.is_some(), "media root backup key changed");
+        if let Err(error) = self.db.set_setting(SETTING_MEDIA_ROOT_KEY, &value).await {
+            return self.error("failed to save the media backup key", error);
+        }
+        let _ = self.db.set_setting(SETTING_SIGNATURE_KEY_SET, "").await;
+        self.backup_media.reset().await;
+    }
+
+    /// The account's backup tier from its storage record (Desktop's
+    /// `saveBackupTier`, which resets its cached backup data on a change).
+    async fn save_backup_tier(&self, tier: u64) {
+        use crate::backup_media::SETTING_BACKUP_TIER;
+        let tier = tier.to_string();
+        let old = self.db.setting(SETTING_BACKUP_TIER).await.ok().flatten();
+        if old.as_deref() == Some(tier.as_str()) {
+            return;
+        }
+        if let Err(error) = self.db.set_setting(SETTING_BACKUP_TIER, &tier).await {
+            return warn!(%error, "failed to save the backup tier");
+        }
+        info!(%tier, "backup tier changed");
+        self.backup_media.reset().await;
+    }
+
+    /// Asks the phone for its keys when the media root key is missing (a
+    /// device linked before it was kept), at most daily, as Desktop's
+    /// `ensureAEP` asks for a missing account entropy pool.
+    async fn request_keys_if_missing(&self) {
+        use crate::backup_media::{SETTING_KEYS_REQUESTED, SETTING_MEDIA_ROOT_KEY};
+        if self.db.setting(SETTING_MEDIA_ROOT_KEY).await.ok().flatten().is_some_and(|k| !k.is_empty()) {
+            return;
+        }
+        let now = now_millis();
+        let last = self.db.setting(SETTING_KEYS_REQUESTED).await.ok().flatten().and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+        if now - last < 24 * 60 * 60 * 1000 && last <= now {
+            return;
+        }
+        info!("no media backup key; asking the phone for its keys");
+        self.enqueue(Outbound::Sync {
+            body: SyncMessage {
+                content: Some(sync_message::Content::Request(sync_message::Request {
+                    r#type: Some(sync_message::request::Type::Keys as i32),
+                })),
+                ..SyncMessage::with_padding(&mut rand::rng())
+            },
+        });
+        let _ = self.db.set_setting(SETTING_KEYS_REQUESTED, &now.to_string()).await;
+    }
+
+    /// Downloads an attachment from its saved locator.
     async fn download_remote(
         &self,
         manager: &SignalManager,
@@ -4709,7 +4857,7 @@ impl Actor {
         if meta.size > crate::remote_config().attachment_max_receive_bytes() {
             anyhow::bail!("it's over Signal's receive limit");
         }
-        let bytes = crate::history::download_attachment(manager, remote, meta.size).await?;
+        let bytes = self.remote_bytes(manager, remote, meta.size).await?;
         let pointer = AttachmentPointer {
             content_type: Some(meta.content_type.clone()),
             file_name: meta.file_name.clone(),
@@ -4772,21 +4920,38 @@ impl Actor {
         info!(added, "installed transferred sticker packs");
     }
 
-    /// Photos and GIFs from transferred history, one at a time. Ones that
-    /// fail (expired from the transit tier, usually) stay downloadable by
-    /// hand, which says why.
+    /// Attachments from transferred history, one at a time: photos and GIFs
+    /// whole, falling back to their backup thumbnail as Desktop's download
+    /// job does, and other images and videos as thumbnails only (what
+    /// Desktop shows first for messages on screen). Ones that fail (expired
+    /// from the transit tier, usually) stay downloadable by hand, which
+    /// says why.
     async fn download_transferred(self: Rc<Self>, manager: SignalManager, downloads: Vec<(i64, usize)>) {
         let total = downloads.len();
-        let mut failed = 0;
+        let (mut whole, mut thumbnails, mut failed) = (0, 0, 0);
         for (message_id, index) in downloads {
             let Some(message) = self.db.message(message_id).await.ok().flatten() else { continue };
             let Some(meta) = message.attachments.get(index).filter(|a| a.local_path.is_none()) else { continue };
-            if let Err(error) = self.download_remote(&manager, &message.conversation_id, message_id, index, meta).await {
-                debug!(error = %format!("{error:#}"), "transferred attachment download failed");
-                failed += 1;
+            let conversation = &message.conversation_id;
+            if downloads_whole(meta) {
+                match self.download_remote(&manager, conversation, message_id, index, meta).await {
+                    Ok(()) => {
+                        whole += 1;
+                        continue;
+                    }
+                    Err(error) => debug!(error = %format!("{error:#}"), "transferred attachment download failed"),
+                }
+            }
+            match self.fetch_thumbnail(&manager, &message, index, meta).await {
+                Ok(true) => thumbnails += 1,
+                Ok(false) => failed += usize::from(downloads_whole(meta)),
+                Err(error) => {
+                    debug!(error = %format!("{error:#}"), "backup thumbnail download failed");
+                    failed += 1;
+                }
             }
         }
-        info!(total, failed, "downloaded transferred photos");
+        info!(total, whole, thumbnails, failed, "downloaded transferred attachments");
     }
 
     async fn download_preview_image(

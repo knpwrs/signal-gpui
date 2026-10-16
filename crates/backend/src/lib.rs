@@ -17,6 +17,7 @@ pub mod mapping;
 mod storage;
 mod groups;
 mod history;
+mod backup_media;
 mod safety;
 mod calling;
 mod call_links;

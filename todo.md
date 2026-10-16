@@ -48,10 +48,22 @@ number.
 
 ## Attachments in transferred history
 
-Done for the transit tier (`FilePointer.locatorInfo`: CDN number, key, and
-digest or plaintext hash), which is what the phone fills for link and sync.
-Attachments only in the backup (media) tier need backup-tier credentials
-and aren't downloaded.
+Both tiers are read (`backup_media.rs`): the backup (media) tier first
+when the account has paid media backups and we have the media root key,
+then the transit tier. Backup thumbnails stand in for images and videos
+not downloaded. Not verified against Signal's servers (no account with
+media backups was used): the REST paths and JSON (`/v1/archives/auth`,
+`/v1/archives/keys`, `/v1/archives`, `/v1/archives/auth/read`)
+come from Desktop's earlier REST client and Signal-Server, since Desktop
+now makes those calls over libsignal's gRPC. Left:
+
+- Desktop lists the backup's media (`backupListMedia`) to learn each
+  file's CDN when the backup didn't name one; we use only the remote
+  config fallback (`global.backups.mediaTierFallbackCdnNumber`).
+- Desktop downloads all media in the background with paid backups; we
+  download photos whole and other images and videos as thumbnails only.
+- Downloads aren't resumed (Desktop's `downloadPath` and range requests).
+- Credentials are kept in memory per run, not across runs as Desktop does.
 
 ## Sender keys
 

@@ -171,6 +171,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "aes-gcm-siv"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c32325128cb24de2a2d14d92da7569dae7073f9e47334521d494747fa94d902"
+dependencies = [
+ "aead 0.6.1",
+ "aes 0.9.3",
+ "cipher 0.5.2",
+ "ctr 0.10.1",
+ "ctutils",
+ "polyval 0.7.3",
+ "zeroize",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5344,6 +5359,34 @@ dependencies = [
 [[package]]
 name = "libsignal-account-keys"
 version = "0.1.0"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.105.0#4beb029d8a941f81e7d9c6d8af1ed25a677569a8"
+dependencies = [
+ "aes 0.9.3",
+ "argon2",
+ "cbc 0.2.1",
+ "derive_more",
+ "displaydoc",
+ "hkdf 0.13.0",
+ "hmac 0.13.0",
+ "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.105.0)",
+ "libsignal-protocol 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.105.0)",
+ "partial-default",
+ "password-hash",
+ "protobuf 3.7.2",
+ "protobuf-codegen",
+ "rand 0.9.5",
+ "rand_core 0.9.5",
+ "serde",
+ "sha2 0.11.1",
+ "static_assertions",
+ "subtle",
+ "thiserror 2.0.21",
+ "zerocopy",
+]
+
+[[package]]
+name = "libsignal-account-keys"
+version = "0.1.0"
 source = "git+https://github.com/signalapp/libsignal?tag=v0.99.0#439f035d9cfd7efe5435cbea0294591c9ed17232"
 dependencies = [
  "argon2",
@@ -5390,6 +5433,25 @@ dependencies = [
  "static_assertions",
  "subtle",
  "thiserror 2.0.21",
+ "zerocopy",
+]
+
+[[package]]
+name = "libsignal-core"
+version = "0.1.0"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.105.0#4beb029d8a941f81e7d9c6d8af1ed25a677569a8"
+dependencies = [
+ "curve25519-dalek",
+ "derive_more",
+ "displaydoc",
+ "libsignal-debug 0.105.0",
+ "log",
+ "rand 0.9.5",
+ "sha2 0.11.1",
+ "subtle",
+ "thiserror 2.0.21",
+ "uuid",
+ "x25519-dalek",
  "zerocopy",
 ]
 
@@ -5448,6 +5510,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "libsignal-debug"
+version = "0.105.0"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.105.0#4beb029d8a941f81e7d9c6d8af1ed25a677569a8"
+dependencies = [
+ "cfg-if 1.0.5",
+]
+
+[[package]]
 name = "libsignal-keytrans"
 version = "0.0.1"
 source = "git+https://github.com/signalapp/libsignal?tag=v0.99.0#439f035d9cfd7efe5435cbea0294591c9ed17232"
@@ -5487,7 +5557,7 @@ dependencies = [
  "libsignal-account-keys 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.99.0)",
  "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.99.0)",
  "libsignal-message-backup-macros",
- "libsignal-protocol",
+ "libsignal-protocol 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.99.0)",
  "libsignal-svrb",
  "log",
  "macro_rules_attribute",
@@ -5553,7 +5623,7 @@ dependencies = [
  "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.99.0)",
  "libsignal-keytrans",
  "libsignal-net-infra",
- "libsignal-protocol",
+ "libsignal-protocol 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.99.0)",
  "libsignal-svrb",
  "log",
  "nonzero_ext",
@@ -5639,10 +5709,49 @@ dependencies = [
 [[package]]
 name = "libsignal-protocol"
 version = "0.1.0"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.105.0#4beb029d8a941f81e7d9c6d8af1ed25a677569a8"
+dependencies = [
+ "aes 0.9.3",
+ "aes-gcm-siv 0.12.1",
+ "assert_matches",
+ "async-trait",
+ "bitflags 2.13.2",
+ "const-str",
+ "ctr 0.10.1",
+ "data-encoding-macro",
+ "derive-where",
+ "derive_more",
+ "displaydoc",
+ "hex",
+ "hkdf 0.13.0",
+ "hmac 0.13.0",
+ "indexmap 2.14.2",
+ "itertools 0.15.0",
+ "libcrux-ml-kem",
+ "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.105.0)",
+ "libsignal-debug 0.105.0",
+ "log",
+ "prost",
+ "prost-build",
+ "rand 0.9.5",
+ "rayon",
+ "serde",
+ "sha2 0.11.1",
+ "signal-crypto 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.105.0)",
+ "spqr 1.6.0",
+ "subtle",
+ "thiserror 2.0.21",
+ "uuid",
+ "zerocopy",
+]
+
+[[package]]
+name = "libsignal-protocol"
+version = "0.1.0"
 source = "git+https://github.com/signalapp/libsignal?tag=v0.99.0#439f035d9cfd7efe5435cbea0294591c9ed17232"
 dependencies = [
  "aes 0.9.3",
- "aes-gcm-siv",
+ "aes-gcm-siv 0.11.1",
  "assert_matches",
  "async-trait",
  "bitflags 2.13.2",
@@ -5668,7 +5777,7 @@ dependencies = [
  "serde",
  "sha2 0.11.1",
  "signal-crypto 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.99.0)",
- "spqr",
+ "spqr 1.5.3",
  "subtle",
  "thiserror 2.0.21",
  "uuid",
@@ -5697,7 +5806,7 @@ dependencies = [
  "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.99.0)",
  "libsignal-net",
  "libsignal-net-infra",
- "libsignal-protocol",
+ "libsignal-protocol 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.99.0)",
  "phonenumber",
  "prost",
  "prost-build",
@@ -5724,7 +5833,7 @@ name = "libsignal-svrb"
 version = "0.1.0"
 source = "git+https://github.com/signalapp/libsignal?tag=v0.99.0#439f035d9cfd7efe5435cbea0294591c9ed17232"
 dependencies = [
- "aes-gcm-siv",
+ "aes-gcm-siv 0.11.1",
  "curve25519-dalek",
  "displaydoc",
  "hkdf 0.13.0",
@@ -7482,6 +7591,16 @@ dependencies = [
 [[package]]
 name = "poksho"
 version = "0.7.0"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.105.0#4beb029d8a941f81e7d9c6d8af1ed25a677569a8"
+dependencies = [
+ "curve25519-dalek",
+ "hmac 0.13.0",
+ "sha2 0.11.1",
+]
+
+[[package]]
+name = "poksho"
+version = "0.7.0"
 source = "git+https://github.com/signalapp/libsignal?tag=v0.99.0#439f035d9cfd7efe5435cbea0294591c9ed17232"
 dependencies = [
  "curve25519-dalek",
@@ -8530,7 +8649,7 @@ version = "2.72.1"
 source = "git+https://github.com/signalapp/ringrtc?tag=v2.72.1#331d601894f931337d24e9d56c68b94d28fc4555"
 dependencies = [
  "aes 0.9.3",
- "aes-gcm-siv",
+ "aes-gcm-siv 0.11.1",
  "anyhow",
  "base64 0.23.1",
  "bincode",
@@ -9327,7 +9446,9 @@ dependencies = [
  "imagesize 0.15.0",
  "jpeg-decoder",
  "jpeg-encoder",
+ "libsignal-account-keys 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.105.0)",
  "libsignal-account-keys 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.99.0)",
+ "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.105.0)",
  "libsignal-message-backup",
  "linkify",
  "mozjpeg-sys",
@@ -9338,6 +9459,7 @@ dependencies = [
  "prost",
  "protobuf 3.7.2",
  "rand 0.9.5",
+ "rand_chacha 0.9.0",
  "regex",
  "reqwest",
  "rustls",
@@ -9356,6 +9478,7 @@ dependencies = [
  "unicode-segmentation",
  "url",
  "uuid",
+ "zkgroup 0.9.0 (git+https://github.com/signalapp/libsignal?tag=v0.105.0)",
 ]
 
 [[package]]
@@ -9368,6 +9491,32 @@ dependencies = [
  "ringrtc",
  "screencapturekit 11.0.0",
  "tracing",
+]
+
+[[package]]
+name = "signal-crypto"
+version = "0.1.0"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.105.0#4beb029d8a941f81e7d9c6d8af1ed25a677569a8"
+dependencies = [
+ "aes 0.9.3",
+ "cbc 0.2.1",
+ "ctr 0.10.1",
+ "derive_more",
+ "displaydoc",
+ "ghash",
+ "hkdf 0.13.0",
+ "hmac 0.13.0",
+ "hpke-rs",
+ "hpke-rs-crypto",
+ "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.105.0)",
+ "libsignal-debug 0.105.0",
+ "rand_chacha 0.9.0",
+ "rand_core 0.9.5",
+ "sha1 0.11.0",
+ "sha2 0.11.1",
+ "subtle",
+ "thiserror 2.0.21",
+ "zeroize",
 ]
 
 [[package]]
@@ -9695,6 +9844,27 @@ dependencies = [
  "cpufeatures 0.3.1",
  "curve25519-dalek",
  "displaydoc",
+ "hax-lib",
+ "hkdf 0.13.0",
+ "libcrux-hmac",
+ "libcrux-ml-kem",
+ "log",
+ "num_enum",
+ "prost",
+ "prost-build",
+ "rand 0.9.5",
+ "rand_core 0.9.5",
+ "sha2 0.11.1",
+ "sorted-vec",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "spqr"
+version = "1.6.0"
+source = "git+https://github.com/signalapp/SparsePostQuantumRatchet.git?tag=v1.6.0#06959b4708f9b7b1e94d0f8cc835f3958c077e94"
+dependencies = [
+ "cpufeatures 0.3.1",
  "hax-lib",
  "hkdf 0.13.0",
  "libcrux-hmac",
@@ -12864,6 +13034,24 @@ dependencies = [
 [[package]]
 name = "zkcredential"
 version = "0.1.0"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.105.0#4beb029d8a941f81e7d9c6d8af1ed25a677569a8"
+dependencies = [
+ "cfg-if 1.0.5",
+ "curve25519-dalek",
+ "derive-where",
+ "displaydoc",
+ "partial-default",
+ "poksho 0.7.0 (git+https://github.com/signalapp/libsignal?tag=v0.105.0)",
+ "rayon",
+ "serde",
+ "sha2 0.11.1",
+ "subtle",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "zkcredential"
+version = "0.1.0"
 source = "git+https://github.com/signalapp/libsignal?tag=v0.99.0#439f035d9cfd7efe5435cbea0294591c9ed17232"
 dependencies = [
  "cfg-if 1.0.5",
@@ -12900,10 +13088,41 @@ dependencies = [
 [[package]]
 name = "zkgroup"
 version = "0.9.0"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.105.0#4beb029d8a941f81e7d9c6d8af1ed25a677569a8"
+dependencies = [
+ "aes 0.9.3",
+ "aes-gcm-siv 0.12.1",
+ "bincode",
+ "const-str",
+ "curve25519-dalek",
+ "derive-where",
+ "derive_more",
+ "displaydoc",
+ "hex",
+ "hkdf 0.13.0",
+ "libsignal-account-keys 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.105.0)",
+ "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.105.0)",
+ "partial-default",
+ "poksho 0.7.0 (git+https://github.com/signalapp/libsignal?tag=v0.105.0)",
+ "rand 0.9.5",
+ "rayon",
+ "serde",
+ "sha1 0.11.0",
+ "sha2 0.11.1",
+ "static_assertions",
+ "subtle",
+ "thiserror 2.0.21",
+ "uuid",
+ "zkcredential 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.105.0)",
+]
+
+[[package]]
+name = "zkgroup"
+version = "0.9.0"
 source = "git+https://github.com/signalapp/libsignal?tag=v0.99.0#439f035d9cfd7efe5435cbea0294591c9ed17232"
 dependencies = [
  "aes 0.9.3",
- "aes-gcm-siv",
+ "aes-gcm-siv 0.11.1",
  "bincode",
  "const-str",
  "curve25519-dalek",
@@ -12933,7 +13152,7 @@ version = "0.9.0"
 source = "git+https://github.com/signalapp/libsignal?tag=v0.99.1#97801d22dcf9f5bf714f7b8fa3212cdc973ae1c8"
 dependencies = [
  "aes 0.9.3",
- "aes-gcm-siv",
+ "aes-gcm-siv 0.11.1",
  "bincode",
  "const-str",
  "curve25519-dalek",

@@ -60,7 +60,7 @@ pub fn trim_body(body: &str) -> String {
 }
 
 /// Desktop's `logPadSize`: attachments are padded to a size on a 5% scale.
-fn log_pad(size: u64) -> u64 {
+pub(crate) fn log_pad(size: u64) -> u64 {
     let steps = ((size.max(1) as f64).ln() / 1.05f64.ln()).ceil();
     (1.05f64.powf(steps).floor() as u64).max(541)
 }
@@ -68,7 +68,7 @@ fn log_pad(size: u64) -> u64 {
 /// Desktop's `getAttachmentCiphertextSize` for the transit tier: padded,
 /// then AES-CBC with its IV and MAC. Desktop pads twice on the way
 /// (`ts/util/AttachmentCrypto.std.ts`), so this does too.
-fn ciphertext_size(plaintext: u64) -> u64 {
+pub(crate) fn ciphertext_size(plaintext: u64) -> u64 {
     let padded = log_pad(log_pad(plaintext));
     16 + (padded / 16 + 1) * 16 + 32
 }

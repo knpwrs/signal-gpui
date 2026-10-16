@@ -89,6 +89,9 @@ pub(crate) struct StorageSnapshot {
     pub profile_sharing: Vec<(ConversationId, bool)>,
     /// Each group's story send mode (`storySendMode`).
     pub story_send_modes: Vec<(ConversationId, signal_store::StorySendMode)>,
+    /// The account's `backupTier` (a zkgroup `BackupLevel`), `Some(0)` when
+    /// backups are off; `None` without an account record.
+    pub backup_tier: Option<u64>,
 }
 
 /// A call link record (Desktop's `mergeCallLinkRecord`): only links we're
@@ -175,6 +178,9 @@ pub(crate) async fn fetch(manager: &SignalManager) -> anyhow::Result<StorageSnap
                     snapshot.settings = account_settings(&account);
                     snapshot.stories_disabled = Some(account.stories_disabled);
                     snapshot.my_story_privacy_set = Some(account.has_set_my_stories_privacy);
+                    // Desktop's `saveBackupTier(toNumber(backupTier))`:
+                    // unset means backups are off.
+                    snapshot.backup_tier = Some(account.backup_tier.unwrap_or(0));
                     snapshot.story_view_receipts = match account.story_view_receipts_enabled() {
                         presage::proto::OptionalBool::Enabled => Some(true),
                         presage::proto::OptionalBool::Disabled => Some(false),

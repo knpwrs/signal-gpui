@@ -7,8 +7,9 @@
 //! attachment format), wrapping gzip, wrapping length-prefixed protobufs: a
 //! `BackupInfo`, then `Frame`s (recipients, chats, then chat items).
 //!
-//! Attachments come over as metadata only; Desktop fetches their files in
-//! a separate step that isn't here yet.
+//! Attachments come over as locators (where each file is and its key); the
+//! files are fetched after the import, from the transit tier or the backup
+//! (media) tier (`backup_media.rs`).
 
 use std::collections::HashMap;
 use std::io::Read as _;
@@ -208,8 +209,10 @@ fn delimited(mut bytes: &[u8]) -> impl Iterator<Item = anyhow::Result<&[u8]>> {
 pub(crate) struct Imported {
     pub chats: usize,
     pub messages: usize,
-    /// Photos and GIFs to download now, as `(message id, attachment index)`;
-    /// other files wait to be opened.
+    /// Attachments to fetch now, as `(message id, attachment index)`: photos
+    /// and GIFs whole, other images and videos that may be in the backup
+    /// tier as thumbnails only (the actor's `download_transferred`); other
+    /// files wait to be opened.
     pub downloads: Vec<(i64, usize)>,
     /// Messages whose whole text is still to download.
     pub long_texts: Vec<i64>,
@@ -690,8 +693,9 @@ async fn import_item(
     }
     let id = db.insert_message(&message).await?;
     for (index, attachment) in message.attachments.iter().enumerate() {
-        let photo = attachment.gif || attachment.voice || attachment.content_type.starts_with("image/");
-        if attachment.remote.is_some() && photo && crate::remote_config().auto_downloads(attachment.size) {
+        let Some(remote) = &attachment.remote else { continue };
+        let thumbnail = remote.plaintext_hash.is_some() && crate::backup_media::can_have_thumbnail(&attachment.content_type);
+        if crate::actor::downloads_whole(attachment) || thumbnail {
             imported.downloads.push((id, index));
         }
     }
@@ -798,27 +802,34 @@ fn attachment(pointer: &proto::FilePointer) -> AttachmentMeta {
     }
 }
 
-/// Where a transferred attachment can be downloaded: the transit tier,
-/// which the phone fills for link and sync (and which expires). The backup
-/// (media) tier needs a backup subscription's credentials, so it isn't used.
+/// Where a transferred attachment can be downloaded, as Desktop reads a
+/// locator (`ts/services/backups/util/filePointers.preload.ts`): the transit
+/// tier, which the phone fills for link and sync (and which expires), when
+/// it has a transit key; and the backup (media) tier, when the key and
+/// plaintext hash name a file there (`backup_media.rs`). Neither: `None`.
 fn remote(locator: &proto::file_pointer::LocatorInfo) -> Option<RemoteAttachment> {
     use proto::file_pointer::locator_info::IntegrityCheck;
-    let cdn_key = locator.transitCdnKey.clone().filter(|k| !k.is_empty())?;
     if locator.key.len() != 64 {
         return None;
     }
     let (digest, plaintext_hash) = match &locator.integrityCheck {
-        Some(IntegrityCheck::EncryptedDigest(d)) => (Some(hex::encode(d)), None),
-        Some(IntegrityCheck::PlaintextHash(h)) => (None, Some(hex::encode(h))),
+        Some(IntegrityCheck::EncryptedDigest(d)) if !d.is_empty() => (Some(hex::encode(d)), None),
+        Some(IntegrityCheck::PlaintextHash(h)) if !h.is_empty() => (None, Some(hex::encode(h))),
         _ => return None,
     };
+    let cdn_key = locator.transitCdnKey.clone().filter(|k| !k.is_empty());
+    // Desktop keeps the media tier's CDN only alongside a media name.
+    let media_tier_cdn = plaintext_hash.as_ref().and(locator.mediaTierCdnNumber);
+    if cdn_key.is_none() && plaintext_hash.is_none() {
+        return None;
+    }
     Some(RemoteAttachment {
         cdn: locator.transitCdnNumber.unwrap_or(0),
-        cdn_key: Some(cdn_key),
+        cdn_key,
         key: hex::encode(&locator.key),
         digest,
         plaintext_hash,
-        media_tier_cdn: None,
+        media_tier_cdn,
     })
 }
 
@@ -1014,6 +1025,28 @@ mod tests {
         let mut photo_attachment = proto::MessageAttachment::new();
         photo_attachment.pointer = Some(photo).into();
         standard.attachments.push(photo_attachment);
+        // A video only in the backup (media) tier, and a file the phone
+        // never uploaded.
+        let mut locator = proto::file_pointer::LocatorInfo::new();
+        locator.key = vec![6; 64];
+        locator.size = 9_000_000;
+        locator.mediaTierCdnNumber = Some(3);
+        locator.integrityCheck = Some(proto::file_pointer::locator_info::IntegrityCheck::PlaintextHash(vec![7; 32]));
+        let mut video = proto::FilePointer::new();
+        video.contentType = Some("video/mp4".into());
+        video.locatorInfo = Some(locator).into();
+        let mut video_attachment = proto::MessageAttachment::new();
+        video_attachment.pointer = Some(video).into();
+        standard.attachments.push(video_attachment);
+        let mut locator = proto::file_pointer::LocatorInfo::new();
+        locator.key = vec![8; 64];
+        locator.size = 10;
+        let mut file = proto::FilePointer::new();
+        file.contentType = Some("application/pdf".into());
+        file.locatorInfo = Some(locator).into();
+        let mut file_attachment = proto::MessageAttachment::new();
+        file_attachment.pointer = Some(file).into();
+        standard.attachments.push(file_attachment);
         let mut quote = proto::Quote::new();
         quote.targetSentTimestamp = Some(900);
         quote.authorId = 2;
@@ -1150,7 +1183,17 @@ mod tests {
         let remote = photo.remote.as_ref().unwrap();
         assert_eq!((remote.cdn, remote.cdn_key.as_deref(), remote.key.len()), (3, Some("abc"), 128));
         assert_eq!(remote.digest.as_deref(), Some(hex::encode([2; 32]).as_str()));
-        assert_eq!(imported.downloads, vec![(reply.id, 0)]);
+        assert_eq!(remote.media_tier_cdn, None);
+        // The video is only in the backup tier: named by its key and
+        // plaintext hash, on the CDN the backup gave.
+        let video = reply.attachments[1].remote.as_ref().unwrap();
+        assert_eq!(video.cdn_key, None);
+        assert_eq!(video.plaintext_hash.as_deref(), Some(hex::encode([7; 32]).as_str()));
+        assert_eq!((video.media_tier_cdn, video.digest.as_ref()), (Some(3), None));
+        // The file can't be checked anywhere, so it has nowhere to come from.
+        assert_eq!(reply.attachments[2].remote, None);
+        // The photo whole; the video's backup thumbnail.
+        assert_eq!(imported.downloads, vec![(reply.id, 0), (reply.id, 1)]);
         assert!(with_alice[1].deleted);
 
         // The phone's release notes are the Signal chat's.
