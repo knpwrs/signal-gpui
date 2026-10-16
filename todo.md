@@ -39,12 +39,48 @@ number.
 | `normalDeleteMaxAgeInSeconds`, `adminDeleteMaxAgeInSeconds` | 1 day (receivers add a day of grace) | Follows the config. |
 | `pinnedChatLimit`, `pinnedMessageLimit` | 4, 3 | Follows the config. |
 | `attachments.maxBytes`, `attachments.maxReceiveBytes` | 100 MiB, 1.25 × the send limit | Follows the config. Desktop marks an attachment too big when a download is tried; here it's judged from the size the sender gave, so the bubble says so from the start. |
-| `attachments.maxAutoDownloadSizeBytes` | 200 MiB | Follows the config. |
+| `attachments.maxAutoDownloadSizeBytes` | 200 MiB | Follows the config, under Data usage's choices by kind. |
 | `textAttachmentLimitBytes` | Size of a long-text attachment | Desktop's built-in limits, hard-coded (`crates/backend/src/long_text.rs`): bodies over 2 KiB go as a `text/x-signal-plain` attachment (group story replies too), received ones download and replace the body, a failed download is retried after 30 s, 5 min, 50 min and 6 h as Desktop's download job does, received messages and edits whose inline body is over 2 KiB are dropped and logged, the composer stops at 64 KiB, and a bubble shows 800 characters with "Read more" adding 3,000. Retries and the drop were unit tested; the downloads themselves weren't tried against Signal's CDN. |
 | `groupsv2.maxGroupSize` / `groupSizeHardLimit` | 151 / 1001 | Follows the config in New group and Add members, with Desktop's alerts; the backend refuses to go past the hard limit. Not tried against Signal's group server. |
 | `nicknames.min` / `.max` | 3 / 32 | Username nickname limits (`ts/util/Username.dom.ts`), not contact nicknames: the username editor checks them (`signal_backend::usernames::limits`). Contact nicknames and notes use Desktop's built-in limits (`signal_store::NICKNAME_LIMITS`), which no config key sets. |
 | `messageQueueTimeInSeconds` | 30 days (never less) | How long the server keeps undelivered messages. Follows the config, never under 30 days, for erasing view-once messages left unviewed (Desktop's `getMessageQueueTime`). |
 | `videoAttachments.transcodeTargetBytes`, `mediaQuality.levels`, `calling.*`, `clientExpiration`, `maxAllowedClockSkewSeconds` | n/a | Not applicable for now. |
+
+## Settings and notifications
+
+Settings follows Desktop's Preferences pages (General, Appearance, Chats,
+Calls, Notifications, Privacy, Data usage, with While muted, Phone Number
+and Blocked under them), its account record settings read and written as
+Desktop does. Tested with unit, store, mapping and headless UI tests from
+the demo; none of it has been tried with a real account. Not done, or not
+checked:
+
+- **Untried against the server:** the profile write for "Who can see my
+  number" (our profile re-sent as the server has it, with
+  `phoneNumberSharing`), `PUT /v2/accounts/phone_number_discoverability`,
+  the import's sync requests, and the contact sync's photos.
+- **Open at login** uses `SMAppService.mainAppService` and needs the app
+  bundle (macOS 13 or later); only a stand-in ran in tests.
+- **Zoom** scales the theme's text size (and anything in rems); sizes in
+  pixels stay, where Desktop zooms the whole page.
+- **Per-chat settings:** Desktop's per-chat "While muted" and unread
+  reminder choices (contact and group record fields) aren't read or
+  offered; the global ones apply everywhere.
+- **Default timer:** Desktop also adds a notice to the open chat when it
+  changes, and to a new 1:1 chat before the first message; neither is
+  shown here. The timer still applies on our first message.
+- **Blocked:** only people and groups we have a chat with are listed, and
+  without Desktop's "Blocked on" date.
+- **Sealed sender:** ours sent from this computer aren't marked (presage's
+  send doesn't report it), nor messages from the link-time backup.
+- **Missed call notifications:** Desktop 8.34 has none (only the incoming
+  call notification), so there are none here either.
+- **Not here from Desktop's pages:** language, chat color, spell check,
+  text formatting, the default skin tone, chat folders, chat export, the
+  badge count settings, notification profiles, "Reset" notification
+  settings, sent media quality, the device name, and the Account page.
+- **Sounds:** only pop, whoosh and the ringtone; Desktop's hang-up and
+  hand-raised sounds aren't played.
 
 ## Key transparency
 
