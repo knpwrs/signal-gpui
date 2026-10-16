@@ -10,7 +10,8 @@ pub use manager::{
     InMemoryCredentialsCache,
 };
 pub use model::{
-    AccessControl, AccessRequired, Group, GroupChange, GroupChanges,
-    GroupMemberCandidate, Member, PendingMember, RequestingMember, Role, Timer,
+    AccessControl, AccessRequired, BannedMember, Group, GroupChange,
+    GroupChanges, GroupMemberCandidate, Member, PendingMember, PromotedMember,
+    RequestingMember, Role, Timer,
 };
 pub use operations::{GroupDecodingError, GroupOperations};

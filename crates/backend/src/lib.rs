@@ -16,6 +16,7 @@ mod demo;
 pub mod mapping;
 mod storage;
 mod groups;
+pub mod group_admin;
 mod history;
 mod backup_media;
 mod safety;

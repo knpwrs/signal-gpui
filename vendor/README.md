@@ -97,3 +97,6 @@ Powers for signal-gpui since 2026-10-15. Changes:
   from the provisioning message's `mediaRootBackupKey` (one that isn't 32
   bytes is dropped rather than failing the link). Upstream ignores it when
   linking.
+- `src/groups_v2/mod.rs`: `BannedMember` and `PromotedMember` are exported
+  with the other group types (upstream keeps them private to `model`, so a
+  `Group`'s `members_banned` couldn't be built in tests).
