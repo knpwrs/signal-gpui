@@ -17,6 +17,11 @@ upstream workspace). Changes:
   `MessageSender::send_story`, with our profile key in it.
 - `src/manager/registered.rs`: `Manager::remote_config` fetches the
   account's remote config through libsignal-service's `get_remote_config`.
+- `src/manager/linking.rs`, `src/manager/registered.rs`,
+  `src/manager/confirmation.rs`: `RegistrationData::read_receipts` holds
+  the primary's read receipts setting from linking (not persisted, like
+  `ephemeral_backup_key`), which Signal Desktop takes as its own
+  (`AccountManager`'s `createAccount`).
 
 ## libsignal-service
 
@@ -32,3 +37,5 @@ whisperfish/libsignal-service-rs at `fb92b13c82fde40ba4d10696cf79aa4f36ce25f1`
   `If-None-Match`, returning the config (or none on a 304), the `ETag` and
   `X-Signal-Timestamp`, as Desktop's `getConfig`. Upstream has no call for
   it.
+- `src/provisioning/mod.rs`: `NewDeviceRegistration::read_receipts` carries
+  `ProvisionMessage.readReceipts` (upstream drops it).

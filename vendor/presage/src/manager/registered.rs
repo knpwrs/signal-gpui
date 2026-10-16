@@ -157,6 +157,10 @@ pub struct RegistrationData {
     /// Decrypts the link-time message history archive. Single-use, so not persisted.
     #[serde(skip)]
     pub(crate) ephemeral_backup_key: Option<[u8; 32]>,
+    /// The primary's read receipts setting, sent when linking. Only set
+    /// right after linking, so not persisted.
+    #[serde(skip)]
+    pub(crate) read_receipts: Option<bool>,
 }
 
 impl RegistrationData {
@@ -174,6 +178,12 @@ impl RegistrationData {
     /// if the primary device offered to transfer message history.
     pub fn ephemeral_backup_key(&self) -> Option<[u8; 32]> {
         self.ephemeral_backup_key
+    }
+
+    /// Set right after [`Manager::link_secondary_device`][crate::Manager::link_secondary_device]
+    /// when the primary device sent its read receipts setting.
+    pub fn read_receipts(&self) -> Option<bool> {
+        self.read_receipts
     }
 }
 

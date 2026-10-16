@@ -130,6 +130,7 @@ impl<S: Store> Manager<S, Confirmation> {
                 pni_registration_id: Some(pni_registration_id),
                 profile_key,
                 ephemeral_backup_key: None,
+                read_receipts: None,
             }),
         };
 
