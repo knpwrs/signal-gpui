@@ -6,6 +6,7 @@
 use gpui_kit::component::input::{Copy, Cut, Delete, Paste, Redo, SelectAll, Undo};
 use gpui_kit::{App, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType, Window};
 
+use crate::shortcuts::ShowKeyboardShortcuts;
 use crate::{About, CreateStickerPack, OpenSettings, Quit, ShowDebugLog};
 
 gpui_kit::actions!(
@@ -106,6 +107,8 @@ pub fn install(cx: &mut App) {
             MenuItem::action("Bring All to Front", BringAllToFront),
         ]),
         Menu::new("Help").items([
+            MenuItem::action("Show Keyboard Shortcuts", ShowKeyboardShortcuts),
+            MenuItem::separator(),
             MenuItem::action("Contact Us", ContactUs),
             MenuItem::action("Go to Forums", GoToForums),
             MenuItem::action("Go to Support Page", GoToSupportPage),
@@ -133,6 +136,11 @@ pub fn install(cx: &mut App) {
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
     cx.on_action(|_: &PasteAndMatchStyle, cx| {
         with_active_window(cx, |window, cx| window.dispatch_action(Box::new(Paste), cx))
+    });
+    // From the menu with the main window hidden (shown, it handles it).
+    cx.on_action(|_: &ShowKeyboardShortcuts, cx| {
+        crate::main_window::show(cx);
+        crate::main_window::update(cx, crate::views::shortcut_guide::open);
     });
     cx.on_action(|_: &ContactUs, cx| cx.open_url(CONTACT_URL));
     cx.on_action(|_: &GoToForums, cx| cx.open_url(FORUMS_URL));

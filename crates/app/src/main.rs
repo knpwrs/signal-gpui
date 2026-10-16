@@ -17,6 +17,7 @@ mod platform;
 mod prefs;
 mod recorder;
 mod reminders;
+mod shortcuts;
 mod sidebar_width;
 mod sounds;
 mod ringtone;
@@ -137,6 +138,7 @@ fn bind_keys(cx: &mut App) {
     ]);
 
     menus::bind_keys(cx);
+    shortcuts::bind_keys(cx);
 }
 
 fn main() -> Result<()> {

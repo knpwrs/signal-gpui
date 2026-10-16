@@ -330,6 +330,19 @@ impl EmojiPicker {
             )
     }
 
+    /// The panel showing.
+    pub fn tab(&self) -> Tab {
+        self.tab
+    }
+
+    /// Shows a panel (from a shortcut); Stickers and GIFs only where
+    /// they're offered.
+    pub fn show_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+        if tab != self.tab && (self.media || tab == Tab::Emoji) {
+            self.set_tab(tab, window, cx);
+        }
+    }
+
     fn set_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
         self.tab = tab;
         let placeholder = match tab {

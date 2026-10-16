@@ -137,6 +137,8 @@ pub struct CallView {
     reactions_open: bool,
     /// People in a call link's call whose names were asked for.
     names_asked: std::collections::HashSet<String>,
+    /// Focused while the call or lobby fills the window, for its shortcuts.
+    focus: gpui_kit::FocusHandle,
     /// Ticks the call's clock.
     _clock: Task<()>,
 }
@@ -167,7 +169,48 @@ impl CallView {
             page: 0,
             shown: None,
             reactions_open: false,
+            focus: cx.focus_handle(),
             _clock: clock,
+        }
+    }
+
+    /// Whether the call (or lobby) fills the window: not ringing in its
+    /// bar, nor minimized.
+    pub fn fills_window(state: &AppState) -> bool {
+        match &state.call {
+            Some(call) => !state.call_minimized && !(call.incoming && call.status == CallStatus::Ringing),
+            None => state.lobby.is_some(),
+        }
+    }
+
+    /// Desktop's ⇧M (`CallScreen`, `CallingLobby`): mute or unmute.
+    fn toggle_audio(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| match &state.lobby {
+            Some(lobby) => {
+                let audio = !lobby.audio;
+                state.set_lobby_audio(audio, cx);
+            }
+            None => state.toggle_call_audio(cx),
+        });
+    }
+
+    /// Desktop's ⇧V: the camera on or off.
+    fn toggle_video(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| match &state.lobby {
+            Some(lobby) => {
+                let video = !lobby.video;
+                state.set_lobby_video(video, cx);
+            }
+            None => state.toggle_call_video(cx),
+        });
+    }
+
+    /// Desktop's ⇧H: a hand up or down, in a group call.
+    fn toggle_hand(&mut self, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        if let Some(call) = state.call.as_ref().filter(|c| c.group) {
+            let hand_up = call.local_demux_id.is_some_and(|me| call.raised_hands.contains(&me));
+            state.send(signal_backend::Command::RaiseHand(!hand_up));
         }
     }
 
@@ -1230,6 +1273,12 @@ impl CallView {
     }
 }
 
+impl gpui_kit::Focusable for CallView {
+    fn focus_handle(&self, _: &gpui_kit::App) -> gpui_kit::FocusHandle {
+        self.focus.clone()
+    }
+}
+
 impl Render for CallView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let size = window.viewport_size();
@@ -1259,8 +1308,21 @@ impl Render for CallView {
             (None, None) => div().into_any_element(),
         };
         // Each positions itself over the window (the root is `relative`):
-        // the full screens cover it, the bar and small window don't.
-        content
+        // the full screens cover it, the bar and small window don't. The
+        // full screens take the keyboard, for Desktop's call shortcuts.
+        if !Self::fills_window(self.state.read(cx)) {
+            return content;
+        }
+        div()
+            .absolute()
+            .inset_0()
+            .key_context(crate::shortcuts::CALL_SCREEN)
+            .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &crate::shortcuts::ToggleCallAudio, _, cx| this.toggle_audio(cx)))
+            .on_action(cx.listener(|this, _: &crate::shortcuts::ToggleCallVideo, _, cx| this.toggle_video(cx)))
+            .on_action(cx.listener(|this, _: &crate::shortcuts::ToggleRaiseHand, _, cx| this.toggle_hand(cx)))
+            .child(content)
+            .into_any_element()
     }
 }
 

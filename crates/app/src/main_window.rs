@@ -131,6 +131,15 @@ fn show_now(cx: &mut App) {
     }
 }
 
+/// Runs `f` on the main window, once whatever's dispatching is done with it.
+pub fn update(cx: &mut App, f: impl FnOnce(&mut Window, &mut App) + 'static) {
+    cx.defer(move |cx| {
+        if let Some(window) = handle(cx) {
+            let _ = window.update(cx, |_, window, cx| f(window, cx));
+        }
+    });
+}
+
 /// The window's close button (or Close Window): Desktop on macOS hides
 /// the window and keeps running, asking first during a call (and ending
 /// it). Returns whether to really close, which only quitting does.

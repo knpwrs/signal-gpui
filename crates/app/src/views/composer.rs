@@ -956,14 +956,7 @@ impl Composer {
                         .id("dismiss-link-preview")
                         .p_1()
                         .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if let Some(staged) = this.link_preview.take() {
-                                staged.release(cx);
-                                this.dismissed_previews.insert(staged.url);
-                            }
-                            this.preview_task = None;
-                            cx.notify();
-                        }))
+                        .on_click(cx.listener(|this, _, _, cx| this.remove_link_preview(cx)))
                         .child(Icon::new(IconName::X).size_4().text_color(palette.text_secondary)),
                 ),
         )
@@ -1224,6 +1217,51 @@ impl Composer {
             });
             cx.notify();
         }
+    }
+
+    /// Desktop's ⌘⇧J, ⌘⇧O and ⌘⇧G: the picker opened at its emoji,
+    /// stickers or GIFs (or closed, when it's already open there).
+    pub fn open_picker_at(&mut self, tab: crate::views::emoji_picker::Tab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.recording.is_some() {
+            return;
+        }
+        if self.picker_open && self.picker.read(cx).tab() == tab {
+            self.close_picker(window, cx);
+            return;
+        }
+        if !self.picker_open {
+            self.toggle_picker(window, cx);
+        }
+        self.picker.update(cx, |picker, cx| picker.show_tab(tab, window, cx));
+        cx.notify();
+    }
+
+    /// Desktop's ⌘U (`onAttachFileShortcut`).
+    pub fn attach_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.recording.is_none() {
+            self.pick_files(window, cx);
+        }
+    }
+
+    /// Desktop's ⌘P: the draft's link preview goes (and stays gone for that
+    /// link, as its ✕ does).
+    pub fn remove_link_preview(&mut self, cx: &mut Context<Self>) {
+        if let Some(staged) = self.link_preview.take() {
+            staged.release(cx);
+            self.dismissed_previews.insert(staged.url);
+        }
+        self.preview_task = None;
+        cx.notify();
+    }
+
+    /// Desktop's ⌘⇧P: every staged photo and file goes.
+    pub fn remove_attachments(&mut self, cx: &mut Context<Self>) {
+        for image in self.images.drain(..) {
+            image.release(cx);
+        }
+        self.files.clear();
+        self.view_once = false;
+        cx.notify();
     }
 
     pub fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2063,6 +2101,35 @@ mod tests {
         .unwrap();
         assert_eq!(cx.update(|cx| f.composer.read(cx).images.len()), 0);
         assert_eq!(text(&f, cx), "");
+    }
+
+    #[gpui_kit::test]
+    fn shortcuts_open_the_picker_at_a_tab_and_clear_attachments(cx: &mut TestAppContext) {
+        use crate::views::emoji_picker::Tab;
+        let f = mount(cx);
+        let open = |cx: &mut TestAppContext, tab: Tab| {
+            cx.update_window(f.window, |_, window, cx| f.composer.update(cx, |c, cx| c.open_picker_at(tab, window, cx))).unwrap();
+            cx.run_until_parked();
+            cx.update(|cx| {
+                let composer = f.composer.read(cx);
+                composer.picker_open.then(|| composer.picker.read(cx).tab())
+            })
+        };
+        assert_eq!(open(cx, Tab::Stickers), Some(Tab::Stickers));
+        assert_eq!(open(cx, Tab::Gifs), Some(Tab::Gifs), "switches while open");
+        assert_eq!(open(cx, Tab::Gifs), None, "the same shortcut closes it");
+        assert_eq!(open(cx, Tab::Emoji), Some(Tab::Emoji));
+
+        // ⌘⇧P: every staged photo and file goes.
+        let image = gpui_kit::Image::from_bytes(gpui_kit::ImageFormat::Png, PIXEL_PNG.to_vec());
+        cx.update(|cx| cx.write_to_clipboard(gpui_kit::ClipboardItem::new_image(&image)));
+        let target = input_id(&f, cx);
+        cx.update_window(f.window, |_, window, cx| window.click(target, cx)).unwrap();
+        cx.update_window(f.window, |_, window, cx| window.dispatch_action(Box::new(Paste), cx)).unwrap();
+        cx.run_until_parked();
+        assert_eq!(cx.update(|cx| f.composer.read(cx).images.len()), 1);
+        cx.update(|cx| f.composer.update(cx, |c, cx| c.remove_attachments(cx)));
+        assert_eq!(cx.update(|cx| f.composer.read(cx).images.len()), 0);
     }
 
     /// The demo's messages in the composer's chat, once `filter` matches one.

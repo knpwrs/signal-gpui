@@ -2,7 +2,7 @@
 
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::prelude::*;
-use gpui_kit::{Context, Entity, Focusable as _, FontWeight, Subscription, Window, div, px};
+use gpui_kit::{App, Context, Entity, Focusable as _, FontWeight, Subscription, Window, div, px};
 
 use crate::state::{AppEvent, AppState, NavTab, Screen};
 use crate::theme::Palette;
@@ -28,6 +28,8 @@ pub struct RootView {
     video_viewer: Option<(Entity<crate::views::video_viewer::VideoViewer>, Subscription)>,
     /// The lobby or call, while there is one.
     call: Option<Entity<crate::views::call::CallView>>,
+    /// The call screen has the keyboard (it fills the window).
+    call_focused: bool,
     /// The Stories and Calls tabs' lists.
     stories: Entity<crate::views::stories::StoriesPane>,
     calls: Entity<crate::views::calls::CallsPane>,
@@ -147,16 +149,32 @@ impl RootView {
                     cx.notify();
                 }
             }),
-            cx.observe(&state, |this, state, cx| {
+            cx.observe_in(&state, window, |this, state, window, cx| {
                 this.follow_account(cx);
-                let active = {
+                let (active, fills) = {
                     let s = state.read(cx);
-                    s.call.is_some() || s.lobby.is_some()
+                    (s.call.is_some() || s.lobby.is_some(), crate::views::call::CallView::fills_window(s))
                 };
                 if active && this.call.is_none() {
                     this.call = Some(cx.new(|cx| crate::views::call::CallView::new(state.clone(), cx)));
                 } else if !active {
                     this.call = None;
+                }
+                // The call screen takes the keyboard while it fills the
+                // window (Desktop's call shortcuts), and gives it back to
+                // the chat after.
+                match (&this.call, fills) {
+                    (Some(call), true) if !this.call_focused => {
+                        this.call_focused = true;
+                        window.focus(&call.focus_handle(cx), cx);
+                    }
+                    (_, false) if this.call_focused => {
+                        this.call_focused = false;
+                        if let Some(conversation) = &this.conversation {
+                            window.focus(&conversation.focus_handle(cx), cx);
+                        }
+                    }
+                    _ => {}
                 }
                 cx.notify()
             }),
@@ -172,6 +190,7 @@ impl RootView {
             viewer: None,
             video_viewer: None,
             call: None,
+            call_focused: false,
             stories,
             calls,
             call_details,
@@ -239,6 +258,158 @@ impl RootView {
     }
 
     /// Desktop's `expandNarrowLeftPane`.
+    /// The main window's open, linked and caught up.
+    fn ready(&self, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        matches!(state.screen, Screen::Main) && !state.is_loading()
+    }
+
+    /// The open chat's view, on the Chats tab.
+    fn open_chat(&self, cx: &App) -> Option<Entity<ConversationView>> {
+        let ready = self.ready(cx) && self.state.read(cx).tab == NavTab::Chats;
+        self.conversation.clone().filter(|_| ready)
+    }
+
+    /// Acts on the open chat's composer.
+    fn with_composer(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut crate::views::composer::Composer, &mut Window, &mut Context<crate::views::composer::Composer>),
+    ) {
+        if let Some(view) = self.open_chat(cx) {
+            let composer = view.read(cx).composer().clone();
+            composer.update(cx, |composer, cx| f(composer, window, cx));
+        }
+    }
+
+    /// Desktop's shortcuts for the main window (see `crate::shortcuts`).
+    fn with_shortcuts(&self, d: gpui_kit::Div, cx: &mut Context<Self>) -> gpui_kit::Div {
+        use crate::shortcuts::*;
+        use crate::views::emoji_picker::Tab;
+        d.on_action(cx.listener(|_, _: &ShowKeyboardShortcuts, window, cx| crate::views::shortcut_guide::open(window, cx)))
+            .on_action(cx.listener(|this, _: &PreviousUnreadConversation, _, cx| {
+                if this.ready(cx) {
+                    this.state.update(cx, |state, cx| state.select_in_direction(true, true, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &NextUnreadConversation, _, cx| {
+                if this.ready(cx) {
+                    this.state.update(cx, |state, cx| state.select_in_direction(false, true, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, jump: &JumpToChat, _, cx| {
+                if this.ready(cx) {
+                    this.state.update(cx, |state, cx| state.select_index(jump.0, cx));
+                }
+            }))
+            // New chats start from the search box here (Desktop's compose
+            // pane finds people by name, number or username the same way).
+            .on_action(cx.listener(|this, _: &StartNewChat, window, cx| {
+                if this.ready(cx) {
+                    this.state.update(cx, |state, cx| state.set_tab(NavTab::Chats, cx));
+                    window.dispatch_action(Box::new(FocusSearch), cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &FocusComposer, window, cx| {
+                this.with_composer(window, cx, |composer, window, cx| composer.focus(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &OpenAllMedia, window, cx| {
+                if let Some(view) = this.open_chat(cx) {
+                    let id = view.read(cx).id.clone();
+                    crate::views::all_media::open(this.state.clone(), id, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &OpenEmojiChooser, window, cx| {
+                this.with_composer(window, cx, |composer, window, cx| composer.open_picker_at(Tab::Emoji, window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &OpenStickerChooser, window, cx| {
+                this.with_composer(window, cx, |composer, window, cx| composer.open_picker_at(Tab::Stickers, window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &OpenGifChooser, window, cx| {
+                this.with_composer(window, cx, |composer, window, cx| composer.open_picker_at(Tab::Gifs, window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &AttachFile, window, cx| {
+                this.with_composer(window, cx, |composer, window, cx| composer.attach_file(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &RemoveLinkPreview, window, cx| {
+                this.with_composer(window, cx, |composer, _, cx| composer.remove_link_preview(cx));
+            }))
+            .on_action(cx.listener(|this, _: &RemoveDraftAttachments, window, cx| {
+                this.with_composer(window, cx, |composer, _, cx| composer.remove_attachments(cx));
+            }))
+            // Desktop's `onArchiveConversation` and `onUnarchiveConversation`:
+            // only one that isn't already.
+            .on_action(cx.listener(|this, _: &ArchiveChat, _, cx| this.set_archived(true, cx)))
+            .on_action(cx.listener(|this, _: &UnarchiveChat, _, cx| this.set_archived(false, cx)))
+            .on_action(cx.listener(|this, _: &CloseChat, _, cx| {
+                if this.ready(cx) {
+                    this.state.update(cx, |state, cx| state.select(None, cx));
+                }
+            }))
+            // Desktop's `ConversationHeader` call shortcuts, where its call
+            // buttons are.
+            .on_action(cx.listener(|this, _: &StartAudioCall, _, cx| this.start_call(false, cx)))
+            .on_action(cx.listener(|this, _: &StartVideoCall, _, cx| this.start_call(true, cx)))
+            // Desktop's `IncomingCallBar` (answering with video only for a
+            // video call) and `CallScreen` shortcuts; with no call the keys
+            // go on to the text field.
+            .on_action(cx.listener(|this, _: &AcceptVideoCall, _, cx| match this.ringing(cx) {
+                Some(true) => this.state.update(cx, |state, cx| state.accept_call(true, cx)),
+                Some(false) => {}
+                None => cx.propagate(),
+            }))
+            .on_action(cx.listener(|this, _: &AcceptAudioCall, _, cx| match this.ringing(cx) {
+                Some(_) => this.state.update(cx, |state, cx| state.accept_call(false, cx)),
+                None => cx.propagate(),
+            }))
+            .on_action(cx.listener(|this, _: &DeclineCall, _, cx| match this.ringing(cx) {
+                Some(_) => this.state.update(cx, |state, _| state.decline_call()),
+                None => cx.propagate(),
+            }))
+            .on_action(cx.listener(|this, _: &HangUp, _, cx| {
+                let in_call = this.ringing(cx).is_none() && this.state.read(cx).call.is_some();
+                if in_call {
+                    this.state.update(cx, |state, _| state.hang_up());
+                } else {
+                    cx.propagate();
+                }
+            }))
+    }
+
+    /// An incoming call that's ringing: whether it's a video call.
+    fn ringing(&self, cx: &App) -> Option<bool> {
+        let call = self.state.read(cx).call.as_ref()?;
+        (call.incoming && call.status == signal_backend::CallStatus::Ringing).then_some(call.video)
+    }
+
+    fn set_archived(&mut self, archived: bool, cx: &mut Context<Self>) {
+        if !self.ready(cx) {
+            return;
+        }
+        let state = self.state.read(cx);
+        if let Some(chat) = state.selected.as_ref().and_then(|id| state.conversation(id)).filter(|c| c.archived != archived) {
+            state.set_chat(chat.id.clone(), signal_backend::ChatChange::Archived(archived));
+        }
+    }
+
+    /// Ctrl-Shift-C and Ctrl-Shift-Y: the open chat's call lobby, where its
+    /// header offers a call.
+    fn start_call(&mut self, video: bool, cx: &mut Context<Self>) {
+        if self.open_chat(cx).is_none() {
+            return;
+        }
+        let state = self.state.read(cx);
+        if state.call.is_some() || state.lobby.is_some() {
+            return;
+        }
+        let Some(chat) = state.selected.as_ref().and_then(|id| state.conversation(id)) else { return };
+        if crate::views::conversation::call_kind(chat).is_some() {
+            let id = chat.id.clone();
+            self.state.update(cx, |state, cx| state.open_call_lobby(id, video, cx));
+        }
+    }
+
     fn expand_sidebar(&mut self, cx: &mut Context<Self>) {
         if self.sidebar_preferred < crate::sidebar_width::MIN_FULL_WIDTH {
             self.sidebar_preferred = crate::sidebar_width::MIN_FULL_WIDTH;
@@ -391,17 +562,18 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &NextConversation, _, cx| {
                 this.state.update(cx, |state, cx| {
                     if !state.is_loading() {
-                        state.select_relative(1, cx);
+                        state.select_in_direction(false, false, cx);
                     }
                 });
             }))
             .on_action(cx.listener(|this, _: &PreviousConversation, _, cx| {
                 this.state.update(cx, |state, cx| {
                     if !state.is_loading() {
-                        state.select_relative(-1, cx);
+                        state.select_in_direction(true, false, cx);
                     }
                 });
             }))
+            .map(|d| self.with_shortcuts(d, cx))
             .child(body)
             .when_some(self.call.clone().filter(|_| call_shown), |d, call| d.child(call))
             .when_some(viewer, |d, viewer| d.child(viewer))

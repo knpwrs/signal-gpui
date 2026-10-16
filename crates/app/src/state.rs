@@ -423,6 +423,27 @@ pub(crate) fn allowed_while_muted(direct: bool, mentions: Mentions, prefs: &crat
             || (mentions.replies_to_me && prefs.flag(AccountSetting::NotifyRepliesIfMuted)))
 }
 
+/// Desktop's `getConversationInDirection`
+/// (ts/components/leftPane/getConversationInDirection.dom.ts), over the
+/// list's chats by whether each is unread: with nothing open, the first
+/// (or last) one; unread only, the nearest unread one that way (none past
+/// the end); otherwise the next one, wrapping around.
+pub(crate) fn conversation_in_direction(unread: &[bool], selected: Option<usize>, up: bool, unread_only: bool) -> Option<usize> {
+    let count = unread.len();
+    if count == 0 {
+        return None;
+    }
+    match (selected.filter(|&ix| ix < count), unread_only) {
+        (None, true) if up => unread.iter().rposition(|&u| u),
+        (None, true) => unread.iter().position(|&u| u),
+        (None, false) => Some(if up { count - 1 } else { 0 }),
+        (Some(ix), true) if up => unread[..ix].iter().rposition(|&u| u),
+        (Some(ix), true) => unread[ix + 1..].iter().position(|&u| u).map(|found| ix + 1 + found),
+        (Some(ix), false) if up => Some(if ix == 0 { count - 1 } else { ix - 1 }),
+        (Some(ix), false) => Some(if ix + 1 >= count { 0 } else { ix + 1 }),
+    }
+}
+
 /// Desktop's `notificationReactionMessage`: "{sender} reacted {emoji} to:
 /// {message}".
 pub(crate) fn reaction_text(sender: &str, emoji: &str, message: &str) -> String {
@@ -2571,21 +2592,25 @@ impl AppState {
         cx.notify();
     }
 
-    /// Selects the conversation `delta` rows away from the current one.
-    pub fn select_relative(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if self.conversations.is_empty() {
-            return;
+    /// Desktop's previous and next chat shortcuts (⌥↑ and ⌥↓, with ⇧ for
+    /// unread chats only): the chat above or below the open one in the
+    /// list, wrapping around.
+    pub fn select_in_direction(&mut self, up: bool, unread_only: bool, cx: &mut Context<Self>) {
+        let unread: Vec<bool> = self.conversations.iter().map(|c| c.unread_count > 0 || c.marked_unread).collect();
+        let current = self.selected.as_ref().and_then(|id| self.conversations.iter().position(|c| &c.id == id));
+        if let Some(next) = conversation_in_direction(&unread, current, up, unread_only) {
+            let id = self.conversations[next].id.clone();
+            self.select(Some(id), cx);
         }
-        let current = self
-            .selected
-            .as_ref()
-            .and_then(|id| self.conversations.iter().position(|c| &c.id == id));
-        let next = match current {
-            Some(ix) => (ix as isize + delta).clamp(0, self.conversations.len() as isize - 1) as usize,
-            None => 0,
-        };
-        let id = self.conversations[next].id.clone();
-        self.select(Some(id), cx);
+    }
+
+    /// Desktop's ⌘1 to ⌘9 (`getConversationAndMessageAtIndex`): the chat
+    /// at that place in the list (pinned ones first), or the last one.
+    pub fn select_index(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(chat) = self.conversations.get(index).or(self.conversations.last()) {
+            let id = chat.id.clone();
+            self.select(Some(id), cx);
+        }
     }
 
     pub fn send(&self, command: Command) {
@@ -2708,6 +2733,32 @@ mod sticker_tests {
         let recents = vec![(vec![0xde, 0x70], 3), (vec![0x01], 12)];
         assert_eq!(parse_recent_stickers(&format_recent_stickers(&recents)), recents);
         assert_eq!(parse_recent_stickers("junk,zz:1,ab:x"), vec![]);
+    }
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::conversation_in_direction as find;
+
+    #[test]
+    fn chats_up_and_down_as_desktops_tests_have_them() {
+        let unread = [false, true, false, true, false];
+        // Nothing open: the first or the last.
+        assert_eq!(find(&unread, None, false, false), Some(0));
+        assert_eq!(find(&unread, None, true, false), Some(4));
+        assert_eq!(find(&unread, None, false, true), Some(1));
+        assert_eq!(find(&unread, None, true, true), Some(3));
+        // Next and previous wrap around.
+        assert_eq!(find(&unread, Some(2), false, false), Some(3));
+        assert_eq!(find(&unread, Some(4), false, false), Some(0));
+        assert_eq!(find(&unread, Some(0), true, false), Some(4));
+        // Unread only: the nearest that way, and none past the end.
+        assert_eq!(find(&unread, Some(1), false, true), Some(3));
+        assert_eq!(find(&unread, Some(3), false, true), None);
+        assert_eq!(find(&unread, Some(3), true, true), Some(1));
+        assert_eq!(find(&unread, Some(1), true, true), None);
+        assert_eq!(find(&[], None, false, false), None);
+        assert_eq!(find(&[false, false], Some(0), false, true), None);
     }
 }
 

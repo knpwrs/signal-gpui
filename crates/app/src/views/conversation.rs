@@ -92,7 +92,24 @@ pub struct ConversationView {
 /// How long a jumped-to message stays highlighted.
 const HIGHLIGHT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Whether a chat offers calls, as its header's buttons (Desktop's
+/// `getConversationCallMode`): `Some(false)` for a 1:1 chat, `Some(true)`
+/// for a group, `None` for neither (a message request, a blocked chat, a
+/// group we left or that ended, the Signal chat).
+pub fn call_kind(chat: &signal_store::Conversation) -> Option<bool> {
+    match chat.kind {
+        ConversationKind::Direct if !chat.blocked && chat.accepted && !chat.id.is_signal() => Some(false),
+        ConversationKind::Group if !chat.left && !chat.blocked && !chat.ended && chat.accepted => Some(true),
+        _ => None,
+    }
+}
+
 impl ConversationView {
+    /// The chat's composer.
+    pub fn composer(&self) -> &Entity<Composer> {
+        &self.composer
+    }
+
     pub fn new(
         state: Entity<AppState>,
         picker: Entity<EmojiPicker>,
@@ -1101,8 +1118,7 @@ impl ConversationView {
                 )
             })
             // Desktop's call buttons: a 1:1 chat's two.
-            // Desktop's `getConversationCallMode`: not for a message request.
-            .when(conversation.is_some_and(|c| c.kind == ConversationKind::Direct && !c.blocked && c.accepted && !c.id.is_signal()), |d| {
+            .when(conversation.and_then(call_kind) == Some(false), |d| {
                 use gpui_kit::component::button::ButtonVariants as _;
                 let call = |id: &'static str, icon: IconName, tooltip: &'static str, video: bool| {
                     gpui_kit::component::button::Button::new(id).ghost().icon(icon).tooltip(tooltip).on_click(cx.listener(
@@ -1116,7 +1132,7 @@ impl ConversationView {
                     .child(call("voice-call", IconName::Phone, "Start a call", false))
             })
             // A group's: one button, as Desktop's.
-            .when(conversation.is_some_and(|c| c.kind == ConversationKind::Group && !c.left && !c.blocked && !c.ended && c.accepted), |d| {
+            .when(conversation.and_then(call_kind) == Some(true), |d| {
                 use gpui_kit::component::button::ButtonVariants as _;
                 d.child(
                     gpui_kit::component::button::Button::new("group-call")
