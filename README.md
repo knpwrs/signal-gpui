@@ -23,7 +23,6 @@ The goal is to do what Signal Desktop does, the way it does it. When behavior is
 - **Stories**: viewing, posting text, photo and video stories, replies, and story privacy from your phone.
 - **Message history when linking**: like Desktop's "link and sync", your phone sends your history, which is downloaded, decrypted and imported.
 - **Sync with your other devices**: pins, archived, muted and unread chats, blocks, hidden stories and settings go through Signal's Storage Service, editing only the fields that changed and keeping the ones this client doesn't know.
-- **Desktop's layout**: navigation tabs, a resizable chat list that narrows to avatars, Desktop's wording, and its keyboard shortcuts.
 
 Where Signal's server turns features on or sets limits through remote config, this client reads the same config and follows it as Desktop 8.34 would. `todo.md` lists what's left.
 
