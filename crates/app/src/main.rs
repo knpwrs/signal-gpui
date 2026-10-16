@@ -1,6 +1,7 @@
 //! Signal GPUI: a native Signal Desktop client.
 
 mod assets;
+mod avatar_presets;
 mod audio;
 mod emoji_usage;
 mod fonts;

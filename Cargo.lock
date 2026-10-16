@@ -9676,6 +9676,7 @@ dependencies = [
  "objc2-user-notifications",
  "qrcode",
  "rand 0.9.5",
+ "resvg 0.45.1",
  "security-framework",
  "serde_json",
  "signal-backend",

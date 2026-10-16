@@ -57,6 +57,9 @@ Bundled data and assets:
     (images/profile-avatar.svg), and the navigation tabs' icons
     (images/icons/v3), from Signal Desktop (AGPL-3.0-only),
     Copyright Signal Messenger, LLC. See crates/app/assets/icons/signal.
+  - The preset profile photos from Signal Desktop (images/avatars,
+    AGPL-3.0-only), Copyright Signal Messenger, LLC. See
+    crates/app/assets/avatars.
   - The ringtone from Signal Desktop (sounds/ringtone_minimal.ogg,
     AGPL-3.0-only), Copyright Signal Messenger, LLC, converted to AAC. See
     crates/app/assets/sounds.

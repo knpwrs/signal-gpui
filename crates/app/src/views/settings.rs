@@ -31,6 +31,8 @@ pub fn open(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
                     .flex()
                     .flex_col()
                     .gap_4()
+                    .child(section("Profile", palette))
+                    .child(profile(&state, cx))
                     .child(section("Account", palette))
                     .child(
                         div()
@@ -88,6 +90,37 @@ pub fn open(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
                     ),
             )
     });
+}
+
+/// Desktop's profile row (Preferences' top, `PreferencesProfile`): our
+/// photo, name and username, opening the profile editor.
+fn profile(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
+    let palette = Palette::get(cx);
+    let s = state.read(cx);
+    let profile = s.own_profile.clone().unwrap_or_default();
+    let aci = s.our_aci().unwrap_or_default().to_owned();
+    let name = profile.name().unwrap_or_else(|| "Set up your profile".into());
+    let state = state.clone();
+    div()
+        .flex()
+        .items_center()
+        .gap_3()
+        .child(crate::views::common::person_avatar(profile.photo.as_deref(), &name, crate::theme::color_for(&aci), px(48.)))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(div().debug_selector(|| "settings-profile-name".into()).font_weight(FontWeight::SEMIBOLD).truncate().child(name))
+                .when_some(profile.username.clone(), |d, username| {
+                    d.child(div().text_sm().text_color(palette.text_secondary).truncate().child(username))
+                }),
+        )
+        .child(Button::new("edit-profile").label("Edit profile…").small().outline().on_click(move |_, window, cx| {
+            window.close_all_dialogs(cx);
+            crate::views::profile_editor::open(state.clone(), window, cx);
+        }))
 }
 
 fn confirm_unlink(state: Entity<AppState>, window: &mut Window, cx: &mut App) {

@@ -31,6 +31,7 @@ url = "2"
 # Frames for looping video (GIFs) handed to gpui.
 image = { version = "0.25", default-features = false, features = ["png", "webp"] }
 qrcode = { version = "0.14", default-features = false }
+resvg = { version = "0.45", default-features = false }
 # Stickers for the pack creator: decoded, fitted to 512px, then lossy WebP
 # (libwebp), as Desktop's creator encodes them.
 webp = { version = "0.3", default-features = false }

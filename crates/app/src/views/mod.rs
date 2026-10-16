@@ -20,6 +20,7 @@ pub mod new_group;
 pub mod nickname;
 pub mod notices;
 pub mod poll;
+pub mod profile_editor;
 pub mod root;
 pub mod safety_number;
 pub mod settings;
@@ -30,4 +31,6 @@ pub mod story_creator;
 pub mod story_privacy;
 pub mod story_viewer;
 pub mod syncing;
+#[cfg(test)]
+pub mod test_support;
 pub mod video_viewer;

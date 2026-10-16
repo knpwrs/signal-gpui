@@ -162,7 +162,12 @@ impl Sidebar {
                 | AppEvent::KeyTransparencyFailed
                 | AppEvent::GroupLinkPreview(_)
                 | AppEvent::Alert { .. }
-                | AppEvent::Info(_) => {}
+                | AppEvent::Info(_)
+                | AppEvent::OwnProfileChanged
+                | AppEvent::ProfileSaved(_)
+                | AppEvent::UsernameReserved { .. }
+                | AppEvent::UsernameSaved(_)
+                | AppEvent::UsernameLinkReset(_) => {}
             }),
         ];
         Self {

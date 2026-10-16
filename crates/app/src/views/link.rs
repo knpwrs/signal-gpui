@@ -99,7 +99,14 @@ pub fn render(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> im
 }
 
 /// Paints `data` as a `size`-point QR code, one quad per dark module.
+/// Always black (on the white it's put on): phones scan this, not people.
 pub(crate) fn qr_code(data: &[u8], side: f32) -> impl IntoElement {
+    qr_code_colored(data, side, gpui_kit::black())
+}
+
+/// [`qr_code`] in `color` (a username link's, Desktop's
+/// `BrandedQRCode`), still on white.
+pub(crate) fn qr_code_colored(data: &[u8], side: f32, color: gpui_kit::Hsla) -> impl IntoElement {
     let modules: Option<(usize, Vec<bool>)> = QrCode::new(data).ok().map(|code| {
         let width = code.width();
         let dark = code
@@ -120,8 +127,7 @@ pub(crate) fn qr_code(data: &[u8], side: f32) -> impl IntoElement {
                 if *is_dark {
                     let (x, y) = ((ix % width) as f32, (ix / width) as f32);
                     let quad = Bounds::new(origin + point(cell * x, cell * y), size(cell, cell));
-                    // Always black on white: phones scan this, not people.
-                    window.paint_quad(fill(quad, gpui_kit::black()));
+                    window.paint_quad(fill(quad, color));
                 }
             }
         },

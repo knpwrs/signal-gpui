@@ -103,6 +103,11 @@ const AVATAR_COLORS: [(u32, u32); 12] = [
     (0xD7D7D9, 0x5C5C5C),
 ];
 
+/// Signal's avatar color `index` as (background, foreground) RGB.
+pub fn avatar_rgb(index: u8) -> (u32, u32) {
+    AVATAR_COLORS[index as usize % AVATAR_COLORS.len()]
+}
+
 pub fn avatar_colors(index: u8) -> (Hsla, Hsla) {
     let (bg, fg) = AVATAR_COLORS[index as usize % AVATAR_COLORS.len()];
     (c(bg), c(fg))

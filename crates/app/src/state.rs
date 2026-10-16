@@ -144,6 +144,20 @@ pub enum AppEvent {
     Alert { title: SharedString, description: SharedString },
     /// A short note to show (Desktop's toasts).
     Info(SharedString),
+    /// Our profile, username or link changed (`AppState::own_profile`).
+    OwnProfileChanged,
+    /// Answer to writing our profile.
+    ProfileSaved(Result<(), String>),
+    /// Answer to reserving a username, for that nickname and digits.
+    UsernameReserved {
+        nickname: String,
+        discriminator: Option<String>,
+        result: Result<signal_backend::usernames::Reservation, signal_backend::usernames::UsernameProblem>,
+    },
+    /// Answer to confirming (`Some`) or deleting (`None`) our username.
+    UsernameSaved(Result<Option<String>, signal_backend::usernames::UsernameProblem>),
+    /// Answer to resetting our username link.
+    UsernameLinkReset(Result<(), String>),
 }
 
 /// The key transparency button in the safety number screen, in Desktop's
@@ -203,6 +217,8 @@ pub struct AppState {
     jump: Option<(ConversationId, i64)>,
     /// Downloaded profile photos by service id.
     person_avatars: HashMap<String, std::path::PathBuf>,
+    /// Our profile, username and link (`None` until read).
+    pub own_profile: Option<signal_backend::OwnProfile>,
     pub selected: Option<ConversationId>,
     /// Authors currently typing, per conversation, with expiry.
     typing: HashMap<ConversationId, Vec<(String, Instant)>>,
@@ -324,6 +340,7 @@ impl AppState {
             conversations: Vec::new(),
             archived: Vec::new(),
             person_avatars: HashMap::new(),
+            own_profile: None,
             jump: None,
             selected: None,
             typing: HashMap::new(),
@@ -636,6 +653,7 @@ impl AppState {
                 self.reload_conversations(cx);
                 self.reload_stories(cx);
                 self.reload_call_links(cx);
+                self.reload_own_profile(cx);
                 self.start_catch_up(cx);
             }
             Event::Connection(state) => {
@@ -791,14 +809,15 @@ impl AppState {
             Event::AuthorNamesChanged(names) => cx.emit(AppEvent::AuthorNamesChanged(names.into())),
             // Limits and features read it when drawn: just redraw.
             Event::RemoteConfigChanged => cx.emit(AppEvent::ConversationsChanged),
-            // Shown by the profile and contact views, added next.
-            Event::ProfileChanged(_)
-            | Event::OwnProfileChanged
-            | Event::BadgesChanged
-            | Event::ProfileSaved(_)
-            | Event::UsernameReserved { .. }
-            | Event::UsernameSaved(_)
-            | Event::UsernameLinkReset(_) => {}
+            // Shown by the contact views, added next.
+            Event::ProfileChanged(_) | Event::BadgesChanged => {}
+            Event::OwnProfileChanged => self.reload_own_profile(cx),
+            Event::ProfileSaved(result) => cx.emit(AppEvent::ProfileSaved(result)),
+            Event::UsernameReserved { nickname, discriminator, result } => {
+                cx.emit(AppEvent::UsernameReserved { nickname, discriminator, result })
+            }
+            Event::UsernameSaved(result) => cx.emit(AppEvent::UsernameSaved(result)),
+            Event::UsernameLinkReset(result) => cx.emit(AppEvent::UsernameLinkReset(result)),
             Event::Error(error) => {
                 tracing::warn!("backend error: {error}");
                 self.report_error(error, cx);
@@ -835,6 +854,7 @@ impl AppState {
                 self.conversations.clear();
                 self.archived.clear();
                 self.person_avatars.clear();
+                self.own_profile = None;
                 self.selected = None;
                 // The database was cleared; so are the next account's caches.
                 self.typing.clear();
@@ -1855,6 +1875,34 @@ impl AppState {
     pub fn take_jump(&mut self, conversation: &ConversationId) -> Option<i64> {
         let (_, id) = self.jump.take_if(|(c, _)| c == conversation)?;
         Some(id)
+    }
+
+    /// Reads our profile, username and link again.
+    pub fn reload_own_profile(&mut self, cx: &mut Context<Self>) {
+        let Some(aci) = self.account.as_ref().map(|a| a.aci.clone()) else { return };
+        let db = self.backend.db().clone();
+        let read = self.backend.spawn(async move { signal_backend::own_profile(&db, &aci).await });
+        cx.spawn(async move |this, cx| {
+            let profile = read.await;
+            let _ = this.update(cx, |this, cx| {
+                // Our photo is in the people's photos too.
+                if let Some(aci) = this.account.as_ref().map(|a| a.aci.clone()) {
+                    match &profile.photo {
+                        Some(photo) => this.person_avatars.insert(aci, photo.clone()),
+                        None => this.person_avatars.remove(&aci),
+                    };
+                }
+                this.own_profile = Some(profile);
+                cx.emit(AppEvent::OwnProfileChanged);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Our own service id.
+    pub fn our_aci(&self) -> Option<&str> {
+        self.account.as_ref().map(|a| a.aci.as_str())
     }
 
     /// Someone's downloaded profile photo.
