@@ -28,6 +28,7 @@ pub(super) fn render(settings: &Entity<Settings>, palette: Palette, cx: &mut App
     };
     let emoji_state = state.clone();
     let formatting_state = state.clone();
+    let spell_state = state.clone();
     let sync_state = state.clone();
     let pending = matches!(sync, ContactSync::Pending(_));
     div()
@@ -57,6 +58,16 @@ pub(super) fn render(settings: &Entity<Settings>, palette: Palette, cx: &mut App
             Some("Text input"),
             None,
             [
+                // Desktop applies it at the next start; here at once.
+                switch(
+                    "spell-check",
+                    "Spell check text entered in message composition box",
+                    None,
+                    prefs.on(Toggle::SpellCheck),
+                    false,
+                    palette,
+                    move |on, _, cx| spell_state.update(cx, |s, cx| s.set_toggle(Toggle::SpellCheck, on, cx)),
+                ),
                 switch(
                     "text-formatting",
                     "Show text formatting popover when text is selected",

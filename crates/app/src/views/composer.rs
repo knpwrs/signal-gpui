@@ -39,6 +39,31 @@ gpui_kit::actions!(composer, [RecordVoice]);
 // Desktop's large composer (`CompositionArea`'s `large`, ⌘⇧K; bound in
 // `shortcuts.rs`).
 gpui_kit::actions!(composer, [ToggleLargeComposer]);
+// The spell check menu's disabled "No Suggestions".
+gpui_kit::actions!(composer, [NoSuggestions]);
+
+/// A spelling suggestion picked from the input's menu: `word`, at `range`
+/// (bytes), becomes `replacement` (Desktop's `replaceMisspelling`).
+#[derive(Clone, PartialEq, Debug, gpui_kit::Action)]
+#[action(namespace = composer, no_json)]
+pub struct ReplaceMisspelling {
+    pub range: Range<usize>,
+    pub word: String,
+    pub replacement: String,
+}
+
+/// How long typing pauses before the text is spell checked.
+const SPELL_CHECK_PAUSE: Duration = Duration::from_millis(400);
+
+/// What the spell checker last found, and in which text.
+#[derive(Default)]
+struct Spelling {
+    checked: String,
+    found: Vec<Range<usize>>,
+    /// The misspellings underlined in the last frame.
+    marked: Vec<Range<usize>>,
+    _task: Option<Task<()>>,
+}
 
 /// The large composer's rows: Desktop's 212px input at 20px lines.
 const LARGE_ROWS: usize = 10;
@@ -190,6 +215,7 @@ pub struct Composer {
     large: bool,
     /// The pointer is over the composer (Desktop shows its expand tab then).
     hovered: bool,
+    spelling: Spelling,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -314,11 +340,100 @@ impl Composer {
             recording_focus: cx.focus_handle(),
             large: false,
             hovered: false,
+            spelling: Spelling::default(),
             _recording_poll: None,
             _subscriptions: subscriptions,
         };
         this.load_members(cx);
         this
+    }
+
+    /// Spell checks the text once typing pauses, off the main thread; a
+    /// result for text that has changed since is dropped.
+    fn check_spelling_later(&mut self, text: String, cx: &mut Context<Self>) {
+        if !self.state.read(cx).prefs.on(crate::prefs::Toggle::SpellCheck) || text.trim().is_empty() {
+            self.spelling = Spelling { checked: text, ..Default::default() };
+            return;
+        }
+        self.spelling._task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SPELL_CHECK_PAUSE).await;
+            let checked = text.clone();
+            let found = cx.background_executor().spawn(async move { crate::spelling::check(&checked) }).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.input.read(cx).value().as_ref() == text.as_str() {
+                    this.spelling.checked = text;
+                    this.spelling.found = found;
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    /// The misspellings to underline now: carried over to the text as it
+    /// is, without mentions, links, or the word being typed.
+    fn marked_misspellings(&self, cx: &App) -> Vec<Range<usize>> {
+        if !self.state.read(cx).prefs.on(crate::prefs::Toggle::SpellCheck) {
+            return Vec::new();
+        }
+        let input = self.input.read(cx);
+        let text = input.value().to_string();
+        let found = crate::spelling::carry_over(&self.spelling.checked, &self.spelling.found, &text);
+        let mut skip: Vec<Range<usize>> = crate::views::common::find_links(&text).into_iter().map(|(r, _)| r).collect();
+        for (label, _) in &self.mentions {
+            skip.extend(text.match_indices(label.as_str()).map(|(at, m)| at..at + m.len()));
+        }
+        let selection = input.selected_range();
+        let caret = selection.is_empty().then(|| input.cursor());
+        crate::spelling::marked(&found, &skip, caret)
+    }
+
+    /// Desktop's spell check menu (`app/spell_check.main.ts`): on a
+    /// misspelled word, its suggestions (or a disabled "No Suggestions"),
+    /// then Undo, Redo, Cut, Copy, Paste and Select All. (No "Add to
+    /// dictionary", as Desktop.)
+    fn spelling_menu(
+        &self,
+        menu: gpui_kit::component::native_menu::NativeMenu,
+        cx: &App,
+    ) -> gpui_kit::component::native_menu::NativeMenu {
+        use gpui_kit::component::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
+        let input = self.input.read(cx);
+        let text = input.value().to_string();
+        let selected = !input.selected_range().is_empty();
+        let mut menu = menu;
+        if let Some(range) = crate::spelling::at(&self.spelling.marked, input.cursor()) {
+            let word = text.get(range.clone()).unwrap_or_default().to_owned();
+            let guesses = crate::spelling::guesses(&text, range.clone());
+            if guesses.is_empty() {
+                menu = menu.menu_with_disabled("No Suggestions", true, Box::new(NoSuggestions));
+            }
+            for guess in guesses {
+                let action = ReplaceMisspelling { range: range.clone(), word: word.clone(), replacement: guess.clone() };
+                menu = menu.menu(guess, Box::new(action));
+            }
+            menu = menu.separator();
+        }
+        menu.menu("Undo", Box::new(Undo))
+            .menu("Redo", Box::new(Redo))
+            .separator()
+            .menu_with_disabled("Cut", !selected, Box::new(Cut))
+            .menu_with_disabled("Copy", !selected, Box::new(Copy))
+            .menu("Paste", Box::new(Paste))
+            .menu("Select All", Box::new(SelectAll))
+    }
+
+    /// A suggestion picked: the word is replaced, if it's still there, as
+    /// an edit that Undo takes back.
+    fn replace_misspelling(&mut self, action: &ReplaceMisspelling, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_kit::EntityInputHandler as _;
+        let text = self.input.read(cx).value().to_string();
+        if text.get(action.range.clone()) != Some(action.word.as_str()) {
+            return;
+        }
+        let start = text[..action.range.start].encode_utf16().count();
+        let end = start + action.word.encode_utf16().count();
+        self.input.update(cx, |input, cx| input.replace_text_in_range(Some(start..end), &action.replacement, window, cx));
+        self.on_change(window, cx);
     }
 
     /// Desktop's expand and collapse (`handleToggleLarge`).
@@ -464,6 +579,7 @@ impl Composer {
         if text.is_empty() {
             self.mentions.clear();
         }
+        self.check_spelling_later(text.clone(), cx);
         self.update_typeahead(&text, cursor, cx);
         self.update_link_preview(&text, cx);
         self.update_typing(!text.trim().is_empty(), cx);
@@ -1681,6 +1797,7 @@ impl Focusable for Composer {
 impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::get(cx);
+        self.spelling.marked = self.marked_misspellings(cx);
         let typeahead_open = self.typeahead.is_some();
         let can_send =
             !self.input.read(cx).value().trim().is_empty() || !self.images.is_empty() || !self.files.is_empty();
@@ -1695,6 +1812,7 @@ impl Render for Composer {
             .on_action(cx.listener(|this, _: &FormatSpoiler, window, cx| this.format(TextStyle::Spoiler, window, cx)))
             .on_action(cx.listener(|this, _: &RecordVoice, window, cx| this.start_recording(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleLargeComposer, _, cx| this.set_large(!this.large, cx)))
+            .on_action(cx.listener(|this, action: &ReplaceMisspelling, window, cx| this.replace_misspelling(action, window, cx)))
             .id("composer")
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                 this.hovered = *hovered;
@@ -1831,15 +1949,28 @@ impl Render for Composer {
                     .child(Icon::new(IconName::FaceSlightlySmiling).size_5().text_color(palette.text_secondary));
                 // One line tall when empty, like Signal Desktop: the pill
                 // supplies the padding, the textarea none.
+                let composer = cx.entity().downgrade();
                 let input = div()
                     .debug_selector(|| "composer-input".into())
+                    .relative()
                     .flex_1()
                     .min_w_0()
                     .px(px(12.))
                     .py(px(6.))
                     .rounded(px(16.))
                     .bg(palette.input_bg)
-                    .child(Textarea::new(&self.input).appearance(false).xsmall().text_size(px(14.5)).line_height(px(20.)));
+                    .child(
+                        Textarea::new(&self.input)
+                            .appearance(false)
+                            .xsmall()
+                            .text_size(px(14.5))
+                            .line_height(px(20.))
+                            .context_menu(move |menu, _, cx| match composer.upgrade() {
+                                Some(composer) => composer.read(cx).spelling_menu(menu, cx),
+                                None => menu,
+                            }),
+                    )
+                    .child(self.render_misspellings(palette));
                 let send = div()
                     .id("send-button")
                     .flex_none()
@@ -1973,6 +2104,36 @@ impl Composer {
             )
             .into_any_element(),
         )
+    }
+
+    /// Chromium's red wavy underline under each misspelled word, drawn over
+    /// the input from its laid-out text (the input itself has no hook for
+    /// it), clipped to what the input shows.
+    fn render_misspellings(&self, palette: Palette) -> impl IntoElement {
+        let (input, marked, color) = (self.input.clone(), self.spelling.marked.clone(), palette.danger);
+        gpui_kit::canvas(
+            |_, _, _| (),
+            move |_, _, window, cx| {
+                if marked.is_empty() {
+                    return;
+                }
+                let input = input.read(cx);
+                let clip = gpui_kit::ContentMask { bounds: input.input_bounds() };
+                let style = gpui_kit::UnderlineStyle { thickness: px(1.), color: Some(color), wavy: true };
+                window.with_content_mask(Some(clip), |window| {
+                    for range in &marked {
+                        let Some(bounds) = input.range_to_bounds(range) else { continue };
+                        // A word broken across lines isn't marked.
+                        if bounds.size.height > px(30.) || bounds.size.width <= px(0.) {
+                            continue;
+                        }
+                        window.paint_underline(gpui_kit::point(bounds.left(), bounds.bottom() - px(3.)), bounds.size.width, &style);
+                    }
+                });
+            },
+        )
+        .absolute()
+        .inset_0()
     }
 
     /// Desktop hides the expand tab while view-once is on.
@@ -2772,6 +2933,52 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(sent.get(), 1);
         assert_eq!(text(&f, cx), "");
+    }
+
+    #[gpui_kit::test]
+    fn misspellings_are_marked_once_typing_pauses_and_replaced_from_the_menu(cx: &mut TestAppContext) {
+        let f = mount(cx);
+        let target = input_id(&f, cx);
+        let mut vcx = gpui_kit::VisualTestContext::from_window(f.window, cx);
+        vcx.update(|window, cx| {
+            window.click(target.clone(), cx);
+            window.input("Thiss is a tesst ", cx);
+        });
+        let marked = |cx: &mut gpui_kit::VisualTestContext| {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            cx.update(|_, cx| f.composer.read(cx).spelling.marked.clone())
+        };
+        assert!(marked(&mut vcx).is_empty(), "not while typing");
+        vcx.executor().advance_clock(SPELL_CHECK_PAUSE + Duration::from_millis(50));
+        let mut found = Vec::new();
+        for _ in 0..200 {
+            found = marked(&mut vcx);
+            if found.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // macOS's checker: only these obvious misspellings are relied on.
+        assert!(found.contains(&(0..5)) && found.contains(&(11..16)), "{found:?}");
+
+        let replace = ReplaceMisspelling { range: 11..16, word: "tesst".into(), replacement: "test".into() };
+        vcx.update(|window, cx| window.dispatch_action(Box::new(replace.clone()), cx));
+        vcx.run_until_parked();
+        assert_eq!(text(&f, cx), "Thiss is a test ");
+        // The marks it no longer fits go at once.
+        let mut vcx = gpui_kit::VisualTestContext::from_window(f.window, cx);
+        assert!(!marked(&mut vcx).contains(&(11..16)));
+        // A replacement for a word that's gone does nothing.
+        vcx.update(|window, cx| window.dispatch_action(Box::new(replace), cx));
+        vcx.run_until_parked();
+        assert_eq!(text(&f, cx), "Thiss is a test ");
+
+        // Off in Settings: nothing is marked.
+        let state = cx.update(|cx| f.composer.read(cx).state.clone());
+        cx.update(|cx| state.update(cx, |s, cx| s.set_toggle(crate::prefs::Toggle::SpellCheck, false, cx)));
+        let mut vcx = gpui_kit::VisualTestContext::from_window(f.window, cx);
+        assert!(marked(&mut vcx).is_empty());
     }
 
     #[gpui_kit::test]

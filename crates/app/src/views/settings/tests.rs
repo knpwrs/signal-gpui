@@ -165,6 +165,8 @@ fn chat_folders_are_made_from_suggestions_and_the_editor(cx: &mut TestAppContext
     // The demo's sync made "All chats"; no custom folder yet.
     assert!(wait(cx, |cx| h.state.read_with(cx, |s, _| !s.current_folders().is_empty())));
     assert_eq!(h.value(cx, "chat-folders-settings"), None);
+    // Below the text input switches.
+    h.scroll_down(cx);
     h.click(cx, "chat-folders-settings");
     assert_eq!(cx.read(|cx| h.settings.read(cx).page), Page::ChatFolders);
     assert!(h.shown(cx, "chat-folder-suggest-groups") && h.shown(cx, "chat-folder-0"));
@@ -349,6 +351,12 @@ fn chats_toggles_save_and_contacts_import(cx: &mut TestAppContext) {
     assert_eq!(h.value(cx, "keep-muted-chats-archived").as_deref(), Some("off"));
     assert_eq!(h.value(cx, "address-book-photos").as_deref(), Some("off"));
     assert_eq!(h.value(cx, "auto-convert-emoji").as_deref(), Some("on"));
+    // This device's spell check and formatting popover, on by default.
+    assert_eq!(h.value(cx, "spell-check").as_deref(), Some("on"));
+    assert_eq!(h.value(cx, "text-formatting").as_deref(), Some("on"));
+    h.click(cx, "spell-check");
+    h.click(cx, "text-formatting");
+    assert!(wait(cx, |_| h.stored("spell_check").as_deref() == Some("false") && h.stored("text_formatting").as_deref() == Some("false")));
     h.click(cx, "keep-muted-chats-archived");
     h.click(cx, "address-book-photos");
     h.click(cx, "link-previews");
