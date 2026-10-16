@@ -264,6 +264,56 @@ impl<C: CredentialsCache> GroupsManager<C> {
         self.identified_push_service.get_group(authorization).await
     }
 
+    /// signal-gpui: the group (encrypted) and its members' send
+    /// endorsements, verified for its full members (us included), as
+    /// Desktop's `maybeUpdateGroup` takes them from `GET /v2/groups/`.
+    /// `None` when the server sent no endorsements (an ended group).
+    pub async fn fetch_group_send_endorsements<R: Rng + CryptoRng>(
+        &mut self,
+        csprng: &mut R,
+        master_key_bytes: &[u8],
+        now_seconds: u64,
+    ) -> Result<
+        (Group, Option<super::endorsements::GroupSendEndorsements>),
+        ServiceError,
+    > {
+        let group_master_key = GroupMasterKey::new(
+            master_key_bytes
+                .try_into()
+                .map_err(|_| ServiceError::GroupsV2Error)?,
+        );
+        let group_secret_params =
+            GroupSecretParams::derive_from_master_key(group_master_key);
+        let authorization = self
+            .get_authorization_for_today(csprng, group_secret_params)
+            .await?;
+        let response = self
+            .identified_push_service
+            .get_group_with_endorsements(authorization)
+            .await?;
+        let encrypted = response.group.ok_or(ServiceError::GroupsV2Error)?;
+        let group = GroupOperations::new(group_secret_params)
+            .decrypt_group(encrypted)?;
+        if response.group_send_endorsements_response.is_empty() {
+            return Ok((group, None));
+        }
+        let members: Vec<libsignal_core::Aci> =
+            group.members.iter().map(|m| m.aci).collect();
+        let endorsements = super::endorsements::GroupSendEndorsements::receive(
+            &response.group_send_endorsements_response,
+            &members,
+            self.service_ids.aci(),
+            &group_secret_params,
+            &self.server_public_params,
+            now_seconds,
+        )
+        .map_err(|error| {
+            tracing::warn!(%error, "group send endorsements didn't verify");
+            ServiceError::GroupsV2Error
+        })?;
+        Ok((group, Some(endorsements)))
+    }
+
     #[tracing::instrument(
         skip(self, group_secret_params),
         fields(path = %path[..4.min(path.len())]),

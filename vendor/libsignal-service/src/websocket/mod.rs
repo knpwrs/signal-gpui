@@ -32,7 +32,7 @@ pub mod profile;
 pub mod registration;
 pub mod remote_config;
 mod request;
-mod sender;
+pub mod sender;
 pub mod stickers;
 mod usernames;
 

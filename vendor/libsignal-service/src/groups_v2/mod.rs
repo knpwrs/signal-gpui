@@ -1,4 +1,5 @@
 //! Everything needed to support [Signal Groups v2](https://signal.org/blog/new-groups/)
+pub mod endorsements;
 mod manager;
 mod model;
 mod operations;

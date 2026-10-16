@@ -27,7 +27,6 @@ error_mapper! {
 // Signal-Server: controllers/MessageController.java:466
 // (PUT /v1/messages/multi_recipient)
 error_mapper! {
-    #[allow(dead_code)]
     put_multi_recipient_messages_errors:
         // 409: mismatched devices, MessageController.java:670
         CONFLICT => MultiRecipientMismatchedDevices(Vec<crate::push_service::AccountMismatchedDevices>),
@@ -74,16 +73,89 @@ impl<C: WebSocketType> SignalWebSocket<C> {
         messages: OutgoingPushMessages,
         access: &UnidentifiedAccess,
     ) -> Result<SendMessageResponse, ServiceError> {
-        let request = WebSocketRequestMessage::new(Method::PUT)
-            .path(format!(
-                "/v1/messages/{}",
-                messages.destination.service_id_string()
-            ))
-            .header(
+        let builder = WebSocketRequestMessage::new(Method::PUT).path(format!(
+            "/v1/messages/{}",
+            messages.destination.service_id_string()
+        ));
+        // signal-gpui: a group send endorsement stands in for the access
+        // key (libsignal-net's `UserBasedSendAuthorization`).
+        let builder = match &access.group_send_token {
+            Some(token) => builder
+                .header("Group-Send-Token", BASE64_RELAXED.encode(token)),
+            None => builder.header(
                 "Unidentified-Access-Key",
                 BASE64_RELAXED.encode(&access.key),
-            )
-            .json(&messages)?;
+            ),
+        };
+        let request = builder.json(&messages)?;
         self.request_json_with(request, put_messages_errors).await
     }
+
+    /// signal-gpui: one sealed sender message for many recipients
+    /// (`PUT /v1/messages/multi_recipient`), as libsignal-net's
+    /// `send_multi_recipient_message` sends it. Returns the recipients the
+    /// server says aren't registered.
+    pub async fn send_multi_recipient_message(
+        &mut self,
+        payload: Vec<u8>,
+        timestamp: u64,
+        auth: &MultiRecipientAuth,
+        online: bool,
+        urgent: bool,
+    ) -> Result<MultiRecipientResponse, ServiceError> {
+        let request =
+            multi_recipient_request(payload, timestamp, auth, online, urgent);
+        self.request_json_with(request, put_multi_recipient_messages_errors)
+            .await
+    }
+}
+
+/// signal-gpui: how a multi-recipient send is authorized.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MultiRecipientAuth {
+    /// A story: no authorization, and the story flag.
+    Story,
+    /// A group message: a serialized `GroupSendFullToken` for every
+    /// recipient, from the group's send endorsements.
+    GroupSendToken(Vec<u8>),
+}
+
+/// signal-gpui: the server's answer to a multi-recipient send.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct MultiRecipientResponse {
+    /// Recipients that aren't registered (service id strings).
+    #[serde(default)]
+    pub uuids404: Vec<String>,
+}
+
+/// The content type of a multi-recipient message.
+pub const MULTI_RECIPIENT_CONTENT_TYPE: &str =
+    "application/vnd.signal-messenger.mrm";
+
+/// signal-gpui: the request libsignal-net makes for a multi-recipient send
+/// (`rust/net/chat/src/ws/messages.rs`): the query carries the timestamp,
+/// `online` and `urgent`, and `story=true` for a story; a group message
+/// carries its token, base64, in `Group-Send-Token`.
+pub fn multi_recipient_request(
+    payload: Vec<u8>,
+    timestamp: u64,
+    auth: &MultiRecipientAuth,
+    online: bool,
+    urgent: bool,
+) -> WebSocketRequestMessage {
+    let story = if matches!(auth, MultiRecipientAuth::Story) {
+        "&story=true"
+    } else {
+        ""
+    };
+    let builder = WebSocketRequestMessage::new(Method::PUT).path(format!(
+        "/v1/messages/multi_recipient?ts={timestamp}&online={online}&urgent={urgent}{story}"
+    ));
+    let builder = match auth {
+        MultiRecipientAuth::Story => builder,
+        MultiRecipientAuth::GroupSendToken(token) => {
+            builder.header("Group-Send-Token", BASE64_RELAXED.encode(token))
+        },
+    };
+    builder.body(MULTI_RECIPIENT_CONTENT_TYPE, payload)
 }

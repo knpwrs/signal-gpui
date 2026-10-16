@@ -52,6 +52,17 @@ impl WebSocketRequestMessageBuilder {
         Ok(self.header("content-type", "application/json").request)
     }
 
+    /// signal-gpui: a raw body with its content type (a multi-recipient
+    /// message is `application/vnd.signal-messenger.mrm`).
+    pub fn body(
+        mut self,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> WebSocketRequestMessage {
+        self.request.body = Some(body);
+        self.header("content-type", content_type).request
+    }
+
     pub fn build(self) -> WebSocketRequestMessage {
         self.request
     }

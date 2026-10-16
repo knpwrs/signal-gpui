@@ -57,7 +57,32 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, trace, warn};
 use url::Url;
 
+use libsignal_service::{
+    groups_v2::endorsements::GroupSendEndorsements,
+    sender::{
+        sender_key::{SenderKeyInfo, SenderKeyOutcome},
+        GroupSenderKey, SendMessageResult,
+    },
+};
+use std::collections::HashSet;
+
 use crate::model::contacts::Contact;
+
+/// signal-gpui: how a group message went
+/// ([`Manager::send_message_to_group_with_sender_key`]).
+#[derive(Debug, Default)]
+pub struct GroupSendSummary {
+    /// Members sent to (not us).
+    pub recipients: usize,
+    /// Reached with the one sender key message.
+    pub via_sender_key: usize,
+    /// Not registered any more (skipped).
+    pub unregistered: usize,
+    /// Why the sender key send fell over to one by one, if it did.
+    pub fell_over: Option<String>,
+    /// Each recipient's result, those sent to one by one included.
+    pub results: Vec<(ServiceId, Result<(), MessageSenderError>)>,
+}
 use crate::serde::serde_profile_key;
 use crate::store::{ContentsStore, Sticker, StickerPack, StickerPackManifest, Store, Thread};
 use crate::{model::groups::Group, AvatarBytes, Error, Manager};
@@ -1164,6 +1189,7 @@ impl<S: Store> Manager<S, Registered> {
             .map(|profile_key| UnidentifiedAccess {
                 key: profile_key.derive_access_key().to_vec(),
                 certificate: sender_certificate.clone(),
+                group_send_token: None,
             });
 
         // we need to put our profile key in DataMessage
@@ -1290,6 +1316,47 @@ impl<S: Store> Manager<S, Registered> {
         timestamp: u64,
         only: Option<&[ServiceId]>,
     ) -> Result<Vec<(ServiceId, Result<(), MessageSenderError>)>, Error<S::Error>> {
+        self.send_message_to_group_inner(master_key_bytes, message, timestamp, only, None)
+            .await
+            .map(|summary| summary.results)
+    }
+
+    /// signal-gpui: [`Self::send_message_to_group_members`] with our sender
+    /// key (`info`, kept by the caller and updated here, also when the send
+    /// fails) and the group's send endorsements, as Desktop sends to a
+    /// group (`sendContentMessageToGroup`). With `only`, it's a partial
+    /// send (Desktop's `isPartialSend`): members left out keep our key.
+    /// Members we have no profile key for are sent to one by one with their
+    /// endorsement, when we have one. The summary has each recipient's
+    /// result, also for those sent to one by one; an `Err` means nobody was
+    /// sent the message.
+    pub async fn send_message_to_group_with_sender_key(
+        &mut self,
+        master_key_bytes: &[u8],
+        message: impl Into<ContentBody>,
+        timestamp: u64,
+        only: Option<&[ServiceId]>,
+        info: &mut SenderKeyInfo,
+        endorsements: Option<&GroupSendEndorsements>,
+    ) -> Result<GroupSendSummary, Error<S::Error>> {
+        self.send_message_to_group_inner(
+            master_key_bytes,
+            message,
+            timestamp,
+            only,
+            Some((info, endorsements)),
+        )
+        .await
+    }
+
+    async fn send_message_to_group_inner(
+        &mut self,
+        master_key_bytes: &[u8],
+        message: impl Into<ContentBody>,
+        timestamp: u64,
+        only: Option<&[ServiceId]>,
+        sender_key: Option<(&mut SenderKeyInfo, Option<&GroupSendEndorsements>)>,
+    ) -> Result<GroupSendSummary, Error<S::Error>> {
         let mut content_body = message.into();
         let master_key_bytes = master_key_bytes
             .try_into()
@@ -1309,43 +1376,100 @@ impl<S: Store> Manager<S, Registered> {
         };
 
         let sender_certificate = self.sender_certificate().await?;
+        let our_aci = self.state.data.service_ids.aci();
+        let group_secret_params =
+            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key_bytes));
+        let endorsements = sender_key.as_ref().and_then(|(_, e)| *e);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_millis() as u64;
         let mut recipients = Vec::new();
         for member in group
             .members
             .into_iter()
-            .filter(|m| m.aci != self.state.data.service_ids.aci())
+            .filter(|m| m.aci != our_aci)
             .filter(|m| only.is_none_or(|only| only.contains(&ServiceId::from(m.aci))))
         {
-            let unidentified_access =
-                self.store
-                    .profile_key(&member.aci.into())
-                    .await?
-                    .map(|profile_key| UnidentifiedAccess {
-                        key: profile_key.derive_access_key().to_vec(),
+            let member_id: ServiceId = member.aci.into();
+            let unidentified_access = match self.store.profile_key(&member_id).await? {
+                Some(profile_key) => Some(UnidentifiedAccess {
+                    key: profile_key.derive_access_key().to_vec(),
+                    certificate: sender_certificate.clone(),
+                    group_send_token: None,
+                }),
+                // signal-gpui: Desktop's `getSendOptions` sends with the
+                // member's endorsement when there's no access key to use.
+                None => endorsements
+                    .filter(|e| e.has_member(&member_id))
+                    .and_then(|e| {
+                        e.build_token(
+                            &HashSet::from([member_id]),
+                            our_aci,
+                            &group_secret_params,
+                            now_ms / 1000,
+                        )
+                        .ok()
+                    })
+                    .map(|token| UnidentifiedAccess {
+                        key: Vec::new(),
                         certificate: sender_certificate.clone(),
-                    });
+                        group_send_token: Some(token),
+                    }),
+            };
             let include_pni_signature = false;
-            recipients.push((
-                member.aci.into(),
-                unidentified_access,
-                include_pni_signature,
-            ));
+            recipients.push((member_id, unidentified_access, include_pni_signature));
         }
 
         let online_only = false;
-        let results = sender
-            .send_message_to_group(&recipients, content_body.clone(), timestamp, online_only)
-            .await;
-
-        let results: Vec<(ServiceId, Result<(), MessageSenderError>)> = recipients
+        let mut summary = GroupSendSummary::default();
+        let results: Vec<(ServiceId, SendMessageResult)> = match sender_key {
+            None => {
+                let results = sender
+                    .send_message_to_group(&recipients, content_body.clone(), timestamp, online_only)
+                    .await;
+                recipients
+                    .iter()
+                    .map(|(recipient, _, _)| *recipient)
+                    .zip(results)
+                    .collect()
+            }
+            Some((info, endorsements)) => {
+                let report = sender
+                    .send_message_to_group_with_sender_key(
+                        &recipients,
+                        content_body.clone(),
+                        timestamp,
+                        online_only,
+                        GroupSenderKey {
+                            info,
+                            group_secret_params,
+                            certificate: sender_certificate.clone(),
+                            endorsements,
+                            now_ms,
+                            partial: only.is_some(),
+                        },
+                    )
+                    .await?;
+                summary.via_sender_key = report.via_sender_key;
+                summary.fell_over = report.fell_over;
+                report.results
+            }
+        };
+        summary.recipients = recipients.len();
+        summary.unregistered = results
             .iter()
-            .map(|(recipient, _, _)| *recipient)
-            .zip(results.into_iter().map(|result| result.map(|_| ())))
+            .filter(|(_, r)| matches!(r, Err(MessageSenderError::NotFound { .. })))
+            .count();
+
+        summary.results = results
+            .into_iter()
+            .map(|(recipient, result)| (recipient, result.map(|_| ())))
             .collect();
         // As before: nothing is stored when the first failure (other than
         // an unregistered member) would have failed the whole send.
-        if results.iter().any(|(_, r)| matches!(r, Err(e) if !matches!(e, MessageSenderError::NotFound { .. }))) {
-            return Ok(results);
+        if summary.results.iter().any(|(_, r)| matches!(r, Err(e) if !matches!(e, MessageSenderError::NotFound { .. }))) {
+            return Ok(summary);
         }
 
         let content = Content {
@@ -1374,7 +1498,92 @@ impl<S: Store> Manager<S, Registered> {
         )
         .await?;
 
-        Ok(results)
+        Ok(summary)
+    }
+
+    /// signal-gpui: a story (or group story) to `recipients` with our
+    /// sender key for `info`'s distribution (`group`: the group's master
+    /// key, for a group story), as Desktop's `sendStory` sends one. Our
+    /// profile key goes in it, as in [`Self::send_story`]. Nobody is sent to
+    /// one by one and no sync message is sent: the inner result says who's
+    /// left, or why it failed (and whether to fall over to one by one,
+    /// [`MessageSenderError::sender_key_may_fall_over`]). `info` is updated
+    /// either way.
+    pub async fn send_story_with_sender_key(
+        &mut self,
+        recipients: &[ServiceId],
+        message: impl Into<ContentBody>,
+        timestamp: u64,
+        info: &mut SenderKeyInfo,
+        group: Option<&[u8]>,
+    ) -> Result<Result<SenderKeyOutcome, MessageSenderError>, Error<S::Error>> {
+        let mut sender = self.new_message_sender().await?;
+        let mut content_body: ContentBody = message.into();
+        if let ContentBody::StoryMessage(story) = &mut content_body {
+            story
+                .profile_key
+                .get_or_insert(self.state.data.profile_key().get_bytes().to_vec());
+        }
+        let sender_certificate = self.sender_certificate().await?;
+        let group_secret_params = match group {
+            Some(key) => Some(GroupSecretParams::derive_from_master_key(GroupMasterKey::new(
+                key.try_into().map_err(|_| Error::UnknownGroup)?,
+            ))),
+            None => None,
+        };
+        // A group story's distribution messages go as ordinary messages.
+        let mut with_access = Vec::with_capacity(recipients.len());
+        for recipient in recipients {
+            let access = match group {
+                Some(_) => self.store.profile_key(recipient).await?.map(|profile_key| {
+                    UnidentifiedAccess {
+                        key: profile_key.derive_access_key().to_vec(),
+                        certificate: sender_certificate.clone(),
+                        group_send_token: None,
+                    }
+                }),
+                None => None,
+            };
+            with_access.push((*recipient, access));
+        }
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_millis() as u64;
+        Ok(sender
+            .send_story_with_sender_key(
+                &with_access,
+                content_body,
+                timestamp,
+                info,
+                group_secret_params,
+                &sender_certificate,
+                now_ms,
+            )
+            .await)
+    }
+
+    /// signal-gpui: the group's send endorsements, fetched with its state
+    /// (which is saved, being the newest), as Desktop refreshes them when
+    /// they're missing or about to expire (`maybeCreateGroupSendEndorsementState`).
+    /// `None` when the server sent none.
+    pub async fn group_send_endorsements(
+        &mut self,
+        master_key_bytes: &[u8],
+    ) -> Result<Option<GroupSendEndorsements>, Error<S::Error>> {
+        let master_key: [u8; 32] = master_key_bytes.try_into().map_err(|_| Error::UnknownGroup)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_secs();
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        let (group, endorsements) = groups_manager
+            .fetch_group_send_endorsements(&mut rand::rng(), &master_key, now)
+            .await?;
+        if let Err(error) = self.store.save_group(master_key, group).await {
+            error!(%error, "failed to save group");
+        }
+        Ok(endorsements)
     }
 
     async fn restore_thread_timer(&mut self, thread: &Thread, content_body: &mut ContentBody) {

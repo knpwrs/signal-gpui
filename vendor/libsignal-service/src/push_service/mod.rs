@@ -59,16 +59,18 @@ pub enum AvatarWrite<C> {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MismatchedDevices {
-    #[serde(with = "serde_device_id_vec")]
+    // signal-gpui: either list may be left out of a multi-recipient 409
+    // (Desktop's `multiRecipient409ResponseSchema` has both optional).
+    #[serde(with = "serde_device_id_vec", default)]
     pub missing_devices: Vec<DeviceId>,
-    #[serde(with = "serde_device_id_vec")]
+    #[serde(with = "serde_device_id_vec", default)]
     pub extra_devices: Vec<DeviceId>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StaleDevices {
-    #[serde(with = "serde_device_id_vec")]
+    #[serde(with = "serde_device_id_vec", default)]
     pub stale_devices: Vec<DeviceId>,
 }
 
@@ -196,6 +198,25 @@ impl PushService {
         self.request(
             Method::GET,
             Endpoint::storage("/v1/groups/"),
+            HttpAuthOverride::Identified(credentials),
+        )?
+        .send()
+        .await?
+        .service_error_for_status()
+        .await?
+        .protobuf()
+        .await
+    }
+
+    /// signal-gpui: the group with its send endorsements, as Desktop
+    /// fetches it (`getGroup`, `GET /v2/groups/`, a `GroupResponse`).
+    pub(crate) async fn get_group_with_endorsements(
+        &mut self,
+        credentials: HttpAuth,
+    ) -> Result<crate::proto::GroupResponse, ServiceError> {
+        self.request(
+            Method::GET,
+            Endpoint::storage("/v2/groups/"),
             HttpAuthOverride::Identified(credentials),
         )?
         .send()

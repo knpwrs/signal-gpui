@@ -674,6 +674,12 @@ struct Plaintext {
     message: crate::proto::Content,
 }
 
+/// signal-gpui: a message padded to a multiple of 160 bytes, as for a
+/// current session (Desktop's `padMessage`, for sender key messages).
+pub(crate) fn pad_message(contents: &[u8]) -> Vec<u8> {
+    add_padding(3, contents).expect("version 3 pads")
+}
+
 #[expect(clippy::comparison_chain)]
 fn add_padding(version: u32, contents: &[u8]) -> Result<Vec<u8>, ServiceError> {
     if version < 2 {

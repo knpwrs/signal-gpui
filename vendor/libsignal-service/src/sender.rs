@@ -1,17 +1,50 @@
-use std::{collections::HashSet, time::SystemTime};
+use std::{
+    collections::{HashMap, HashSet},
+    time::SystemTime,
+};
 
 use chrono::prelude::*;
 use libsignal_core::{curve::CurveError, InvalidDeviceId};
 use libsignal_protocol::{
-    process_prekey_bundle, Aci, DeviceId, IdentityKey, IdentityKeyPair, Pni,
-    ProtocolStore, SenderCertificate, SenderKeyStore, ServiceId,
-    SessionNotFound, SignalProtocolError,
+    process_prekey_bundle, Aci, ContentHint, DeviceId, IdentityKey,
+    IdentityKeyPair, Pni, ProtocolStore, SenderCertificate, SenderKeyStore,
+    ServiceId, SessionNotFound, SignalProtocolError,
 };
 use rand::{rng, CryptoRng, Rng};
 use tracing::{debug, error, info, trace, warn};
 use tracing_futures::Instrument;
 use uuid::Uuid;
-use zkgroup::GROUP_IDENTIFIER_LEN;
+use zkgroup::{groups::GroupSecretParams, GROUP_IDENTIFIER_LEN};
+
+pub mod sender_key;
+
+/// signal-gpui: what a group message needs to go with our sender key.
+pub struct GroupSenderKey<'a> {
+    /// Who has our key for this group; updated as the send goes.
+    pub info: &'a mut sender_key::SenderKeyInfo,
+    pub group_secret_params: GroupSecretParams,
+    pub certificate: SenderCertificate,
+    /// The group's send endorsements; without them it goes one by one.
+    pub endorsements:
+        Option<&'a crate::groups_v2::endorsements::GroupSendEndorsements>,
+    /// Milliseconds since the Unix epoch.
+    pub now_ms: u64,
+    /// Sending to only some members (Desktop's `isPartialSend`, a retry to
+    /// those an earlier send missed): members left out keep our key.
+    pub partial: bool,
+}
+
+/// signal-gpui: how a group message went.
+#[derive(Debug)]
+pub struct GroupSendReport {
+    /// One per recipient (those reached by sender key first), with whom
+    /// it's for.
+    pub results: Vec<(ServiceId, SendMessageResult)>,
+    /// How many were reached with the one sender key message.
+    pub via_sender_key: usize,
+    /// Why it went one by one instead, if it did.
+    pub fell_over: Option<String>,
+}
 
 use crate::{
     cipher::{get_preferred_protocol_address, ServiceCipher},
@@ -144,6 +177,19 @@ pub enum MessageSenderError {
 
     #[error("no messages were encrypted: this should not really happen and most likely implies a logic error")]
     NoMessagesToSend,
+
+    // signal-gpui: sender key sends (`sender::sender_key`).
+    #[error("not enough recipients for a sender key message")]
+    NotEnoughRecipients,
+
+    #[error("no group send endorsements to send with")]
+    MissingGroupSendToken,
+
+    #[error("group send endorsements: {0}")]
+    Endorsement(String),
+
+    #[error("the sender key send started over too many times")]
+    SenderKeyAttempts,
 }
 
 pub type GroupV2Id = [u8; GROUP_IDENTIFIER_LEN];
@@ -465,42 +511,220 @@ where
         online: bool,
     ) -> Vec<SendMessageResult> {
         let content_body: ContentBody = message.into();
+        let results = self
+            .send_one_by_one(
+                recipients.as_ref(),
+                &content_body,
+                timestamp,
+                online,
+            )
+            .await;
+        self.sync_group_send(content_body, timestamp, &results.iter().collect::<Vec<_>>())
+            .await;
+        results
+    }
+
+    /// signal-gpui: a group message, as Desktop's `sendContentMessageToGroup`
+    /// sends it: with our sender key to everyone it can
+    /// ([`sender_key::send_via_sender_key`]), and one by one to the rest.
+    /// When the sender key send fails in a way Desktop falls over on (too
+    /// few recipients, no endorsements, a 401 or 404), everyone gets it one
+    /// by one; when it fails otherwise (rate limits, the network, an
+    /// untrusted identity), nothing more is sent and the error is returned.
+    /// One sync transcript goes to our other devices either way it's sent.
+    #[tracing::instrument(
+        skip(self, recipients, message, sender_key),
+        fields(recipients = recipients.len()),
+    )]
+    pub async fn send_message_to_group_with_sender_key(
+        &mut self,
+        recipients: &[(ServiceId, Option<UnidentifiedAccess>, bool)],
+        message: impl Into<ContentBody>,
+        timestamp: u64,
+        online: bool,
+        sender_key: GroupSenderKey<'_>,
+    ) -> Result<GroupSendReport, MessageSenderError> {
+        use prost::Message;
+        let content_body: ContentBody = message.into();
+        let ids: Vec<ServiceId> = recipients.iter().map(|r| r.0).collect();
+        let access: HashMap<ServiceId, UnidentifiedAccess> = recipients
+            .iter()
+            .filter_map(|(id, access, _)| access.clone().map(|a| (*id, a)))
+            .collect();
+        let group_id =
+            sender_key.group_secret_params.get_group_identifier().to_vec();
+        let mut transport = sender_key::SenderTransport {
+            sender: self,
+            content: content_body.clone().into_proto().encode_to_vec(),
+            timestamp,
+            online,
+            urgent: true,
+            group_id: Some(group_id),
+            // Default, not Desktop's Resendable: we keep no send log to
+            // resend from when a recipient asks.
+            content_hint: ContentHint::Default,
+            certificate: sender_key.certificate.clone(),
+            access,
+        };
+        let request = sender_key::SenderKeyRequest {
+            recipients: ids,
+            story: false,
+            group: true,
+            auth: sender_key.endorsements.map(|endorsements| {
+                sender_key::GroupSendAuth {
+                    endorsements,
+                    group_secret_params: sender_key.group_secret_params,
+                    our_aci: transport.sender.local_aci,
+                }
+            }),
+            now_ms: sender_key.now_ms,
+            partial: sender_key.partial,
+        };
+        let outcome = sender_key::send_via_sender_key(
+            &mut transport,
+            sender_key.info,
+            &request,
+        )
+        .await;
+        let (mut results, rest, via_sender_key, fell_over) = match outcome {
+            Ok(outcome) => {
+                let mut results: Vec<(ServiceId, SendMessageResult)> =
+                    outcome
+                        .sent
+                        .iter()
+                        .copied()
+                        .zip(
+                            sender_key::sent_messages(
+                                &self.protocol_store,
+                                &outcome.sent,
+                            )
+                            .await,
+                        )
+                        .collect();
+                results.extend(outcome.unregistered.iter().map(|id| {
+                    (*id, Err(MessageSenderError::NotFound { service_id: *id }))
+                }));
+                let rest: Vec<_> = recipients
+                    .iter()
+                    .filter(|r| outcome.normal.contains(&r.0))
+                    .cloned()
+                    .collect();
+                (results, rest, outcome.sent.len(), None)
+            },
+            Err(error) if error.sender_key_may_fall_over() => {
+                info!(%error, "sender key send failed; sending one by one");
+                (Vec::new(), recipients.to_vec(), 0, Some(error.to_string()))
+            },
+            Err(error) => return Err(error),
+        };
+        let one_by_one = self
+            .send_one_by_one(&rest, &content_body, timestamp, online)
+            .await;
+        results.extend(rest.iter().map(|r| r.0).zip(one_by_one));
+        self.sync_group_send(
+            content_body,
+            timestamp,
+            &results.iter().map(|(_, r)| r).collect::<Vec<_>>(),
+        )
+        .await;
+        Ok(GroupSendReport {
+            results,
+            via_sender_key,
+            fell_over,
+        })
+    }
+
+    /// signal-gpui: a story (or a group story) to everyone with our sender
+    /// key for `info`'s distribution, sealed and flagged as a story
+    /// (Desktop's `sendStory` through `sendContentMessageToGroup`). For a
+    /// group story, `group` is the group's secret params; its distribution
+    /// messages go as ordinary messages, with `recipients`' access. No sync
+    /// message is sent, and nobody is sent to one by one: the outcome says
+    /// who's left, and an error whether the caller may fall over to one by
+    /// one ([`MessageSenderError::sender_key_may_fall_over`]).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_story_with_sender_key(
+        &mut self,
+        recipients: &[(ServiceId, Option<UnidentifiedAccess>)],
+        message: impl Into<ContentBody>,
+        timestamp: u64,
+        info: &mut sender_key::SenderKeyInfo,
+        group: Option<GroupSecretParams>,
+        certificate: &SenderCertificate,
+        now_ms: u64,
+    ) -> Result<sender_key::SenderKeyOutcome, MessageSenderError> {
+        use prost::Message;
+        let access = recipients
+            .iter()
+            .filter_map(|(id, access)| access.clone().map(|a| (*id, a)))
+            .collect();
+        let mut transport = sender_key::SenderTransport {
+            sender: self,
+            content: message.into().into_proto().encode_to_vec(),
+            timestamp,
+            online: false,
+            // Desktop's `sendStory`: not urgent, and implicit (no error
+            // shown when it can't be read).
+            urgent: false,
+            group_id: group.map(|g| g.get_group_identifier().to_vec()),
+            content_hint: ContentHint::Implicit,
+            certificate: certificate.clone(),
+            access,
+        };
+        let request = sender_key::SenderKeyRequest {
+            recipients: recipients.iter().map(|r| r.0).collect(),
+            story: true,
+            group: group.is_some(),
+            auth: None,
+            now_ms,
+            partial: false,
+        };
+        sender_key::send_via_sender_key(&mut transport, info, &request).await
+    }
+
+    async fn send_one_by_one(
+        &mut self,
+        recipients: &[(ServiceId, Option<UnidentifiedAccess>, bool)],
+        content_body: &ContentBody,
+        timestamp: u64,
+        online: bool,
+    ) -> Vec<SendMessageResult> {
         let mut results = vec![];
-
-        let mut needs_sync_in_results = false;
-
         for (recipient, unidentified_access, include_pni_signature) in
-            recipients.as_ref()
+            recipients
         {
             let result = self
                 .try_send_message(
                     *recipient,
                     unidentified_access.as_ref(),
-                    &content_body,
+                    content_body,
                     timestamp,
                     *include_pni_signature,
                     online,
                 )
                 .await;
-
-            match result {
-                Ok(SentMessage { needs_sync, .. }) if needs_sync => {
-                    needs_sync_in_results = true;
-                },
-                _ => (),
-            };
-
             results.push(result);
         }
+        results
+    }
 
+    async fn sync_group_send(
+        &mut self,
+        content_body: ContentBody,
+        timestamp: u64,
+        results: &[&SendMessageResult],
+    ) {
+        let needs_sync_in_results = results
+            .iter()
+            .any(|r| matches!(r, Ok(SentMessage { needs_sync: true, .. })));
         // we only need to send a synchronization message once
         if needs_sync_in_results || self.is_multi_device().await {
             if let Some(sync_message) = self
                 .create_multi_device_sent_transcript_content(
                     None,
-                    content_body.clone(),
+                    content_body,
                     timestamp,
-                    &results,
+                    results.iter().copied(),
                 )
             {
                 // Note: the result of sending a sync message is not included in results
@@ -522,8 +746,6 @@ where
                 error!("could not create sync message from a group message")
             }
         }
-
-        results
     }
 
     /// Send a sender-key retry receipt
@@ -629,6 +851,7 @@ where
         let access = UnidentifiedAccess {
             key: Vec::new(),
             certificate: certificate.clone(),
+            group_send_token: None,
         };
         self.try_send(
             *recipient,
@@ -646,21 +869,42 @@ where
     async fn try_send(
         &mut self,
         recipient: ServiceId,
-        mut unidentified_access: Option<&UnidentifiedAccess>,
+        unidentified_access: Option<&UnidentifiedAccess>,
         content_body: &ContentBody,
         timestamp: u64,
         include_pni_signature: bool,
         online: bool,
         story: bool,
     ) -> SendMessageResult {
-        trace!("trying to send a message");
-
-        use prost::Message;
-
         let mut content = content_body.clone().into_proto();
         if include_pni_signature {
             content.pni_signature_message = Some(self.create_pni_signature()?);
         }
+        self.try_send_content(
+            recipient,
+            unidentified_access,
+            content,
+            timestamp,
+            online,
+            story,
+        )
+        .await
+    }
+
+    /// signal-gpui: [`Self::try_send`] for a `Content` built by hand (a
+    /// sender key distribution message has no body).
+    async fn try_send_content(
+        &mut self,
+        recipient: ServiceId,
+        mut unidentified_access: Option<&UnidentifiedAccess>,
+        content: crate::proto::Content,
+        timestamp: u64,
+        online: bool,
+        story: bool,
+    ) -> SendMessageResult {
+        trace!("trying to send a message");
+
+        use prost::Message;
 
         let content_bytes = content.encode_to_vec();
 
