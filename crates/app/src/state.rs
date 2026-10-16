@@ -643,6 +643,8 @@ impl AppState {
             }
             Event::PinsChanged(conversation) => cx.emit(AppEvent::PinsChanged(conversation)),
             Event::SafetyNumber { conversation, result } => self.safety_number = Some((conversation, result)),
+            // Shown by the safety number screen and its dialogs (next change).
+            Event::KeyTransparency { .. } | Event::KeyTransparencyFailed => {}
             Event::Call(update) => self.on_call(update, cx),
             Event::CallLinksChanged => self.reload_call_links(cx),
             Event::CallLinkCreated(room_id) => {

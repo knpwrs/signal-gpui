@@ -845,7 +845,7 @@ dependencies = [
  "bitflags 2.13.2",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.11.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2259,7 +2259,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.3",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2546,7 +2546,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4584,7 +4584,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.57.0",
 ]
 
 [[package]]
@@ -5656,6 +5656,71 @@ dependencies = [
 ]
 
 [[package]]
+name = "libsignal-net-chat"
+version = "0.1.0"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.99.0#439f035d9cfd7efe5435cbea0294591c9ed17232"
+dependencies = [
+ "assert_matches",
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "const-str",
+ "data-encoding-macro",
+ "derive_more",
+ "displaydoc",
+ "either",
+ "futures-util",
+ "hex",
+ "http",
+ "http-body",
+ "http-body-util",
+ "itertools 0.15.0",
+ "libsignal-account-keys 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.99.0)",
+ "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.99.0)",
+ "libsignal-keytrans",
+ "libsignal-net",
+ "libsignal-net-grpc",
+ "libsignal-protocol 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.99.0)",
+ "log",
+ "pin-project",
+ "prost",
+ "prost-types",
+ "rand 0.9.5",
+ "ref-cast",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "static_assertions",
+ "strum 0.28.0",
+ "subtle",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "usernames",
+ "uuid",
+ "visibility",
+ "zkgroup 0.9.0 (git+https://github.com/signalapp/libsignal?tag=v0.99.0)",
+]
+
+[[package]]
+name = "libsignal-net-grpc"
+version = "0.1.0"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.99.0#439f035d9cfd7efe5435cbea0294591c9ed17232"
+dependencies = [
+ "const-str",
+ "derive-where",
+ "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.99.0)",
+ "prost",
+ "prost-types",
+ "strum 0.28.0",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
 name = "libsignal-net-infra"
 version = "0.1.0"
 source = "git+https://github.com/signalapp/libsignal?tag=v0.99.0#439f035d9cfd7efe5435cbea0294591c9ed17232"
@@ -5701,6 +5766,7 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite",
  "tokio-util",
+ "tower-service",
  "tungstenite 0.29.0",
  "visibility",
  "zerocopy",
@@ -6584,7 +6650,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7922,8 +7988,8 @@ version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
- "heck 0.5.0",
- "itertools 0.14.0",
+ "heck 0.4.1",
+ "itertools 0.11.0",
  "log",
  "multimap",
  "petgraph",
@@ -7944,7 +8010,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.11.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -8157,7 +8223,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -8846,7 +8912,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -8933,7 +8999,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs 1.0.9",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -9433,6 +9499,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "bincode",
  "chrono",
@@ -9449,7 +9516,10 @@ dependencies = [
  "libsignal-account-keys 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.105.0)",
  "libsignal-account-keys 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.99.0)",
  "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.105.0)",
+ "libsignal-keytrans",
  "libsignal-message-backup",
+ "libsignal-net",
+ "libsignal-net-chat",
  "linkify",
  "mozjpeg-sys",
  "oxipng",
@@ -9800,7 +9870,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -10396,7 +10466,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -10777,6 +10847,7 @@ version = "0.14.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac2a5518c70fa84342385732db33fb3f44bc4cc748936eb5833d2df34d6445ef"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "bytes",
  "http",
@@ -10801,6 +10872,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "tonic-prost"
+version = "0.14.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50849f68853be452acf590cde0b146665b8d507b3b8af17261df47e02c209ea0"
+dependencies = [
+ "bytes",
+ "prost",
+ "tonic",
 ]
 
 [[package]]
@@ -11022,7 +11104,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -11876,7 +11958,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -12576,7 +12658,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d6f32a0ff4a9f6f01231eb2059cc85479330739333e0e58cadf03b6af2cca10"
 dependencies = [
  "cfg-if 1.0.5",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

@@ -19,6 +19,7 @@ mod groups;
 mod history;
 mod backup_media;
 mod safety;
+mod key_transparency;
 mod calling;
 mod call_links;
 mod profiles;
@@ -123,6 +124,16 @@ pub const SETTING_STORY_VIEW_RECEIPTS: &str = "story_view_receipts";
 pub const SETTING_IMAGE_OPTIMIZATION: &str = "image_optimization";
 
 pub use link_preview::{LinkPreviewDraft, PreviewImage};
+
+/// Settings key: `"true"` when automatic key verification is off.
+pub const SETTING_KEY_TRANSPARENCY_DISABLED: &str = key_transparency::SETTING_DISABLED;
+/// Settings key: `"true"` once Desktop's key transparency introduction was seen.
+pub const SETTING_KEY_TRANSPARENCY_ONBOARDING_SEEN: &str = key_transparency::SETTING_ONBOARDING_SEEN;
+/// Whether key transparency is on at all (Desktop's remote config flag
+/// `desktop.keyTransparency.prod`).
+pub fn key_transparency_on() -> bool {
+    key_transparency::feature_on()
+}
 
 /// TLS for Signal's own servers (the calling server, updates2.signal.org),
 /// whose certificates come from Signal's root CA: trusting only that, as
@@ -290,6 +301,16 @@ pub enum Command {
     /// Marks a 1:1 contact's current identity verified (or clears it), here
     /// and on our other devices; answered with `Event::SafetyNumber`.
     SetVerified { conversation: ConversationId, verified: bool },
+    /// Desktop's "Verify automatically" in their safety number screen: a
+    /// key transparency check of them (and of us, until that has run once).
+    /// Answered with `Event::KeyTransparency`.
+    CheckKeyTransparency { conversation: ConversationId },
+    /// The safety number screen closed: its key transparency check stops.
+    CancelKeyTransparency,
+    /// Automatic key verification off (`true`) or on, for the whole account
+    /// (`AccountRecord.automaticKeyVerificationDisabled`). Off forgets what
+    /// was verified.
+    SetKeyTransparencyDisabled(bool),
     /// A megaphone's button: done with it (donate, finish) or put off
     /// (snooze). Answered with `Event::Megaphones`.
     PressMegaphone { id: String, cta: megaphones::MegaphoneCta },
@@ -704,6 +725,19 @@ pub struct SafetyNumber {
     pub qr: Vec<u8>,
     /// We marked their current identity key verified.
     pub verified: bool,
+    /// Whether the screen offers automatic key verification.
+    pub auto_verify: AutoVerify,
+}
+
+/// Desktop's key transparency section in the safety number screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoVerify {
+    /// Turned off (in Settings, or on another device): not shown.
+    Off,
+    /// We don't know their phone number (Desktop's `unavailable`).
+    Unavailable,
+    /// "Verify automatically" can be pressed.
+    Available,
 }
 
 /// A file (not sent as an image) picked, pasted or dropped in the composer.
@@ -806,6 +840,13 @@ pub enum Event {
     CallLinkRefused { removed: bool },
     /// A 1:1 chat's safety number, or why there isn't one.
     SafetyNumber { conversation: ConversationId, result: Result<SafetyNumber, String> },
+    /// Answer to `Command::CheckKeyTransparency`: whether their key (and
+    /// ours) verified.
+    KeyTransparency { conversation: ConversationId, verified: bool },
+    /// Our own account's key transparency check has started failing:
+    /// Desktop's "Automatic Key Verification is currently unavailable"
+    /// dialog.
+    KeyTransparencyFailed,
     /// A group we created is ready to open.
     GroupCreated(ConversationId),
     /// Progress of the message history transfer after linking.

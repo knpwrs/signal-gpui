@@ -230,6 +230,20 @@ enum Who {
     Other,
 }
 
+/// A contact's verified key transparency data, kept as Desktop's backup
+/// import keeps it (`Contact.keyTransparencyData`, with an ACI).
+async fn import_key_transparency(db: &AppDb, recipient: &proto::Recipient) {
+    use proto::recipient::Destination;
+    let Some(Destination::Contact(contact)) = &recipient.destination else { return };
+    let Some(data) = contact.keyTransparencyData.as_deref().filter(|d| !d.is_empty()) else { return };
+    let Some(aci) = contact.aci.as_deref().and_then(|b| <[u8; 16]>::try_from(b).ok()).map(Aci::from_uuid_bytes) else {
+        return;
+    };
+    if let Err(error) = crate::key_transparency::import_account_data(db, &aci, data).await {
+        tracing::warn!(%error, "failed to save key transparency data");
+    }
+}
+
 fn uuid_sid(bytes: &[u8]) -> Option<String> {
     let bytes: [u8; 16] = bytes.try_into().ok()?;
     Some(Aci::from_uuid_bytes(bytes).service_id_string())
@@ -341,6 +355,7 @@ pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: imp
                     sharing.push((chat.clone(), on));
                     modes.extend(mode.map(|mode| (chat, mode)));
                 }
+                import_key_transparency(db, &recipient).await;
                 people.insert(recipient.id, who(&recipient));
             }
             Some(proto::frame::Item::Chat(chat)) => {
@@ -395,6 +410,12 @@ pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: imp
             }
             Some(proto::frame::Item::Account(account)) => {
                 imported.settings = Some(account_settings(&account));
+                // Desktop: `hasKeyTransparencyDisabled` unless the account allows it.
+                let allowed = account.accountSettings.as_ref().is_some_and(|s| s.allowAutomaticKeyVerification);
+                let value = if allowed { "false" } else { "true" };
+                if let Err(error) = db.set_setting(crate::key_transparency::SETTING_DISABLED, value).await {
+                    tracing::warn!(%error, "failed to save automatic key verification");
+                }
             }
             Some(proto::frame::Item::StickerPack(pack)) => {
                 imported.sticker_packs.push((pack.packId.clone(), pack.packKey.clone()));

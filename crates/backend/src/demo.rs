@@ -698,6 +698,7 @@ const DEMO_REMOTE_CONFIG: &[(&str, &str)] = &[
     ("desktop.stickerReply.send.prod", "8.30.0"),
     ("desktop.groupMemberLabels.edit.prod", "8.30.0"),
     ("desktop.groupTerminate.send.prod", "8.30.0"),
+    ("desktop.keyTransparency.prod", "8.30.0"),
 ];
 
 pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::UnboundedSender<Event>) {
@@ -1664,7 +1665,8 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
             // Made-up digits (there are no keys here), stable per chat.
             Command::LoadSafetyNumber { conversation } => {
                 let verified = db.setting(&format!("demo.verified.{}", conversation.0)).await.ok().flatten().is_some_and(|v| v == "1");
-                emit(Event::SafetyNumber { conversation: conversation.clone(), result: Ok(demo_safety_number(&conversation, verified)) });
+                let auto_verify = demo_auto_verify(&db, &conversation).await;
+                emit(Event::SafetyNumber { conversation: conversation.clone(), result: Ok(demo_safety_number(&conversation, verified, auto_verify)) });
             }
             Command::ViewStory { id } => {
                 if let Ok(Some(story)) = db.story(id).await
@@ -1862,7 +1864,8 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
             }
             Command::SetVerified { conversation, verified } => {
                 let _ = db.set_setting(&format!("demo.verified.{}", conversation.0), if verified { "1" } else { "" }).await;
-                emit(Event::SafetyNumber { conversation: conversation.clone(), result: Ok(demo_safety_number(&conversation, verified)) });
+                let auto_verify = demo_auto_verify(&db, &conversation).await;
+                emit(Event::SafetyNumber { conversation: conversation.clone(), result: Ok(demo_safety_number(&conversation, verified, auto_verify)) });
             }
             Command::MarkCallsRead { conversation } => {
                 let call = match &conversation {
@@ -1896,6 +1899,21 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 }
                 emit(Event::CallLinksChanged);
             }
+            // Made up, and nothing is sent: Maya's key verifies after a
+            // moment, anyone else's doesn't.
+            Command::CheckKeyTransparency { conversation } => {
+                let events = events.clone();
+                tokio::task::spawn_local(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                    let verified = conversation.0 == MAYA;
+                    let _ = events.unbounded_send(Event::KeyTransparency { conversation, verified });
+                });
+            }
+            Command::SetKeyTransparencyDisabled(disabled) => {
+                let _ = db.set_setting(crate::SETTING_KEY_TRANSPARENCY_DISABLED, if disabled { "true" } else { "false" }).await;
+                emit(Event::StorySettingsChanged);
+            }
+            Command::CancelKeyTransparency => {}
             Command::Link
             | Command::Typing { .. }
             | Command::FetchAttachment { .. }
@@ -1907,11 +1925,24 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
     }
 }
 
-fn demo_safety_number(conversation: &ConversationId, verified: bool) -> crate::SafetyNumber {
+fn demo_safety_number(conversation: &ConversationId, verified: bool, auto_verify: crate::AutoVerify) -> crate::SafetyNumber {
     use sha2::Digest as _;
     let hash = sha2::Sha256::digest(conversation.0.as_bytes());
     let digits: String = hash.iter().cycle().take(60).map(|b| char::from(b'0' + b % 10)).collect();
-    crate::SafetyNumber { qr: digits.clone().into_bytes(), digits, verified }
+    crate::SafetyNumber { qr: digits.clone().into_bytes(), digits, verified, auto_verify }
+}
+
+/// As the real backend decides it: off by the remote config or in
+/// Settings, or whether we have their number.
+async fn demo_auto_verify(db: &AppDb, conversation: &ConversationId) -> crate::AutoVerify {
+    if !crate::key_transparency::feature_on()
+        || db.setting(crate::SETTING_KEY_TRANSPARENCY_DISABLED).await.ok().flatten().as_deref() == Some("true") {
+        return crate::AutoVerify::Off;
+    }
+    match db.conversation(conversation).await.ok().flatten().and_then(|c| c.phone) {
+        Some(_) => crate::AutoVerify::Available,
+        None => crate::AutoVerify::Unavailable,
+    }
 }
 
 /// "@Name" for each mention placeholder, names from the demo's chats.

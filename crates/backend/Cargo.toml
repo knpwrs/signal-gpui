@@ -43,6 +43,12 @@ libsignal-account-keys = { git = "https://github.com/signalapp/libsignal", tag =
 zkgroup = { git = "https://github.com/signalapp/libsignal", tag = "v0.105.0" }
 libsignal-core = { git = "https://github.com/signalapp/libsignal", tag = "v0.105.0" }
 backup-account-keys = { package = "libsignal-account-keys", git = "https://github.com/signalapp/libsignal", tag = "v0.105.0" }
+# Key transparency (automatic key verification in safety numbers): libsignal's
+# client and verifier, driven over presage's unauthenticated websocket.
+libsignal-net-chat = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
+libsignal-keytrans = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
+libsignal-net = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
+async-trait = "0.1"
 protobuf = "3"
 hkdf = "0.13"
 hmac = "0.13"
@@ -75,6 +81,8 @@ image = { version = "0.25", default-features = false, features = ["png", "tiff",
 [dev-dependencies]
 # libsignal's fixed-seed test rng, to check presentations against its vectors.
 rand_chacha = "0.9"
+# Paused time, for retries and back-off in tests.
+tokio = { workspace = true, features = ["test-util"] }
 jpeg-encoder = "0.6"
 jpeg-decoder = "0.3"
 tempfile = "3"

@@ -9,6 +9,7 @@ mod group_calls;
 mod polls;
 mod stories;
 mod sender_keys;
+mod key_transparency;
 mod release_notes;
 mod remote_config;
 mod view_once;
@@ -398,6 +399,14 @@ struct Actor {
     last_sent_at: std::cell::Cell<i64>,
     /// When the window's activation last fetched the remote config.
     remote_config_at: std::cell::Cell<Option<Instant>>,
+    /// Our key transparency self check while it runs.
+    kt_self: RefCell<Option<key_transparency::SelfCheck>>,
+    /// Wakes the self check's scheduler when its time moves.
+    kt_schedule: tokio::sync::Notify,
+    /// A contact's key transparency check, while it runs.
+    kt_contact: RefCell<Option<tokio::task::JoinHandle<()>>>,
+    /// Runs the weekly self check.
+    kt_task: RefCell<Option<tokio::task::JoinHandle<()>>>,
 }
 
 pub(crate) async fn run(
@@ -478,6 +487,10 @@ pub(crate) async fn run(
         expiry: tokio::sync::Notify::new(),
         last_sent_at: std::cell::Cell::new(0),
         remote_config_at: std::cell::Cell::new(None),
+        kt_self: RefCell::new(None),
+        kt_schedule: tokio::sync::Notify::new(),
+        kt_contact: RefCell::new(None),
+        kt_task: RefCell::new(None),
     });
 
     tokio::task::spawn_local(actor.clone().outbound_loop(outbound_rx));
@@ -599,6 +612,7 @@ impl Actor {
             }
             // Desktop's device age, for a donation megaphone's condition.
             let _ = self.db.set_setting(SETTING_DEVICE_CREATED, &now_millis().to_string()).await;
+            self.kt_linked().await;
         }
         // The history transfer, also resumed if the app quit during it.
         let pending = self.db.setting(SETTING_HISTORY_PENDING).await.ok().flatten().is_some_and(|v| v == "1");
@@ -628,6 +642,10 @@ impl Actor {
         }
         let task = tokio::task::spawn_local(self.clone().view_once_expiry_loop());
         if let Some(old) = self.view_once_expiry_task.borrow_mut().replace(task) {
+            old.abort();
+        }
+        let task = tokio::task::spawn_local(self.clone().key_transparency_loop());
+        if let Some(old) = self.kt_task.borrow_mut().replace(task) {
             old.abort();
         }
     }
@@ -810,6 +828,9 @@ impl Actor {
                 Command::CreateGroup { title, members } => self.create_group(title, members).await,
                 Command::SetMemberLabel { conversation, emoji, text } => self.set_member_label(conversation, emoji, text).await,
                 Command::LoadSafetyNumber { conversation } => self.emit_safety_number(conversation).await,
+                Command::CheckKeyTransparency { conversation } => self.check_key_transparency(conversation),
+                Command::CancelKeyTransparency => self.cancel_key_transparency(),
+                Command::SetKeyTransparencyDisabled(disabled) => self.set_key_transparency_disabled(disabled).await,
                 Command::SetVerified { conversation, verified } => self.set_verified(conversation, verified).await,
                 Command::PressMegaphone { id, cta } => self.press_megaphone(id, cta).await,
                 Command::ViewStory { id } => self.view_story(id).await,
@@ -2214,6 +2235,7 @@ impl Actor {
             profile_sharing,
             story_send_modes,
             backup_tier,
+            identifiers,
         } = match storage::fetch(manager).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -2255,6 +2277,9 @@ impl Actor {
             Ok(true) => self.emit(Event::StorySettingsChanged),
             Ok(false) => {}
             Err(error) => warn!(error = %format!("{error:#}"), "failed to save groups' story send modes"),
+        }
+        if let Some(identifiers) = &identifiers {
+            self.apply_account_identifiers(identifiers).await;
         }
         match self.db.apply_chat_states(&chats).await {
             Ok(true) => self.emit(Event::ConversationsChanged),
@@ -4475,7 +4500,8 @@ impl Actor {
             .setting(&format!("{SETTING_VERIFIED}{}", theirs.service_id_string()))
             .await?
             .is_some_and(|key| key == hex::encode(their_key.serialize()));
-        Ok(crate::SafetyNumber { digits, qr, verified })
+        let auto_verify = self.auto_verify(conversation).await;
+        Ok(crate::SafetyNumber { digits, qr, verified, auto_verify })
     }
 
     async fn emit_safety_number(&self, conversation: ConversationId) {

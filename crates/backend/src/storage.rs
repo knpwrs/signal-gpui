@@ -92,6 +92,8 @@ pub(crate) struct StorageSnapshot {
     /// The account's `backupTier` (a zkgroup `BackupLevel`), `Some(0)` when
     /// backups are off; `None` without an account record.
     pub backup_tier: Option<u64>,
+    /// What key transparency needs from the account record.
+    pub identifiers: Option<AccountIdentifiers>,
 }
 
 /// A call link record (Desktop's `mergeCallLinkRecord`): only links we're
@@ -114,6 +116,30 @@ fn call_link(record: &presage::proto::CallLinkRecord) -> Option<StorageCallLink>
         admin_key: (!record.admin_passkey.is_empty()).then(|| record.admin_passkey.clone()),
         deleted_at: (record.deleted_at_timestamp_ms != 0).then(|| clamp_millis(record.deleted_at_timestamp_ms)),
     })
+}
+
+/// The account record's fields key transparency depends on.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct AccountIdentifiers {
+    /// `username`, when set.
+    pub username: Option<String>,
+    /// `unlistedPhoneNumber`: our number isn't discoverable.
+    pub unlisted_phone_number: bool,
+    /// `automaticKeyVerificationDisabled`.
+    pub key_transparency_disabled: bool,
+    /// The record carries our profile key.
+    pub has_profile_key: bool,
+}
+
+impl AccountIdentifiers {
+    pub(crate) fn from_record(account: &AccountRecord) -> Self {
+        Self {
+            username: Some(account.username.clone()).filter(|u| !u.is_empty()),
+            unlisted_phone_number: account.unlisted_phone_number,
+            key_transparency_disabled: account.automatic_key_verification_disabled,
+            has_profile_key: !account.profile_key.is_empty(),
+        }
+    }
 }
 
 /// Reads the account record and every contact record from the Storage Service.
@@ -176,6 +202,7 @@ pub(crate) async fn fetch(manager: &SignalManager) -> anyhow::Result<StorageSnap
                 Some(Record::Account(account)) => {
                     snapshot.pinned = Some(pinned(&account));
                     snapshot.settings = account_settings(&account);
+                    snapshot.identifiers = Some(AccountIdentifiers::from_record(&account));
                     snapshot.stories_disabled = Some(account.stories_disabled);
                     snapshot.my_story_privacy_set = Some(account.has_set_my_stories_privacy);
                     // Desktop's `saveBackupTier(toNumber(backupTier))`:
@@ -423,6 +450,9 @@ pub(crate) enum AccountEdit {
     StoryViewReceipts(bool),
     /// `hasSetMyStoriesPrivacy`: My Story's viewers were chosen.
     HasSetMyStoriesPrivacy(bool),
+    /// `automaticKeyVerificationDisabled` (Desktop's
+    /// `hasKeyTransparencyDisabled`).
+    AutomaticKeyVerificationDisabled(bool),
 }
 
 impl AccountEdit {
@@ -443,6 +473,7 @@ impl AccountEdit {
             AccountEdit::StoriesDisabled(on) => (29, u64::from(on)),
             // OptionalBool: ENABLED = 1, DISABLED = 2.
             AccountEdit::StoryViewReceipts(on) => (30, if on { 1 } else { 2 }),
+            AccountEdit::AutomaticKeyVerificationDisabled(on) => (46, u64::from(on)),
         }
     }
 }
@@ -1389,6 +1420,28 @@ mod tests {
         assert_eq!(decoded.story_view_receipts_enabled(), presage::proto::OptionalBool::Enabled);
         assert!(decoded.has_set_my_stories_privacy && decoded.stories_disabled);
         assert!(edit_account(&edited, &[AccountEdit::StoriesDisabled(false)]).unwrap().is_some());
+
+        // Automatic key verification, Desktop's field 46.
+        let edited = edit_account(&edited, &[AccountEdit::AutomaticKeyVerificationDisabled(true)]).unwrap().unwrap();
+        let decoded = decode_account(&edited);
+        assert!(decoded.automatic_key_verification_disabled && decoded.stories_disabled);
+        assert!(edited.windows(20).any(|w| w == b"future account field"));
+    }
+
+    #[test]
+    fn account_identifiers_for_key_transparency() {
+        let account = AccountRecord {
+            username: "maya.01".into(),
+            unlisted_phone_number: true,
+            automatic_key_verification_disabled: true,
+            profile_key: vec![1; 32],
+            ..Default::default()
+        };
+        let ids = AccountIdentifiers::from_record(&account);
+        assert_eq!(ids.username.as_deref(), Some("maya.01"));
+        assert!(ids.unlisted_phone_number && ids.key_transparency_disabled && ids.has_profile_key);
+        let empty = AccountIdentifiers::from_record(&AccountRecord::default());
+        assert_eq!(empty, AccountIdentifiers::default());
     }
 
     #[test]
