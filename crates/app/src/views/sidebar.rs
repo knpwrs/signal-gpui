@@ -158,7 +158,8 @@ impl Sidebar {
                 | AppEvent::CreateStory(_)
                 | AppEvent::CallLinksChanged
                 | AppEvent::CallLinkCreated(_)
-                | AppEvent::Gifs { .. } => {}
+                | AppEvent::Gifs { .. }
+                | AppEvent::KeyTransparencyFailed => {}
             }),
         ];
         Self {
@@ -1562,7 +1563,7 @@ mod tests {
                 window_bounds: Some(WindowBounds::Windowed(gpui_kit::Bounds {
                     origin: Default::default(),
                     // Tall enough for the whole Settings dialog.
-                    size: size(px(800.), px(1100.)),
+                    size: size(px(800.), px(1300.)),
                 })),
                 ..Default::default()
             };

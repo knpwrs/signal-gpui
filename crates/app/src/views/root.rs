@@ -121,6 +121,9 @@ impl RootView {
                     use gpui_kit::component::WindowExt as _;
                     window.push_notification(gpui_kit::component::notification::Notification::error(message.clone()), cx);
                 }
+                if let AppEvent::KeyTransparencyFailed = event {
+                    crate::views::safety_number::show_error(state.clone(), window, cx);
+                }
                 if let AppEvent::SelectionChanged = event {
                     let selected = state.read(cx).selected.clone();
                     this.conversation = selected.map(|id| {

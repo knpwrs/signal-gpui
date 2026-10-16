@@ -67,6 +67,23 @@ pub fn show(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
 
 /// Assembles the log off the UI thread.
 fn collect(state: &Entity<AppState>, model: &Entity<DebugLog>, cx: &mut App) {
+    let task = assemble(state, cx);
+    let model = model.clone();
+    cx.spawn(async move |cx| {
+        let log = task.await;
+        let preview = preview_of(&log);
+        model.update(cx, |this, cx| {
+            this.log = Some(Arc::new(log));
+            this.preview = preview.into();
+            this.phase = Phase::Ready;
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+/// The redacted log, assembled off the UI thread.
+pub fn assemble(state: &Entity<AppState>, cx: &mut App) -> gpui_kit::Task<String> {
     let state = state.read(cx);
     let data_dir = state.backend.data_dir().to_path_buf();
     let mut user = Vec::new();
@@ -88,21 +105,7 @@ fn collect(state: &Entity<AppState>, model: &Entity<DebugLog>, cx: &mut App) {
     if let Some(home) = std::env::var_os("HOME") {
         sensitive.push(PathBuf::from(home));
     }
-    let task = cx.background_spawn(async move {
-        debug_log::assemble(&debug_log::log_dir(&data_dir), &header, &sensitive)
-    });
-    let model = model.clone();
-    cx.spawn(async move |cx| {
-        let log = task.await;
-        let preview = preview_of(&log);
-        model.update(cx, |this, cx| {
-            this.log = Some(Arc::new(log));
-            this.preview = preview.into();
-            this.phase = Phase::Ready;
-            cx.notify();
-        });
-    })
-    .detach();
+    cx.background_spawn(async move { debug_log::assemble(&debug_log::log_dir(&data_dir), &header, &sensitive) })
 }
 
 fn preview_of(log: &str) -> String {

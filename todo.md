@@ -24,7 +24,7 @@ made-up config; the fetch hasn't been run against Signal's server.
 | `binaryServiceId` | Service ids in the binary proto fields (`*Binary`) instead of strings. | Done for the messages and sync messages we build: only the binary fields with the flag on, only the strings without, as Desktop's `SendMessage.preload.ts`. Sent transcripts built in libsignal-service-rs and the Storage Service records we write (contacts, story lists, pins) carry both forms, which every client reads; Desktop writes one. We accept both. |
 | `retireAccessKeyGroupSend` | Group sends with group send endorsements instead of access keys. | Always on: group messages go with a sender key and a `Group-Send-Token`, and one by one without endorsements. See "Sender keys" below. |
 | `sendMessageViaLibsignal` | Sending through libsignal's network stack. | Not applicable. |
-| `keyTransparency` | Key transparency checks in safety numbers. | Not done: safety numbers are shown and can be verified, without key transparency. |
+| `keyTransparency` | Key transparency checks in safety numbers. | Follows `desktop.keyTransparency.prod`. See "Key transparency" below. |
 | `localBackups` | Local (on-disk) backups. | Not applicable. |
 | `disappearingCalls` | Call notices follow the chat's disappearing timer. | Done, always on: a call's notice takes the chat's timer and counts down once it's seen and the call is over (`signal_store::call_history`). |
 | `remoteMute.send` | Muting someone in a group call. | Done, always on (`Command::RemoteMute`). |
@@ -45,6 +45,36 @@ number.
 | `nicknames.min` / `.max` | 3 / 32 | Username nickname limits (`ts/util/Username.dom.ts`), not contact nicknames. Read (`username_nickname_min` / `_max`) but unused: usernames can't be set here. Contact nicknames and notes use Desktop's built-in limits (`signal_store::NICKNAME_LIMITS`), which no config key sets. |
 | `messageQueueTimeInSeconds` | 30 days (never less) | How long the server keeps undelivered messages. Follows the config, never under 30 days, for erasing view-once messages left unviewed (Desktop's `getMessageQueueTime`). |
 | `videoAttachments.transcodeTargetBytes`, `mediaQuality.levels`, `calling.*`, `clientExpiration`, `maxAllowedClockSkewSeconds` | n/a | Not applicable for now. |
+
+## Key transparency
+
+Done the way Desktop does it (`ts/services/keyTransparency.preload.ts`),
+with libsignal's own client and verifier (`libsignal-net-chat`'s
+`keytrans::check`). Its three requests are rebuilt over presage's
+unauthenticated websocket. That covers "Verify automatically" in the
+safety number screen, the weekly self check (5 minutes after linking,
+retried a day after a first failure), the Settings switch (synced through
+`automaticKeyVerificationDisabled`), the introduction dialog, the error
+dialog, and the data from transferred history.
+
+Tested with unit tests on the request and response wire formats against
+libsignal's code and test vectors, Desktop's retry, health and schedule
+rules, a forged tree head and garbage responses (nothing is stored), and
+the store. Demo-mode UI tests cover the button's states. Not yet run
+against Signal's servers or a real account, so a check that succeeds
+end to end has only been exercised by libsignal's own tests. Not done:
+
+- **Our number changing:** Desktop forgets the number in our stored data
+  when our number changes. We don't handle number changes at all.
+- **Username capability:** Desktop sends our username hash only when our
+  profile has the `usernameChangeSyncMessage` capability. We send it
+  whenever the account record has a username.
+- **Request timeout:** our websocket has none, so a key transparency
+  request gives up after 30 seconds. libsignal-net uses its own timeout.
+- **Key icon:** the idle button has no icon, because the icon set has no key.
+- **Closing the screen:** the running check stops when the dialog's
+  `on_close` fires. Whether Escape fires it wasn't checked. Either way the
+  result is dropped the next time the screen opens.
 
 ## Attachments in transferred history
 

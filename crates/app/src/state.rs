@@ -135,6 +135,21 @@ pub enum AppEvent {
     CallLinksChanged,
     /// A call link we made is ready: show its details (its room id).
     CallLinkCreated(String),
+    /// Our own key transparency check started failing: Desktop's
+    /// `KeyTransparencyErrorDialog`.
+    KeyTransparencyFailed,
+}
+
+/// The key transparency button in the safety number screen, in Desktop's
+/// states (`KeyTransparencyStatusType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KtStatus {
+    Idle,
+    Running,
+    Ok,
+    Fail,
+    /// We don't know their phone number.
+    Unavailable,
 }
 
 /// The audio attachment being played.
@@ -276,6 +291,12 @@ pub struct AppState {
     ringtone: Option<crate::ringtone::Ringtone>,
     /// The safety number last loaded (`Command::LoadSafetyNumber`).
     pub safety_number: Option<(ConversationId, Result<signal_backend::SafetyNumber, String>)>,
+    /// The safety number screen's key transparency check, once started.
+    pub kt_status: Option<(ConversationId, KtStatus)>,
+    /// Automatic key verification is off (Settings, Privacy).
+    pub key_transparency_disabled: bool,
+    /// Desktop's key transparency introduction was seen.
+    pub kt_onboarding_seen: bool,
     pub catching_up: Option<CatchUp>,
     /// Like Desktop, notifications wait until the catch-up is done, and then
     /// only the latest is shown.
@@ -333,6 +354,9 @@ impl AppState {
             window_active: true,
             history: None,
             safety_number: None,
+            kt_status: None,
+            key_transparency_disabled: false,
+            kt_onboarding_seen: false,
             call: None,
             lobby: None,
             call_links: Vec::new(),
@@ -643,8 +667,13 @@ impl AppState {
             }
             Event::PinsChanged(conversation) => cx.emit(AppEvent::PinsChanged(conversation)),
             Event::SafetyNumber { conversation, result } => self.safety_number = Some((conversation, result)),
-            // Shown by the safety number screen and its dialogs (next change).
-            Event::KeyTransparency { .. } | Event::KeyTransparencyFailed => {}
+            Event::KeyTransparency { conversation, verified } => {
+                // Only the check this screen is waiting for.
+                if self.kt_status == Some((conversation.clone(), KtStatus::Running)) {
+                    self.kt_status = Some((conversation, if verified { KtStatus::Ok } else { KtStatus::Fail }));
+                }
+            }
+            Event::KeyTransparencyFailed => cx.emit(AppEvent::KeyTransparencyFailed),
             Event::Call(update) => self.on_call(update, cx),
             Event::CallLinksChanged => self.reload_call_links(cx),
             Event::CallLinkCreated(room_id) => {
@@ -774,6 +803,9 @@ impl AppState {
                 self.has_giphy_key = std::env::var_os("GIPHY_API_KEY").is_some();
                 self.image_optimization = Default::default();
                 self.seen_admin_delete_education = false;
+                self.kt_status = None;
+                self.key_transparency_disabled = false;
+                self.kt_onboarding_seen = false;
                 self.history = None;
                 self.catching_up = None;
                 self.held_notification = None;
@@ -872,13 +904,15 @@ impl AppState {
                     db.setting(ADMIN_DELETE_EDUCATION_SETTING).await?,
                     db.setting(signal_backend::SETTING_TYPING_INDICATORS).await?,
                     db.story_send_modes().await?,
+                    db.setting(signal_backend::SETTING_KEY_TRANSPARENCY_DISABLED).await?,
+                    db.setting(signal_backend::SETTING_KEY_TRANSPARENCY_ONBOARDING_SEEN).await?,
                 ),
             ))
         });
         cx.spawn(async move |this, cx| {
             let (optimization, recents, giphy, notifications, collapsed, hidden, stories_off, view_receipts, more) =
                 read.await.unwrap_or_default();
-            let (read_receipts, lists, privacy_set, admin_delete_seen, typing, send_modes) = more;
+            let (read_receipts, lists, privacy_set, admin_delete_seen, typing, send_modes, kt_disabled, kt_seen) = more;
             let _ = this.update(cx, |this, cx| {
                 this.read_receipts = signal_backend::setting_on(read_receipts.as_deref());
                 this.typing_indicators = signal_backend::setting_on(typing.as_deref());
@@ -894,6 +928,8 @@ impl AppState {
                     .collect();
                 this.stories_disabled = stories_off.as_deref() == Some("true");
                 this.seen_admin_delete_education = admin_delete_seen.as_deref() == Some("true");
+                this.key_transparency_disabled = kt_disabled.as_deref() == Some("true");
+                this.kt_onboarding_seen = kt_seen.as_deref() == Some("true");
                 this.story_view_receipts = view_receipts.map(|v| v != "false");
                 this.notification_setting = crate::notifications::NotificationSetting::from_setting(notifications.as_deref());
                 this.has_giphy_key |= giphy.is_some_and(|k| !k.trim().is_empty());
@@ -999,6 +1035,37 @@ impl AppState {
         }
         self.send(Command::SetStoriesDisabled(disabled));
         cx.notify();
+    }
+
+    /// "Verify automatically": checks their key (Desktop's
+    /// `checkKeyTransparency`), shown as running until the answer comes.
+    pub fn check_key_transparency(&mut self, conversation: ConversationId, cx: &mut Context<Self>) {
+        self.kt_status = Some((conversation.clone(), KtStatus::Running));
+        self.send(Command::CheckKeyTransparency { conversation });
+        cx.notify();
+    }
+
+    /// The safety number screen closed: its check stops.
+    pub fn close_safety_number(&mut self) {
+        if matches!(self.kt_status, Some((_, KtStatus::Running))) {
+            self.send(Command::CancelKeyTransparency);
+        }
+        self.kt_status = None;
+    }
+
+    /// Automatic key verification on or off, for the whole account.
+    pub fn set_key_transparency_disabled(&mut self, disabled: bool, cx: &mut Context<Self>) {
+        self.key_transparency_disabled = disabled;
+        self.send(Command::SetKeyTransparencyDisabled(disabled));
+        cx.notify();
+    }
+
+    /// Desktop's key transparency introduction was seen; it isn't shown again.
+    pub fn set_kt_onboarding_seen(&mut self, cx: &mut Context<Self>) {
+        if !self.kt_onboarding_seen {
+            self.kt_onboarding_seen = true;
+            self.save_setting(signal_backend::SETTING_KEY_TRANSPARENCY_ONBOARDING_SEEN, "true".into(), cx);
+        }
     }
 
     /// Desktop's admin delete confirmation was confirmed; it isn't shown again.

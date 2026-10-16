@@ -42,6 +42,7 @@ pub fn open(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
                     )
                     .child(section("Privacy", palette))
                     .child(privacy(&state, cx))
+                    .when(signal_backend::key_transparency_on(), |d| d.child(key_transparency(&state, cx)))
                     .child(section("Notifications", palette))
                     .child(notifications(&state, cx))
                     .child(section("Calls", palette))
@@ -251,6 +252,51 @@ fn stories(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                     ),
             )
         })
+}
+
+/// Desktop's "Automatic key verification" (Privacy), kept in the account
+/// record.
+fn key_transparency(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
+    let palette = Palette::get(cx);
+    let on = !state.read(cx).key_transparency_disabled;
+    let state = state.clone();
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .child(div().text_sm().child("Automatic key verification"))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(palette.text_secondary)
+                        .child("When enabled, Signal will attempt to automatically verify the encryption of 1:1 chats."),
+                )
+                .child(
+                    div().child(
+                        Button::new("key-transparency-learn-more")
+                            .link()
+                            .small()
+                            .label("Learn More")
+                            .on_click(|_, _, cx| cx.open_url("https://support.signal.org/hc/articles/10223569377562")),
+                    ),
+                ),
+        )
+        .child(
+            Button::new("key-transparency-toggle")
+                .label(if on { "On" } else { "Off" })
+                .small()
+                .when(on, |b| b.primary())
+                .when(!on, |b| b.outline())
+                .on_click(move |_, window, cx| {
+                    state.update(cx, |s, cx| s.set_key_transparency_disabled(on, cx));
+                    window.refresh();
+                }),
+        )
 }
 
 /// Desktop's call device choices: microphone, speaker and camera.
