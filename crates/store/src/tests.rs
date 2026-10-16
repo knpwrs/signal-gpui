@@ -858,6 +858,8 @@ async fn drop_later_migrations(db: &AppDb) {
     sqlx::query("ALTER TABLE messages DROP COLUMN poll").execute(&db.writer).await.unwrap();
     sqlx::query("DROP TABLE contact_nicknames").execute(&db.writer).await.unwrap();
     sqlx::query("DROP TABLE early_events").execute(&db.writer).await.unwrap();
+    sqlx::query("DROP TABLE adhoc_calls").execute(&db.writer).await.unwrap();
+    sqlx::query("DROP TABLE call_links").execute(&db.writer).await.unwrap();
     sqlx::query("ALTER TABLE conversations DROP COLUMN can_add_members").execute(&db.writer).await.unwrap();
     sqlx::query("ALTER TABLE conversations DROP COLUMN group_ended").execute(&db.writer).await.unwrap();
     sqlx::query("DROP INDEX messages_view_once").execute(&db.writer).await.unwrap();

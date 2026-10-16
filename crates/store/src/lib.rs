@@ -13,12 +13,14 @@ use sqlx::{
 };
 
 mod call_history;
+mod call_links;
 mod early;
 mod nickname;
 mod poll;
 mod stories;
 mod view_once;
 pub use call_history::*;
+pub use call_links::*;
 pub use early::*;
 pub use nickname::*;
 pub use poll::*;
@@ -42,6 +44,7 @@ pub enum Error {
 /// Stable conversation key.
 /// Direct conversations: `"d:<service id string>"` (ACI uuid).
 /// Groups: `"g:<hex group master key>"`.
+/// A call link's call (no chat): `"l:<hex room id>"`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct ConversationId(pub String);
 
@@ -719,6 +722,17 @@ impl ConversationId {
 
     pub fn is_group(&self) -> bool {
         self.0.starts_with("g:")
+    }
+
+    /// A call link's call, which has no chat: `"l:<room id hex>"`. Only
+    /// calls (and the lobby) use these.
+    pub fn call_link(room_id: &str) -> Self {
+        Self(format!("l:{room_id}"))
+    }
+
+    /// A call link's room id (hex), for a call link's call.
+    pub fn as_call_link(&self) -> Option<&str> {
+        self.0.strip_prefix("l:")
     }
 }
 
@@ -2662,6 +2676,8 @@ impl AppDb {
         sqlx::query("DELETE FROM pinned_messages").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM emoji_usage").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM early_events").execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM adhoc_calls").execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM call_links").execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
     }
