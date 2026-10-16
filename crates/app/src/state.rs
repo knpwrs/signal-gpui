@@ -454,7 +454,10 @@ impl AppState {
                 let sender = message.author_name.clone().unwrap_or_else(|| "Unknown".into());
                 let group = (chat.kind == signal_store::ConversationKind::Group).then_some(chat.title.as_str());
                 let sender = if group.is_some() { sender } else { chat.title.clone() };
-                let (title, body) = setting.text(&sender, group, &notification_preview(&message));
+                // Desktop shows a request's notifications without what it
+                // says (`getNotificationTextForMessage`).
+                let preview = if chat.accepted { notification_preview(&message) } else { "Message Request".into() };
+                let (title, body) = setting.text(&sender, group, &preview);
                 let id = format!("{}:{message_id}", chat.id.0);
                 notifier.post(&crate::notifications::Notification {
                     id: &id,

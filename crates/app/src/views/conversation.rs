@@ -75,6 +75,15 @@ pub struct ConversationView {
     /// Pinned messages, newest pin first, and which one the bar shows.
     pins: Vec<Message>,
     pin_index: usize,
+    /// For message requests and name collisions: names of the group's
+    /// members and of who added us, who's in our address book, the
+    /// collisions whose warning was closed, and whether the 1:1 warning was
+    /// (Desktop's `hasDismissedDirectContactSpoofingWarning`, for while the
+    /// chat is open).
+    names: std::collections::HashMap<String, String>,
+    system_contacts: std::collections::HashSet<String>,
+    acknowledged_collisions: std::collections::BTreeMap<String, Vec<String>>,
+    spoofing_dismissed: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -219,8 +228,13 @@ impl ConversationView {
             selecting: None,
             pins: Vec::new(),
             pin_index: 0,
+            names: Default::default(),
+            system_contacts: Default::default(),
+            acknowledged_collisions: Default::default(),
+            spoofing_dismissed: false,
             _subscriptions: subscriptions,
         };
+        this.load_request_details(cx);
         let jump = this.state.update(cx, |state, _| state.take_jump(&this.id));
         match jump {
             Some(message_id) => this.load_around(message_id, cx),
@@ -229,6 +243,143 @@ impl ConversationView {
         this.mark_read(cx);
         this.load_pins(cx);
         this
+    }
+
+    /// What message requests and name collisions need from the database:
+    /// the group's members' names (and who added us), who's in our address
+    /// book, and the collisions already acknowledged.
+    fn load_request_details(&mut self, cx: &mut Context<Self>) {
+        let chat = self.state.read(cx).conversation(&self.id).cloned();
+        let mut people = chat.as_ref().map(|c| c.members.clone()).unwrap_or_default();
+        people.extend(chat.as_ref().and_then(|c| c.inviter().map(str::to_owned)));
+        let backend = self.state.read(cx).backend.clone();
+        let db = backend.db().clone();
+        let key = crate::views::message_request::acknowledged_key(&self.id);
+        let query = backend.spawn(async move {
+            Ok::<_, signal_store::Error>((db.display_names(&people).await?, db.system_contacts().await?, db.setting(&key).await?))
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok((names, system, acknowledged)) = query.await else { return };
+            let _ = this.update(cx, |this, cx| {
+                this.names = names.into_iter().collect();
+                this.system_contacts = system.into_iter().collect();
+                this.acknowledged_collisions = acknowledged.and_then(|a| serde_json::from_str(&a).ok()).unwrap_or_default();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Who added or invited us to this group, by name.
+    fn added_by_name(&self, cx: &App) -> Option<String> {
+        let state = self.state.read(cx);
+        let chat = state.conversation(&self.id)?;
+        crate::views::message_request::added_by_name(state, chat, &self.names)
+    }
+
+    /// This group's members' names, for collisions: each member's chat
+    /// title, else the name the database knows.
+    fn member_names(&self, cx: &App) -> Vec<(String, String)> {
+        let state = self.state.read(cx);
+        let Some(chat) = state.conversation(&self.id) else { return Vec::new() };
+        chat.members
+            .iter()
+            .filter_map(|aci| {
+                let name = state
+                    .conversation(&ConversationId::direct(aci))
+                    .map(|c| c.title.clone())
+                    .or_else(|| self.names.get(aci).cloned())?;
+                Some((aci.clone(), name))
+            })
+            .collect()
+    }
+
+    /// Desktop's name collision warning under the header: a 1:1 request
+    /// with a contact's name, or group members sharing one.
+    fn render_spoofing_warning(&self, palette: Palette, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::views::message_request as mr;
+        let state = self.state.read(cx);
+        let chat = state.conversation(&self.id)?.clone();
+        match chat.kind {
+            ConversationKind::Direct if !self.spoofing_dismissed => {
+                let contact = mr::same_name_contact(&chat, state.conversations.iter().chain(&state.archived))?.clone();
+                let sid = chat.id.as_direct()?.to_owned();
+                let request = mr::ReviewPerson::of(state, &sid, chat.title.clone());
+                let contact = mr::ReviewPerson::of(state, contact.id.as_direct()?, contact.title.clone());
+                let view = cx.entity().downgrade();
+                let review_state = self.state.clone();
+                Some(mr::render_warning(
+                    mr::SAME_NAME_TEXT.into(),
+                    "Review request",
+                    move |window, cx| mr::open_direct_review(review_state.clone(), request.clone(), contact.clone(), window, cx),
+                    move |_, cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            this.spoofing_dismissed = true;
+                            cx.notify();
+                        });
+                    },
+                    palette,
+                ))
+            }
+            ConversationKind::Group if !chat.left => {
+                let me = state.account.as_ref().map(|a| a.aci.clone()).unwrap_or_default();
+                let members = self.member_names(cx);
+                let collisions = mr::name_collisions(&members, &me, &self.system_contacts);
+                if collisions.is_empty() || !mr::has_unacknowledged(&self.acknowledged_collisions, &collisions) {
+                    return None;
+                }
+                let state = self.state.read(cx);
+                let names: std::collections::HashMap<String, String> = members.into_iter().collect();
+                let people: Vec<mr::ReviewPerson> = collisions
+                    .values()
+                    .flatten()
+                    .map(|aci| mr::ReviewPerson::of(state, aci, names.get(aci).cloned().unwrap_or_default()))
+                    .collect();
+                let view = cx.entity().downgrade();
+                let (review_state, system, shown) = (self.state.clone(), self.system_contacts.clone(), collisions.clone());
+                let admin_of = chat.admins.contains(&me).then(|| chat.id.clone());
+                Some(mr::render_warning(
+                    mr::group_warning_text(&collisions),
+                    "Review members",
+                    move |window, cx| {
+                        mr::open_group_review(
+                            review_state.clone(),
+                            admin_of.clone(),
+                            shown.clone(),
+                            people.clone(),
+                            system.clone(),
+                            window,
+                            cx,
+                        )
+                    },
+                    move |_, cx| {
+                        let collisions = collisions.clone();
+                        let _ = view.update(cx, |this, cx| this.acknowledge_collisions(collisions, cx));
+                    },
+                    palette,
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// Closing the group warning (Desktop's
+    /// `acknowledgeGroupMemberNameCollisions`): kept, so it shows again
+    /// only for someone new.
+    fn acknowledge_collisions(&mut self, collisions: std::collections::BTreeMap<String, Vec<String>>, cx: &mut Context<Self>) {
+        let Ok(json) = serde_json::to_string(&collisions) else { return };
+        self.acknowledged_collisions = collisions;
+        let backend = self.state.read(cx).backend.clone();
+        let db = backend.db().clone();
+        let key = crate::views::message_request::acknowledged_key(&self.id);
+        let save = backend.spawn(async move { db.set_setting(&key, &json).await });
+        cx.spawn(async move |_, _| {
+            if let Err(error) = save.await {
+                tracing::warn!(%error, "couldn't save the acknowledged name collisions");
+            }
+        })
+        .detach();
+        cx.notify();
     }
 
     fn load_pins(&mut self, cx: &mut Context<Self>) {
@@ -283,6 +434,15 @@ impl ConversationView {
         };
         // Desktop's "Join" on a group call's notice.
         let join = matches!(notice, Notice::GroupCall { .. });
+        // Desktop's `MessageRequestResponseNotification` buttons: "Block or
+        // Report..." on the accept (unless blocked since), "Learn More"
+        // (the safety tips) on a report.
+        let chat = self.state.read(cx).conversation(&self.id).cloned();
+        let request_options = match notice {
+            Notice::MessageRequest { event: signal_store::MessageRequestEvent::Accept, .. } => chat.filter(|c| !c.blocked),
+            _ => None,
+        };
+        let learn_more = matches!(notice, Notice::MessageRequest { event: signal_store::MessageRequestEvent::Spam, .. });
         // Their safety number (they may have no 1:1 chat, only a group).
         let safety_with = match notice {
             Notice::SafetyNumberChanged { who } => Some((ConversationId::direct(who), self.reactor_name(Some(who), cx))),
@@ -344,6 +504,29 @@ impl ConversationView {
                                     let chat = this.id.clone();
                                     this.state.update(cx, |state, cx| state.open_call_lobby(chat, true, cx));
                                 })),
+                        )
+                    })
+                    .when_some(request_options, |d, chat| {
+                        let (state, added_by) = (self.state.clone(), self.added_by_name(cx));
+                        d.child(
+                            div().debug_selector(|| "notice-block-or-report".into()).child(
+                                Button::new(SharedString::from(format!("notice-request-{sent_at}")))
+                                    .label("Block or Report...")
+                                    .ghost()
+                                    .on_click(move |_, window, cx| {
+                                        crate::views::message_request::accepted_options(&state, &chat, added_by.clone(), window, cx)
+                                    }),
+                            ),
+                        )
+                    })
+                    .when(learn_more, |d| {
+                        d.child(
+                            div().debug_selector(|| "notice-learn-more".into()).child(
+                                Button::new(SharedString::from(format!("notice-learn-{sent_at}")))
+                                    .label("Learn More")
+                                    .ghost()
+                                    .on_click(|_, window, cx| crate::views::message_request::open_safety_tips(window, cx)),
+                            ),
                         )
                     })
                     .when_some(safety_with, |d, (chat, name)| {
@@ -877,7 +1060,8 @@ impl ConversationView {
                 )
             })
             // Desktop's call buttons: a 1:1 chat's two.
-            .when(conversation.is_some_and(|c| c.kind == ConversationKind::Direct && !c.blocked && !c.id.is_signal()), |d| {
+            // Desktop's `getConversationCallMode`: not for a message request.
+            .when(conversation.is_some_and(|c| c.kind == ConversationKind::Direct && !c.blocked && c.accepted && !c.id.is_signal()), |d| {
                 use gpui_kit::component::button::ButtonVariants as _;
                 let call = |id: &'static str, icon: IconName, tooltip: &'static str, video: bool| {
                     gpui_kit::component::button::Button::new(id).ghost().icon(icon).tooltip(tooltip).on_click(cx.listener(
@@ -891,7 +1075,7 @@ impl ConversationView {
                     .child(call("voice-call", IconName::Phone, "Start a call", false))
             })
             // A group's: one button, as Desktop's.
-            .when(conversation.is_some_and(|c| c.kind == ConversationKind::Group && !c.left && !c.blocked && !c.ended), |d| {
+            .when(conversation.is_some_and(|c| c.kind == ConversationKind::Group && !c.left && !c.blocked && !c.ended && c.accepted), |d| {
                 use gpui_kit::component::button::ButtonVariants as _;
                 d.child(
                     gpui_kit::component::button::Button::new("group-call")
@@ -943,42 +1127,12 @@ impl ConversationView {
             })
     }
 
-    /// In place of the composer when the chat is blocked, as Desktop shows.
-    fn render_blocked(&self, conversation: &signal_store::Conversation, palette: Palette) -> impl IntoElement {
-        use gpui_kit::component::button::{Button, ButtonVariants as _};
-        let group = conversation.kind == ConversationKind::Group;
-        let text = if group {
-            "Unblock this group and share your name and photo with its members? You won't receive any messages until you unblock them.".to_owned()
-        } else {
-            format!(
-                "Let {} message you and share your name and photo with them? You won't receive any messages until you unblock them.",
-                conversation.title
-            )
-        };
-        let (state, id, title) = (self.state.clone(), self.id.clone(), conversation.title.clone());
-        let (delete_state, delete_id) = (self.state.clone(), self.id.clone());
-        div()
-            .flex_none()
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap_3()
-            .px_6()
-            .py_4()
-            .border_t_1()
-            .border_color(palette.panel_border)
-            .child(div().text_sm().text_color(palette.text_secondary).text_center().child(text))
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(Button::new("blocked-delete").label("Delete").outline().on_click(move |_, window, cx| {
-                        crate::views::chat_menu::confirm_delete_chat(delete_state.clone(), delete_id.clone(), group, window, cx)
-                    }))
-                    .child(Button::new("blocked-unblock").label("Unblock").primary().on_click(move |_, window, cx| {
-                        crate::views::chat_menu::confirm_block(state.clone(), id.clone(), &title, group, false, window, cx)
-                    })),
-            )
+    /// Desktop's `ConversationHero` for a message request (and Safety tips).
+    fn render_request_hero(&self, palette: Palette, cx: &App) -> Option<AnyElement> {
+        let state = self.state.read(cx);
+        let chat = state.conversation(&self.id).filter(|c| !c.accepted && !c.id.is_signal())?;
+        let shared = chat.id.as_direct().map(|aci| crate::views::message_request::shared_groups(state, aci)).unwrap_or_default();
+        Some(crate::views::message_request::render_hero(chat, &shared, &chat.members, palette, cx))
     }
 
     fn render_item(&mut self, ix: usize, palette: Palette, cx: &mut Context<Self>) -> AnyElement {
@@ -1144,6 +1298,8 @@ impl ConversationView {
             })
             // The start of the Signal chat: Desktop's hero.
             .when(ix == 0 && !self.has_more && self.id.is_signal(), |d| d.child(signal_hero(palette, cx)))
+            // A message request's (with Desktop's "Safety tips").
+            .when(ix == 0 && !self.has_more, |d| d.children(self.render_request_hero(palette, cx)))
             .when(show_day, |d| {
                 let signal = self.id.is_signal().then(|| signal_colors(cx));
                 d.child(
@@ -1433,7 +1589,7 @@ impl ConversationView {
         // A poll shows in place of its text (its body is the question).
         let poll = message.poll.as_ref().filter(|_| !message.deleted).map(|poll| {
             let can_vote = !self.id.is_signal()
-                && self.state.read(cx).conversation(&self.id).is_none_or(|c| !c.left && !c.blocked && !c.ended);
+                && self.state.read(cx).conversation(&self.id).is_none_or(|c| !c.left && !c.blocked && !c.ended && c.accepted);
             let secondary = if outgoing { meta_color } else { palette.text_secondary };
             crate::views::poll::render_poll(message, poll, outgoing, fg, secondary, can_vote, palette, cx.entity().downgrade(), self.state.clone())
         });
@@ -1585,8 +1741,9 @@ impl ConversationView {
 
     fn render_hover_actions(&self, message: &Message, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let id = message.id;
-        // Desktop's `canReply` and `canReact`: not in an ended group.
-        let ended = self.ended(cx);
+        // Desktop's `canReplyOrReact`: not in an ended group, a blocked
+        // chat or a message request.
+        let ended = self.ended(cx) || self.state.read(cx).conversation(&self.id).is_some_and(|c| c.blocked || !c.accepted);
         let for_reply = message.clone();
         // View-once media can't be saved (Desktop's `canDownload`).
         let downloadable: Vec<AttachmentMeta> = message
@@ -2100,6 +2257,7 @@ impl ConversationView {
         state
             .conversation(&ConversationId::direct(author))
             .map(|c| c.title.clone())
+            .or_else(|| self.names.get(author).cloned())
             .or_else(|| {
                 self.messages.iter().rev().find(|m| m.author.as_deref() == Some(author)).and_then(|m| m.author_name.clone())
             })
@@ -3306,6 +3464,7 @@ impl Render for ConversationView {
             .bg(palette.background)
             .text_color(palette.text)
             .child(self.render_header(palette, cx))
+            .children(self.render_spoofing_warning(palette, cx))
             .children(self.render_mini_player(palette, cx))
             .children(self.render_pins(palette, cx))
             .child(
@@ -3404,14 +3563,18 @@ impl Render for ConversationView {
                 if self.id.is_signal() {
                     return d;
                 }
-                // An invitation, a request to join, or announcement-only.
+                // A request to join, or announcement-only (a message request,
+                // an invitation among them, has the bar below, as Desktop's
+                // `CompositionArea` puts it first).
                 if let Some(chat) = self.state.read(cx).conversation(&self.id)
+                    && !crate::views::message_request::shows_bar(chat)
                     && let Some(replacement) = crate::views::group_admin::composer_replacement(&self.state, chat, palette, cx)
                 {
                     return d.child(replacement);
                 }
-                match self.state.read(cx).conversation(&self.id).filter(|c| c.blocked || c.left || c.ended) {
-                    Some(conversation) if conversation.blocked => d.child(self.render_blocked(conversation, palette)),
+                let state = self.state.read(cx);
+                let chat = state.conversation(&self.id);
+                match chat.filter(|c| c.blocked || c.left || c.ended || !c.accepted) {
                     // Desktop's `CompositionArea--group-terminated`.
                     Some(conversation) if conversation.ended => d.child(
                         div()
@@ -3427,6 +3590,22 @@ impl Render for ConversationView {
                             .text_color(palette.text_secondary)
                             .child("You can't send messages because the group has ended."),
                     ),
+                    // Desktop's message request bar (blocked chats too).
+                    Some(conversation) if crate::views::message_request::shows_bar(conversation) => {
+                        let shared = conversation
+                            .id
+                            .as_direct()
+                            .map_or(0, |aci| crate::views::message_request::shared_groups(state, aci).len());
+                        let bar = crate::views::message_request::render_bar(
+                            conversation,
+                            &self.state,
+                            self.added_by_name(cx),
+                            shared,
+                            palette,
+                            cx,
+                        );
+                        d.child(bar)
+                    }
                     // Desktop: "You are no longer a member of the group."
                     Some(_) => d.child(
                         div()

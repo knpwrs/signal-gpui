@@ -83,7 +83,9 @@ pub fn conversation_avatar(conversation: &Conversation, size: Pixels) -> AnyElem
     if conversation.id.is_signal() {
         return signal_avatar(size);
     }
-    if let Some(path) = &conversation.avatar_path {
+    // A message request's photo isn't shown (Desktop doesn't download it
+    // until the request is accepted).
+    if let Some(path) = conversation.avatar_path.as_ref().filter(|_| conversation.accepted) {
         return img(std::path::PathBuf::from(path))
             .flex_none()
             .size(size)

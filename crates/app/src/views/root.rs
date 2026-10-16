@@ -970,4 +970,108 @@ mod tests {
         assert!(chat.ended && !chat.can_edit_info && !chat.can_add_members);
         backend.shutdown();
     }
+
+    /// The demo's stranger with Maya's name, and the group we're invited to.
+    const STRANGER: &str = "d:00000000-0000-4000-8000-0000000000a5";
+    const INVITE: &str = "g:0000000000000000000000000000000000000000000000000000000000000005";
+
+    fn request(cx: &mut VisualTestContext, state: &Entity<AppState>, id: &str) -> signal_store::ConversationId {
+        let id = signal_store::ConversationId(id.into());
+        wait(cx, "the request", &|cx| state.read_with(cx, |s, _| s.conversation(&id).is_some_and(|c| !c.accepted)));
+        state.update(cx, |s, cx| s.select(Some(id.clone()), cx));
+        wait(cx, "the message request bar", &|cx| cx.debug_bounds("message-request").is_some());
+        id
+    }
+
+    #[gpui_kit::test]
+    fn a_strangers_request_is_answered_from_its_bar(cx: &mut TestAppContext) {
+        let (mut cx, state, _root, backend, _dir) = demo_window(cx);
+        let stranger = request(&mut cx, &state, STRANGER);
+        // In place of the composer, with Desktop's hero, the warning about
+        // a contact's name, and no reply or call buttons.
+        assert!(cx.debug_bounds("emoji-button").is_none());
+        wait(&mut cx, "the hero", &|cx| cx.debug_bounds("mr-hero").is_some());
+        wait(&mut cx, "the name warning", &|cx| cx.debug_bounds("spoofing-warning").is_some());
+        assert!(cx.debug_bounds("voice-call").is_none());
+        // Delete only once reported or blocked.
+        assert!(cx.debug_bounds("mr-delete").is_none() && cx.debug_bounds("mr-block").is_some());
+
+        click(&mut cx, "spoofing-review");
+        wait(&mut cx, "the review", &|cx| cx.debug_bounds("review-request").is_some());
+        cx.simulate_keystrokes("escape");
+        wait(&mut cx, "the review to close", &|cx| cx.debug_bounds("review-request").is_none());
+
+        click(&mut cx, "mr-accept");
+        click(&mut cx, "mr-confirm-accept");
+        wait(&mut cx, "the composer", &|cx| cx.debug_bounds("emoji-button").is_some());
+        let chat = state.read_with(&cx, |s, _| s.conversation(&stranger).cloned()).unwrap();
+        assert!(chat.accepted && chat.message_request == signal_store::MessageRequestResponse::Accept);
+        assert!(cx.debug_bounds("spoofing-warning").is_none(), "only a request is warned about");
+        // Desktop's notice, and its Block or Report... button.
+        wait(&mut cx, "the notice", &|cx| cx.debug_bounds("notice-block-or-report").is_some());
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn reporting_and_blocking_a_request(cx: &mut TestAppContext) {
+        let (mut cx, state, _root, backend, _dir) = demo_window(cx);
+        let stranger = request(&mut cx, &state, STRANGER);
+        click(&mut cx, "mr-report");
+        click(&mut cx, "mr-confirm-report-block");
+        wait(&mut cx, "the block", &|cx| state.read_with(cx, |s, _| s.conversation(&stranger).is_some_and(|c| c.blocked)));
+        let chat = state.read_with(&cx, |s, _| s.conversation(&stranger).cloned()).unwrap();
+        assert!(chat.reported && chat.message_request == signal_store::MessageRequestResponse::BlockAndSpam);
+        // Blocked and reported: Delete and Unblock, no Accept or Report.
+        wait(&mut cx, "the blocked bar", &|cx| cx.debug_bounds("mr-unblock").is_some());
+        assert!(cx.debug_bounds("mr-delete").is_some() && cx.debug_bounds("mr-accept").is_none());
+        assert!(cx.debug_bounds("mr-report").is_none());
+        wait(&mut cx, "Learn More", &|cx| cx.debug_bounds("notice-learn-more").is_some());
+        // Deleting keeps the blocked chat, without its messages.
+        click(&mut cx, "mr-delete");
+        click(&mut cx, "mr-confirm-delete");
+        let db = backend.db().clone();
+        let id = stranger.clone();
+        wait(&mut cx, "the messages to go", &|_| {
+            let (db, id) = (db.clone(), id.clone());
+            futures::executor::block_on(backend.spawn(async move { db.messages(&id, None, 10).await }))
+                .unwrap_or_default()
+                .iter()
+                .all(|m| m.notice.is_some())
+        });
+        assert!(state.read_with(&cx, |s, _| s.conversation(&stranger).is_some_and(|c| c.blocked)));
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn a_group_invitation_is_joined_or_declined(cx: &mut TestAppContext) {
+        let (mut cx, state, _root, backend, _dir) = demo_window(cx);
+        let invite = request(&mut cx, &state, INVITE);
+        let chat = state.read_with(&cx, |s, _| s.conversation(&invite).cloned()).unwrap();
+        assert!(chat.invited() && chat.inviter().is_some());
+        assert_eq!(chat.last_message_preview.as_deref(), Some("Maya Chen invited you to the group."));
+        click(&mut cx, "mr-block");
+        click(&mut cx, "mr-confirm-block");
+        wait(&mut cx, "the decline", &|cx| state.read_with(cx, |s, _| s.conversation(&invite).is_some_and(|c| c.blocked && c.left)));
+        assert!(!state.read_with(&cx, |s, _| s.conversation(&invite).unwrap().invited()));
+        // Unblocking accepts (Desktop's unblock is an accept).
+        click(&mut cx, "mr-unblock");
+        click(&mut cx, "mr-confirm-unblock");
+        wait(&mut cx, "the unblock", &|cx| state.read_with(cx, |s, _| s.conversation(&invite).is_some_and(|c| !c.blocked && c.accepted)));
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn safety_tips_page_through_desktops_tips(cx: &mut TestAppContext) {
+        let (mut cx, state, _root, backend, _dir) = demo_window(cx);
+        request(&mut cx, &state, STRANGER);
+        click(&mut cx, "safety-tips");
+        wait(&mut cx, "the summary", &|cx| cx.debug_bounds("safety-tips-summary").is_some());
+        click(&mut cx, "safety-tips-more");
+        wait(&mut cx, "the first tip", &|cx| cx.debug_bounds("safety-tip-0").is_some());
+        click(&mut cx, "safety-tips-next");
+        wait(&mut cx, "the second tip", &|cx| cx.debug_bounds("safety-tip-1").is_some());
+        click(&mut cx, "safety-tips-previous");
+        wait(&mut cx, "back to the first", &|cx| cx.debug_bounds("safety-tip-0").is_some());
+        backend.shutdown();
+    }
 }

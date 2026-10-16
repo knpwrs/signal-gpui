@@ -14,6 +14,7 @@ pub mod group_admin;
 pub mod image_viewer;
 pub mod link;
 pub mod message_info;
+pub mod message_request;
 pub mod nav;
 pub mod new_group;
 pub mod nickname;

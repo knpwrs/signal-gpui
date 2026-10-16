@@ -308,6 +308,54 @@ with a membership proof from `GET /v1/groups/token`. Not done yet:
   presage uses v0.99.0; both build side by side. Keep RingRTC's pin in step
   when presage moves.
 
+## Message requests
+
+Done following Desktop: who is a request (`isConversationAccepted`: our
+answer, profile sharing, a message of ours, the address book, an empty
+1:1 chat, a group someone trusted added us to; an invitation until it's
+taken), the bar in place of the composer with Desktop's wording and
+confirmations, Accept (unblocks, shares our profile here and in Storage
+Service, sends our profile key, joins an invited group, downloads what was
+held), Delete, Block, Report spam and Report and block
+(`POST /v1/messages/report/{aci}/{serverGuid}` for the newest three
+incoming messages, with the sender's report spam token, retried as
+Desktop's job queue does), the `MessageRequestResponse` sync both ways,
+the notices (and those in transferred history), the hero with Safety
+tips, the safety tips dialog, the name collision warnings and their review
+dialogs, "Message Request" in the chat list and notifications, and holding
+read receipts, typing indicators, sends, reactions, replies, calls (an
+offer gets Desktop's NeedPermission hangup and a missed call), group call
+rings, media, link preview images and long texts until accepted.
+
+Tested with store, mapping, storage record, backup import and wire format
+unit tests, and demo-mode UI tests (a made-up stranger with a contact's
+name, and an invitation from another made-up stranger). Not tried with a
+real account or against Signal's servers: the spam report (never sent from
+a test), taking or declining a real group invitation on the group server,
+the syncs with a phone, and the hangup to a real caller. Left:
+
+- **Existing chats after upgrading:** a group nobody we trust is known to
+  have added us to, where we never sent anything and Storage Service has
+  no `whitelisted`, now shows as a request, as it would in Desktop; who
+  added us is only known from group changes seen from now on.
+- **Reports aren't kept across restarts:** Desktop's job queue is
+  persisted; here a report still retrying is lost when the app quits.
+- **Delivery receipts:** Desktop holds them for requests; this client
+  doesn't send delivery receipts at all.
+- **Photos:** a request's photo isn't shown, but it may already have been
+  downloaded (Desktop doesn't download it until accepted, and offers
+  "click to view").
+- **Links:** Desktop doesn't make links clickable in a request.
+- **Removed contacts** (Desktop's `removalStage` and its
+  "message-direct-hidden" wording), and leaving groups a blocked contact
+  added us to, aren't done.
+- **Review dialogs:** the "Signal Connection" line, opening a person's
+  details, and Desktop's colliding avatars beside the group warning.
+- **Name changes** in the group review ("Recently changed their profile
+  name from ...") aren't tracked.
+- **Address book:** who's in it is refreshed with each Storage Service
+  sync, not on contact sync alone.
+
 ## Voice messages
 
 Recording, the draft kept when you leave the app, and sending work. Not

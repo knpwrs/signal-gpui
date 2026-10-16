@@ -586,6 +586,9 @@ impl Sidebar {
         // Desktop's order: blocked, then someone typing, then the draft.
         let preview = if conversation.blocked {
             StyledText::new("Blocked").into_any_element()
+        } else if !conversation.accepted {
+            // Desktop's `ConversationListItem--message-request`.
+            StyledText::new("Message Request").into_any_element()
         } else if typing {
             typing_dots(palette.text_secondary).into_any_element()
         } else if let Some(draft) = draft {

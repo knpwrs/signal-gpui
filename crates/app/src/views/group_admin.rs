@@ -603,52 +603,6 @@ pub fn composer_replacement(state: &Entity<AppState>, chat: &Conversation, palet
             .text_center()
     };
     match &chat.group_state.membership {
-        // Desktop's `MessageRequestActions` for a group we're invited to.
-        Membership::Invited { .. } if !chat.left => {
-            let (block_state, block_chat) = (state.clone(), chat.clone());
-            let (delete_state, delete_chat) = (state.clone(), chat.clone());
-            let (accept_state, accept_id) = (state.clone(), chat.id.clone());
-            Some(
-                bar("group-invite-actions")
-                    .child(div().text_color(palette.text_secondary).child(
-                        "Join this group and share your name and photo with its members? They won’t know you’ve seen their messages until you accept.",
-                    ))
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(Button::new("invite-block").label("Block").outline().on_click(move |_, window, cx| {
-                                let (state, id) = (block_state.clone(), block_chat.id.clone());
-                                confirm(
-                                    Some(format!("Block and Leave {}?", block_chat.title)),
-                                    "You will no longer receive messages or updates from this group and members won't be able to add you to this group again."
-                                        .into(),
-                                    "Block",
-                                    true,
-                                    window,
-                                    cx,
-                                    move |_, cx| state.read(cx).send(Command::AnswerMessageRequest { conversation: id.clone(), answer: signal_store::MessageRequestResponse::Block }),
-                                );
-                            }))
-                            .child(Button::new("invite-delete").label("Delete").outline().on_click(move |_, window, cx| {
-                                let (state, id) = (delete_state.clone(), delete_chat.id.clone());
-                                confirm(
-                                    Some(format!("Delete and Leave {}?", delete_chat.title)),
-                                    "You will leave this group, and it will be deleted from all your devices.".into(),
-                                    "Delete and Leave",
-                                    true,
-                                    window,
-                                    cx,
-                                    move |_, cx| state.read(cx).send(Command::AnswerMessageRequest { conversation: id.clone(), answer: signal_store::MessageRequestResponse::Delete }),
-                                );
-                            }))
-                            .child(Button::new("invite-accept").label("Accept").primary().on_click(move |_, _, cx| {
-                                accept_state.read(cx).send(Command::AnswerMessageRequest { conversation: accept_id.clone(), answer: signal_store::MessageRequestResponse::Accept });
-                            })),
-                    )
-                    .into_any_element(),
-            )
-        }
         // Desktop's `GroupV2PendingApprovalActions`.
         Membership::Requesting { .. } => {
             let (state, id) = (state.clone(), chat.id.clone());
@@ -1043,10 +997,13 @@ mod tests {
         // Not a group in common with Maya until we're in it.
         assert!(state.read_with(cx, |s, _| groups_in_common(s, MAYA)).iter().all(|g| g.id.0 != INVITED));
         state.update(cx, |s, cx| s.select(Some(ConversationId(INVITED.into())), cx));
-        wait(cx, "the invitation actions", &|cx| cx.debug_bounds("group-invite-actions").is_some());
-        press(cx, "invite-accept");
+        // Desktop's message request bar, whose Accept takes the invitation.
+        wait(cx, "the invitation actions", &|cx| cx.debug_bounds("message-request").is_some());
+        press(cx, "mr-accept");
+        press(cx, "mr-confirm-accept");
         until(cx, &state, INVITED, "us to join", |c| c.group_state.membership == Membership::Member);
-        wait(cx, "the composer", &|cx| cx.debug_bounds("group-invite-actions").is_none());
+        until(cx, &state, INVITED, "it accepted", |c| c.accepted);
+        wait(cx, "the composer", &|cx| cx.debug_bounds("message-request").is_none());
         let common: Vec<String> = state.read_with(cx, |s, _| groups_in_common(s, MAYA)).into_iter().map(|g| g.id.0).collect();
         assert!(common.contains(&HIKES.to_owned()) && common.contains(&INVITED.to_owned()), "{common:?}");
         backend.shutdown();

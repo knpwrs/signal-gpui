@@ -67,6 +67,7 @@ gpui_kit::assets::icon_assets!(
         SquarePen,
         Timer,
         Trash,
+        TriangleAlert,
         User,
         Video,
         VideoOff,
