@@ -76,6 +76,8 @@ impl CatchUp {
 
 /// How long to wait for the connection before showing the app anyway.
 const CATCH_UP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a saved setting's value outlasts reloads that don't read it back.
+const PENDING_PREF_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Desktop's lobby: the camera preview and toggles before a call starts.
 #[derive(Debug, Clone, PartialEq)]
@@ -315,8 +317,10 @@ pub struct AppState {
     pub image_optimization: signal_backend::media::Optimization,
     /// Settings' other values (theme, zoom, the account's on/off settings).
     pub prefs: crate::prefs::Prefs,
-    /// Settings' values being saved (see `save_pref`).
-    pending_prefs: HashMap<&'static str, String>,
+    /// Settings' values being saved, and since when (see `save_pref`).
+    pending_prefs: HashMap<&'static str, (String, std::time::Instant)>,
+    /// The newest `load_prefs` read; an older one finishing late is dropped.
+    prefs_read: u64,
     /// Open at computer login, as the system last said.
     pub open_at_login: bool,
     /// The system's login item (a stand-in in tests).
@@ -445,6 +449,7 @@ impl AppState {
             prefs: Default::default(),
             open_at_login: false,
             pending_prefs: HashMap::new(),
+            prefs_read: 0,
             login_item: Default::default(),
             sticker_packs: Vec::new(),
             has_giphy_key: std::env::var_os("GIPHY_API_KEY").is_some(),
@@ -1200,6 +1205,7 @@ impl AppState {
                 self.has_giphy_key = std::env::var_os("GIPHY_API_KEY").is_some();
                 self.image_optimization = Default::default();
                 self.prefs = Default::default();
+                self.pending_prefs.clear();
                 crate::prefs::apply(self.prefs.theme, self.prefs.zoom, cx);
                 self.seen_admin_delete_education = false;
                 self.kt_status = None;
@@ -1348,6 +1354,8 @@ impl AppState {
 
     /// Reads Settings' other values, and applies the theme and zoom.
     fn load_prefs(&mut self, cx: &mut Context<Self>) {
+        self.prefs_read += 1;
+        let generation = self.prefs_read;
         let db = self.backend.db().clone();
         let read = self.backend.spawn(async move {
             let mut values = HashMap::new();
@@ -1359,10 +1367,17 @@ impl AppState {
         cx.spawn(async move |this, cx| {
             let Ok(mut values) = read.await else { return };
             let _ = this.update(cx, |this, cx| {
+                if this.prefs_read != generation {
+                    return;
+                }
                 // A setting still being saved may have been read as it was;
                 // once it reads back as set, it's saved.
-                this.pending_prefs.retain(|key, value| values.get(*key).and_then(|v| v.as_deref()) != Some(value.as_str()));
-                for (key, value) in &this.pending_prefs {
+                // One not read back within `PENDING_PREF_TIMEOUT` failed to
+                // save (or was saved in another form): the database wins.
+                this.pending_prefs.retain(|key, (value, since)| {
+                    since.elapsed() < PENDING_PREF_TIMEOUT && values.get(*key).and_then(|v| v.as_deref()) != Some(value.as_str())
+                });
+                for (key, (value, _)) in &this.pending_prefs {
                     values.insert((*key).to_owned(), Some(value.clone()));
                 }
                 this.prefs = crate::prefs::Prefs::from_values(&values);
@@ -1373,10 +1388,15 @@ impl AppState {
         .detach();
     }
 
+    /// Keeps `value` over what a reload reads for `key` until it reads back.
+    fn mark_pending(&mut self, key: &'static str, value: String) {
+        self.pending_prefs.insert(key, (value, std::time::Instant::now()));
+    }
+
     /// Saves one of Settings' values; until it's written, a reload of the
     /// settings keeps the new value rather than reading the old one back.
     fn save_pref(&mut self, key: &'static str, value: String, cx: &mut Context<Self>) {
-        self.pending_prefs.insert(key, value.clone());
+        self.mark_pending(key, value.clone());
         let db = self.backend.db().clone();
         let save = self.backend.spawn(async move { db.set_setting(key, &value).await });
         // It stays pending until a reload reads it back as saved: a reload
@@ -1576,7 +1596,7 @@ impl AppState {
         use signal_backend::AccountSetting;
         self.prefs.flags.insert(setting, on);
         // The backend saves it; until then a reload keeps this value.
-        self.pending_prefs.insert(setting.key(), on.to_string());
+        self.mark_pending(setting.key(), on.to_string());
         match setting {
             AccountSetting::ReadReceipts => self.read_receipts = on,
             AccountSetting::TypingIndicators => {
@@ -2396,7 +2416,7 @@ impl AppState {
     /// Desktop's "Default timer for new chats", for the whole account.
     pub fn set_universal_timer(&mut self, seconds: u32, cx: &mut Context<Self>) {
         self.prefs.universal_timer = seconds;
-        self.pending_prefs.insert(signal_backend::SETTING_UNIVERSAL_EXPIRE_TIMER, seconds.to_string());
+        self.mark_pending(signal_backend::SETTING_UNIVERSAL_EXPIRE_TIMER, seconds.to_string());
         self.send(Command::SetUniversalExpireTimer(seconds));
         cx.notify();
     }
@@ -2404,10 +2424,10 @@ impl AppState {
     /// Desktop's "Who can see my number"; everybody also makes us findable.
     pub fn set_number_shared(&mut self, everybody: bool, cx: &mut Context<Self>) {
         self.prefs.number_shared = everybody;
-        self.pending_prefs.insert(signal_backend::SETTING_PHONE_NUMBER_SHARING, everybody.to_string());
+        self.mark_pending(signal_backend::SETTING_PHONE_NUMBER_SHARING, everybody.to_string());
         if everybody {
             self.prefs.number_discoverable = true;
-            self.pending_prefs.insert(signal_backend::SETTING_PHONE_NUMBER_DISCOVERABLE, "true".into());
+            self.mark_pending(signal_backend::SETTING_PHONE_NUMBER_DISCOVERABLE, "true".into());
         }
         self.send(Command::SetPhoneNumberSharing(everybody));
         cx.notify();
@@ -2416,7 +2436,7 @@ impl AppState {
     /// Desktop's "Who can find me by number".
     pub fn set_number_discoverable(&mut self, discoverable: bool, cx: &mut Context<Self>) {
         self.prefs.number_discoverable = discoverable;
-        self.pending_prefs.insert(signal_backend::SETTING_PHONE_NUMBER_DISCOVERABLE, discoverable.to_string());
+        self.mark_pending(signal_backend::SETTING_PHONE_NUMBER_DISCOVERABLE, discoverable.to_string());
         self.send(Command::SetPhoneNumberDiscoverable(discoverable));
         cx.notify();
     }
@@ -2425,7 +2445,7 @@ impl AppState {
     pub fn set_auto_download(&mut self, choices: signal_backend::auto_download::AutoDownload, cx: &mut Context<Self>) {
         self.prefs.auto_download = choices;
         if let Ok(json) = serde_json::to_string(&choices) {
-            self.pending_prefs.insert(signal_backend::auto_download::SETTING_AUTO_DOWNLOAD, json);
+            self.mark_pending(signal_backend::auto_download::SETTING_AUTO_DOWNLOAD, json);
         }
         self.send(Command::SetAutoDownload(choices));
         cx.notify();
