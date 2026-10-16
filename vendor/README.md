@@ -93,6 +93,12 @@ Powers for signal-gpui since 2026-10-15. Changes:
   `GroupsManager::fetch_group_send_endorsements` and
   `PushService::get_group_with_endorsements` (`GET /v2/groups/`, a
   `GroupResponse`).
+- `src/cipher.rs`: the envelope's `report_spam_token` is kept, by server
+  GUID, for the newest 256 decrypted envelopes, and taken once with
+  `cipher::take_report_spam_token` (Desktop keeps it as the sender's
+  `reportingToken` and sends it with a spam report). It's kept apart from
+  `Metadata` because presage-store-sqlite (not vendored) lists that
+  struct's fields exhaustively. Upstream drops the token.
 - `src/provisioning/mod.rs`: `NewDeviceRegistration::media_root_backup_key`,
   from the provisioning message's `mediaRootBackupKey` (one that isn't 32
   bytes is dropped rather than failing the link). Upstream ignores it when

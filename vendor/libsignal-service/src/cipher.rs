@@ -30,6 +30,38 @@ use crate::{
     ServiceIdExt,
 };
 
+/// The report spam tokens of recently decrypted envelopes
+/// (`Envelope.report_spam_token`), by server GUID. Kept apart from
+/// [`Metadata`], whose fields other crates (presage's stores) list
+/// exhaustively. Holds the newest [`REPORT_SPAM_TOKENS_KEPT`].
+static REPORT_SPAM_TOKENS: std::sync::Mutex<
+    std::collections::VecDeque<(Uuid, Vec<u8>)>,
+> = std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// How many tokens [`take_report_spam_token`] can still find.
+pub const REPORT_SPAM_TOKENS_KEPT: usize = 256;
+
+fn keep_report_spam_token(server_guid: Uuid, token: Vec<u8>) {
+    let mut tokens = REPORT_SPAM_TOKENS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    tokens.retain(|(guid, _)| *guid != server_guid);
+    if tokens.len() >= REPORT_SPAM_TOKENS_KEPT {
+        tokens.pop_front();
+    }
+    tokens.push_back((server_guid, token));
+}
+
+/// The report spam token the envelope with this server GUID carried, if
+/// any (once: it's forgotten as it's taken).
+pub fn take_report_spam_token(server_guid: Uuid) -> Option<Vec<u8>> {
+    let mut tokens = REPORT_SPAM_TOKENS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let index = tokens.iter().position(|(guid, _)| *guid == server_guid)?;
+    tokens.remove(index).map(|(_, token)| token)
+}
+
 /// Decrypts incoming messages and encrypts outgoing messages.
 ///
 /// Equivalent of SignalServiceCipher in Java.
@@ -152,6 +184,18 @@ where
                 tracing::warn!("empty decrypted content");
                 return Ok(None);
             };
+
+            // Only the tokens of envelopes that decrypted to real content are
+            // kept (not plaintext ones, which may only carry a decryption
+            // error), so an invalid one can't push out a real sender's.
+            if !was_plaintext {
+                if let (Some(guid), Some(token)) = (
+                    envelope.parse_server_guid(),
+                    envelope.report_spam_token.clone().filter(|t| !t.is_empty()),
+                ) {
+                    keep_report_spam_token(guid, token);
+                }
+            }
 
             // Now, process actual content, *after* side-car messages such as SKDM or PNI
             // signatures.
@@ -925,4 +969,23 @@ async fn sealed_sender_decrypt_with_validated_usmc(
         device_id: usmc.sender()?.sender_device_id()?,
         message,
     })
+}
+
+#[cfg(test)]
+mod report_spam_token_tests {
+    use super::*;
+
+    #[test]
+    fn tokens_are_taken_once_and_the_oldest_go_first() {
+        let first = Uuid::from_u128(1);
+        keep_report_spam_token(first, vec![1]);
+        assert_eq!(take_report_spam_token(first), Some(vec![1]));
+        assert_eq!(take_report_spam_token(first), None);
+        keep_report_spam_token(first, vec![2]);
+        for n in 0..REPORT_SPAM_TOKENS_KEPT as u128 {
+            keep_report_spam_token(Uuid::from_u128(1000 + n), vec![3]);
+        }
+        assert_eq!(take_report_spam_token(first), None);
+        assert_eq!(take_report_spam_token(Uuid::from_u128(1000)), Some(vec![3]));
+    }
 }
