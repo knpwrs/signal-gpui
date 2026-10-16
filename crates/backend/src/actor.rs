@@ -16,6 +16,7 @@ mod release_notes;
 mod remote_config;
 mod view_once;
 mod profile;
+mod settings;
 
 pub(crate) use view_once::VIEW_ONCE_DIR;
 
@@ -648,7 +649,7 @@ impl Actor {
             // Desktop takes the phone's read receipts setting when linked;
             // Storage Service has the rest once read.
             if let Some(on) = manager.registration_data().read_receipts() {
-                self.save_account_settings(crate::AccountSettings { read_receipts: Some(on), ..Default::default() }).await;
+                self.save_account_settings(crate::AccountSettings::flag(AccountSetting::ReadReceipts, on)).await;
             }
             // Desktop keeps the media root key from linking
             // (`AccountManager`'s `backupMediaRootKey`).
@@ -924,6 +925,9 @@ impl Actor {
                 Command::SetStoriesDisabled(disabled) => self.set_stories_disabled(disabled).await,
                 Command::SetStoryViewReceipts(on) => self.set_story_view_receipts(on).await,
                 Command::SetAccountSetting { setting, on } => self.set_account_setting(setting, on).await,
+                Command::SetUniversalExpireTimer(seconds) => self.set_universal_expire_timer(seconds).await,
+                Command::SetPhoneNumberSharing(everybody) => self.set_phone_number_sharing(everybody).await,
+                Command::SetPhoneNumberDiscoverable(on) => self.set_phone_number_discoverable(on).await,
                 Command::StartCall { conversation, video } if conversation.as_call_link().is_some() => {
                     self.start_link_call(conversation, video).await
                 }
@@ -1655,6 +1659,11 @@ impl Actor {
         if conversation.as_group().is_some() {
             return self.set_group_timer(conversation, seconds).await;
         }
+        self.set_direct_timer(conversation, seconds).await;
+    }
+
+    /// A 1:1 chat's timer: here, a notice, and a timer update to them.
+    async fn set_direct_timer(&self, conversation: ConversationId, seconds: u32) {
         let local = self.db.conversation(&conversation).await.ok().flatten().map_or(1, |c| c.expire_timer_version);
         let version = local.saturating_add(1);
         if let Err(error) = self.db.set_expire_timer(&conversation, seconds, version).await {
@@ -3901,6 +3910,7 @@ impl Actor {
         view_once: bool,
     ) -> Option<(i64, DataMessage, u64)> {
         let conversation = conversation.clone();
+        self.maybe_apply_universal_timer(&conversation).await;
         let timestamp = self.next_timestamp();
         let quoted = match quote {
             Some(id) => self.db.message(id).await.ok().flatten(),
@@ -4208,23 +4218,27 @@ impl Actor {
         media::Optimization::from_setting(value.as_deref())
     }
 
-    /// Whether an account setting is on (unset: Desktop's default, off).
+    /// Whether an account setting is on (unset: Desktop's default).
     pub(crate) async fn setting_on(&self, setting: AccountSetting) -> bool {
-        crate::setting_on(self.db.setting(setting.key()).await.ok().flatten().as_deref())
+        setting.is_on(self.db.setting(setting.key()).await.ok().flatten().as_deref())
     }
 
     /// Saves account settings from Storage Service, a configuration sync,
     /// the link-time backup or linking; tells the UI if one changed.
     pub(crate) async fn save_account_settings(&self, settings: crate::AccountSettings) {
+        let flags = settings.values().map(|(setting, on)| (setting.key(), if on { "true" } else { "false" }.to_owned()));
+        let timer = settings.universal_expire_timer.map(|t| (crate::SETTING_UNIVERSAL_EXPIRE_TIMER, t.to_string()));
+        let sharing = settings
+            .phone_number_sharing
+            .map(|everybody| (crate::SETTING_PHONE_NUMBER_SHARING, everybody.to_string()));
         let mut changed = false;
-        for (setting, on) in settings.values() {
-            let value = if on { "true" } else { "false" };
-            if self.db.setting(setting.key()).await.ok().flatten().as_deref() == Some(value) {
+        for (key, value) in flags.chain(timer).chain(sharing) {
+            if self.db.setting(key).await.ok().flatten().as_deref() == Some(value.as_str()) {
                 continue;
             }
-            match self.db.set_setting(setting.key(), value).await {
+            match self.db.set_setting(key, &value).await {
                 Ok(()) => changed = true,
-                Err(error) => warn!(%error, ?setting, "failed to save an account setting"),
+                Err(error) => warn!(%error, key, "failed to save an account setting"),
             }
         }
         if changed {
@@ -4236,14 +4250,7 @@ impl Actor {
     /// for our other devices (`captureChange`). If that write fails,
     /// re-reading Storage Service puts it back.
     async fn set_account_setting(self: Rc<Self>, setting: AccountSetting, on: bool) {
-        let mut settings = crate::AccountSettings::default();
-        match setting {
-            AccountSetting::ReadReceipts => settings.read_receipts = Some(on),
-            AccountSetting::TypingIndicators => settings.typing_indicators = Some(on),
-            AccountSetting::LinkPreviews => settings.link_previews = Some(on),
-            AccountSetting::SealedSenderIndicators => settings.sealed_sender_indicators = Some(on),
-        }
-        self.save_account_settings(settings).await;
+        self.save_account_settings(crate::AccountSettings::flag(setting, on)).await;
         self.write_account(&[storage::AccountEdit::Setting(setting, on)]).await;
     }
 

@@ -106,3 +106,8 @@ Powers for signal-gpui since 2026-10-15. Changes:
 - `src/groups_v2/mod.rs`: `BannedMember` and `PromotedMember` are exported
   with the other group types (upstream keeps them private to `model`, so a
   `Group`'s `members_banned` couldn't be built in tests).
+- `protobuf/StorageService.proto`: `AccountRecord` fields 55 to 59
+  (`reactionNotifications`, `notifyFor{Calls,Mentions,Replies}IfMuted`,
+  `showUnreadReminders`), from Signal Desktop's `protos/SignalStorage.proto`,
+  so the notification settings can be read. Writes edit the record's wire
+  bytes, so fields neither proto knows are kept.

@@ -16,9 +16,6 @@ use crate::usernames::{self, Reservation, ReserveRequest, SETTING_USERNAME_LINK,
 /// linked device follows the account record's, as Desktop's
 /// `mergeAccountRecord` does.
 const SETTING_PROFILE_KEY: &str = "account.profile_key";
-/// Settings key: `"true"` when our number is shared with everybody
-/// (Desktop's `phoneNumberSharingMode` item).
-const SETTING_SHARING_NUMBER: &str = "account.sharing_number";
 /// Settings key: our photo's CDN path (Desktop's `avatarUrl` item).
 const SETTING_AVATAR_URL: &str = "account.avatar_url";
 
@@ -128,7 +125,8 @@ impl Actor {
                 let _ = self.db.set_setting(SETTING_PROFILE_KEY, &hex).await;
             }
         }
-        let _ = self.db.set_setting(SETTING_SHARING_NUMBER, if record.sharing_number { "true" } else { "false" }).await;
+        // (Whether our number is shared is saved with the account's other
+        // settings, `crate::SETTING_PHONE_NUMBER_SHARING`.)
         if !record.given_name.is_empty() {
             changed |= self.db.set_profile_name(&me, &record.given_name, &record.family_name).await.unwrap_or(false);
         }
@@ -266,6 +264,25 @@ impl Actor {
         self.emit(Event::ProfileSaved(result.map_err(|_| "Your profile could not be updated. Please try again.".to_owned())));
     }
 
+    /// Desktop's `writeProfile` after "Who can see my number" changes
+    /// (`onWhoCanSeeMeChange`): our profile as it is, its
+    /// `phoneNumberSharing` from the setting just saved.
+    pub(super) async fn rewrite_profile(self: &Rc<Self>) -> anyhow::Result<()> {
+        let _edit = self.profile_edit.lock().await;
+        let manager = self.manager().context("not linked")?;
+        let aci = Aci::parse_from_service_id_string(&self.self_aci()).context("no ACI")?;
+        let key = self.our_profile_key(&manager).await;
+        let current = profiles::fetch(&manager, aci, key).await.context("reading our profile first")?;
+        let edit = ProfileEdit {
+            given_name: current.profile.given_name.clone(),
+            family_name: current.profile.family_name.clone(),
+            about: current.profile.about.clone(),
+            about_emoji: current.profile.about_emoji.clone(),
+            avatar: AvatarChange::Keep,
+        };
+        self.write_profile(&edit).await
+    }
+
     async fn write_profile(self: &Rc<Self>, edit: &ProfileEdit) -> anyhow::Result<()> {
         let manager = self.manager().context("not linked")?;
         let me = self.self_aci();
@@ -276,7 +293,7 @@ impl Actor {
         let current = profiles::fetch(&manager, aci, key).await.context("reading our profile first")?;
         let badge_ids: Vec<String> =
             current.profile.badges.iter().filter(|b| b.is_visible()).map(|b| b.id.clone()).collect();
-        let sharing = self.db.setting(SETTING_SHARING_NUMBER).await.ok().flatten().as_deref() == Some("true");
+        let sharing = crate::setting_on(self.db.setting(crate::SETTING_PHONE_NUMBER_SHARING).await.ok().flatten().as_deref());
         let kept = profiles::Kept {
             has_avatar: current.avatar.is_some(),
             badge_ids: &badge_ids,

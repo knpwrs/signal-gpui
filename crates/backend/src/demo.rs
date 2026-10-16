@@ -1900,6 +1900,22 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 let _ = db.set_setting(crate::SETTING_STORY_VIEW_RECEIPTS, if on { "true" } else { "false" }).await;
                 emit(Event::StorySettingsChanged);
             }
+            Command::SetUniversalExpireTimer(seconds) => {
+                let _ = db.set_setting(crate::SETTING_UNIVERSAL_EXPIRE_TIMER, &seconds.to_string()).await;
+                emit(Event::AccountSettingsChanged);
+            }
+            // As the real backend: everybody also makes us findable.
+            Command::SetPhoneNumberSharing(everybody) => {
+                let _ = db.set_setting(crate::SETTING_PHONE_NUMBER_SHARING, &everybody.to_string()).await;
+                if everybody {
+                    let _ = db.set_setting(crate::SETTING_PHONE_NUMBER_DISCOVERABLE, "true").await;
+                }
+                emit(Event::AccountSettingsChanged);
+            }
+            Command::SetPhoneNumberDiscoverable(on) => {
+                let _ = db.set_setting(crate::SETTING_PHONE_NUMBER_DISCOVERABLE, if on { "true" } else { "false" }).await;
+                emit(Event::AccountSettingsChanged);
+            }
             Command::SetStorySendMode { groups, mode } => {
                 let modes: Vec<_> = groups.into_iter().map(|g| (g, mode)).collect();
                 if db.set_story_send_modes(&modes).await.unwrap_or(false) {

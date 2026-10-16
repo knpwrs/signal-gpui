@@ -52,26 +52,79 @@ pub const SETTING_TYPING_INDICATORS: &str = "typing_indicators";
 /// Settings key: `"true"` when link previews are generated.
 pub const SETTING_LINK_PREVIEWS: &str = "link_previews";
 /// Settings key: `"true"` to show which messages came by sealed sender
-/// (Desktop's "Show status icon"). Kept for the account record; nothing
-/// shows it here yet.
+/// (Desktop's "Show status icon", in message details).
 pub const SETTING_SEALED_SENDER_INDICATORS: &str = "sealed_sender_indicators";
+/// Settings key: `"true"` to show photos from the phone's address book
+/// (Desktop's `preferContactAvatars`).
+pub const SETTING_PREFER_CONTACT_AVATARS: &str = "prefer_contact_avatars";
+/// Settings key: `"true"` to keep muted chats archived when a message comes
+/// (Desktop's `keepMutedChatsArchived`). The store reads it.
+pub const SETTING_KEEP_MUTED_CHATS_ARCHIVED: &str = "keep_muted_chats_archived";
+/// Settings key: notify when someone reacts to our message (Desktop's
+/// `reaction-notification`; unset is on).
+pub const SETTING_REACTION_NOTIFICATIONS: &str = "reaction_notifications";
+/// Settings key: ring or notify for calls in muted chats (Desktop's
+/// `notifyForCallsIfMuted`; unset is off).
+pub const SETTING_NOTIFY_CALLS_IF_MUTED: &str = "notify_calls_if_muted";
+/// Settings key: notify for mentions in muted chats (unset is on).
+pub const SETTING_NOTIFY_MENTIONS_IF_MUTED: &str = "notify_mentions_if_muted";
+/// Settings key: notify for replies to our messages in muted chats (unset
+/// is on).
+pub const SETTING_NOTIFY_REPLIES_IF_MUTED: &str = "notify_replies_if_muted";
+/// Settings key: unread reminders for muted chats (Desktop's
+/// `showUnreadReminders`; unset is off, `DEFAULT_SHOW_UNREAD_REMINDERS`).
+pub const SETTING_SHOW_UNREAD_REMINDERS: &str = "show_unread_reminders";
+/// Settings key: the default disappearing message timer for new chats, in
+/// seconds (Desktop's `universalExpireTimer`; unset or `0` is off).
+pub const SETTING_UNIVERSAL_EXPIRE_TIMER: &str = "universal_expire_timer";
+/// Settings key: `"true"` when everybody can see our phone number, else
+/// nobody can (Desktop's `phoneNumberSharingMode`; unset is nobody). Our
+/// profile's `phoneNumberSharing` follows it.
+pub const SETTING_PHONE_NUMBER_SHARING: &str = "account.sharing_number";
+/// Settings key: `"true"` when people can find us by our number (Desktop's
+/// `phoneNumberDiscoverability`, the account record's
+/// `unlistedPhoneNumber` turned around). Unset counts as not.
+pub const SETTING_PHONE_NUMBER_DISCOVERABLE: &str = key_transparency::SETTING_E164_DISCOVERABLE;
+/// Settings key: the app's theme, `"system"`, `"light"` or `"dark"`
+/// (Desktop's `theme-setting`). Not synced; the link-time backup sets it.
+pub const SETTING_THEME: &str = "theme";
 
-/// One of the account's privacy settings that Signal syncs between devices
-/// (the `AccountRecord` in Storage Service, the configuration sync message
-/// and the link-time backup). Like Desktop (`ts/util/Settings.preload.ts`),
-/// each is off until one of those says otherwise; read receipts also take
-/// the phone's setting at linking (`AccountManager`'s `createAccount`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// One of the account's on/off settings that Signal syncs between devices
+/// (the `AccountRecord` in Storage Service; the first four also in the
+/// configuration sync message, and all but the notification ones in the
+/// link-time backup). Like Desktop (`ts/util/Settings.preload.ts`,
+/// `STORAGE_KEY_DEFAULTS`), each keeps its default until one of those says
+/// otherwise; read receipts also take the phone's setting at linking
+/// (`AccountManager`'s `createAccount`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum AccountSetting {
     ReadReceipts,
     TypingIndicators,
     LinkPreviews,
     SealedSenderIndicators,
+    PreferContactAvatars,
+    KeepMutedChatsArchived,
+    ReactionNotifications,
+    NotifyCallsIfMuted,
+    NotifyMentionsIfMuted,
+    NotifyRepliesIfMuted,
+    ShowUnreadReminders,
 }
 
 impl AccountSetting {
-    pub const ALL: [AccountSetting; 4] =
-        [Self::ReadReceipts, Self::TypingIndicators, Self::LinkPreviews, Self::SealedSenderIndicators];
+    pub const ALL: [AccountSetting; 11] = [
+        Self::ReadReceipts,
+        Self::TypingIndicators,
+        Self::LinkPreviews,
+        Self::SealedSenderIndicators,
+        Self::PreferContactAvatars,
+        Self::KeepMutedChatsArchived,
+        Self::ReactionNotifications,
+        Self::NotifyCallsIfMuted,
+        Self::NotifyMentionsIfMuted,
+        Self::NotifyRepliesIfMuted,
+        Self::ShowUnreadReminders,
+    ];
 
     /// Where it's kept in the app database's settings.
     pub fn key(self) -> &'static str {
@@ -80,38 +133,64 @@ impl AccountSetting {
             Self::TypingIndicators => SETTING_TYPING_INDICATORS,
             Self::LinkPreviews => SETTING_LINK_PREVIEWS,
             Self::SealedSenderIndicators => SETTING_SEALED_SENDER_INDICATORS,
+            Self::PreferContactAvatars => SETTING_PREFER_CONTACT_AVATARS,
+            Self::KeepMutedChatsArchived => SETTING_KEEP_MUTED_CHATS_ARCHIVED,
+            Self::ReactionNotifications => SETTING_REACTION_NOTIFICATIONS,
+            Self::NotifyCallsIfMuted => SETTING_NOTIFY_CALLS_IF_MUTED,
+            Self::NotifyMentionsIfMuted => SETTING_NOTIFY_MENTIONS_IF_MUTED,
+            Self::NotifyRepliesIfMuted => SETTING_NOTIFY_REPLIES_IF_MUTED,
+            Self::ShowUnreadReminders => SETTING_SHOW_UNREAD_REMINDERS,
+        }
+    }
+
+    /// Its value until something sets it: Desktop's defaults
+    /// (`STORAGE_KEY_DEFAULTS`, `DEFAULT_NOTIFY_IF_MUTED`,
+    /// `DEFAULT_SHOW_UNREAD_REMINDERS`).
+    pub fn default_on(self) -> bool {
+        matches!(self, Self::ReactionNotifications | Self::NotifyMentionsIfMuted | Self::NotifyRepliesIfMuted)
+    }
+
+    /// Whether it's on, from its stored value.
+    pub fn is_on(self, value: Option<&str>) -> bool {
+        match value {
+            Some("true") => true,
+            Some("false") => false,
+            _ => self.default_on(),
         }
     }
 }
 
-/// Whether a stored [`AccountSetting`] is on: only `"true"` is (unset is
-/// Desktop's default, off).
+/// Whether a stored setting that's off until set is on: only `"true"` is.
 pub fn setting_on(value: Option<&str>) -> bool {
     value == Some("true")
 }
 
-/// Account settings as one source gives them; `None` leaves one as it is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Account settings as one source gives them; what it leaves out stays as
+/// it is.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AccountSettings {
-    pub read_receipts: Option<bool>,
-    pub typing_indicators: Option<bool>,
-    pub link_previews: Option<bool>,
-    pub sealed_sender_indicators: Option<bool>,
+    /// On/off settings.
+    pub flags: std::collections::BTreeMap<AccountSetting, bool>,
+    /// The default disappearing timer for new chats, in seconds (0: off).
+    pub universal_expire_timer: Option<u32>,
+    /// Everybody can see our number (`true`) or nobody can.
+    pub phone_number_sharing: Option<bool>,
 }
 
 impl AccountSettings {
-    /// Each setting this gives a value for.
-    pub fn values(&self) -> impl Iterator<Item = (AccountSetting, bool)> {
-        [
-            (AccountSetting::ReadReceipts, self.read_receipts),
-            (AccountSetting::TypingIndicators, self.typing_indicators),
-            (AccountSetting::LinkPreviews, self.link_previews),
-            (AccountSetting::SealedSenderIndicators, self.sealed_sender_indicators),
-        ]
-        .into_iter()
-        .filter_map(|(setting, on)| Some((setting, on?)))
+    /// Only `setting`, `on`.
+    pub fn flag(setting: AccountSetting, on: bool) -> Self {
+        let mut settings = Self::default();
+        settings.flags.insert(setting, on);
+        settings
+    }
+
+    /// Each on/off setting this gives a value for.
+    pub fn values(&self) -> impl Iterator<Item = (AccountSetting, bool)> + '_ {
+        self.flags.iter().map(|(setting, on)| (*setting, *on))
     }
 }
+
 /// Settings key: your Giphy API key for GIF search (`GIPHY_API_KEY` also
 /// works). Not a Signal setting.
 pub const SETTING_GIPHY_API_KEY: &str = "giphy_api_key";
@@ -396,6 +475,15 @@ pub enum Command {
     /// whole account (Desktop's Privacy settings, kept in the
     /// `AccountRecord`).
     SetAccountSetting { setting: AccountSetting, on: bool },
+    /// The default disappearing timer for chats we start, in seconds (0:
+    /// off), for the whole account (`AccountRecord.universalExpireTimer`).
+    SetUniversalExpireTimer(u32),
+    /// Who can see our number: everybody (`true`) or nobody, for the whole
+    /// account and in our profile (Desktop's "Who can see my number").
+    SetPhoneNumberSharing(bool),
+    /// Whether people can find us by our number (Desktop's "Who can find
+    /// me by number"), on the server and for the whole account.
+    SetPhoneNumberDiscoverable(bool),
     /// Adds groups' stories to the list we post to (`Always`, Desktop's
     /// "New group story") or removes them (`Never`, "Remove group story"),
     /// for the whole account (`GroupV2Record.storySendMode`).

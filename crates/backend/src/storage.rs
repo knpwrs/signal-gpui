@@ -268,15 +268,38 @@ pub(crate) async fn fetch(manager: &SignalManager) -> anyhow::Result<StorageSnap
     Ok(snapshot)
 }
 
-/// The account record's privacy settings, as Desktop's
-/// `mergeAccountRecord` (`ts/services/storageRecordOps.preload.ts`) takes
-/// them: every one, false when the record leaves it out.
+/// The account record's settings, as Desktop's `mergeAccountRecord`
+/// (`ts/services/storageRecordOps.preload.ts`) takes them: every one; a
+/// plain flag the record leaves out is off, an unset `OptionalBool` is the
+/// setting's default, and an unset sharing mode is everybody.
 pub(crate) fn account_settings(account: &AccountRecord) -> crate::AccountSettings {
+    use crate::AccountSetting as S;
+    use presage::proto::OptionalBool;
+    let optional = |setting: S, value: OptionalBool| match value {
+        OptionalBool::Enabled => true,
+        OptionalBool::Disabled => false,
+        OptionalBool::Unset => setting.default_on(),
+    };
+    let flags = [
+        (S::ReadReceipts, account.read_receipts),
+        (S::TypingIndicators, account.typing_indicators),
+        (S::LinkPreviews, account.link_previews),
+        (S::SealedSenderIndicators, account.sealed_sender_indicators),
+        (S::PreferContactAvatars, account.prefer_contact_avatars),
+        (S::KeepMutedChatsArchived, account.keep_muted_chats_archived),
+        (S::ReactionNotifications, optional(S::ReactionNotifications, account.reaction_notifications())),
+        (S::NotifyCallsIfMuted, optional(S::NotifyCallsIfMuted, account.notify_for_calls_if_muted())),
+        (S::NotifyMentionsIfMuted, optional(S::NotifyMentionsIfMuted, account.notify_for_mentions_if_muted())),
+        (S::NotifyRepliesIfMuted, optional(S::NotifyRepliesIfMuted, account.notify_for_replies_if_muted())),
+        (S::ShowUnreadReminders, optional(S::ShowUnreadReminders, account.show_unread_reminders())),
+    ];
+    // `PhoneNumberSharingMode`: unset (0 is never written) and EVERYBODY
+    // are everybody, NOBODY nobody.
+    let sharing = account.phone_number_sharing_mode != presage::proto::account_record::PhoneNumberSharingMode::Nobody as i32;
     crate::AccountSettings {
-        read_receipts: Some(account.read_receipts),
-        typing_indicators: Some(account.typing_indicators),
-        link_previews: Some(account.link_previews),
-        sealed_sender_indicators: Some(account.sealed_sender_indicators),
+        flags: flags.into_iter().collect(),
+        universal_expire_timer: Some(account.universal_expire_timer),
+        phone_number_sharing: Some(sharing),
     }
 }
 
@@ -486,9 +509,15 @@ fn set_varint(message: &[u8], number: u32, value: u64) -> anyhow::Result<Option<
 /// A change to one of the account record's settings.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum AccountEdit {
-    /// `readReceipts`, `typingIndicators`, `linkPreviews` or
-    /// `sealedSenderIndicators`.
+    /// One of the on/off settings (`readReceipts`, `keepMutedChatsArchived`,
+    /// `reactionNotifications`…).
     Setting(crate::AccountSetting, bool),
+    /// `universalExpireTimer`, in seconds.
+    UniversalExpireTimer(u32),
+    /// `phoneNumberSharingMode`: EVERYBODY (`true`) or NOBODY.
+    PhoneNumberSharing(bool),
+    /// `unlistedPhoneNumber`.
+    UnlistedPhoneNumber(bool),
     /// `storiesDisabled` (Desktop's `hasStoriesDisabled`).
     StoriesDisabled(bool),
     /// `storyViewReceiptsEnabled`, an `OptionalBool`.
@@ -504,16 +533,26 @@ impl AccountEdit {
     /// The `AccountRecord` field and its value.
     fn field(self) -> (u32, u64) {
         use crate::AccountSetting;
+        // OptionalBool: ENABLED = 1, DISABLED = 2.
+        let optional = |on: bool| if on { 1 } else { 2 };
         match self {
-            AccountEdit::Setting(setting, on) => {
-                let field = match setting {
-                    AccountSetting::ReadReceipts => 6,
-                    AccountSetting::SealedSenderIndicators => 7,
-                    AccountSetting::TypingIndicators => 8,
-                    AccountSetting::LinkPreviews => 11,
-                };
-                (field, u64::from(on))
-            }
+            AccountEdit::Setting(setting, on) => match setting {
+                AccountSetting::ReadReceipts => (6, u64::from(on)),
+                AccountSetting::SealedSenderIndicators => (7, u64::from(on)),
+                AccountSetting::TypingIndicators => (8, u64::from(on)),
+                AccountSetting::LinkPreviews => (11, u64::from(on)),
+                AccountSetting::PreferContactAvatars => (15, u64::from(on)),
+                AccountSetting::KeepMutedChatsArchived => (25, u64::from(on)),
+                // Desktop's protos/SignalStorage.proto.
+                AccountSetting::ReactionNotifications => (55, optional(on)),
+                AccountSetting::NotifyCallsIfMuted => (56, optional(on)),
+                AccountSetting::NotifyMentionsIfMuted => (57, optional(on)),
+                AccountSetting::NotifyRepliesIfMuted => (58, optional(on)),
+                AccountSetting::ShowUnreadReminders => (59, optional(on)),
+            },
+            AccountEdit::UniversalExpireTimer(seconds) => (17, u64::from(seconds)),
+            AccountEdit::PhoneNumberSharing(everybody) => (12, if everybody { 1 } else { 2 }),
+            AccountEdit::UnlistedPhoneNumber(on) => (13, u64::from(on)),
             AccountEdit::HasSetMyStoriesPrivacy(on) => (26, u64::from(on)),
             AccountEdit::StoriesDisabled(on) => (29, u64::from(on)),
             // OptionalBool: ENABLED = 1, DISABLED = 2.
@@ -1688,17 +1727,29 @@ mod tests {
     #[test]
     fn privacy_settings_read_and_write_the_account_record() {
         use crate::AccountSetting;
-        let account = AccountRecord { given_name: "Ken".into(), typing_indicators: true, ..Default::default() };
-        // Desktop takes every one, false when left out.
-        assert_eq!(
-            account_settings(&account),
-            crate::AccountSettings {
-                read_receipts: Some(false),
-                typing_indicators: Some(true),
-                link_previews: Some(false),
-                sealed_sender_indicators: Some(false),
-            }
-        );
+        let account = AccountRecord {
+            given_name: "Ken".into(),
+            typing_indicators: true,
+            keep_muted_chats_archived: true,
+            universal_expire_timer: 3600,
+            notify_for_calls_if_muted: presage::proto::OptionalBool::Enabled.into(),
+            notify_for_replies_if_muted: presage::proto::OptionalBool::Disabled.into(),
+            ..Default::default()
+        };
+        // Desktop takes every one: a flag left out is off, an unset
+        // OptionalBool the default, an unset sharing mode everybody.
+        let settings = account_settings(&account);
+        let on = |s: AccountSetting| settings.flags[&s];
+        assert!(!on(AccountSetting::ReadReceipts) && on(AccountSetting::TypingIndicators));
+        assert!(!on(AccountSetting::LinkPreviews) && !on(AccountSetting::SealedSenderIndicators));
+        assert!(on(AccountSetting::KeepMutedChatsArchived) && !on(AccountSetting::PreferContactAvatars));
+        assert!(on(AccountSetting::ReactionNotifications), "unset is on");
+        assert!(on(AccountSetting::NotifyCallsIfMuted) && !on(AccountSetting::NotifyRepliesIfMuted));
+        assert!(on(AccountSetting::NotifyMentionsIfMuted) && !on(AccountSetting::ShowUnreadReminders));
+        assert_eq!(settings.flags.len(), AccountSetting::ALL.len());
+        assert_eq!((settings.universal_expire_timer, settings.phone_number_sharing), (Some(3600), Some(true)));
+        let nobody = AccountRecord { phone_number_sharing_mode: 2, ..Default::default() };
+        assert_eq!(account_settings(&nobody).phone_number_sharing, Some(false));
         let mut account_bytes = account.encode_to_vec();
         wire::put_len(&mut account_bytes, 999, b"future account field");
         let mut record = Vec::new();
@@ -1716,6 +1767,35 @@ mod tests {
         assert_eq!(decoded.given_name, "Ken");
         assert!(edited.windows(20).any(|w| w == b"future account field"));
         assert_eq!(edit_account(&edited, &edits).unwrap(), None, "already so");
+
+        // The rest, Desktop's field numbers and OptionalBool values.
+        use presage::proto::OptionalBool;
+        let edits = [
+            AccountEdit::Setting(AccountSetting::PreferContactAvatars, true),
+            AccountEdit::Setting(AccountSetting::KeepMutedChatsArchived, false),
+            AccountEdit::Setting(AccountSetting::ReactionNotifications, false),
+            AccountEdit::Setting(AccountSetting::NotifyCallsIfMuted, true),
+            AccountEdit::Setting(AccountSetting::NotifyMentionsIfMuted, false),
+            AccountEdit::Setting(AccountSetting::NotifyRepliesIfMuted, true),
+            AccountEdit::Setting(AccountSetting::ShowUnreadReminders, true),
+            AccountEdit::UniversalExpireTimer(86_400),
+            AccountEdit::PhoneNumberSharing(false),
+            AccountEdit::UnlistedPhoneNumber(true),
+        ];
+        let edited = edit_account(&edited, &edits).unwrap().unwrap();
+        let decoded = decode_account(&edited);
+        assert!(decoded.prefer_contact_avatars && !decoded.keep_muted_chats_archived);
+        assert_eq!(decoded.reaction_notifications(), OptionalBool::Disabled);
+        assert_eq!(decoded.notify_for_calls_if_muted(), OptionalBool::Enabled);
+        assert_eq!(decoded.notify_for_mentions_if_muted(), OptionalBool::Disabled);
+        assert_eq!(decoded.notify_for_replies_if_muted(), OptionalBool::Enabled);
+        assert_eq!(decoded.show_unread_reminders(), OptionalBool::Enabled);
+        assert_eq!((decoded.universal_expire_timer, decoded.phone_number_sharing_mode), (86_400, 2));
+        assert!(decoded.unlisted_phone_number && decoded.read_receipts);
+        assert!(edited.windows(20).any(|w| w == b"future account field"));
+        let everybody = edit_account(&edited, &[AccountEdit::PhoneNumberSharing(true), AccountEdit::UniversalExpireTimer(0)]);
+        let decoded = decode_account(&everybody.unwrap().unwrap());
+        assert_eq!((decoded.universal_expire_timer, decoded.phone_number_sharing_mode), (0, 1));
     }
 
     #[test]

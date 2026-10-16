@@ -1209,7 +1209,7 @@ impl AppState {
                     }
                 }
             }
-            AccountSetting::LinkPreviews | AccountSetting::SealedSenderIndicators => {}
+            _ => {}
         }
         self.send(Command::SetAccountSetting { setting, on });
         cx.notify();

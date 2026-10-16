@@ -396,17 +396,20 @@ fn configuration_syncs_carry_privacy_settings_as_desktop_reads_them() {
     assert_eq!(
         map_content(&content(ME, configuration(all)), &ctx()),
         vec![Action::AccountSettings(crate::AccountSettings {
-            read_receipts: Some(true),
-            typing_indicators: Some(false),
-            link_previews: Some(true),
-            sealed_sender_indicators: None,
+            flags: [
+                (crate::AccountSetting::ReadReceipts, true),
+                (crate::AccountSetting::TypingIndicators, false),
+                (crate::AccountSetting::LinkPreviews, true),
+            ]
+            .into(),
+            ..Default::default()
         })]
     );
     // Read receipts left out are off (Desktop's `Boolean(readReceipts)`);
     // the others stay as they are.
     assert_eq!(
         map_content(&content(ME, configuration(Default::default())), &ctx()),
-        vec![Action::AccountSettings(crate::AccountSettings { read_receipts: Some(false), ..Default::default() })]
+        vec![Action::AccountSettings(crate::AccountSettings::flag(crate::AccountSetting::ReadReceipts, false))]
     );
 }
 

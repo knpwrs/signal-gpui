@@ -2243,3 +2243,15 @@ async fn badges_and_their_images_are_kept() {
     assert_eq!(db.badge_image_files().await.unwrap().get("https://u/l").map(String::as_str), Some("/tmp/l.svg"));
 }
 
+#[tokio::test]
+async fn user_messages_are_told_from_notices() {
+    let db = test_db().await;
+    let chat = conv("d:new");
+    db.upsert_conversation(&chat, ConversationUpdate::default()).await.unwrap();
+    assert!(!db.has_user_messages(&chat).await.unwrap());
+    // A notice (a timer change, say) isn't anyone writing.
+    db.insert_notice(&chat, 10, &Notice::Timer { by: None, seconds: 60 }).await.unwrap();
+    assert!(!db.has_user_messages(&chat).await.unwrap());
+    db.insert_message(&incoming("d:new", "alice", 20, "hi")).await.unwrap();
+    assert!(db.has_user_messages(&chat).await.unwrap());
+}

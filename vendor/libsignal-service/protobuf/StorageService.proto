@@ -305,6 +305,13 @@ message AccountRecord {
   optional uint64                            releaseNotesChatMutedUntilTimestamp        = 49;
   optional bool                              releaseNotesChatBlocked                    = 50;
   optional bool                              releaseNotesChatMarkedUnread               = 51;
+  // signal-gpui: Signal Desktop's notification settings (its
+  // protos/SignalStorage.proto); 52 to 54 and 60 aren't read here.
+           OptionalBool                      reactionNotifications                      = 55; // If unset, consider this on
+           OptionalBool                      notifyForCallsIfMuted                      = 56; // If unset, consider this off
+           OptionalBool                      notifyForMentionsIfMuted                   = 57; // If unset, consider this on
+           OptionalBool                      notifyForRepliesIfMuted                    = 58; // If unset, consider this on
+           OptionalBool                      showUnreadReminders                        = 59; // If unset, consider this on
 }
 
 message StoryDistributionListRecord {

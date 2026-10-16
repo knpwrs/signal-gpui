@@ -1701,12 +1701,11 @@ fn map_sync(sync: &SyncMessage, envelope_ts: i64, ctx: &MapContext) -> Vec<Actio
 /// `unidentifiedDeliveryIndicators` is left out: Desktop keeps it apart from
 /// the account record's `sealedSenderIndicators`, for message details only.
 pub(crate) fn account_settings(configuration: &sync_message::Configuration) -> crate::AccountSettings {
-    crate::AccountSettings {
-        read_receipts: Some(configuration.read_receipts.unwrap_or(false)),
-        typing_indicators: configuration.typing_indicators,
-        link_previews: configuration.link_previews,
-        sealed_sender_indicators: None,
-    }
+    use crate::AccountSetting as S;
+    let mut settings = crate::AccountSettings::flag(S::ReadReceipts, configuration.read_receipts.unwrap_or(false));
+    settings.flags.extend(configuration.typing_indicators.map(|on| (S::TypingIndicators, on)));
+    settings.flags.extend(configuration.link_previews.map(|on| (S::LinkPreviews, on)));
+    settings
 }
 
 fn map_receipt(receipt: &ReceiptMessage) -> Option<Action> {

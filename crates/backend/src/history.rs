@@ -445,6 +445,15 @@ pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: imp
                 if let Err(error) = db.set_setting(crate::key_transparency::SETTING_DISABLED, value).await {
                     tracing::warn!(%error, "failed to save automatic key verification");
                 }
+                // Desktop's import also takes who can find us by number
+                // and the app's theme.
+                let hidden = account.accountSettings.as_ref().is_some_and(|s| s.notDiscoverableByPhoneNumber);
+                let discoverable = if hidden { "false" } else { "true" };
+                for (key, value) in [(crate::SETTING_PHONE_NUMBER_DISCOVERABLE, discoverable), (crate::SETTING_THEME, theme(&account))] {
+                    if let Err(error) = db.set_setting(key, value).await {
+                        tracing::warn!(%error, key, "failed to save an account setting from the backup");
+                    }
+                }
             }
             Some(proto::frame::Item::StickerPack(pack)) => {
                 imported.sticker_packs.push((pack.packId.clone(), pack.packKey.clone()));
@@ -798,13 +807,37 @@ async fn import_item(
 /// (`ts/services/backups/import.preload.ts`) takes them: each on only when
 /// the backup says so.
 fn account_settings(account: &proto::AccountData) -> crate::AccountSettings {
+    use crate::AccountSetting as S;
+    use proto::account_data::PhoneNumberSharingMode;
     let settings = account.accountSettings.as_ref();
-    let on = |get: fn(&proto::account_data::AccountSettings) -> bool| Some(settings.is_some_and(get));
+    let on = |get: fn(&proto::account_data::AccountSettings) -> bool| settings.is_some_and(get);
+    let flags = [
+        (S::ReadReceipts, on(|s| s.readReceipts)),
+        (S::TypingIndicators, on(|s| s.typingIndicators)),
+        (S::LinkPreviews, on(|s| s.linkPreviews)),
+        (S::SealedSenderIndicators, on(|s| s.sealedSenderIndicators)),
+        (S::PreferContactAvatars, on(|s| s.preferContactAvatars)),
+        (S::KeepMutedChatsArchived, on(|s| s.keepMutedChatsArchived)),
+    ];
+    // Desktop sets the timer only when there is one, and takes anything
+    // but EVERYBODY as nobody.
+    let timer = settings.map_or(0, |s| s.universalExpireTimerSeconds);
+    let everybody = settings.is_some_and(|s| s.phoneNumberSharingMode.enum_value_or_default() == PhoneNumberSharingMode::EVERYBODY);
     crate::AccountSettings {
-        read_receipts: on(|s| s.readReceipts),
-        typing_indicators: on(|s| s.typingIndicators),
-        link_previews: on(|s| s.linkPreviews),
-        sealed_sender_indicators: on(|s| s.sealedSenderIndicators),
+        flags: flags.into_iter().collect(),
+        universal_expire_timer: (timer > 0).then_some(timer),
+        phone_number_sharing: Some(everybody),
+    }
+}
+
+/// The backup's app theme, as Desktop's `toThemeSetting`: light, dark, or
+/// the system's.
+fn theme(account: &proto::AccountData) -> &'static str {
+    use proto::account_data::AppTheme;
+    match account.accountSettings.as_ref().map(|s| s.appTheme.enum_value_or_default()) {
+        Some(AppTheme::LIGHT) => "light",
+        Some(AppTheme::DARK) => "dark",
+        _ => "system",
     }
 }
 
@@ -967,6 +1000,11 @@ mod tests {
         let mut settings = proto::account_data::AccountSettings::new();
         settings.readReceipts = true;
         settings.typingIndicators = true;
+        settings.keepMutedChatsArchived = true;
+        settings.universalExpireTimerSeconds = 604_800;
+        settings.phoneNumberSharingMode = proto::account_data::PhoneNumberSharingMode::EVERYBODY.into();
+        settings.notDiscoverableByPhoneNumber = true;
+        settings.appTheme = proto::account_data::AppTheme::DARK.into();
         account.accountSettings = Some(settings).into();
         push(proto::Frame { item: Some(proto::frame::Item::Account(account)), ..Default::default() });
         let recipient = |id, destination| {
@@ -1181,15 +1219,16 @@ mod tests {
         assert_eq!((imported.chats, imported.messages), (4, 6));
         assert_eq!(imported.sticker_packs, vec![(vec![0xab; 16], vec![0xcd; 32])]);
         // Each setting the backup leaves off is off, as Desktop imports them.
-        assert_eq!(
-            imported.settings,
-            Some(crate::AccountSettings {
-                read_receipts: Some(true),
-                typing_indicators: Some(true),
-                link_previews: Some(false),
-                sealed_sender_indicators: Some(false),
-            })
-        );
+        let settings = imported.settings.clone().unwrap();
+        let on = |s: crate::AccountSetting| settings.flags[&s];
+        assert!(on(crate::AccountSetting::ReadReceipts) && on(crate::AccountSetting::TypingIndicators));
+        assert!(!on(crate::AccountSetting::LinkPreviews) && !on(crate::AccountSetting::SealedSenderIndicators));
+        assert!(on(crate::AccountSetting::KeepMutedChatsArchived) && !on(crate::AccountSetting::PreferContactAvatars));
+        // The timer and who sees our number, and nothing the backup doesn't carry.
+        assert_eq!((settings.universal_expire_timer, settings.phone_number_sharing), (Some(604_800), Some(true)));
+        assert!(!settings.flags.contains_key(&crate::AccountSetting::ReactionNotifications));
+        assert_eq!(db.setting(crate::SETTING_THEME).await.unwrap().as_deref(), Some("dark"));
+        assert_eq!(db.setting(crate::SETTING_PHONE_NUMBER_DISCOVERABLE).await.unwrap().as_deref(), Some("false"));
 
         let alice_sid = Aci::from_uuid_bytes([0xa1; 16]).service_id_string();
         let alice = db.conversation(&ConversationId::direct(&alice_sid)).await.unwrap().unwrap();

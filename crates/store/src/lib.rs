@@ -2064,6 +2064,15 @@ impl AppDb {
         Ok(out)
     }
 
+    /// Whether a chat has any message someone wrote, not only notices
+    /// (Desktop's `hasUserInitiatedMessages`).
+    pub async fn has_user_messages(&self, conversation: &ConversationId) -> Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM messages WHERE conversation_id = ? AND notice IS NULL)")
+            .bind(&conversation.0)
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
     /// A chat's messages with attachments or link previews, newest first
     /// (Desktop's "All media").
     pub async fn media_messages(&self, conversation: &ConversationId, limit: u32) -> Result<Vec<Message>> {
