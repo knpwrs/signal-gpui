@@ -62,14 +62,16 @@ pub fn story_background(background: &StoryBackground) -> gpui_kit::Div {
     }
 }
 
-/// The font for a text story's style (Desktop bundles Inter, EB Garamond,
-/// Parisienne and Barlow Condensed; these are macOS's nearest).
-fn font_family(font: StoryFont) -> &'static str {
+/// The font for a text story's style: Desktop's, bundled (`FONT_MAP.latin`
+/// in `ts/util/getFontNameByTextScript`). Other scripts fall back to the
+/// system's fonts.
+pub fn font_family(font: StoryFont) -> &'static str {
+    use crate::fonts;
     match font {
-        StoryFont::Default | StoryFont::Regular | StoryFont::Bold => ".SystemUIFont",
-        StoryFont::Serif => "Georgia",
-        StoryFont::Script => "Snell Roundhand",
-        StoryFont::Condensed => "Avenir Next Condensed",
+        StoryFont::Default | StoryFont::Regular | StoryFont::Bold => fonts::INTER,
+        StoryFont::Serif => fonts::EB_GARAMOND,
+        StoryFont::Script => fonts::PARISIENNE,
+        StoryFont::Condensed => fonts::BARLOW_CONDENSED,
     }
 }
 

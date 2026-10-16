@@ -3,6 +3,7 @@
 mod assets;
 mod audio;
 mod emoji_usage;
+mod fonts;
 mod formatting;
 mod image_cache;
 mod keys;
@@ -165,6 +166,7 @@ fn main() -> Result<()> {
 
     gpui_kit::application().with_assets(assets::Assets).run(move |cx| {
         gpui_kit::init(cx);
+        fonts::register(cx);
         Theme::sync_system_appearance(None, cx);
         bind_keys(cx);
 
