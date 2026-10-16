@@ -91,126 +91,50 @@ fn confirm(
     });
 }
 
-/// Desktop's `ContactModal` for someone in a group: who they are, ways to
-/// reach them, and (for admins) making them an admin or removing them.
+/// Desktop's `ContactModal` for someone in a group: the contact modal
+/// (`views::contact`), with the admin actions below.
 pub fn open_member(state: Entity<AppState>, group: ConversationId, member: String, window: &mut Window, cx: &mut App) {
-    let names = load_names(&state, vec![member.clone()], cx);
-    window.open_dialog(cx, move |dialog, _, cx| {
-        let palette = Palette::get(cx);
-        let me = our_aci(&state, cx);
-        let Some(chat) = current(&state, &group, cx) else { return dialog };
-        let name = name_in(names.read(cx), &member);
-        let direct = ConversationId::direct(&member);
-        let is_admin = chat.admins.contains(&member);
-        let in_group = chat.members.contains(&member);
-        let admin_actions = we_are_admin(&chat, &me) && in_group && member != me;
-        let label = chat.member_labels.get(&member).cloned();
-        let row_button = |id: &'static str, label: &'static str| Button::new(id).label(label).outline().small();
-        let (message_state, message_to) = (state.clone(), direct.clone());
-        let message = row_button("member-message", "Message").on_click(move |_, window, cx| {
-            window.close_all_dialogs(cx);
-            let entry = signal_store::DirectoryEntry {
-                id: message_to.clone(),
-                kind: ConversationKind::Direct,
-                title: String::new(),
-                phone: None,
+    crate::views::contact::open_contact(state, member, Some(group), window, cx);
+}
+
+/// The contact modal's admin actions for `member` of `chat` (Desktop's
+/// `canDoGroupAdminActions`): make or remove admin, and remove from the
+/// group, each after Desktop's confirmation. None unless we're an admin
+/// and they're a member.
+pub fn member_actions(state: &Entity<AppState>, chat: &Conversation, member: &str, name: &str, cx: &App) -> Vec<AnyElement> {
+    let me = our_aci(state, cx);
+    if !(we_are_admin(chat, &me) && chat.members.iter().any(|m| m == member) && member != me) {
+        return Vec::new();
+    }
+    let is_admin = chat.admins.iter().any(|a| a == member);
+    let (admin_state, admin_group, admin_member, admin_name) = (state.clone(), chat.id.clone(), member.to_owned(), name.to_owned());
+    let labels_go = label_goes_with_admin(chat, member);
+    let toggle = Button::new("member-toggle-admin")
+        .label(if is_admin { "Remove as admin" } else { "Make admin" })
+        .outline()
+        .small()
+        .on_click(move |_, window, cx| {
+            let description = if is_admin {
+                let mut text = format!("Remove {admin_name} as group admin?");
+                if labels_go {
+                    text.push_str(" This will also clear their member label.");
+                }
+                text
+            } else {
+                format!("{admin_name} will be able to edit this group and its members.")
             };
-            message_state.update(cx, |s, cx| s.start_conversation(entry, cx));
-        });
-        let call = |id: &'static str, label: &'static str, video: bool| {
-            let (state, to) = (state.clone(), direct.clone());
-            row_button(id, label).on_click(move |_, window, cx| {
+            let (state, group, member) = (admin_state.clone(), admin_group.clone(), admin_member.clone());
+            confirm(None, description, if is_admin { "Remove as admin" } else { "Make admin" }, false, window, cx, move |window, cx| {
+                state.read(cx).send(Command::SetGroupAdmin { conversation: group.clone(), member: member.clone(), admin: !is_admin });
                 window.close_all_dialogs(cx);
-                state.update(cx, |s, cx| s.open_call_lobby(to.clone(), video, cx));
-            })
-        };
-        let (safety_state, safety_to, safety_name) = (state.clone(), direct.clone(), name.clone());
-        let safety = row_button("member-safety-number", "View safety number").on_click(move |_, window, cx| {
-            window.close_all_dialogs(cx);
-            crate::views::safety_number::open(safety_state.clone(), safety_to.clone(), safety_name.clone(), window, cx);
-        });
-        // Desktop's "Nickname": for someone we have a chat with.
-        let nickname_chat = current(&state, &direct, cx).filter(crate::views::nickname::can_have_nickname);
-        let mut body = div()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap_2()
-                    .child(person_avatar(state.read(cx).photo_of(&member), &name, color_for(&member), px(80.)))
-                    .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(name.clone()))
-                    .when_some(label, |d, label| {
-                        d.child(div().text_sm().text_color(palette.text_secondary).child(match label.emoji {
-                            Some(emoji) => format!("{emoji} {}", label.text),
-                            None => label.text,
-                        }))
-                    })
-                    .when(is_admin, |d| d.child(div().text_xs().text_color(palette.text_secondary).child("Admin"))),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .justify_center()
-                    .gap_2()
-                    .child(message)
-                    .child(call("member-voice", "Voice", false))
-                    .child(call("member-video", "Video", true)),
-            )
-            .child(div().flex().flex_col().gap_2().child(safety));
-        if let Some(chat_with) = nickname_chat {
-            let (nick_state, nick_chat) = (state.clone(), chat_with.clone());
-            body = body.child(div().child(row_button("member-nickname", "Nickname").on_click(move |_, window, cx| {
-                window.close_all_dialogs(cx);
-                let (state, chat) = (nick_state.clone(), nick_chat.clone());
-                let backend = state.read(cx).backend.clone();
-                let db = backend.db().clone();
-                let sid = chat.id.as_direct().unwrap_or_default().to_owned();
-                let query = backend.spawn(async move { db.contact_nickname(&sid).await });
-                window
-                    .spawn(cx, async move |cx| {
-                        let found = query.await.ok().flatten().unwrap_or_default();
-                        let _ = cx.update(|window, cx| crate::views::nickname::open_edit(state, chat, found, window, cx));
-                    })
-                    .detach();
-            })));
-        }
-        if admin_actions {
-            let (admin_state, admin_group, admin_member, admin_name) = (state.clone(), group.clone(), member.clone(), name.clone());
-            let labels_go = label_goes_with_admin(&chat, &member);
-            let toggle = Button::new("member-toggle-admin")
-                .label(if is_admin { "Remove as admin" } else { "Make admin" })
-                .outline()
-                .small()
-                .on_click(move |_, window, cx| {
-                    let description = if is_admin {
-                        let mut text = format!("Remove {admin_name} as group admin?");
-                        if labels_go {
-                            text.push_str(" This will also clear their member label.");
-                        }
-                        text
-                    } else {
-                        format!("{admin_name} will be able to edit this group and its members.")
-                    };
-                    let (state, group, member) = (admin_state.clone(), admin_group.clone(), admin_member.clone());
-                    confirm(None, description, if is_admin { "Remove as admin" } else { "Make admin" }, false, window, cx, move |window, cx| {
-                        state.read(cx).send(Command::SetGroupAdmin { conversation: group.clone(), member: member.clone(), admin: !is_admin });
-                        window.close_all_dialogs(cx);
-                    });
-                });
-            let (remove_state, remove_group, remove_member, remove_name) = (state.clone(), group.clone(), member.clone(), name.clone());
-            let with_link = chat.group_state.link.is_some();
-            let remove = Button::new("member-remove").label("Remove from group").danger().small().on_click(move |_, window, cx| {
-                confirm_remove(remove_state.clone(), remove_group.clone(), remove_member.clone(), &remove_name, with_link, window, cx);
             });
-            body = body.child(div().flex().flex_col().gap_2().child(toggle).child(remove));
-        }
-        dialog.w(px(380.)).child(body)
+        });
+    let (remove_state, remove_group, remove_member, remove_name) = (state.clone(), chat.id.clone(), member.to_owned(), name.to_owned());
+    let with_link = chat.group_state.link.is_some();
+    let remove = Button::new("member-remove").label("Remove from group").danger().small().on_click(move |_, window, cx| {
+        confirm_remove(remove_state.clone(), remove_group.clone(), remove_member.clone(), &remove_name, with_link, window, cx);
     });
+    vec![div().pt_2().flex().gap_2().child(toggle).child(remove).into_any_element()]
 }
 
 /// Desktop's `buildModifyMemberRoleChange`: an admin's label goes with the

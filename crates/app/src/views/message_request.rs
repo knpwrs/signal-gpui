@@ -30,7 +30,7 @@ pub fn safety_color(cx: &App) -> Hsla {
 }
 
 /// Desktop's `fill-safety-tint`.
-fn safety_tint(cx: &App) -> Hsla {
+pub fn safety_tint(cx: &App) -> Hsla {
     let dark = gpui_kit::component::ActiveTheme::theme(cx).is_dark();
     let (rgb, a) = if dark { (0xeb977d, 0.16) } else { (0xb95929, 0.12) };
     Hsla { a, ..Hsla::from(gpui_kit::rgb(rgb)) }
@@ -60,15 +60,10 @@ pub fn shared_groups_text(groups: &[String]) -> String {
     }
 }
 
-/// The groups we're in with someone (by their ACI), by title.
+/// The groups we're in with someone (by their ACI), by title
+/// (`group_admin::groups_in_common`).
 pub fn shared_groups(state: &AppState, aci: &str) -> Vec<String> {
-    state
-        .conversations
-        .iter()
-        .chain(&state.archived)
-        .filter(|c| c.kind == ConversationKind::Group && !c.left && !c.invited() && c.members.iter().any(|m| m == aci))
-        .map(|c| c.title.clone())
-        .collect()
+    crate::views::group_admin::groups_in_common(state, aci).into_iter().map(|c| c.title).collect()
 }
 
 /// Who added or invited us to a group, by name, as the database knows them.
@@ -316,77 +311,6 @@ pub fn render_bar(
                 .when(!chat.blocked, |d| d.child(button("mr-accept", "Accept", false, accept))),
         )
         .into_any_element()
-}
-
-/// Desktop's `ConversationHero` at the start of a request: who it is,
-/// "Name not verified" (Desktop's `NameNotVerifiedWarning`), the groups we
-/// share (or a group's members), and "Safety tips".
-pub fn render_hero(chat: &Conversation, shared: &[String], members: &[String], palette: Palette, cx: &App) -> AnyElement {
-    let group = chat.kind == ConversationKind::Group;
-    // Desktop: a 1:1 name is verified when it's our address book's.
-    let unverified = group || !chat.system_contact;
-    let line = if group {
-        match members.len() {
-            0 => "No group members".to_owned(),
-            n => format!("{} {}", n, if n == 1 { "member" } else { "members" }),
-        }
-    } else if shared.is_empty() {
-        "No groups in common. Review requests carefully.".to_owned()
-    } else {
-        shared_groups_text(shared)
-    };
-    div().debug_selector(|| "mr-hero".into()).pt_6().pb_2().px_6().flex().justify_center().child(
-        div()
-            .w(px(256.))
-            .px_5()
-            .pb_5()
-            .pt_4()
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap_2()
-            .rounded_xl()
-            .border_2()
-            .border_color(palette.panel_border)
-            .child(conversation_avatar(chat, px(72.)))
-            .child(div().text_xl().font_weight(FontWeight::MEDIUM).text_center().child(chat.title.clone()))
-            .when(unverified, |d| {
-                d.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .px_2p5()
-                        .py_1()
-                        .rounded_full()
-                        .bg(safety_tint(cx))
-                        .text_color(safety_color(cx))
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .child(Icon::new(if group { IconName::Users } else { IconName::User }).size_4())
-                        .child("Name not verified"),
-                )
-            })
-            .when_some(chat.description.clone().filter(|_| group), |d, description| {
-                d.child(div().text_sm().text_center().child(description))
-            })
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .text_sm()
-                    .text_center()
-                    .child(Icon::new(IconName::Users).size_4())
-                    .child(line),
-            )
-            .child(
-                div().debug_selector(|| "safety-tips".into()).mt_1().child(
-                    Button::new("safety-tips").label("Safety tips").outline().on_click(|_, window, cx| open_safety_tips(window, cx)),
-                ),
-            ),
-    )
-    .into_any_element()
 }
 
 /// Desktop's safety tips: the summary's three, then "View more".

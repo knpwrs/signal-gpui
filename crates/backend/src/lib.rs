@@ -1044,6 +1044,37 @@ pub async fn own_profile(db: &AppDb, aci: &str) -> OwnProfile {
     }
 }
 
+/// What the About and contact screens show about someone (Desktop's
+/// `AboutContactModal` and `ContactModal` props).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ContactDetails {
+    /// Their profile and contact record details, when known.
+    pub profile: Option<signal_store::PersonProfile>,
+    /// They're in our address book (Desktop's `isInSystemContacts`).
+    pub in_system_contacts: bool,
+    /// The nickname and note we gave them.
+    pub nickname: Option<signal_store::ContactNickname>,
+    /// We marked their current identity key verified (Desktop's
+    /// `isVerified`): the key we verified is the one we last saw.
+    pub verified: bool,
+    /// We share our profile with them (Desktop's `profileSharing`).
+    pub profile_sharing: bool,
+}
+
+/// Reads what the About and contact screens show about `service_id`.
+pub async fn contact_details(db: &AppDb, service_id: &str) -> ContactDetails {
+    let verified_key = db.setting(&format!("{}{service_id}", actor::SETTING_VERIFIED)).await.ok().flatten().filter(|k| !k.is_empty());
+    let current_key = db.setting(&format!("{}{service_id}", actor::SETTING_IDENTITY)).await.ok().flatten();
+    ContactDetails {
+        profile: db.person_profile(service_id).await.ok().flatten(),
+        in_system_contacts: db.system_contacts().await.unwrap_or_default().iter().any(|s| s == service_id),
+        nickname: db.contact_nickname(service_id).await.ok().flatten(),
+        // No key recorded yet: the verified one is the one we have.
+        verified: verified_key.is_some() && (current_key.is_none() || verified_key == current_key),
+        profile_sharing: db.profile_sharing(&ConversationId::direct(service_id)).await.unwrap_or(false),
+    }
+}
+
 /// The backend thread's stack (see `Backend::start`).
 const BACKEND_STACK: usize = 16 * 1024 * 1024;
 

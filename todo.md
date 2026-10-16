@@ -42,7 +42,7 @@ number.
 | `attachments.maxAutoDownloadSizeBytes` | 200 MiB | Follows the config. |
 | `textAttachmentLimitBytes` | Size of a long-text attachment | Desktop's built-in limits, hard-coded (`crates/backend/src/long_text.rs`): bodies over 2 KiB go as a `text/x-signal-plain` attachment (group story replies too), received ones download and replace the body, a failed download is retried after 30 s, 5 min, 50 min and 6 h as Desktop's download job does, received messages and edits whose inline body is over 2 KiB are dropped and logged, the composer stops at 64 KiB, and a bubble shows 800 characters with "Read more" adding 3,000. Retries and the drop were unit tested; the downloads themselves weren't tried against Signal's CDN. |
 | `groupsv2.maxGroupSize` / `groupSizeHardLimit` | 151 / 1001 | Follows the config in New group and Add members, with Desktop's alerts; the backend refuses to go past the hard limit. Not tried against Signal's group server. |
-| `nicknames.min` / `.max` | 3 / 32 | Username nickname limits (`ts/util/Username.dom.ts`), not contact nicknames. Read (`username_nickname_min` / `_max`) but unused: usernames can't be set here. Contact nicknames and notes use Desktop's built-in limits (`signal_store::NICKNAME_LIMITS`), which no config key sets. |
+| `nicknames.min` / `.max` | 3 / 32 | Username nickname limits (`ts/util/Username.dom.ts`), not contact nicknames: the username editor checks them (`signal_backend::usernames::limits`). Contact nicknames and notes use Desktop's built-in limits (`signal_store::NICKNAME_LIMITS`), which no config key sets. |
 | `messageQueueTimeInSeconds` | 30 days (never less) | How long the server keeps undelivered messages. Follows the config, never under 30 days, for erasing view-once messages left unviewed (Desktop's `getMessageQueueTime`). |
 | `videoAttachments.transcodeTargetBytes`, `mediaQuality.levels`, `calling.*`, `clientExpiration`, `maxAllowedClockSkewSeconds` | n/a | Not applicable for now. |
 
@@ -180,9 +180,9 @@ list, mentions, message authors, notifications, search). Tested with
 store, wire-format and demo-mode UI tests; not yet tried with a real
 account or checked on a phone. Not done:
 
-- **Group members' details:** the contact modal (clicking a member in Group
-  settings) offers Nickname only for someone we already have a 1:1 chat
-  with; Desktop offers it for anyone.
+- **Group members' details:** the contact modal (clicking a member's
+  avatar or name in a group, or in Group settings) offers Nickname only for
+  someone we already have a 1:1 chat with; Desktop offers it for anyone.
 - **Short names:** Desktop uses the nickname's first name where it shows
   short names (`getTitle` with `isShort`). We show full names everywhere.
 - **Delete menu:** Desktop puts "Delete" in a menu beside the Nickname row,
@@ -233,6 +233,49 @@ group (we assume they can, as Desktop does). Not done:
   square and scaled to 512 pixels, as Desktop's `processImageFile`.
 - **Group updates to people outside the group** (invitees, whoever was
   removed or turned down) go to ACIs only, one by one.
+
+## Profile, usernames and contact screens
+
+Built after Desktop's `ProfileEditor`, `AvatarEditor`, `writeProfile`,
+`username.preload.ts`, `UsernameEditor`, `UsernameLinkEditor`,
+`AboutContactModal`, `ContactModal`, `ConversationHero` and `BadgeDialog`:
+our name, about and emoji, photo (picked, Desktop's twelve presets, or
+removed) written with the encrypted versioned profile and the avatar upload
+form; usernames reserved, confirmed, deleted, their link reset and
+colored, and the account record kept in step; About and the contact modal;
+the hero at the start of chats; badges on avatars and their dialog.
+Tested with unit tests against libsignal with made-up keys (profile
+encryption and padding, request bodies, username hashes, proofs, link
+encryption), storage wire-format tests, store tests, and demo-mode UI
+tests. Nothing here was run against Signal's servers or a real account:
+the profile write, avatar upload, username endpoints, badge image
+downloads and the account record writes are written from Desktop's code
+and the server's API and haven't been tried. Not done:
+
+- **Profile key from the account record:** writes and our own profile
+  fetches use the account record's profile key (Desktop's
+  `mergeAccountRecord`), but presage keeps the key from linking for what
+  it sends with messages; when the phone makes a new key the two differ
+  until relinking. presage has no way to set it (a vendor change).
+- **Preset photos:** Desktop's twelve illustrated presets are offered;
+  its text presets (initials on a color, `AvatarTextEditor`) and color
+  picker aren't. There's no crop or zoom: a picked image is cropped to the
+  middle square, as Desktop's `processImageFile` does.
+- **Username link extras:** Desktop's "Save" (the QR card as a PNG), its
+  branded QR code with the Signal logo, and the "username corrupted"
+  checks (`usernameIntegrity`) and their "Fix now" dialogs.
+- **Username megaphone and onboarding** (`UsernameOnboardingModal`).
+- **About:** "Signal Connection" doesn't open Desktop's explanation.
+- **Contact modal:** "Add to another group" and the photo lightbox.
+  Clicking a group member's avatar or name beside their message opens it;
+  that path isn't covered by a UI test (Group settings' is).
+- **Hero:** an accepted group doesn't get Desktop's "Name not verified"
+  (Desktop's `isGroupNameVerified` needs who added us to be trusted); a
+  request does.
+- **Badges:** our own badges' visibility can't be changed, and gift
+  badges aren't shown.
+- **Phone number sharing:** read from the account record for profile
+  writes; there's no setting to change it here.
 
 ## Sticker pack creator
 

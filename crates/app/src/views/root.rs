@@ -990,7 +990,7 @@ mod tests {
         // In place of the composer, with Desktop's hero, the warning about
         // a contact's name, and no reply or call buttons.
         assert!(cx.debug_bounds("emoji-button").is_none());
-        wait(&mut cx, "the hero", &|cx| cx.debug_bounds("mr-hero").is_some());
+        wait(&mut cx, "the hero", &|cx| cx.debug_bounds("conversation-hero").is_some());
         wait(&mut cx, "the name warning", &|cx| cx.debug_bounds("spoofing-warning").is_some());
         assert!(cx.debug_bounds("voice-call").is_none());
         // Delete only once reported or blocked.

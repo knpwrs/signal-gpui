@@ -109,10 +109,10 @@ const AVATAR_CHECKS_PER_SYNC: usize = 100;
 const AVATAR_BATCH_DELAY: Duration = Duration::from_secs(5 * 60);
 /// `verified.<ACI>`: the identity key (hex) we marked verified for them;
 /// empty when cleared. Verification lapses when their key changes.
-const SETTING_VERIFIED: &str = "verified.";
+pub(crate) const SETTING_VERIFIED: &str = "verified.";
 /// `identity.<ACI>`: their identity key (hex) as last seen, to notice a
 /// change.
-const SETTING_IDENTITY: &str = "identity.";
+pub(crate) const SETTING_IDENTITY: &str = "identity.";
 
 /// Whether an attachment is fetched whole as soon as it arrives: photos,
 /// GIFs and voice messages under the auto-download limit.

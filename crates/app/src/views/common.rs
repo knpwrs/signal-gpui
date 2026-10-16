@@ -33,6 +33,71 @@ pub fn title_bar_inset(window: &gpui_kit::Window) -> Pixels {
     if window.is_fullscreen() { px(0.) } else { px(40.) }
 }
 
+/// The badge drawn on an avatar of `avatar` pixels (Desktop's
+/// `_getBadgeSize` in `Avatar.dom.tsx`); none under 24.
+pub fn badge_size(avatar: f32) -> Option<f32> {
+    match avatar {
+        a if a < 24. => None,
+        a if a <= 36. => Some(16.),
+        a if a <= 64. => Some(24.),
+        a if a <= 112. => Some(36.),
+        a => Some((a * 0.4).round()),
+    }
+}
+
+/// Where the badge sits, `(bottom, right)` (Desktop's
+/// `BADGE_PLACEMENT_BY_SIZE`; other sizes sit in the corner).
+fn badge_placement(avatar: f32) -> (f32, f32) {
+    match avatar as u32 {
+        28..=32 => (-4., -2.),
+        36 => (-3., 0.),
+        40 | 48 => (-6., -4.),
+        52 => (-6., -2.),
+        56 | 64 => (-6., 0.),
+        72 => (-6., -6.),
+        80 => (-8., 0.),
+        88 | 112 => (-4., 3.),
+        _ => (0., 0.),
+    }
+}
+
+/// `avatar` (of `size` pixels) with someone's badge in its corner, as
+/// Desktop's `Avatar` draws `badge`.
+pub fn with_badge(avatar: AnyElement, size: f32, badge: Option<std::path::PathBuf>) -> AnyElement {
+    let (Some(badge), Some(badge_size)) = (badge, badge_size(size)) else { return avatar };
+    let (bottom, right) = badge_placement(size);
+    div()
+        .relative()
+        .flex_none()
+        .size(px(size))
+        .child(avatar)
+        .child(img(badge).absolute().bottom(px(bottom)).right(px(right)).size(px(badge_size)))
+        .into_any_element()
+}
+
+/// Someone's avatar with their preferred badge (Desktop shows `badges[0]`).
+pub fn badged_avatar(state: &crate::state::AppState, service_id: &str, name: &str, size: f32, cx: &gpui_kit::App) -> AnyElement {
+    let avatar = person_avatar(state.photo_of(service_id), name, crate::theme::color_for(service_id), px(size));
+    with_badge(avatar, size, badge_image(state, service_id, size, cx))
+}
+
+/// A chat's avatar, with the person's badge for a 1:1 chat (Desktop's
+/// chat list and header pass `badge`).
+pub fn chat_avatar(state: &crate::state::AppState, conversation: &Conversation, size: f32, cx: &gpui_kit::App) -> AnyElement {
+    let avatar = conversation_avatar(conversation, px(size));
+    match conversation.id.as_direct().filter(|_| conversation.kind == ConversationKind::Direct && !conversation.id.is_signal()) {
+        Some(sid) => with_badge(avatar, size, badge_image(state, sid, size, cx)),
+        None => avatar,
+    }
+}
+
+/// The image of their preferred badge at `size` (for this theme).
+pub fn badge_image(state: &crate::state::AppState, service_id: &str, size: f32, cx: &gpui_kit::App) -> Option<std::path::PathBuf> {
+    let badge = state.badges.preferred(service_id)?;
+    let dark = gpui_kit::component::ActiveTheme::theme(cx).is_dark();
+    state.badges.image(badge, badge_size(size)?, dark)
+}
+
 /// A person's avatar: their profile photo once downloaded, else initials.
 pub fn person_avatar(photo: Option<&std::path::Path>, name: &str, color: u8, size: Pixels) -> AnyElement {
     match photo {

@@ -144,6 +144,8 @@ pub enum AppEvent {
     Alert { title: SharedString, description: SharedString },
     /// A short note to show (Desktop's toasts).
     Info(SharedString),
+    /// Someone's profile (name, about, badges) or contact details changed.
+    ProfileChanged(String),
     /// Our profile, username or link changed (`AppState::own_profile`).
     OwnProfileChanged,
     /// Answer to writing our profile.
@@ -158,6 +160,36 @@ pub enum AppEvent {
     UsernameSaved(Result<Option<String>, signal_backend::usernames::UsernameProblem>),
     /// Answer to resetting our username link.
     UsernameLinkReset(Result<(), String>),
+}
+
+/// Badges: who shows which, their descriptions, and their downloaded
+/// images (Desktop's `badges` state).
+#[derive(Debug, Clone, Default)]
+pub struct Badges {
+    /// Each person's visible badges' ids, the first one first.
+    pub holders: HashMap<String, Vec<String>>,
+    pub badges: HashMap<String, signal_store::Badge>,
+    /// Downloaded images by URL.
+    pub files: HashMap<String, std::path::PathBuf>,
+}
+
+impl Badges {
+    /// The badge to draw on someone's avatar (Desktop's `badges[0]`).
+    pub fn preferred(&self, service_id: &str) -> Option<&signal_store::Badge> {
+        self.holders.get(service_id)?.iter().find_map(|id| self.badges.get(id))
+    }
+
+    /// All of their visible badges, for the badge dialog.
+    pub fn of(&self, service_id: &str) -> Vec<signal_store::Badge> {
+        self.holders.get(service_id).into_iter().flatten().filter_map(|id| self.badges.get(id).cloned()).collect()
+    }
+
+    /// The downloaded image of `badge` to draw at `size` pixels.
+    pub fn image(&self, badge: &signal_store::Badge, size: f32, dark: bool) -> Option<std::path::PathBuf> {
+        let theme = if dark { signal_store::BadgeTheme::Dark } else { signal_store::BadgeTheme::Light };
+        let url = badge.image_for(size, theme, |url| self.files.contains_key(url))?;
+        self.files.get(&url).cloned()
+    }
 }
 
 /// The key transparency button in the safety number screen, in Desktop's
@@ -219,6 +251,7 @@ pub struct AppState {
     person_avatars: HashMap<String, std::path::PathBuf>,
     /// Our profile, username and link (`None` until read).
     pub own_profile: Option<signal_backend::OwnProfile>,
+    pub badges: Badges,
     pub selected: Option<ConversationId>,
     /// Authors currently typing, per conversation, with expiry.
     typing: HashMap<ConversationId, Vec<(String, Instant)>>,
@@ -341,6 +374,7 @@ impl AppState {
             archived: Vec::new(),
             person_avatars: HashMap::new(),
             own_profile: None,
+            badges: Badges::default(),
             jump: None,
             selected: None,
             typing: HashMap::new(),
@@ -654,6 +688,7 @@ impl AppState {
                 self.reload_stories(cx);
                 self.reload_call_links(cx);
                 self.reload_own_profile(cx);
+                self.reload_badges(cx);
                 self.start_catch_up(cx);
             }
             Event::Connection(state) => {
@@ -809,9 +844,15 @@ impl AppState {
             Event::AuthorNamesChanged(names) => cx.emit(AppEvent::AuthorNamesChanged(names.into())),
             // Limits and features read it when drawn: just redraw.
             Event::RemoteConfigChanged => cx.emit(AppEvent::ConversationsChanged),
-            // Shown by the contact views, added next.
-            Event::ProfileChanged(_) | Event::BadgesChanged => {}
-            Event::OwnProfileChanged => self.reload_own_profile(cx),
+            Event::ProfileChanged(service_id) => {
+                self.reload_badges(cx);
+                cx.emit(AppEvent::ProfileChanged(service_id));
+            }
+            Event::OwnProfileChanged => {
+                self.reload_own_profile(cx);
+                self.reload_badges(cx);
+            }
+            Event::BadgesChanged => self.reload_badges(cx),
             Event::ProfileSaved(result) => cx.emit(AppEvent::ProfileSaved(result)),
             Event::UsernameReserved { nickname, discriminator, result } => {
                 cx.emit(AppEvent::UsernameReserved { nickname, discriminator, result })
@@ -855,6 +896,7 @@ impl AppState {
                 self.archived.clear();
                 self.person_avatars.clear();
                 self.own_profile = None;
+                self.badges = Badges::default();
                 self.selected = None;
                 // The database was cleared; so are the next account's caches.
                 self.typing.clear();
@@ -1894,6 +1936,26 @@ impl AppState {
                 }
                 this.own_profile = Some(profile);
                 cx.emit(AppEvent::OwnProfileChanged);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Reads who has which badge, and the badges, again.
+    pub fn reload_badges(&mut self, cx: &mut Context<Self>) {
+        let db = self.backend.db().clone();
+        let read = self.backend.spawn(async move {
+            Ok::<_, signal_store::Error>((db.badge_holders().await?, db.badges().await?, db.badge_image_files().await?))
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok((holders, badges, files)) = read.await else { return };
+            let _ = this.update(cx, |this, cx| {
+                this.badges = Badges {
+                    holders,
+                    badges: badges.into_iter().map(|b| (b.id.clone(), b)).collect(),
+                    files: files.into_iter().map(|(url, path)| (url, path.into())).collect(),
+                };
                 cx.notify();
             });
         })

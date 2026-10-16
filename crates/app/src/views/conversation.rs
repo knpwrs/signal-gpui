@@ -84,6 +84,8 @@ pub struct ConversationView {
     system_contacts: std::collections::HashSet<String>,
     acknowledged_collisions: std::collections::BTreeMap<String, Vec<String>>,
     spoofing_dismissed: bool,
+    /// For a 1:1 chat's hero: what's known about them.
+    hero_details: Option<signal_backend::ContactDetails>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -150,6 +152,8 @@ impl ConversationView {
                     cx.notify()
                 }
                 AppEvent::AuthorNamesChanged(names) => this.rename_authors(names, cx),
+                AppEvent::ProfileChanged(sid) if this.id.as_direct() == Some(sid.as_str()) => this.load_hero(cx),
+                AppEvent::ProfileChanged(_) | AppEvent::OwnProfileChanged => cx.notify(),
                 _ => {}
             }),
             cx.observe_window_activation(window, |this, window, cx| {
@@ -232,6 +236,7 @@ impl ConversationView {
             system_contacts: Default::default(),
             acknowledged_collisions: Default::default(),
             spoofing_dismissed: false,
+            hero_details: None,
             _subscriptions: subscriptions,
         };
         this.load_request_details(cx);
@@ -242,6 +247,12 @@ impl ConversationView {
         }
         this.mark_read(cx);
         this.load_pins(cx);
+        // Desktop fetches a person's profile when their chat opens
+        // (`throttledGetProfiles`).
+        if let Some(sid) = this.id.as_direct().filter(|_| !this.id.is_signal()).map(str::to_owned) {
+            this.state.read(cx).send(signal_backend::Command::LoadProfile { service_id: sid });
+        }
+        this.load_hero(cx);
         this
     }
 
@@ -264,6 +275,22 @@ impl ConversationView {
                 this.names = names.into_iter().collect();
                 this.system_contacts = system.into_iter().collect();
                 this.acknowledged_collisions = acknowledged.and_then(|a| serde_json::from_str(&a).ok()).unwrap_or_default();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// What the hero shows about the person this chat is with.
+    fn load_hero(&mut self, cx: &mut Context<Self>) {
+        let Some(sid) = self.id.as_direct().filter(|_| !self.id.is_signal()).map(str::to_owned) else { return };
+        let backend = self.state.read(cx).backend.clone();
+        let db = backend.db().clone();
+        let read = backend.spawn(async move { signal_backend::contact_details(&db, &sid).await });
+        cx.spawn(async move |this, cx| {
+            let details = read.await;
+            let _ = this.update(cx, |this, cx| {
+                this.hero_details = Some(details);
                 cx.notify();
             });
         })
@@ -380,6 +407,16 @@ impl ConversationView {
         })
         .detach();
         cx.notify();
+    }
+
+    /// Desktop's hero, at the start of the chat (not the Signal chat's,
+    /// which has its own).
+    fn render_hero(&self, cx: &App) -> Option<AnyElement> {
+        if self.id.is_signal() {
+            return None;
+        }
+        let conversation = self.state.read(cx).conversation(&self.id)?;
+        Some(crate::views::contact::hero(&self.state, conversation, self.hero_details.as_ref(), cx))
     }
 
     fn load_pins(&mut self, cx: &mut Context<Self>) {
@@ -1022,6 +1059,10 @@ impl ConversationView {
                         })
                     })
                     .child(match conversation {
+                        Some(c) if c.kind == ConversationKind::Direct && !c.id.is_signal() => {
+                            let badge = c.id.as_direct().and_then(|sid| crate::views::common::badge_image(self.state.read(cx), sid, 32., cx));
+                            crate::views::common::with_badge(conversation_avatar(c, px(32.)), 32., badge)
+                        }
                         Some(c) => conversation_avatar(c, px(32.)),
                         None => avatar(&title, color, px(32.)).into_any_element(),
                     })
@@ -1128,13 +1169,6 @@ impl ConversationView {
     }
 
     /// Desktop's `ConversationHero` for a message request (and Safety tips).
-    fn render_request_hero(&self, palette: Palette, cx: &App) -> Option<AnyElement> {
-        let state = self.state.read(cx);
-        let chat = state.conversation(&self.id).filter(|c| !c.accepted && !c.id.is_signal())?;
-        let shared = chat.id.as_direct().map(|aci| crate::views::message_request::shared_groups(state, aci)).unwrap_or_default();
-        Some(crate::views::message_request::render_hero(chat, &shared, &chat.members, palette, cx))
-    }
-
     fn render_item(&mut self, ix: usize, palette: Palette, cx: &mut Context<Self>) -> AnyElement {
         let Some(message) = self.messages.get(ix).cloned() else {
             return div().into_any_element();
@@ -1145,7 +1179,11 @@ impl ConversationView {
 
         let show_day = prev.is_none_or(|p| !same_day(p.sent_at, message.sent_at));
         if let Some(notice) = &message.notice {
-            return self.render_notice(notice, show_day, message.sent_at, palette, cx);
+            let notice = self.render_notice(notice, show_day, message.sent_at, palette, cx);
+            return match (ix == 0 && !self.has_more).then(|| self.render_hero(cx)).flatten() {
+                Some(hero) => div().flex().flex_col().w_full().child(hero).child(notice).into_any_element(),
+                None => notice,
+            };
         }
         let first_in_group = show_day || prev.is_none_or(|p| !same_group(p, &message));
         let last_in_group = next.is_none_or(|n| !same_group(&message, n));
@@ -1229,10 +1267,19 @@ impl ConversationView {
                         // Level with the bubble's bottom, not the reactions under it.
                         .pb(px(reactions_below(&message)))
                         .when(last_in_group, |d| {
+                            let avatar = person_avatar(author_photo.as_deref(), &author_name, author_color, px(28.));
+                            let badge = message.author.as_deref().and_then(|a| crate::views::common::badge_image(self.state.read(cx), a, 28., cx));
+                            let open = message.author.clone().map(|a| (self.state.clone(), a, self.id.clone()));
                             d.child(
                                 div()
+                                    .id(("avatar", message_id as u64))
                                     .debug_selector(move || format!("avatar-{message_id}"))
-                                    .child(person_avatar(author_photo.as_deref(), &author_name, author_color, px(28.))),
+                                    .child(crate::views::common::with_badge(avatar, 28., badge))
+                                    .when_some(open, |d, (state, sid, group)| {
+                                        d.cursor_pointer().on_click(move |_, window, cx| {
+                                            crate::views::contact::open_contact(state.clone(), sid.clone(), Some(group.clone()), window, cx);
+                                        })
+                                    }),
                             )
                         }),
                 )
@@ -1298,8 +1345,7 @@ impl ConversationView {
             })
             // The start of the Signal chat: Desktop's hero.
             .when(ix == 0 && !self.has_more && self.id.is_signal(), |d| d.child(signal_hero(palette, cx)))
-            // A message request's (with Desktop's "Safety tips").
-            .when(ix == 0 && !self.has_more, |d| d.children(self.render_request_hero(palette, cx)))
+            .when(ix == 0 && !self.has_more, |d| d.children(self.render_hero(cx)))
             .when(show_day, |d| {
                 let signal = self.id.is_signal().then(|| signal_colors(cx));
                 d.child(
@@ -1422,6 +1468,7 @@ impl ConversationView {
         }
 
         let author_name = message.author_name.clone().unwrap_or_else(|| "Unknown".into());
+        let author_open = message.author.clone().map(|a| (self.state.clone(), a, self.id.clone()));
         // The mini player's title for its audio: who sent it.
         let title = self.reactor_name(message.author.as_deref(), cx);
         let author_color = {
@@ -1485,7 +1532,7 @@ impl ConversationView {
                             .pt_2()
                             .pb_1p5()
                             .when(show_author && !outgoing, |d| {
-                                d.child(author_line(author_name, author_color, author_label))
+                                d.child(author_line(author_name, author_color, author_label, author_open))
                             })
                             .when_some(message.quote.clone(), |d, quote| d.child(self.render_quote(message.id, quote, fg, palette, cx))),
                     )
@@ -1566,7 +1613,7 @@ impl ConversationView {
                             .pt_2()
                             .pb_1p5()
                             .when(show_author && !outgoing, |d| {
-                                d.child(author_line(author_name, author_color, author_label))
+                                d.child(author_line(author_name, author_color, author_label, author_open))
                             })
                             .when_some(message.quote.clone(), |d, quote| d.child(self.render_quote(message.id, quote, fg, palette, cx))),
                     )
@@ -1608,7 +1655,7 @@ impl ConversationView {
             .bg(bg)
             .text_color(fg)
             .when(show_author && !outgoing, |d| {
-                d.child(author_line(author_name, author_color, author_label))
+                d.child(author_line(author_name, author_color, author_label, author_open))
             })
             .when_some(message.quote.clone(), |d, quote| d.child(self.render_quote(message.id, quote, fg, palette, cx)))
             .children(
@@ -1661,6 +1708,7 @@ impl ConversationView {
             _ => None,
         };
         let author_name = message.author_name.clone().unwrap_or_else(|| "Unknown".into());
+        let author_open = message.author.clone().map(|a| (self.state.clone(), a, self.id.clone()));
         let author_color = {
             let members = self.state.read(cx).conversation(&self.id).map(|c| c.members.clone()).unwrap_or_default();
             crate::theme::name_color(&members, message.author.as_deref().unwrap_or(""), gpui_kit::component::ActiveTheme::theme(&**cx).is_dark())
@@ -1681,7 +1729,7 @@ impl ConversationView {
             .py_2()
             .bg(bg)
             .text_color(fg)
-            .when(show_author && !outgoing, |d| d.child(author_line(author_name, author_color, author_label)))
+            .when(show_author && !outgoing, |d| d.child(author_line(author_name, author_color, author_label, author_open)))
             .child(
                 div()
                     .debug_selector(move || format!("view-once-label-{id}"))
@@ -2524,13 +2572,35 @@ fn reactions_below(message: &Message) -> f32 {
 
 /// A sender's name in a group bubble, then their member label as a pill
 /// tinted with the name's colour (Desktop's `GroupMemberLabel`).
-fn author_line(name: String, color: Hsla, label: Option<signal_store::MemberLabel>) -> impl IntoElement {
+/// A group message's author, as Desktop shows it: their name in their
+/// color, opening the contact modal (`open`: the app, their service id and
+/// the group), and their member label.
+fn author_line(
+    name: String,
+    color: Hsla,
+    label: Option<signal_store::MemberLabel>,
+    open: Option<(Entity<AppState>, String, ConversationId)>,
+) -> impl IntoElement {
     div()
         .flex()
         .items_center()
         .gap_1p5()
         .min_w_0()
-        .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(color).truncate().child(name))
+        .child(
+            div()
+                .id("author-name")
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(color)
+                .truncate()
+                .child(name)
+                .when_some(open, |d, (state, sid, group)| {
+                    d.cursor_pointer().on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        crate::views::contact::open_contact(state.clone(), sid.clone(), Some(group.clone()), window, cx);
+                    })
+                }),
+        )
         .when_some(label, |d, label| {
             d.child(
                 div()
@@ -3473,6 +3543,7 @@ impl Render for ConversationView {
                     .flex_1()
                     .min_h_0()
                     .image_cache(self.image_cache.clone())
+                    .when(self.messages.is_empty() && !self.has_more, |d| d.children(self.render_hero(cx)))
                     .child(
                         list(self.list.clone(), move |ix, _window, cx| {
                             entity.update(cx, |this, cx| {

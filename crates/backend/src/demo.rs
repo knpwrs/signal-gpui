@@ -2110,6 +2110,10 @@ async fn seed_profiles(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> 
         db.save_fetched_profile(aci(id), &profile, at).await?;
     }
     db.replace_usernames(&[(aci(MAYA).into(), "maya.42".into())]).await?;
+    // The stranger's request: a profile with Maya's name, not in our
+    // address book (Desktop's "Name not verified").
+    let stranger = FetchedProfile { given_name: "Maya".into(), family_name: "Chen".into(), ..Default::default() };
+    db.save_fetched_profile(aci(STRANGER), &stranger, at).await?;
     let ours = FetchedProfile {
         given_name: "Riley".into(),
         family_name: "Park".into(),

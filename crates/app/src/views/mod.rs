@@ -6,6 +6,7 @@ pub mod chat_menu;
 pub mod chat_settings;
 pub mod common;
 pub mod composer;
+pub mod contact;
 pub mod conversation;
 pub mod debug_log;
 pub mod emoji_picker;

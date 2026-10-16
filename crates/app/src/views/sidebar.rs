@@ -163,6 +163,7 @@ impl Sidebar {
                 | AppEvent::GroupLinkPreview(_)
                 | AppEvent::Alert { .. }
                 | AppEvent::Info(_)
+                | AppEvent::ProfileChanged(_)
                 | AppEvent::OwnProfileChanged
                 | AppEvent::ProfileSaved(_)
                 | AppEvent::UsernameReserved { .. }
@@ -546,7 +547,7 @@ impl Sidebar {
                 .child(
                     div()
                         .relative()
-                        .child(conversation_avatar(conversation, px(48.)))
+                        .child(crate::views::common::chat_avatar(self.state.read(cx), conversation, 48., cx))
                         .when(unread > 0 || conversation.marked_unread, |d| {
                             d.child(
                                 div()
@@ -631,7 +632,7 @@ impl Sidebar {
                     this.state.update(cx, |state, cx| state.select(Some(id), cx));
                 }
             }))
-            .child(conversation_avatar(conversation, px(48.)))
+            .child(crate::views::common::chat_avatar(self.state.read(cx), conversation, 48., cx))
             .child(
                 div()
                     .flex()
