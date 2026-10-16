@@ -708,6 +708,8 @@ impl AppState {
                 cx.emit(AppEvent::LinkPreview { url, preview: preview.map(std::rc::Rc::new) })
             }
             Event::AuthorNamesChanged(names) => cx.emit(AppEvent::AuthorNamesChanged(names.into())),
+            // Limits and features read it when drawn: just redraw.
+            Event::RemoteConfigChanged => cx.emit(AppEvent::ConversationsChanged),
             Event::Error(error) => {
                 tracing::warn!("backend error: {error}");
                 self.report_error(error, cx);

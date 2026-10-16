@@ -31,6 +31,9 @@ pub mod edits;
 pub mod long_text;
 pub mod release_notes;
 pub mod megaphones;
+pub mod remote_config;
+
+pub use remote_config::{RemoteConfig, current as remote_config};
 
 /// Most conversations an account can pin (Signal's limit).
 pub use storage::MAX_PINNED;
@@ -285,6 +288,9 @@ pub enum Command {
     /// Stops waiting for the history transfer and continues without it.
     /// Ignored once the import has started.
     SkipHistory,
+    /// The window became active: fetches the remote config again if it's
+    /// been two hours (Desktop's `maybeRefreshRemoteConfig`).
+    RefreshRemoteConfig,
 }
 
 /// A per-chat setting kept in the Storage Service.
@@ -668,6 +674,9 @@ pub enum Event {
     /// Stored author names changed: `(service id, name)` pairs. Loaded
     /// messages and quotes by these authors should take the new names.
     AuthorNamesChanged(Vec<(String, String)>),
+    /// The remote config changed (see [`remote_config()`]): limits and
+    /// features may have too.
+    RemoteConfigChanged,
     Error(String),
     Unlinked,
 }

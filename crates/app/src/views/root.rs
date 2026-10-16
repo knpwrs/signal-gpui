@@ -55,6 +55,10 @@ impl RootView {
             cx.observe_window_activation(window, |this, window, cx| {
                 let active = window.is_window_active();
                 this.state.update(cx, |state, _| state.window_active = active);
+                // Desktop refreshes its remote config when it becomes active.
+                if active {
+                    this.state.read(cx).send(signal_backend::Command::RefreshRemoteConfig);
+                }
             }),
             cx.subscribe_in(&state, window, |this, state, event: &AppEvent, window, cx| {
                 if let AppEvent::ViewImage(image) = event {

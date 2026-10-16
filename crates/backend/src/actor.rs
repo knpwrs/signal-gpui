@@ -8,6 +8,7 @@ mod group_calls;
 mod polls;
 mod stories;
 mod release_notes;
+mod remote_config;
 
 use std::{
     cell::RefCell,
@@ -251,6 +252,8 @@ struct Actor {
     /// The last timestamp we sent with: each send gets a later one, since
     /// a timestamp names a message (two in one millisecond would collide).
     last_sent_at: std::cell::Cell<i64>,
+    /// When the window's activation last fetched the remote config.
+    remote_config_at: std::cell::Cell<Option<Instant>>,
 }
 
 pub(crate) async fn run(
@@ -320,6 +323,7 @@ pub(crate) async fn run(
         story_lists_edit: tokio::sync::Mutex::new(()),
         expiry: tokio::sync::Notify::new(),
         last_sent_at: std::cell::Cell::new(0),
+        remote_config_at: std::cell::Cell::new(None),
     });
 
     tokio::task::spawn_local(actor.clone().outbound_loop(outbound_rx));
@@ -327,6 +331,7 @@ pub(crate) async fn run(
     tokio::task::spawn_local(actor.clone().call_loop(call_events_rx));
     tokio::task::spawn_local(actor.clone().call_send_loop(call_sends_rx));
     actor.load_call_choices().await;
+    actor.load_remote_config().await;
 
     if actor.store.is_registered().await {
         match Manager::load_registered(actor.store.clone()).await {
@@ -655,6 +660,7 @@ impl Actor {
                 Command::ClearCallHistory => self.clear_call_history().await,
                 Command::Unlink => self.unlink().await,
                 Command::SkipHistory => self.skip_history().await,
+                Command::RefreshRemoteConfig => self.maybe_refresh_remote_config().await,
             }
         });
     }
@@ -757,6 +763,8 @@ impl Actor {
         self.names.borrow_mut().clear();
         self.self_aci.borrow_mut().clear();
         self.storage_synced.replace(false);
+        crate::remote_config::set_current(Default::default());
+        self.remote_config_at.set(None);
     }
 
     // -------------------------------------------------------------- receiving
@@ -766,6 +774,8 @@ impl Actor {
         let mut caught_up = false;
         let mut catch_up_first = None;
         let mut catch_up_every = Every::new(PROGRESS_INTERVAL);
+        // The remote config before the queue, as Desktop fetches it.
+        self.first_remote_config(&manager).await;
         loop {
             self.emit(Event::Connection(ConnectionState::Connecting));
             let started = Instant::now();

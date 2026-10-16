@@ -1514,7 +1514,8 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
             | Command::FetchAttachment { .. }
             | Command::FetchLongText { .. }
             | Command::Unlink
-            | Command::SkipHistory => {}
+            | Command::SkipHistory
+            | Command::RefreshRemoteConfig => {}
         }
     }
 }
