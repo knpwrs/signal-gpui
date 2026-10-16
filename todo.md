@@ -193,9 +193,9 @@ mapping and history import unit tests and demo-mode UI tests; not yet
 tried with a real account, against phones, or against the server's rate
 limits and refusals. Left:
 
-- **Send states for other messages:** who a message reached is kept only
-  for polls (all Desktop needs it for here), and only whether it reached
-  them, not per-person delivered or read.
+- **Poll reach and send states:** every message now keeps each
+  recipient's send state (`message_send_states`), but a poll's voters
+  still come from its own reached list, filled as before.
 - **Retrying a poll:** "Retry send" on a poll that reached only some
   members sends it to everyone again (they drop the repeat by its
   timestamp); Desktop sends only to the ones it missed.
@@ -459,8 +459,6 @@ the syncs with a phone, and the hangup to a real caller. Left:
   added us is only known from group changes seen from now on.
 - **Reports aren't kept across restarts:** Desktop's job queue is
   persisted; here a report still retrying is lost when the app quits.
-- **Delivery receipts:** Desktop holds them for requests; this client
-  doesn't send delivery receipts at all.
 - **Photos:** a request's photo isn't shown, but it may already have been
   downloaded (Desktop doesn't download it until accepted, and offers
   "click to view").
@@ -525,3 +523,46 @@ formatting, and Desktop's tabs work. Not done yet:
   to the system's fonts here.
 - **A text story's link preview image** is sent, but not kept or shown
   here, for ours or others' (the card shows the title).
+
+## Challenges, notices, collapse sets and receipts
+
+Done following Desktop: captcha challenges on a 428 (held sends, the
+dialog, `signalcaptcha://`, resend after), idle-phone alerts and the clock
+skew warning; confirming before sending to someone whose verified safety
+number changed; profile name, number, session refreshed, delivery issue,
+unsupported message and verification notices; collapse sets; these
+updates and group changes in transferred history; per-recipient send
+states with delivery, read and viewed receipts, message details and
+partial sends; delivery receipts sent (sealed sender, accepted chats,
+batched); viewed receipts for voice messages. Tested with unit, store,
+mapping and demo-mode UI tests; nothing here has been tried against the
+server or a phone. Left:
+
+- **Retry requests:** Desktop asks the sender to send again when it can't
+  decrypt a message (`DecryptionErrorMessage`, `desktop.senderKey.retry`)
+  and answers theirs by resending. Neither is done: a message we can't
+  decrypt resets the session and shows "Chat session refreshed" (Desktop's
+  fallback), and a retry request to us is only logged. So "Delivery issue"
+  only comes from transferred history.
+- **Safety number confirmation:** only the composer's sends ask. Desktop
+  also asks before stickers, GIFs, voice messages, calls, forwards and
+  stories, asks about keys changed in the last five seconds without
+  approval, and has a review step past five people.
+- **Clock skew:** shown, but Desktop also stops connecting until the clock
+  is right.
+- **Collapse sets:** each detail of a group change is a notice here, so
+  each counts toward the 50 a set holds, and a change that ended the group
+  keeps its other details collapsible. The call going on in a group stands
+  for Desktop's era match by being the newest call notice, and sets don't
+  update when a call starts or ends until the timeline changes.
+- **Send states:** an unregistered member in a group is left out of the
+  states (Desktop marks them failed the first time). Ours sent from this
+  computer don't record which recipients got them by sealed sender.
+  Messages sent before this keep their one status.
+- **Viewed receipts:** only voice messages (as Desktop); Desktop's "played"
+  dot on a voice message isn't shown.
+- **Captcha:** the page's redirect into the app and a real 428 haven't been
+  tried; challenges on sends other than our messages (receipts, syncs) are
+  ignored.
+- **Unsupported messages:** Desktop shows "Update Signal"; nothing here
+  updates the app, so there's no button.
