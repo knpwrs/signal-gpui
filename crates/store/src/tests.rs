@@ -408,6 +408,49 @@ async fn contact_names_are_replaced_wholesale() {
 }
 
 #[tokio::test]
+async fn nicknames_follow_storage_and_local_edits() {
+    let db = test_db().await;
+    let nick = |given: &str, family: &str, note: &str, plain: Option<&str>| ContactNickname {
+        given: given.into(),
+        family: family.into(),
+        note: note.into(),
+        plain_name: plain.map(Into::into),
+    };
+    // From a sync: a nickname over the profile name, and a note alone.
+    db.replace_contacts(
+        &[("a".into(), "Mo".into()), ("b".into(), "Bo Lee".into())],
+        &[("a".into(), nick("Mo", "", "Met at the gym", Some("Maurice Diaz"))), ("b".into(), nick("", "", "", None))],
+    )
+    .await
+    .unwrap();
+    assert_eq!(db.contact_nickname("a").await.unwrap(), Some(nick("Mo", "", "Met at the gym", Some("Maurice Diaz"))));
+    assert_eq!(db.contact_nickname("b").await.unwrap(), None, "empty ones aren't kept");
+
+    // Edited here: the display name follows, and the plain name is kept.
+    let name = db.set_contact_nickname("a", &nick(" Moe ", "D", "", None)).await.unwrap();
+    assert_eq!(name.as_deref(), Some("Moe D"));
+    assert_eq!(db.contact_name("a").await.unwrap().as_deref(), Some("Moe D"));
+    assert_eq!(db.contact_nickname("a").await.unwrap(), Some(nick("Moe", "D", "", Some("Maurice Diaz"))));
+    // Deleted: back to the plain name, and no row.
+    assert_eq!(db.set_contact_nickname("a", &ContactNickname::default()).await.unwrap().as_deref(), Some("Maurice Diaz"));
+    assert_eq!(db.contact_name("a").await.unwrap().as_deref(), Some("Maurice Diaz"));
+    assert_eq!(db.contact_nickname("a").await.unwrap(), None);
+
+    // A first nickname remembers the name they had.
+    db.set_contact_nickname("b", &nick("Bobo", "", "", None)).await.unwrap();
+    assert_eq!(db.contact_nickname("b").await.unwrap().unwrap().plain_name.as_deref(), Some("Bo Lee"));
+    assert_eq!(db.display_names(&["b".into()]).await.unwrap(), [("b".to_owned(), "Bobo".to_owned())]);
+    // Someone with no saved name: none after, so their profile name shows.
+    db.set_contact_nickname("c", &nick("", "", "Just a note", None)).await.unwrap();
+    assert_eq!(db.contact_name("c").await.unwrap(), None);
+    assert_eq!(db.set_contact_nickname("c", &ContactNickname::default()).await.unwrap(), None);
+
+    // The next sync replaces them all.
+    db.replace_contact_names(&[]).await.unwrap();
+    assert_eq!(db.contact_nickname("b").await.unwrap(), None);
+}
+
+#[tokio::test]
 async fn rename_authors_updates_messages_and_quotes() {
     let db = test_db().await;
     let mut first = incoming("g:01", "jon", 1, "hi");
@@ -798,6 +841,7 @@ async fn drop_later_migrations(db: &AppDb) {
     sqlx::query("DROP INDEX messages_long_text").execute(&db.writer).await.unwrap();
     sqlx::query("ALTER TABLE messages DROP COLUMN long_text").execute(&db.writer).await.unwrap();
     sqlx::query("ALTER TABLE messages DROP COLUMN poll").execute(&db.writer).await.unwrap();
+    sqlx::query("DROP TABLE contact_nicknames").execute(&db.writer).await.unwrap();
 }
 
 /// Rewrites the migration history to look like a pre-squash database that

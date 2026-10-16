@@ -12,8 +12,10 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous},
 };
 
+mod nickname;
 mod poll;
 mod stories;
+pub use nickname::*;
 pub use poll::*;
 pub use stories::*;
 
@@ -793,6 +795,18 @@ const SINCE_FIRST_INIT: &str = "\
 /// get what the init has gained since, and their history is rewritten to
 /// the init alone; the data is kept. A partly migrated database is rebuilt
 /// if it holds no chats, and refused otherwise.
+async fn put_nickname(tx: &mut sqlx::SqliteConnection, service_id: &str, nickname: &ContactNickname) -> Result<()> {
+    sqlx::query("INSERT OR REPLACE INTO contact_nicknames (service_id, given, family, note, plain_name) VALUES (?, ?, ?, ?, ?)")
+        .bind(service_id)
+        .bind(&nickname.given)
+        .bind(&nickname.family)
+        .bind(&nickname.note)
+        .bind(&nickname.plain_name)
+        .execute(tx)
+        .await?;
+    Ok(())
+}
+
 async fn adopt_squashed_history(pool: &SqlitePool, migrator: &sqlx::migrate::Migrator) -> Result<()> {
     let has_history: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations')")
@@ -1020,8 +1034,15 @@ impl AppDb {
 
     /// Replaces all Storage Service contact names.
     pub async fn replace_contact_names(&self, names: &[(String, String)]) -> Result<()> {
+        self.replace_contacts(names, &[]).await
+    }
+
+    /// Replaces all Storage Service contact names, and the nicknames and
+    /// notes we gave them, in one transaction.
+    pub async fn replace_contacts(&self, names: &[(String, String)], nicknames: &[(String, ContactNickname)]) -> Result<()> {
         let mut tx = self.write().await?;
         sqlx::query("DELETE FROM contact_names").execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM contact_nicknames").execute(&mut *tx).await?;
         for (service_id, name) in names {
             sqlx::query("INSERT OR REPLACE INTO contact_names (service_id, name) VALUES (?, ?)")
                 .bind(service_id)
@@ -1029,8 +1050,68 @@ impl AppDb {
                 .execute(&mut *tx)
                 .await?;
         }
+        for (service_id, nickname) in nicknames.iter().filter(|(_, n)| !n.is_empty()) {
+            put_nickname(&mut tx, service_id, nickname).await?;
+        }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// The nickname and note we gave someone, if any.
+    pub async fn contact_nickname(&self, service_id: &str) -> Result<Option<ContactNickname>> {
+        let row: Option<(String, String, String, Option<String>)> =
+            sqlx::query_as("SELECT given, family, note, plain_name FROM contact_nicknames WHERE service_id = ?")
+                .bind(service_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(given, family, note, plain_name)| ContactNickname { given, family, note, plain_name }))
+    }
+
+    /// Sets (or, all empty, clears) someone's nickname and note here, and
+    /// their display name to follow: the nickname, else the name they had
+    /// without one. Returns the display name now saved (`None` when none
+    /// is, so their profile name shows). `plain_name` is ignored: the one
+    /// already known is kept.
+    pub async fn set_contact_nickname(&self, service_id: &str, nickname: &ContactNickname) -> Result<Option<String>> {
+        let mut tx = self.write().await?;
+        let saved: Option<Option<String>> =
+            sqlx::query_scalar("SELECT plain_name FROM contact_nicknames WHERE service_id = ?")
+                .bind(service_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        // Without a row, nothing has a nickname yet: the saved name is the plain one.
+        let plain = match saved {
+            Some(plain) => plain,
+            None => sqlx::query_scalar("SELECT name FROM contact_names WHERE service_id = ?")
+                .bind(service_id)
+                .fetch_optional(&mut *tx)
+                .await?,
+        };
+        let nickname = ContactNickname {
+            given: nickname.given.trim().to_owned(),
+            family: nickname.family.trim().to_owned(),
+            note: nickname.note.trim().to_owned(),
+            plain_name: plain.clone(),
+        };
+        sqlx::query("DELETE FROM contact_nicknames WHERE service_id = ?").bind(service_id).execute(&mut *tx).await?;
+        if !nickname.is_empty() {
+            put_nickname(&mut tx, service_id, &nickname).await?;
+        }
+        let name = nickname.nickname().or(plain);
+        match &name {
+            Some(name) => {
+                sqlx::query("INSERT OR REPLACE INTO contact_names (service_id, name) VALUES (?, ?)")
+                    .bind(service_id)
+                    .bind(name)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            None => {
+                sqlx::query("DELETE FROM contact_names WHERE service_id = ?").bind(service_id).execute(&mut *tx).await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(name)
     }
 
     pub async fn contact_name(&self, service_id: &str) -> Result<Option<String>> {
@@ -2270,6 +2351,12 @@ impl AppDb {
         Ok(())
     }
 
+    /// Renames someone in the directory, if they're there.
+    pub async fn retitle_directory_entry(&self, id: &ConversationId, title: &str) -> Result<()> {
+        sqlx::query("UPDATE directory SET title = ? WHERE id = ?").bind(title).bind(&id.0).execute(&self.writer).await?;
+        Ok(())
+    }
+
     /// Directory entries matching `query` (title words or phone digits) that
     /// have no conversation yet, by title.
     /// Everyone you could add to a group: your 1:1 chats (not blocked) and
@@ -2453,6 +2540,7 @@ impl AppDb {
         sqlx::query("DELETE FROM conversations").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM settings").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM contact_names").execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM contact_nicknames").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM directory").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM person_avatars").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM pinned_messages").execute(&mut *tx).await?;
