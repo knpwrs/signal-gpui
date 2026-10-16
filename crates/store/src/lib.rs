@@ -18,6 +18,7 @@ mod early;
 mod message_requests;
 mod nickname;
 mod poll;
+mod profile;
 mod stories;
 mod view_once;
 pub use call_history::*;
@@ -26,6 +27,7 @@ pub use early::*;
 pub use message_requests::*;
 pub use nickname::*;
 pub use poll::*;
+pub use profile::*;
 pub use stories::*;
 pub use view_once::*;
 
@@ -2919,6 +2921,9 @@ impl AppDb {
         sqlx::query("DELETE FROM profile_sharing").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM story_send_modes").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM system_contacts").execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM profiles").execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM badges").execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM badge_image_files").execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
     }

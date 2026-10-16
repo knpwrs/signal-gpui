@@ -921,6 +921,9 @@ async fn drop_later_migrations(db: &AppDb) {
     }
     sqlx::query("ALTER TABLE messages DROP COLUMN server_guid").execute(&db.writer).await.unwrap();
     sqlx::query("DROP TABLE system_contacts").execute(&db.writer).await.unwrap();
+    sqlx::query("DROP TABLE profiles").execute(&db.writer).await.unwrap();
+    sqlx::query("DROP TABLE badges").execute(&db.writer).await.unwrap();
+    sqlx::query("DROP TABLE badge_image_files").execute(&db.writer).await.unwrap();
 }
 
 /// Rewrites the migration history to look like a pre-squash database that
@@ -2186,3 +2189,57 @@ async fn whether_a_chat_is_accepted_is_found_by_index() {
     assert!(!plan.contains("SCAN s"), "{plan}");
     assert!(!plan.contains("SCAN p"), "{plan}");
 }
+
+#[tokio::test]
+async fn profiles_keep_fetches_and_usernames_apart() {
+    let db = test_db().await;
+    let fetched = FetchedProfile {
+        given_name: "Maya".into(),
+        family_name: "Chen".into(),
+        about: "Out hiking".into(),
+        about_emoji: "🥾".into(),
+        badges: vec![ProfileBadge { id: "R_LOW".into(), expires_at: None, visible: None }],
+    };
+    assert!(db.save_fetched_profile("a", &fetched, 10).await.unwrap());
+    // The same again only moves the time.
+    assert!(!db.save_fetched_profile("a", &fetched, 20).await.unwrap());
+    db.replace_usernames(&[("a".into(), "maya.42".into()), ("b".into(), "bo.01".into())]).await.unwrap();
+    let a = db.person_profile("a").await.unwrap().unwrap();
+    assert_eq!((a.profile_name().as_deref(), a.about.as_str(), a.fetched_at), (Some("Maya Chen"), "Out hiking", 20));
+    assert_eq!(a.username.as_deref(), Some("maya.42"));
+    // A fetch leaves the username; a new sync replaces them all.
+    db.save_fetched_profile("a", &FetchedProfile { about: String::new(), ..fetched.clone() }, 30).await.unwrap();
+    db.replace_usernames(&[("b".into(), "bo.02".into())]).await.unwrap();
+    let a = db.person_profile("a").await.unwrap().unwrap();
+    assert_eq!((a.about.as_str(), a.username), ("", None));
+    let b = db.person_profile("b").await.unwrap().unwrap();
+    assert_eq!((b.fetched_at, b.username.as_deref()), (0, Some("bo.02")));
+    assert_eq!(db.person_profile("c").await.unwrap(), None);
+    assert_eq!(db.badge_holders().await.unwrap().get("a").cloned(), Some(vec!["R_LOW".to_owned()]));
+
+    // Our own name, from the account record.
+    assert!(db.set_profile_name("me", "Sam", "").await.unwrap());
+    assert!(!db.set_profile_name("me", "Sam", "").await.unwrap());
+    assert_eq!(db.person_profile("me").await.unwrap().unwrap().given_name, "Sam");
+}
+
+#[tokio::test]
+async fn badges_and_their_images_are_kept() {
+    let db = test_db().await;
+    let badge = Badge {
+        id: "R_LOW".into(),
+        category: BadgeCategory::Donor,
+        name: "Signal Sustainer".into(),
+        description: "{short_name} supports Signal".into(),
+        images: vec![BadgeImage { light: Some("https://u/l".into()), ..Default::default() }],
+    };
+    db.save_badges(std::slice::from_ref(&badge)).await.unwrap();
+    db.save_badges(&[Badge { name: "Sustainer".into(), ..badge.clone() }]).await.unwrap();
+    let badges = db.badges().await.unwrap();
+    assert_eq!(badges.len(), 1);
+    assert_eq!((badges[0].name.as_str(), badges[0].category), ("Sustainer", BadgeCategory::Donor));
+    assert_eq!(badges[0].images, badge.images);
+    db.set_badge_image_file("https://u/l", "/tmp/l.svg").await.unwrap();
+    assert_eq!(db.badge_image_files().await.unwrap().get("https://u/l").map(String::as_str), Some("/tmp/l.svg"));
+}
+
