@@ -19,6 +19,7 @@ gpui-kit.workspace = true
 
 anyhow.workspace = true
 chrono.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 futures.workspace = true
 tracing.workspace = true
@@ -46,8 +47,10 @@ objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-user-notifications = "0.3"
 block2 = "0.6"
-# The ringtone (NSSound).
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSSound"] }
+# The ringtone (NSSound), and hiding the main window on close (NSWindow).
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSSound", "NSResponder", "NSView", "NSWindow"] }
+# The main window's NSView, to hide its NSWindow.
+raw-window-handle = "0.6"
 # Playing audio attachments and voice messages, and their waveforms.
 objc2-avf-audio = { version = "0.3", default-features = false, features = ["std", "AVAudioPlayer", "AVAudioRecorder", "AVAudioSettings", "AVAudioFile", "AVAudioBuffer", "AVAudioFormat", "AVAudioTypes"] }
 # Playing video attachments: AVPlayer, with its frames read out as BGRA.

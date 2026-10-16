@@ -9,6 +9,7 @@ mod formatting;
 mod image_cache;
 mod keys;
 mod login_item;
+mod main_window;
 mod loop_cache;
 mod notifications;
 mod platform;
@@ -24,19 +25,16 @@ mod theme;
 mod video;
 mod video_player;
 mod views;
+mod window_state;
 
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
 use futures::StreamExt as _;
 use gpui_kit::component::Theme;
-use gpui_kit::{
-    App, AppContext as _, Bounds, KeyBinding, Menu, MenuItem, TitlebarOptions, WindowBounds, WindowOptions, point, px,
-    size,
-};
+use gpui_kit::{App, KeyBinding, Menu, MenuItem};
 use signal_backend::{Backend, Config};
 
-use crate::views::root::RootView;
 
 gpui_kit::actions!(signal, [Quit, About, OpenSettings, ShowDebugLog, FocusSearch, SearchInChat, NextConversation, PreviousConversation, CreateStickerPack]);
 
@@ -158,14 +156,6 @@ fn bind_keys(cx: &mut App) {
     }]);
 }
 
-/// Brings the app and its main window to the front.
-fn show_main_window(cx: &mut App) {
-    cx.activate(true);
-    if let Some(window) = cx.windows().into_iter().find(|w| w.downcast::<RootView>().is_some()) {
-        let _ = window.update(cx, |_, window, _| window.activate_window());
-    }
-}
-
 fn main() -> Result<()> {
     let (data_dir, key_store) = data_dir()?;
     std::fs::create_dir_all(&data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
@@ -175,6 +165,7 @@ fn main() -> Result<()> {
     // Parse the emoji index off the main thread while the window opens.
     std::thread::spawn(signal_emoji::warm_up);
 
+    let window_dir = data_dir.clone();
     let (backend, mut events) = start_backend(data_dir, key_store)?;
 
     // Links macOS opens us with (`sgnl://`, registered in the bundle's
@@ -186,6 +177,8 @@ fn main() -> Result<()> {
             let _ = link_tx.unbounded_send(url);
         }
     });
+    // Desktop's `activate`: the Dock icon brings the window back.
+    app.on_reopen(main_window::show);
     app.run(move |cx| {
         gpui_kit::init(cx);
         fonts::register(cx);
@@ -193,11 +186,20 @@ fn main() -> Result<()> {
         bind_keys(cx);
 
         let state = state::new_state(backend, cx);
+        cx.on_action(|_: &Quit, cx| main_window::quit(cx));
+        // However the app quits (the menu, the Dock, logging out), the
+        // databases close first.
         let quit_state = state.clone();
-        cx.on_action(move |_: &Quit, cx| {
-            quit_state.read(cx).backend.shutdown();
-            cx.quit();
-        });
+        cx.on_app_quit(move |cx| {
+            let state = quit_state.read(cx);
+            // A call still up (the Dock's Quit doesn't ask) is hung up.
+            if state.call.is_some() {
+                state.send(signal_backend::Command::HangUp);
+            }
+            state.backend.shutdown();
+            async {}
+        })
+        .detach();
 
         // Desktop's File → Create/upload sticker pack: its own window. It
         // uploads as this account, so only once one is linked.
@@ -233,7 +235,7 @@ fn main() -> Result<()> {
         cx.spawn(async move |cx| {
             while let Some(url) = links.next().await {
                 cx.update(|cx| {
-                    show_main_window(cx);
+                    main_window::show(cx);
                     link_state.update(cx, |state, cx| state.open_link_from_system(url, cx));
                 });
             }
@@ -243,27 +245,7 @@ fn main() -> Result<()> {
         // Opens without taking focus from whatever you're typing in (for
         // screenshots and scripted runs).
         let background = std::env::var_os("SIGNAL_GPUI_BACKGROUND").is_some();
-        let bounds = Bounds::centered(None, size(px(1100.), px(760.)), cx);
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            window_min_size: Some(size(px(720.), px(480.))),
-            titlebar: Some(TitlebarOptions {
-                title: Some("Signal".into()),
-                appears_transparent: true,
-                // Centered over the tabs' rail (80 wide; the three buttons
-                // span about 59), like Desktop's.
-                traffic_light_position: Some(point(px(10.5), px(18.))),
-            }),
-            app_id: Some("org.signal-gpui".into()),
-            focus: !background,
-            ..Default::default()
-        };
-        let opened = gpui_kit::open_window(options, cx, |window, cx| {
-            window.observe_window_appearance(crate::prefs::appearance_changed)
-                .detach();
-            cx.new(|cx| RootView::new(state.clone(), window, cx))
-        });
-        if let Err(e) = opened {
+        if let Err(e) = main_window::open(state.clone(), window_dir.clone(), background, cx) {
             tracing::error!("failed to open window: {e:#}");
             cx.quit();
         }
