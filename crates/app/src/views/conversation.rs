@@ -2801,6 +2801,12 @@ fn message_text(
     text.child(gpui_kit::InteractiveText::new(("message-text", message_id as u64), styled).on_click(
         ranges,
         move |ix, _, cx| match &actions[ix] {
+            // A call link opens its lobby here, as Desktop does.
+            TextClick::Open(url) if url.starts_with("https://signal.link/call/") => {
+                if let Some(state) = view.upgrade().map(|v| v.read(cx).state.clone()) {
+                    state.update(cx, |s, _| s.open_call_link(url.clone()));
+                }
+            }
             TextClick::Open(url) => cx.open_url(url),
             TextClick::Reveal => {
                 let _ = view.update(cx, |this, cx| {

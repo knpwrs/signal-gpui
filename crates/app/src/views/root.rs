@@ -31,6 +31,8 @@ pub struct RootView {
     /// The Stories and Calls tabs' lists.
     stories: Entity<crate::views::stories::StoriesPane>,
     calls: Entity<crate::views::calls::CallsPane>,
+    /// The chosen call's details, beside the Calls tab's list.
+    call_details: Entity<crate::views::calls::CallDetails>,
     story_viewer: Option<(Entity<crate::views::story_viewer::StoryViewer>, Subscription)>,
     story_creator: Option<(Entity<crate::views::story_creator::StoryCreator>, Subscription)>,
     /// The chat list's width as dragged (see `crate::sidebar_width`).
@@ -145,7 +147,8 @@ impl RootView {
             }),
         ];
         let stories = cx.new(|cx| crate::views::stories::StoriesPane::new(state.clone(), cx));
-        let calls = cx.new(|cx| crate::views::calls::CallsPane::new(state.clone(), cx));
+        let calls = cx.new(|cx| crate::views::calls::CallsPane::new(state.clone(), window, cx));
+        let call_details = cx.new(|cx| crate::views::calls::CallDetails::new(state.clone(), calls.clone(), cx));
         let mut this = Self {
             state,
             sidebar,
@@ -156,6 +159,7 @@ impl RootView {
             call: None,
             stories,
             calls,
+            call_details,
             story_viewer: None,
             story_creator: None,
             sidebar_preferred: crate::sidebar_width::DEFAULT_WIDTH,
@@ -307,6 +311,7 @@ impl Render for RootView {
                 )
                 .child(div().flex_1().min_w_0().h_full().child(match (tab, &self.conversation) {
                     (NavTab::Stories, _) => crate::views::stories::render_placeholder(palette).into_any_element(),
+                    (NavTab::Calls, _) => self.call_details.clone().into_any_element(),
                     (_, Some(view)) if tab == NavTab::Chats => view.clone().into_any_element(),
                     (_, _) => div()
                         .size_full()

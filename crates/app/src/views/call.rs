@@ -135,6 +135,8 @@ pub struct CallView {
     shown: Option<(Vec<u32>, Option<u32>)>,
     /// The reactions picker is open.
     reactions_open: bool,
+    /// People in a call link's call whose names were asked for.
+    names_asked: std::collections::HashSet<String>,
     /// Ticks the call's clock.
     _clock: Task<()>,
 }
@@ -160,6 +162,7 @@ impl CallView {
             tiles: HashMap::new(),
             names: HashMap::new(),
             names_for: None,
+            names_asked: Default::default(),
             speaker_view: false,
             page: 0,
             shown: None,
@@ -209,6 +212,90 @@ impl CallView {
             });
         })
         .detach();
+    }
+
+    /// Names of the people in a call link's call (anyone may be; there's
+    /// no group to read them from), each asked for once.
+    fn load_link_names(&mut self, acis: Vec<String>, cx: &mut Context<Self>) {
+        let unknown: Vec<String> = acis.into_iter().filter(|a| self.names_asked.insert(a.clone())).collect();
+        if unknown.is_empty() {
+            return;
+        }
+        let backend = self.state.read(cx).backend.clone();
+        let db = backend.db().clone();
+        let query = backend.spawn(async move { db.display_names(&unknown).await });
+        cx.spawn(async move |this, cx| {
+            let names = query.await.unwrap_or_default();
+            let _ = this.update(cx, |this, cx| {
+                this.names.extend(names);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The call's avatar: its chat's, or a call link's.
+    fn avatar_for(&self, id: &ConversationId, size: Pixels, cx: &Context<Self>) -> AnyElement {
+        match id.as_call_link() {
+            Some(room) => crate::views::calls::link_avatar(room, size),
+            None => Self::big_avatar(self.chat(id, cx).as_ref(), size),
+        }
+    }
+
+    /// Desktop's join requests, for a call link's admin: each person with
+    /// "Approve entry" and "Deny entry".
+    fn render_requests(&self, pending: &[String]) -> AnyElement {
+        let state = self.state.clone();
+        div()
+            .absolute()
+            .top(px(60.))
+            .left_4()
+            .w(px(320.))
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .rounded_xl()
+            .bg(rgb(0x2c2c2c))
+            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(match pending.len() {
+                1 => "1 request to join the call".to_owned(),
+                n => format!("{n} requests to join the call"),
+            }))
+            .children(pending.iter().enumerate().map(|(ix, aci)| {
+                let (approve, deny) = (state.clone(), state.clone());
+                let (a, d) = (aci.clone(), aci.clone());
+                let button = |id: (&'static str, usize), icon: IconName, bg: Hsla, tooltip: &'static str| {
+                    div()
+                        .id(id)
+                        .size(px(32.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .cursor_pointer()
+                        .bg(bg)
+                        .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tooltip).build(window, cx))
+                        .child(Icon::new(icon).size_4().text_color(gpui_kit::white()))
+                };
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().truncate().child(self.name(aci)))
+                            .child(div().text_xs().text_color(dim_text()).child("Would like to join...")),
+                    )
+                    .child(button(("call-deny", ix), IconName::X, end_red(), "Deny entry").on_click(move |_, _, cx| {
+                        deny.read(cx).send(signal_backend::Command::ApproveCallJoin { aci: d.clone(), approve: false })
+                    }))
+                    .child(button(("call-approve", ix), IconName::Check, start_green(), "Approve entry").on_click(move |_, _, cx| {
+                        approve.read(cx).send(signal_backend::Command::ApproveCallJoin { aci: a.clone(), approve: true })
+                    }))
+            }))
+            .into_any_element()
     }
 
     /// Video tiles for who's in the group call now (and no others).
@@ -309,10 +396,29 @@ impl CallView {
 
     fn render_lobby(&self, lobby: &CallLobby, cx: &mut Context<Self>) -> AnyElement {
         let chat = self.chat(&lobby.conversation, cx);
-        let title = Self::title(chat.as_ref());
+        let title = self.state.read(cx).call_title(&lobby.conversation);
         let state = self.state.clone();
         let (video, audio) = (lobby.video, lobby.audio);
+        let link = lobby.conversation.as_call_link().map(|room| self.state.read(cx).call_link(room).cloned());
         let (note, start) = match (&chat, &lobby.peek) {
+            // A call link's: who's in it, and "Ask to join" where an admin
+            // lets people in (Desktop's `CallingLobby`).
+            _ if let Some(link) = &link => {
+                let me = self.state.read(cx).account.as_ref().map(|a| a.aci.clone()).unwrap_or_default();
+                let mut here: Vec<String> = Vec::new();
+                for aci in lobby.peek.iter().flatten().filter(|a| **a != me) {
+                    if !here.contains(aci) {
+                        here.push(aci.clone());
+                    }
+                }
+                let asks = link.as_ref().is_some_and(|l| !l.is_admin() && l.restrictions == signal_store::CallLinkRestrictions::AdminApproval);
+                let note = if here.is_empty() {
+                    String::new()
+                } else {
+                    in_this_call(&here.iter().map(|a| self.name(a)).collect::<Vec<_>>())
+                };
+                (note, if asks { "Ask to join" } else { "Join" })
+            }
             (Some(chat), peek) if chat.id.as_group().is_some() => {
                 let me = self.state.read(cx).account.as_ref().map(|a| a.aci.clone()).unwrap_or_default();
                 let mut here: Vec<String> = Vec::new();
@@ -389,7 +495,7 @@ impl CallView {
                                     .justify_center()
                                     .gap_3()
                                     .bg(control_bg())
-                                    .child(Self::big_avatar(chat.as_ref(), px(96.)))
+                                    .child(self.avatar_for(&lobby.conversation, px(96.), cx))
                                     .child(div().text_sm().text_color(dim_text()).child("Your camera is off"))
                                     .into_any_element()
                             }),
@@ -440,8 +546,7 @@ impl CallView {
     }
 
     fn render_call(&mut self, call: &CallUpdate, viewport: (f32, f32), cx: &mut Context<Self>) -> AnyElement {
-        let chat = self.chat(&call.conversation, cx);
-        let title = Self::title(chat.as_ref());
+        let title = self.state.read(cx).call_title(&call.conversation);
         let state = self.state.clone();
         let (audio, video) = {
             let s = self.state.read(cx);
@@ -451,7 +556,10 @@ impl CallView {
         let connected = matches!(call.status, CallStatus::Connected { .. });
         // A group call shows its header always (its grid has no title).
         let show_header = remote_video || (call.group && !call.participants.is_empty());
-        let status = if call.group && connected && call.participants.is_empty() {
+        let waiting = call.link.as_ref().is_some_and(|l| l.waiting);
+        let status = if waiting {
+            "Waiting to be let in".to_owned()
+        } else if call.group && connected && call.participants.is_empty() {
             "No one else is here".to_owned()
         } else {
             Self::status_text(call)
@@ -479,7 +587,7 @@ impl CallView {
                     .items_center()
                     .justify_center()
                     .gap_3()
-                    .child(Self::big_avatar(chat.as_ref(), px(112.)))
+                    .child(self.avatar_for(&call.conversation, px(112.), cx))
                     .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).child(title.clone()))
                     .child(div().text_color(dim_text()).child(status.clone()))
                     .into_any_element()
@@ -519,6 +627,9 @@ impl CallView {
                             .child(Icon::new(IconName::Minimize2).size_5().text_color(gpui_kit::white())),
                     ),
             )
+            .when_some(call.link.as_ref().filter(|l| l.admin && !l.pending.is_empty()), |d, link| {
+                d.child(self.render_requests(&link.pending))
+            })
             .child(
                 // Our camera, in the corner.
                 div()
@@ -976,7 +1087,6 @@ impl CallView {
     /// Desktop's minimized call: a small window in the corner; a click
     /// brings the call back.
     fn render_pip(&self, call: &CallUpdate, cx: &mut Context<Self>) -> AnyElement {
-        let chat = self.chat(&call.conversation, cx);
         let state = self.state.clone();
         let group_tile = call
             .participants
@@ -1018,7 +1128,7 @@ impl CallView {
                     .items_center()
                     .justify_center()
                     .gap_1()
-                    .child(Self::big_avatar(chat.as_ref(), px(48.)))
+                    .child(self.avatar_for(&call.conversation, px(48.), cx))
                     .child(div().text_xs().text_color(dim_text()).child(Self::status_text(call)))
                     .into_any_element()
             })
@@ -1130,6 +1240,14 @@ impl Render for CallView {
         };
         if let Some(conversation) = call.as_ref().map(|c| &c.conversation).or(lobby.as_ref().map(|l| &l.conversation)) {
             self.load_names(conversation, cx);
+        }
+        if let Some(call) = call.as_ref().filter(|c| c.link.is_some()) {
+            let mut acis: Vec<String> = call.participants.iter().map(|p| p.aci.clone()).collect();
+            acis.extend(call.link.iter().flat_map(|l| l.pending.clone()));
+            self.load_link_names(acis, cx);
+        }
+        if let Some(peek) = lobby.as_ref().filter(|l| l.conversation.as_call_link().is_some()).and_then(|l| l.peek.clone()) {
+            self.load_link_names(peek, cx);
         }
         let participants = call.as_ref().map(|c| c.participants.clone()).unwrap_or_default();
         self.sync_tiles(&participants, cx);

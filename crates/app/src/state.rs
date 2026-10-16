@@ -131,6 +131,10 @@ pub enum AppEvent {
     LinkPreview { url: String, preview: Option<std::rc::Rc<signal_backend::LinkPreviewDraft>> },
     /// How the sticker pack creator's upload is going.
     StickerUpload(signal_backend::sticker_upload::StickerUpload),
+    /// Call links or their calls changed (`AppState::call_links` is reloaded).
+    CallLinksChanged,
+    /// A call link we made is ready: show its details (its room id).
+    CallLinkCreated(String),
 }
 
 /// The audio attachment being played.
@@ -248,6 +252,8 @@ pub struct AppState {
     pub call: Option<signal_backend::CallUpdate>,
     /// Desktop's call lobby, before calling.
     pub lobby: Option<CallLobby>,
+    /// Call links we made or used, newest first.
+    pub call_links: Vec<signal_store::CallLink>,
     /// Our microphone and camera in the call.
     pub call_audio: bool,
     pub call_video: bool,
@@ -325,6 +331,7 @@ impl AppState {
             safety_number: None,
             call: None,
             lobby: None,
+            call_links: Vec::new(),
             call_audio: true,
             call_video: false,
             call_minimized: false,
@@ -591,6 +598,7 @@ impl AppState {
                 self.screen = Screen::Main;
                 self.reload_conversations(cx);
                 self.reload_stories(cx);
+                self.reload_call_links(cx);
                 self.start_catch_up(cx);
             }
             Event::Connection(state) => {
@@ -632,8 +640,20 @@ impl AppState {
             Event::PinsChanged(conversation) => cx.emit(AppEvent::PinsChanged(conversation)),
             Event::SafetyNumber { conversation, result } => self.safety_number = Some((conversation, result)),
             Event::Call(update) => self.on_call(update, cx),
-            // (Call links show in the Calls tab, next.)
-            Event::CallLinksChanged | Event::CallLinkCreated(_) | Event::CallLinkOpened(_) | Event::CallLinkRefused { .. } => {}
+            Event::CallLinksChanged => self.reload_call_links(cx),
+            Event::CallLinkCreated(room_id) => {
+                self.reload_call_links(cx);
+                cx.emit(AppEvent::CallLinkCreated(room_id));
+            }
+            Event::CallLinkOpened(room_id) => {
+                self.reload_call_links(cx);
+                self.open_call_lobby(ConversationId::call_link(&room_id), true, cx);
+            }
+            // Desktop's words for both.
+            Event::CallLinkRefused { removed } => self.report_error(
+                if removed { "Someone has removed you from the call." } else { "Your request to join this call has been denied." },
+                cx,
+            ),
             Event::CallDevices(devices) => self.call_devices = Some(devices),
             Event::CallReactions(reactions) => {
                 let now = std::time::Instant::now();
@@ -734,6 +754,7 @@ impl AppState {
                 // And its call (the backend's ended with it).
                 self.call = None;
                 self.lobby = None;
+                self.call_links.clear();
                 self.ringtone = None;
                 self.conversations.clear();
                 self.archived.clear();
@@ -892,9 +913,49 @@ impl AppState {
         .detach();
     }
 
+    pub fn reload_call_links(&mut self, cx: &mut Context<Self>) {
+        let db = self.backend.db().clone();
+        let query = self.backend.spawn(async move { db.call_links().await });
+        cx.spawn(async move |this, cx| {
+            if let Ok(links) = query.await {
+                let _ = this.update(cx, |this, cx| {
+                    this.call_links = links;
+                    cx.emit(AppEvent::CallLinksChanged);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// A call link we keep, by room id.
+    pub fn call_link(&self, room_id: &str) -> Option<&signal_store::CallLink> {
+        self.call_links.iter().find(|l| l.room_id == room_id)
+    }
+
+    /// What a call is called: its chat's title, or a call link's name
+    /// (Desktop's "Signal Call" when it has none).
+    pub fn call_title(&self, id: &ConversationId) -> String {
+        match id.as_call_link() {
+            Some(room) => crate::views::calls::link_title(self.call_link(room)),
+            None => self.conversation(id).map_or_else(|| "Unknown".to_owned(), |c| c.title.clone()),
+        }
+    }
+
+    /// A `https://signal.link/call/#key=…` URL (from a message, say): the
+    /// backend keeps the link and its lobby opens.
+    pub fn open_call_link(&mut self, url: String) {
+        self.send(Command::OpenCallLink { url });
+    }
+
     pub fn set_tab(&mut self, tab: NavTab, cx: &mut Context<Self>) {
         if self.tab != tab {
             self.tab = tab;
+            // Desktop's `markCallsTabViewed`: viewing the Calls tab reads
+            // every call (and tells our other devices).
+            if tab == NavTab::Calls {
+                self.send(Command::MarkCallsRead { conversation: None });
+            }
             cx.notify();
         }
     }
@@ -1450,7 +1511,7 @@ impl AppState {
         if self.call.is_some() || self.lobby.is_some() {
             return;
         }
-        if conversation.as_group().is_some() {
+        if conversation.as_group().is_some() || conversation.as_call_link().is_some() {
             self.send(Command::PeekGroupCall { conversation: conversation.clone() });
         }
         self.lobby = Some(CallLobby { conversation, video, audio: true, peek: None });

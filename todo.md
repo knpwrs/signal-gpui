@@ -172,7 +172,32 @@ drives RingRTC v2.72.1 with Signal's prebuilt WebRTC, signaling travels as
 `GET /v2/calling/relays`, and group calls go through Signal's calling server
 with a membership proof from `GET /v1/groups/token`. Not done yet:
 
-- **Call links** and adhoc calls.
+- **Call links:** making one (admin approval on, as Desktop), opening a
+  `signal.link/call` URL (from a message too), renaming, approval on or
+  off, deleting, joining ("Ask to join" when an admin lets people in),
+  approving or denying joiners as admin, sharing (copy, or send to chats),
+  the `CallLinkUpdate` sync both ways, Storage Service `CallLinkRecord`s
+  read and written, and calls through links in the call history with
+  `AD_HOC_CALL` call events both ways. Written against RingRTC's call link
+  API and Desktop's code, checked with unit, store, mapping and demo-mode UI
+  tests; none of it has reached Signal's servers yet, so these are unverified:
+  - **Credentials:** Desktop 8.34 asks for call link credentials with
+    `v101=true` and checks them against newer `genericServerPublicParams`
+    (version byte 1) that our zkgroup 0.99 can't read. We ask without
+    `v101` and use the params Desktop 7.60 shipped. Whether the server
+    still issues credentials those verify is untested; once presage moves
+    to libsignal 0.101 or later, switch to Desktop's current params and
+    `v101=true`.
+  - **Profile keys:** Desktop sends its profile key to everyone in a call
+    link's call (`sendProfileKeysForAdhocCall`) so they see our name. We
+    don't, so people who don't know us see "Unknown".
+  - **Leftovers:** removing someone from a call (the backend has
+    `Command::RemoveFromCall`; the call screen has no button), "Approve
+    all" / "Deny all", Desktop's defunct-link records and its cleanup of
+    deleted links after the message queue time, retrying a Storage Service
+    write that failed (it's only logged), and an unseen-calls badge on the
+    Calls tab (viewing it marks every call read, as Desktop does). Links are read from the
+    calling server ten at a time; the rest wait for the next sync.
 - **Group call history** (Desktop's `callDisposition`): Desktop peeks a
   group's call when a `groupCallUpdate` arrives and takes who started it
   from the calling server; we take the message's sender. A group call's
@@ -240,4 +265,3 @@ replied to ours, and Desktop's tabs work. Not done yet:
 - **Who we take stories from:** Desktop shows a person's story when it
   shares its profile with them; here, when we have a chat with them or
   they're in our contacts.
-- **Calls tab:** call details, links and new calls from it.

@@ -156,6 +156,8 @@ impl Sidebar {
                 | AppEvent::ViewVideo(_)
                 | AppEvent::ViewStories(_)
                 | AppEvent::CreateStory(_)
+                | AppEvent::CallLinksChanged
+                | AppEvent::CallLinkCreated(_)
                 | AppEvent::Gifs { .. } => {}
             }),
         ];
