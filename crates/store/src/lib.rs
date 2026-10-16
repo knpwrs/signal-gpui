@@ -576,6 +576,18 @@ pub struct StyleSpan {
     pub style: TextStyle,
 }
 
+/// One earlier version of an edited message (an entry of Desktop's
+/// `editHistory`): the timestamp that named it, and its text as shown.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EditRevision {
+    pub sent_at: i64,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<MentionSpan>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub styles: Vec<StyleSpan>,
+}
+
 /// A style as Signal sends it: UTF-16 positions in the body as sent, where
 /// each mention is one placeholder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -2297,7 +2309,7 @@ impl AppDb {
         self.update_and_refresh(
             message_id,
             "UPDATE messages SET deleted = 1, body = '', attachments = '[]', reactions = '[]', \
-             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL, poll = NULL, unread_poll_votes = 0 \
+             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL, poll = NULL, unread_poll_votes = 0, edit_history = NULL \
              WHERE id = ? RETURNING conversation_id",
             None,
         )
@@ -2311,7 +2323,7 @@ impl AppDb {
         let mut tx = self.write().await?;
         let conversation: Option<String> = sqlx::query_scalar(
             "UPDATE messages SET deleted = 1, deleted_by_admin = ?2, body = '', attachments = '[]', reactions = '[]', \
-             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL, poll = NULL WHERE id = ?1 AND deleted = 0 \
+             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL, poll = NULL, edit_history = NULL WHERE id = ?1 AND deleted = 0 \
              RETURNING conversation_id",
         )
         .bind(message_id)
@@ -2328,16 +2340,47 @@ impl AppDb {
     /// Applies an edit sent at `edit_sent_at`, which then names the message
     /// too (reactions to the edited message use it).
     /// A deleted message ignores it.
+    ///
+    /// The version it replaces goes into the message's edit history
+    /// (Desktop's `editHistory`), dated by the timestamp that named it: the
+    /// latest edit's, or the message's own before any. A repeat of an edit
+    /// already applied adds nothing to the history.
     pub async fn edit_message(&self, message_id: i64, body: &str, edit_sent_at: i64) -> Result<()> {
         let mut tx = self.write().await?;
+        let current = sqlx::query(
+            "SELECT sent_at, body, mentions, styles, edit_history, \
+                (SELECT MAX(sent_at) FROM message_edits WHERE message_id = ?1) AS last_edit, \
+                EXISTS (SELECT 1 FROM message_edits WHERE message_id = ?1 AND sent_at = ?2) AS repeat \
+             FROM messages WHERE id = ?1 AND deleted = 0",
+        )
+        .bind(message_id)
+        .bind(edit_sent_at)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(current) = current else {
+            tx.commit().await?;
+            return Ok(());
+        };
+        let json = |column: &str| -> Result<Option<String>> { Ok(current.try_get::<Option<String>, _>(column)?) };
+        let mut history: Vec<EditRevision> = json("edit_history")?.map(|j| serde_json::from_str(&j)).transpose()?.unwrap_or_default();
+        if !current.try_get::<bool, _>("repeat")? {
+            history.push(EditRevision {
+                sent_at: current.try_get::<Option<i64>, _>("last_edit")?.unwrap_or(current.try_get("sent_at")?),
+                body: current.try_get("body")?,
+                mentions: json("mentions")?.map(|j| serde_json::from_str(&j)).transpose()?.unwrap_or_default(),
+                styles: json("styles")?.map(|j| serde_json::from_str(&j)).transpose()?.unwrap_or_default(),
+            });
+        }
         let conversation: Option<String> = sqlx::query_scalar(
             // The old formatting doesn't fit the new text, nor does a long
             // text still to come; callers set the edit's.
-            "UPDATE messages SET body = ?2, styles = NULL, long_text = NULL, edited = 1, edit_count = edit_count + 1 WHERE id = ?1 AND deleted = 0 \
+            "UPDATE messages SET body = ?2, styles = NULL, long_text = NULL, edited = 1, edit_count = edit_count + 1, \
+                edit_history = ?3 WHERE id = ?1 AND deleted = 0 \
              RETURNING conversation_id",
         )
         .bind(message_id)
         .bind(body)
+        .bind(serde_json::to_string(&history)?)
         .fetch_optional(&mut *tx)
         .await?;
         if let Some(conversation) = conversation {
@@ -2349,6 +2392,28 @@ impl AppDb {
             refresh_preview(&mut tx, &ConversationId(conversation)).await?;
         }
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// An edited message's earlier versions, oldest first; empty when it
+    /// was never edited (or was deleted since).
+    pub async fn edit_history(&self, message_id: i64) -> Result<Vec<EditRevision>> {
+        let json: Option<Option<String>> = sqlx::query_scalar("SELECT edit_history FROM messages WHERE id = ?")
+            .bind(message_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(json.flatten().map(|j| serde_json::from_str(&j)).transpose()?.unwrap_or_default())
+    }
+
+    /// Replaces a message's earlier versions (a transferred backup lists
+    /// each revision's own text), unless it was deleted.
+    pub async fn set_edit_history(&self, message_id: i64, history: &[EditRevision]) -> Result<()> {
+        let json = (!history.is_empty()).then(|| serde_json::to_string(history)).transpose()?;
+        sqlx::query("UPDATE messages SET edit_history = ? WHERE id = ? AND deleted = 0")
+            .bind(json)
+            .bind(message_id)
+            .execute(&self.writer)
+            .await?;
         Ok(())
     }
 

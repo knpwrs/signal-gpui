@@ -1084,6 +1084,23 @@ async fn import_item(
     for at in &edits {
         db.edit_message(id, &message.body, *at).await?;
     }
+    // Its earlier versions, each with its own text (the backup lists them
+    // oldest to newest), for the edit history.
+    if !item.revisions.is_empty() {
+        let history: Vec<signal_store::EditRevision> = item
+            .revisions
+            .iter()
+            .map(|revision| {
+                let text = match &revision.item {
+                    Some(Item::StandardMessage(standard)) => standard.text.as_ref(),
+                    _ => None,
+                };
+                let (body, mentions, styles) = shown_text(text, people, me);
+                signal_store::EditRevision { sent_at: revision.dateSent as i64, body, mentions, styles }
+            })
+            .collect();
+        db.set_edit_history(id, &history).await?;
+    }
     if !spans.is_empty() {
         db.set_mentions(id, &spans).await?;
     }
@@ -1272,6 +1289,42 @@ fn remote(locator: &proto::file_pointer::LocatorInfo) -> Option<RemoteAttachment
 
 /// A backup's text styles (as on the wire: UTF-16, over the body with its
 /// mention placeholders).
+/// A message's text as shown: "@Name" for each mention (in body order),
+/// with where the mentions and formatting land.
+fn shown_text(
+    text: Option<&proto::Text>,
+    people: &HashMap<u64, Who>,
+    me: &str,
+) -> (String, Vec<signal_store::MentionSpan>, Vec<signal_store::StyleSpan>) {
+    let Some(text) = text else { return Default::default() };
+    let mut ranges: Vec<(u32, String)> = text
+        .bodyRanges
+        .iter()
+        .filter_map(|r| match &r.associatedValue {
+            Some(proto::body_range::AssociatedValue::MentionAci(aci)) => Some((r.start, uuid_sid(aci)?)),
+            _ => None,
+        })
+        .collect();
+    ranges.sort_by_key(|(start, _)| *start);
+    let mentions: Vec<String> = ranges.into_iter().map(|(_, sid)| sid).collect();
+    let names: Vec<String> = mentions
+        .iter()
+        .map(|sid| {
+            if sid == me {
+                return "You".to_owned();
+            }
+            people
+                .values()
+                .find_map(|p| match p {
+                    Who::Contact { sid: s, name, .. } if s == sid => Some(name.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "Unknown".into())
+        })
+        .collect();
+    crate::mapping::render_body(&text.body, &mentions, &names, &styles(&text.bodyRanges))
+}
+
 fn styles(ranges: &[proto::BodyRange]) -> Vec<crate::mapping::WireStyle> {
     use proto::body_range::{AssociatedValue, Style};
     use signal_store::TextStyle;
@@ -1598,6 +1651,9 @@ mod tests {
         assert_eq!((in_group[0].sent_at, in_group[0].edited), (800, true));
         let by_edit = db.find_message(&group.id, Some(&alice_sid), 1_000).await.unwrap().map(|m| m.id);
         assert_eq!(by_edit, Some(in_group[0].id));
+        // Its first version's own text is its edit history.
+        let history = db.edit_history(in_group[0].id).await.unwrap();
+        assert_eq!(history.iter().map(|r| (r.sent_at, r.body.as_str())).collect::<Vec<_>>(), [(800, "hi")]);
         // Its whole text downloads next, its mention kept for it.
         let long_text = in_group[0].long_text.as_ref().unwrap();
         assert_eq!((long_text.size, long_text.remote.cdn_key.as_deref()), (3_000, Some("text")));

@@ -115,6 +115,9 @@ pub struct ConversationView {
     fresh: std::collections::HashSet<i64>,
     /// `unseen_from` was placed from the first page loaded.
     marker_placed: bool,
+    /// Drawing the edit history's copies of a message (no clicks in their
+    /// time lines).
+    drawing_history: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -319,6 +322,7 @@ impl ConversationView {
             unseen_from: None,
             fresh: Default::default(),
             marker_placed: false,
+            drawing_history: false,
             _subscriptions: subscriptions,
         };
         this.load_request_details(cx);
@@ -1749,6 +1753,31 @@ impl ConversationView {
             .into_any_element()
     }
 
+    /// What clicks on a bubble's time line do: none while drawing the edit
+    /// history's copies.
+    fn meta_clicks(&self, message: &Message, cx: &mut Context<Self>) -> MetaClicks {
+        if self.drawing_history {
+            return MetaClicks::default();
+        }
+        let edited = (message.edited && !message.deleted).then(|| {
+            let (view, current) = (cx.entity().downgrade(), message.clone());
+            std::rc::Rc::new(move |window: &mut Window, cx: &mut App| {
+                crate::views::edit_history::open(view.clone(), current.clone(), window, cx)
+            }) as crate::views::chat_menu::MenuAction
+        });
+        MetaClicks { edited }
+    }
+
+    /// A message as the edit history shows it (Desktop's
+    /// `EditHistoryMessagesModal`): its bubble alone, nothing clickable in
+    /// its time line.
+    pub(crate) fn render_history_bubble(&mut self, message: &Message, palette: Palette, cx: &mut Context<Self>) -> AnyElement {
+        self.drawing_history = true;
+        let bubble = self.render_bubble(message, false, true, true, palette, cx);
+        self.drawing_history = false;
+        bubble
+    }
+
     /// `first`/`last`: the message's place in a run from the same sender,
     /// which shapes its corners; only the last shows the time.
     fn render_bubble(
@@ -1761,6 +1790,7 @@ impl ConversationView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let show_meta = last;
+        let clicks = self.meta_clicks(message, cx);
         let outgoing = message.direction == Direction::Outgoing;
         let corners = Corners::for_bubble(outgoing, first, last);
         // Ours take the chat's color (Desktop's chat colors), solid or a
@@ -1786,7 +1816,7 @@ impl ConversationView {
 
         let meta = show_meta.then(|| {
             let color = if jumbo.is_some() { palette.text_secondary } else { meta_color };
-            render_meta(message, color, palette)
+            render_meta(message, color, palette, &clicks)
         });
 
         if let Some(count) = jumbo {
@@ -1815,7 +1845,7 @@ impl ConversationView {
 
         // Stickers stand alone, without a bubble, at Desktop's size.
         if let Some(sticker) = message.attachments.first().filter(|a| a.sticker && !message.deleted) {
-            let meta = show_meta.then(|| render_meta(message, palette.text_secondary, palette));
+            let meta = show_meta.then(|| render_meta(message, palette.text_secondary, palette, &clicks));
             let (w, h) = match (sticker.width, sticker.height) {
                 (Some(w), Some(h)) if w > 0 && h > 0 => {
                     let scale = (STICKER_SIZE / w as f32).min(STICKER_SIZE / h as f32);
@@ -1949,7 +1979,7 @@ impl ConversationView {
                                     .py_0p5()
                                     .rounded_full()
                                     .bg(Hsla { h: 0., s: 0., l: 0., a: 0.35 })
-                                    .child(render_meta(message, palette.on_accent, palette)),
+                                    .child(render_meta(message, palette.on_accent, palette, &clicks)),
                             )
                         }),
                 )
@@ -2883,7 +2913,15 @@ fn status_words(status: DeliveryStatus) -> Option<&'static str> {
     }
 }
 
-fn render_meta(message: &Message, color: Hsla, palette: Palette) -> AnyElement {
+/// What clicking parts of a bubble's time line does (nothing, in the edit
+/// history).
+#[derive(Clone, Default)]
+struct MetaClicks {
+    /// "Edited": Desktop's edit history (`showEditHistoryModal`).
+    edited: Option<crate::views::chat_menu::MenuAction>,
+}
+
+fn render_meta(message: &Message, color: Hsla, palette: Palette, clicks: &MetaClicks) -> AnyElement {
     let outgoing = message.direction == Direction::Outgoing;
     if let Some(words) = outgoing.then(|| status_words(message.status)).flatten() {
         return div()
@@ -2896,6 +2934,7 @@ fn render_meta(message: &Message, color: Hsla, palette: Palette) -> AnyElement {
     let status = outgoing
         .then(|| status_icon(message.status, color, palette, StatusPlace::Bubble, message.id.to_string()))
         .flatten();
+    let id = message.id;
     div()
         .flex()
         .items_center()
@@ -2903,7 +2942,21 @@ fn render_meta(message: &Message, color: Hsla, palette: Palette) -> AnyElement {
         .gap(px(META_GAP))
         .text_size(px(META_SIZE))
         .text_color(color)
-        .when(message.edited, |d| d.child("Edited ·"))
+        .when(message.edited, |d| match clicks.edited.clone() {
+            Some(open) => d.child(
+                div()
+                    .id(SharedString::from(format!("edited-{id}")))
+                    .debug_selector(move || format!("edited-{id}"))
+                    .cursor_pointer()
+                    .hover(|d| d.underline())
+                    .on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        open(window, cx)
+                    })
+                    .child("Edited ·"),
+            ),
+            None => d.child("Edited ·"),
+        })
         .when(message.expires_in > 0, |d| d.child(Icon::new(IconName::Timer).size_3().text_color(color)))
         .when(message.status == DeliveryStatus::Failed && outgoing, |d| {
             d.child(div().text_color(palette.danger).child("Not sent"))
@@ -6222,6 +6275,23 @@ mod tests {
         cx.simulate_click(gpui_kit::point(px(450.), px(5.)), gpui_kit::Modifiers::none());
         cx.run_until_parked();
         assert_eq!(viewer(&mut cx), None);
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn edited_opens_the_edit_history(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        // Our plan in the hiking group was edited twice.
+        let plan = wait_for_messages(&backend, GROUP, 1, |m| m.edited && m.direction == Direction::Outgoing).remove(0);
+        let (mut cx, _view) = open_view(cx, &backend, GROUP);
+        let edited = bounds(&mut cx, format!("edited-{}", plan.id));
+        cx.simulate_click(edited.center(), gpui_kit::Modifiers::none());
+        // The message now, then its two earlier versions.
+        bounds(&mut cx, "edit-history".into());
+        let current = bounds(&mut cx, "edit-version-0".into());
+        let oldest = bounds(&mut cx, "edit-version-2".into());
+        assert!(oldest.top() > current.top(), "newest first");
+        assert!(cx.debug_bounds("edit-version-3").is_none());
         backend.shutdown();
     }
 

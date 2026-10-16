@@ -267,9 +267,10 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
     db.insert_message(&incoming(GROUP, SAM, now - 2 * HOUR, "I can drive two people from downtown")).await?;
     let ride = db.insert_message(&incoming(GROUP, JORDAN, now - 2 * HOUR + 3 * MINUTE, "@Sam Okafor save me a seat 🙏")).await?;
     db.set_mentions(ride, &[signal_store::MentionSpan { start: 0, len: "@Sam Okafor".len(), aci: aci(SAM).into() }]).await?;
-    let plan = db
-        .insert_message(&outgoing(GROUP, now - 25 * MINUTE, "Ridge loop it is. Meet at the trailhead lot at 8:30 Saturday?", DeliveryStatus::Read))
-        .await?;
+    // Edited twice, so "Edited" opens an edit history.
+    let plan = db.insert_message(&outgoing(GROUP, now - 25 * MINUTE, "Ridge loop it is. Meet at the trailhead at 8?", DeliveryStatus::Read)).await?;
+    db.edit_message(plan, "Ridge loop it is. Meet at the trailhead lot at 8 Saturday?", now - 24 * MINUTE).await?;
+    db.edit_message(plan, "Ridge loop it is. Meet at the trailhead lot at 8:30 Saturday?", now - 23 * MINUTE).await?;
     // How far it got with each, for its details.
     let reached = |who: &str, status| signal_store::SendState {
         recipient: aci(who).into(),

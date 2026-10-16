@@ -321,6 +321,39 @@ async fn delete_edit_attachments_and_search() {
 }
 
 #[tokio::test]
+async fn edits_keep_the_versions_they_replace() {
+    let db = test_db().await;
+    let id = db.insert_message(&incoming("g:x", "a", 10, "@Bo meet at 8")).await.unwrap();
+    db.set_mentions(id, &[MentionSpan { start: 0, len: 3, aci: "b".into() }]).await.unwrap();
+    db.set_styles(id, &[StyleSpan { start: 12, len: 1, style: TextStyle::Bold }]).await.unwrap();
+    assert!(db.edit_history(id).await.unwrap().is_empty(), "never edited");
+
+    db.edit_message(id, "meet at 9", 20).await.unwrap();
+    db.set_mentions(id, &[]).await.unwrap();
+    db.edit_message(id, "meet at 9:30", 30).await.unwrap();
+    // A repeat of the last edit (a re-delivery) adds nothing.
+    db.edit_message(id, "meet at 9:30", 30).await.unwrap();
+    let history = db.edit_history(id).await.unwrap();
+    assert_eq!(
+        history.iter().map(|r| (r.sent_at, r.body.as_str())).collect::<Vec<_>>(),
+        [(10, "@Bo meet at 8"), (20, "meet at 9")],
+        "oldest first, each dated by the timestamp that named it"
+    );
+    assert_eq!(history[0].mentions, [MentionSpan { start: 0, len: 3, aci: "b".into() }]);
+    assert_eq!(history[0].styles, [StyleSpan { start: 12, len: 1, style: TextStyle::Bold }]);
+    assert!(history[1].mentions.is_empty() && history[1].styles.is_empty());
+
+    // A backup's own revisions replace it.
+    let revision = EditRevision { sent_at: 5, body: "first".into(), mentions: vec![], styles: vec![] };
+    db.set_edit_history(id, std::slice::from_ref(&revision)).await.unwrap();
+    assert_eq!(db.edit_history(id).await.unwrap(), [revision]);
+
+    // Deleting it for everyone forgets the earlier versions too.
+    db.mark_deleted(id).await.unwrap();
+    assert!(db.edit_history(id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn admin_deletes_note_the_admin_once() {
     let db = test_db().await;
     let id = db.insert_message(&incoming("g:x", "a", 10, "off topic")).await.unwrap();
@@ -943,6 +976,7 @@ async fn drop_later_migrations(db: &AppDb) {
     sqlx::query("ALTER TABLE messages DROP COLUMN viewed").execute(&db.writer).await.unwrap();
     sqlx::query("ALTER TABLE messages DROP COLUMN content").execute(&db.writer).await.unwrap();
     sqlx::query("DROP TABLE sticker_packs").execute(&db.writer).await.unwrap();
+    sqlx::query("ALTER TABLE messages DROP COLUMN edit_history").execute(&db.writer).await.unwrap();
 }
 
 /// Rewrites the migration history to look like a pre-squash database that

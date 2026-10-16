@@ -13,6 +13,7 @@ pub mod composer;
 pub mod contact;
 pub mod conversation;
 pub mod debug_log;
+pub mod edit_history;
 pub mod emoji_picker;
 pub mod forward;
 pub mod group_admin;
