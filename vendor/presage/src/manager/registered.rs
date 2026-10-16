@@ -310,6 +310,17 @@ impl<S: Store> Manager<S, Registered> {
         }
     }
 
+    /// signal-gpui: the unauthenticated chat websocket, for requests
+    /// libsignal-service has no call for (key transparency's
+    /// `/v1/key-transparency/*`, which libsignal-net sends on its own
+    /// unauthenticated chat connection). The handle is cheap to clone and
+    /// can be moved to another thread.
+    pub async fn unauthenticated_websocket(
+        &self,
+    ) -> Result<SignalWebSocket<websocket::Unidentified>, Error<S::Error>> {
+        self.unidentified_websocket().await
+    }
+
     /// Returns the current unidentified websocket, or creates a new one
     ///
     /// A new one is created if the current websocket is closed, or if there is none yet.

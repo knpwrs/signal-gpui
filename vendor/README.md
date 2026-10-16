@@ -43,6 +43,10 @@ upstream workspace). Changes:
   carries the media root backup key from linking
   (`RegistrationData::media_root_backup_key`), not persisted, like the
   ephemeral backup key; the app saves it. Upstream drops it.
+- `src/manager/registered.rs`: `Manager::unauthenticated_websocket` hands
+  out the unauthenticated chat websocket, so key transparency's
+  `/v1/key-transparency/*` requests (which libsignal sends on libsignal-net's
+  own unauthenticated connection) can go over it.
 
 ## libsignal-service
 
