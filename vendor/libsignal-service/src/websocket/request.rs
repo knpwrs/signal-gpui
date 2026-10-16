@@ -99,6 +99,13 @@ impl<C: WebSocketType> WebSocketRequestBuilder<'_, C> {
         self.ws.request(request).await
     }
 
+    /// signal-gpui: a header on this request (`If-None-Match` for the
+    /// remote config).
+    pub(crate) fn header(mut self, key: &str, value: impl AsRef<str>) -> Self {
+        self.message_builder = self.message_builder.header(key, value);
+        self
+    }
+
     pub(crate) async fn send(
         self,
     ) -> Result<WebSocketResponseMessage, ServiceError> {

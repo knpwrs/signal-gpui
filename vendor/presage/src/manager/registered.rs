@@ -383,6 +383,20 @@ impl<S: Store> Manager<S, Registered> {
         Ok(self.identified_websocket(false).await?.whoami().await?)
     }
 
+    /// signal-gpui: fetches the account's remote config (`GET /v2/config`);
+    /// with the last answer's `etag`, an unchanged config comes back empty.
+    pub async fn remote_config(
+        &self,
+        etag: Option<&str>,
+    ) -> Result<libsignal_service::websocket::remote_config::RemoteConfigResponse, Error<S::Error>>
+    {
+        Ok(self
+            .identified_websocket(false)
+            .await?
+            .get_remote_config(etag)
+            .await?)
+    }
+
     pub fn device_id(&self) -> DeviceId {
         self.state.device_id()
     }
