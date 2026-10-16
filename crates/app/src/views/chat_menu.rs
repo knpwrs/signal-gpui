@@ -243,7 +243,17 @@ pub fn build(
             .item(PopupMenuItem::new("Select messages").icon(IconName::SquareCheck).on_click(move |_, window, cx| select(window, cx)))
             .separator();
     }
-    if !conversation.marked_unread {
+    // Desktop's `LeftPaneConversationListItemContextMenu`: "Mark as read"
+    // while the chat is unread (`isConversationUnread`: marked unread, or
+    // anything unread), else "Mark as unread".
+    if is_unread(conversation) {
+        let (state, id) = (state.clone(), id.clone());
+        menu = menu.item(
+            PopupMenuItem::new("Mark as read")
+                .icon(IconName::MessageSquareCheck)
+                .on_click(move |_, _, cx| state.read(cx).send(Command::MarkRead { conversation: id.clone() })),
+        );
+    } else {
         menu = menu
             .item(PopupMenuItem::new("Mark as unread").icon(IconName::MessageSquareDot).on_click(change(ChatChange::MarkedUnread(true))));
     }
@@ -333,6 +343,15 @@ pub fn confirm_block(
     });
 }
 
+/// Desktop's `isConversationUnread`: marked unread, or anything unread.
+pub(crate) fn is_unread(conversation: &Conversation) -> bool {
+    unread(conversation.marked_unread, conversation.unread_count)
+}
+
+fn unread(marked_unread: bool, unread_count: u32) -> bool {
+    marked_unread || unread_count > 0
+}
+
 /// Desktop's "Delete chat?": gone here and from your other devices.
 pub fn confirm_delete_chat(state: Entity<AppState>, conversation: ConversationId, group: bool, window: &mut Window, cx: &mut App) {
     window.open_alert_dialog(cx, move |alert, _, _| {
@@ -363,6 +382,13 @@ mod tests {
     fn timer_labels_match_desktop() {
         let labels: Vec<String> = TIMER_CHOICES.iter().map(|s| format_timer_long(*s)).collect();
         assert_eq!(labels, ["Off", "4 weeks", "1 week", "1 day", "8 hours", "1 hour", "5 minutes", "30 seconds"]);
+    }
+
+    #[test]
+    fn unread_chats_offer_mark_as_read() {
+        assert!(!unread(false, 0));
+        assert!(unread(true, 0));
+        assert!(unread(false, 2));
     }
 
     #[test]

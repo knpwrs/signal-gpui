@@ -45,6 +45,7 @@ gpui_kit::assets::icon_assets!(
         Mic,
         MicOff,
         Minimize2,
+        MessageSquareCheck,
         MessageSquareDot,
         NotebookText,
         Paperclip,
