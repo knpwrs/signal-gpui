@@ -1861,6 +1861,35 @@ impl AppDb {
         Ok(out)
     }
 
+    /// The oldest unread message in a chat and how many are unread, for
+    /// Desktop's "N Unread Messages" line (`oldestUnseenIndex`,
+    /// `totalUnseen`).
+    pub async fn first_unread(&self, id: &ConversationId) -> Result<Option<(i64, u32)>> {
+        let row: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT (SELECT id FROM messages WHERE conversation_id = ?1 AND is_read = 0 ORDER BY sent_at, id LIMIT 1), \
+                (SELECT COUNT(*) FROM messages WHERE conversation_id = ?1 AND is_read = 0) \
+             WHERE EXISTS (SELECT 1 FROM messages WHERE conversation_id = ?1 AND is_read = 0)",
+        )
+        .bind(&id.0)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(first, count)| (first, count as u32)))
+    }
+
+    /// Unread messages in a chat that mention `me` (a service id), oldest
+    /// first: Desktop's unread mentions (`getUnreadMentions`).
+    pub async fn unread_mentions(&self, id: &ConversationId, me: &str) -> Result<Vec<i64>> {
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM messages WHERE conversation_id = ?1 AND is_read = 0 AND mentions IS NOT NULL \
+               AND EXISTS (SELECT 1 FROM json_each(mentions) WHERE json_extract(value, '$.aci') = ?2) \
+             ORDER BY sent_at, id",
+        )
+        .bind(&id.0)
+        .bind(me)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// Marks one incoming message read (e.g. read on another device). Returns its
     /// conversation if the message was previously unread.
     pub async fn mark_message_read(&self, author: &str, sent_at: i64) -> Result<Option<ConversationId>> {

@@ -118,6 +118,16 @@ pub struct ConversationView {
     /// Drawing the edit history's copies of a message (no clicks in their
     /// time lines).
     drawing_history: bool,
+    /// Opened at its unread messages: the chat is read once they're loaded
+    /// (so the unread line's place comes from them).
+    read_after_load: bool,
+    /// Messages mentioning us not yet seen, oldest first: those unread when
+    /// the chat opened, and those arriving while scrolled up (Desktop's
+    /// unread mentions, for its "@" button).
+    unread_mentions: Vec<i64>,
+    /// Scrolled in the last few seconds: the floating date shows (Desktop's
+    /// `hasRecentlyScrolled`), until this task hides it.
+    recently_scrolled: Option<gpui_kit::Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -134,6 +144,29 @@ enum Slot {
 
 /// How long a jumped-to message stays highlighted.
 const HIGHLIGHT: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long the floating date stays after scrolling (Desktop's
+/// `hasRecentlyScrolledTimeout`).
+const FLOATING_DATE_FOR: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Where loading a stretch of the chat lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Landing {
+    /// On a message, with a little above it, highlighted briefly (a search
+    /// result, a quote, a pin).
+    Highlight,
+    /// With the unread line at the top.
+    Unread,
+}
+
+/// Desktop's "N Unread Messages" (`icu:unreadMessages`).
+fn unread_line(count: u32) -> String {
+    format!("{count} Unread Message{}", if count == 1 { "" } else { "s" })
+}
+
+/// A scroll-down button's badge: Desktop shows up to 99, then "99+".
+fn badge_count(count: usize) -> String {
+    if count < 100 { count.to_string() } else { "99+".into() }
+}
 
 /// Whether a chat offers calls, as its header's buttons (Desktop's
 /// `getConversationCallMode`): `Some(false)` for a 1:1 chat, `Some(true)`
@@ -183,6 +216,7 @@ impl ConversationView {
                     if at_end && !this.has_newer {
                         this.caught_up(cx);
                     }
+                    this.note_scrolled(cx);
                     cx.notify();
                 });
             });
@@ -323,15 +357,23 @@ impl ConversationView {
             fresh: Default::default(),
             marker_placed: false,
             drawing_history: false,
+            read_after_load: false,
+            unread_mentions: Vec::new(),
+            recently_scrolled: None,
             _subscriptions: subscriptions,
         };
         this.load_request_details(cx);
         let jump = this.state.update(cx, |state, _| state.take_jump(&this.id));
+        let unread = this.state.read(cx).conversation(&this.id).is_some_and(|c| c.unread_count > 0);
         match jump {
             Some(message_id) => this.load_around(message_id, cx),
+            // Read once its unread messages are found.
+            None if unread => this.open_at_unread(cx),
             None => this.load_initial(cx),
         }
-        this.mark_read(cx);
+        if jump.is_some() || !unread {
+            this.mark_read(cx);
+        }
         this.load_pins(cx);
         // Desktop fetches a person's profile when their chat opens
         // (`throttledGetProfiles`).
@@ -983,6 +1025,23 @@ impl ConversationView {
             self.state.read(cx).send(Command::MarkRead { conversation: self.id.clone() });
         }
         self.unseen = 0;
+        // Everything down to here has been seen, mentions too.
+        self.unread_mentions.clear();
+    }
+
+    /// Desktop's "@" button: the oldest mention of us not yet seen.
+    fn jump_to_mention(&mut self, cx: &mut Context<Self>) {
+        if self.unread_mentions.is_empty() {
+            return;
+        }
+        let oldest = self.unread_mentions.remove(0);
+        self.load_around(oldest, cx);
+    }
+
+    /// Whether a message mentions us.
+    fn mentions_us(&self, message: &Message, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        state.account.as_ref().is_some_and(|account| message.mentions.iter().any(|m| m.aci == account.aci))
     }
 
     fn load_initial(&mut self, cx: &mut Context<Self>) {
@@ -1022,9 +1081,74 @@ impl ConversationView {
         .detach();
     }
 
+    /// Opens the chat at its oldest unread message, under Desktop's "N Unread
+    /// Messages" line (`unseen_from`, placed as the page loads), noting which
+    /// unread ones mention us; then it's read (as opening a chat always read
+    /// it here).
+    fn open_at_unread(&mut self, cx: &mut Context<Self>) {
+        self.loading_older = true;
+        self.generation += 1;
+        let generation = self.generation;
+        let state = self.state.read(cx);
+        let me = state.account.as_ref().map(|a| a.aci.clone()).unwrap_or_default();
+        let backend = state.backend.clone();
+        let db = backend.db().clone();
+        let id = self.id.clone();
+        let query = backend.spawn(async move {
+            let first = db.first_unread(&id).await?;
+            let mentions = db.unread_mentions(&id, &me).await?;
+            Ok::<_, signal_store::Error>((first, mentions))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = query.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    return;
+                }
+                match result {
+                    Ok((Some((first, _)), mentions)) => {
+                        this.unread_mentions = mentions;
+                        this.read_after_load = true;
+                        this.load_around_as(first, Landing::Unread, cx);
+                    }
+                    Ok((None, _)) => {
+                        this.load_initial(cx);
+                        this.mark_read(cx);
+                    }
+                    Err(error) => {
+                        tracing::error!("finding unread messages: {error}");
+                        this.load_initial(cx);
+                        this.mark_read(cx);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Scrolled by hand: the floating date shows for three seconds (Desktop's
+    /// `hasRecentlyScrolled`), though not for a scroll at the newest
+    /// messages when it wasn't already showing.
+    fn note_scrolled(&mut self, cx: &mut Context<Self>) {
+        if self.recently_scrolled.is_none() && self.at_end() {
+            return;
+        }
+        self.recently_scrolled = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(FLOATING_DATE_FOR).await;
+            let _ = this.update(cx, |this, cx| {
+                this.recently_scrolled = None;
+                cx.notify();
+            });
+        }));
+    }
+
     /// Loads the messages around `message_id`, scrolls to it and
     /// highlights it (a search result).
     fn load_around(&mut self, message_id: i64, cx: &mut Context<Self>) {
+        self.load_around_as(message_id, Landing::Highlight, cx);
+    }
+
+    fn load_around_as(&mut self, message_id: i64, landing: Landing, cx: &mut Context<Self>) {
         self.loading_older = true;
         self.generation += 1;
         let generation = self.generation;
@@ -1054,6 +1178,16 @@ impl ConversationView {
                     this.relayout(cx);
                 }
                 this.list.set_follow_mode(FollowMode::Normal);
+                if landing == Landing::Unread {
+                    // The unread line at the top, as Desktop scrolls it into
+                    // view; with little unread, the list stops at the end.
+                    this.list.scroll_to(ListOffset { item_ix: ix, offset_in_item: px(0.) });
+                    if std::mem::take(&mut this.read_after_load) {
+                        this.mark_read(cx);
+                    }
+                    cx.notify();
+                    return;
+                }
                 // A little context above it.
                 this.list.scroll_to(ListOffset { item_ix: ix.saturating_sub(2), offset_in_item: px(0.) });
                 this.highlight = Some(message_id);
@@ -1169,12 +1303,17 @@ impl ConversationView {
                     // Past what's loaded (we jumped back): it's waiting below.
                     if message.direction == Direction::Incoming {
                         this.unseen += 1;
+                        if this.mentions_us(&message, cx) {
+                            this.unread_mentions.push(message.id);
+                        }
                     }
                 } else {
                     // New messages are almost always last.
                     // In the store's order (by time, then row).
                     let ix = this.messages.partition_point(|m| (m.sent_at, m.id) < (message.sent_at, message.id));
                     let incoming = message.direction == Direction::Incoming;
+                    let mention = incoming && this.mentions_us(&message, cx);
+                    let id = message.id;
                     // Before the splice, which forgets the scroll position.
                     let was_at_end = this.at_end();
                     this.fresh.insert(message.id);
@@ -1191,6 +1330,9 @@ impl ConversationView {
                             this.state.read(cx).send(Command::MarkRead { conversation: this.id.clone() });
                         } else {
                             this.unseen += 1;
+                            if mention {
+                                this.unread_mentions.push(id);
+                            }
                         }
                     }
                 }
@@ -1519,7 +1661,13 @@ impl ConversationView {
         }
         if let Some(notice) = &message.notice {
             let notice = self.render_notice(notice, show_day, message.sent_at, palette, cx);
-            let notice = div().w_full().when(targeted, |d| d.bg(palette.row_hover)).child(notice).into_any_element();
+            let notice = div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .children(self.render_unread_line(message.id, palette))
+                .child(div().w_full().when(targeted, |d| d.bg(palette.row_hover)).child(notice))
+                .into_any_element();
             return match (ix == 0 && !self.has_more).then(|| self.render_hero(cx)).flatten() {
                 Some(hero) => div().flex().flex_col().w_full().child(hero).child(notice).into_any_element(),
                 None => notice,
@@ -1726,6 +1874,7 @@ impl ConversationView {
             // The start of the Signal chat: Desktop's hero.
             .when(ix == 0 && !self.has_more && self.id.is_signal(), |d| d.child(signal_hero(palette, cx)))
             .when(ix == 0 && !self.has_more, |d| d.children(self.render_hero(cx)))
+            .children(self.render_unread_line(message_id, palette))
             .when(show_day, |d| {
                 let signal = self.id.is_signal().then(|| signal_colors(cx));
                 d.child(
@@ -1751,6 +1900,141 @@ impl ConversationView {
             .child(row)
             .when(ix + 1 == self.messages.len(), |d| d.child(div().h_3()))
             .into_any_element()
+    }
+
+    /// Desktop's `TimelineFloatingHeader`: the date of the topmost message
+    /// shown, over the top of the timeline while scrolling, except at the
+    /// very start of the chat.
+    fn render_floating_date(&self, palette: Palette) -> Option<AnyElement> {
+        self.recently_scrolled.as_ref()?;
+        let top = self.list.logical_scroll_top().item_ix;
+        if top == 0 && !self.has_more {
+            return None;
+        }
+        let message = self.messages.get(top)?;
+        Some(
+            div()
+                .absolute()
+                .top_2()
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .debug_selector(|| "floating-date".into())
+                        .px_2p5()
+                        .py_1p5()
+                        .rounded_full()
+                        .bg(palette.popover)
+                        .shadow_sm()
+                        .text_sm()
+                        .text_color(palette.text_secondary)
+                        .child(day_label(message.sent_at)),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Desktop's scroll-down buttons (`ScrollDownButton`), shown while
+    /// scrolled up: "@" with how many mentions of us haven't been seen,
+    /// over the arrow with how many messages arrived meanwhile.
+    fn render_scroll_down_buttons(&self, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let button = |id: &'static str, icon: IconName, count: usize| {
+            div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .relative()
+                .size(px(40.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(palette.popover)
+                .border_1()
+                .border_color(palette.panel_border)
+                .shadow_md()
+                .cursor_pointer()
+                .child(Icon::new(icon).size_5().text_color(palette.text))
+                .when(count > 0, |d| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .top(px(-6.))
+                            .right(px(-6.))
+                            .min_w(px(20.))
+                            .h(px(20.))
+                            .px_1()
+                            .rounded_full()
+                            .bg(palette.badge)
+                            .text_color(palette.on_accent)
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(badge_count(count)),
+                    )
+                })
+        };
+        div()
+            .absolute()
+            .bottom_4()
+            .right_4()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .when(!self.unread_mentions.is_empty(), |d| {
+                d.child(
+                    button("jump-to-mention", IconName::AtSign, self.unread_mentions.len())
+                        .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Mentions below").build(window, cx))
+                        .on_click(cx.listener(|this, _, _, cx| this.jump_to_mention(cx))),
+                )
+            })
+            .child(
+                // How many arrived while you were scrolled up.
+                button("jump-to-latest", IconName::ArrowDown, self.unseen).on_click(cx.listener(|this, _, _, cx| {
+                    if this.has_newer {
+                        // Jumped back: reload the newest.
+                        this.load_initial(cx);
+                        this.caught_up(cx);
+                        return;
+                    }
+                    this.list.set_follow_mode(FollowMode::Tail);
+                    this.list.scroll_to_end();
+                    this.caught_up(cx);
+                    cx.notify();
+                })),
+            )
+    }
+
+    /// Desktop's `LastSeenIndicator` ("3 Unread Messages"), above the oldest
+    /// message unread when the chat loaded: the same place the collapse sets
+    /// break (`unseen_from`), with how many were unread as it opened.
+    fn render_unread_line(&self, message_id: i64, palette: Palette) -> Option<AnyElement> {
+        if self.unseen_from != Some(message_id) {
+            return None;
+        }
+        let count = match self.unread_at_open {
+            0 => self.messages.iter().filter(|m| !m.is_read).count().max(1) as u32,
+            count => count,
+        };
+        Some(
+            div()
+                .debug_selector(|| "unread-line".into())
+                .w_full()
+                .mt_3()
+                .mb_1()
+                .py_1()
+                .flex()
+                .justify_center()
+                .bg(palette.row_hover)
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(palette.text_secondary)
+                .child(unread_line(count))
+                .into_any_element(),
+        )
     }
 
     /// What clicks on a bubble's time line do: none while drawing the edit
@@ -4163,60 +4447,8 @@ impl Render for ConversationView {
                         gpui_kit::component::scroll::Scrollbar::vertical(&self.list)
                             .mode(gpui_kit::component::scroll::ScrollbarMode::Hover),
                     )
-                    .when(scrolled_up, |d| {
-                        d.child(
-                            div()
-                                .id("jump-to-latest")
-                                .debug_selector(|| "jump-to-latest".into())
-                                .absolute()
-                                .bottom_4()
-                                .right_4()
-                                .size(px(40.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_full()
-                                .bg(palette.popover)
-                                .border_1()
-                                .border_color(palette.panel_border)
-                                .shadow_md()
-                                .cursor_pointer()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if this.has_newer {
-                                        // Jumped back: reload the newest.
-                                        this.load_initial(cx);
-                                        this.caught_up(cx);
-                                        return;
-                                    }
-                                    this.list.set_follow_mode(FollowMode::Tail);
-                                    this.list.scroll_to_end();
-                                    this.caught_up(cx);
-                                    cx.notify();
-                                }))
-                                .child(Icon::new(IconName::ArrowDown).size_5().text_color(palette.text))
-                                // How many arrived while you were scrolled up.
-                                .when(self.unseen > 0, |d| {
-                                    d.child(
-                                        div()
-                                            .absolute()
-                                            .top(px(-6.))
-                                            .right(px(-6.))
-                                            .min_w(px(20.))
-                                            .h(px(20.))
-                                            .px_1()
-                                            .rounded_full()
-                                            .bg(palette.badge)
-                                            .text_color(palette.on_accent)
-                                            .text_xs()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .child(self.unseen.to_string()),
-                                    )
-                                }),
-                        )
-                    })
+                    .children(self.render_floating_date(palette))
+                    .when(scrolled_up, |d| d.child(self.render_scroll_down_buttons(palette, cx)))
                     .when(self.reaction_picker_for.is_some(), |d| {
                         d.child(deferred(
                             div()
@@ -6344,6 +6576,97 @@ mod tests {
         cx.simulate_click(gpui_kit::point(px(450.), px(5.)), gpui_kit::Modifiers::none());
         cx.run_until_parked();
         assert_eq!(viewer(&mut cx), None);
+        backend.shutdown();
+    }
+
+    #[test]
+    fn unread_lines_and_badges_read_as_desktops() {
+        assert_eq!(unread_line(1), "1 Unread Message");
+        assert_eq!(unread_line(3), "3 Unread Messages");
+        assert_eq!((badge_count(5), badge_count(99), badge_count(100)), ("5".into(), "99".into(), "99+".into()));
+    }
+
+    #[gpui_kit::test]
+    fn an_unread_chat_opens_at_its_unread_line_and_mentions_wait_below(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        // The hiking group: two unread, the first mentioning us.
+        let mention = wait_for_messages(&backend, GROUP, 1, |m| m.body.starts_with("@You")).remove(0);
+        wait_for_messages(&backend, GROUP, 1, |m| m.body.contains("first aid kit"));
+        let id = ConversationId(GROUP.into());
+        // Opened once the chat list knows it's unread, as in the app.
+        let state = cx.update(|cx| crate::state::new_state(backend.clone(), cx));
+        let ready = signal_backend::Event::Ready { phone: Some("+1 555 0100".into()), aci: NOTE_TO_SELF.trim_start_matches("d:").into() };
+        cx.update(|cx| state.update(cx, |s, cx| s.handle(ready, cx)));
+        for _ in 0..300 {
+            cx.run_until_parked();
+            if cx.read(|cx| state.read(cx).conversation(&id).is_some_and(|c| c.unread_count == 2)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let (window, chat) = cx.update(|cx| {
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(gpui_kit::Bounds { origin: Default::default(), size: size(px(900.), px(400.)) })),
+                ..Default::default()
+            };
+            gpui_kit::open_window(options, cx, |window, cx| {
+                let picker = cx.new(|cx| EmojiPicker::new(state.clone(), window, cx));
+                cx.new(|cx| ConversationView::new(state.clone(), picker, id.clone(), window, cx))
+            })
+            .unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window, cx);
+        let line = bounds(&mut cx, "unread-line".into());
+        let (marker, count, mentions) =
+            cx.update(|_, cx| (chat.read(cx).unseen_from, chat.read(cx).unread_at_open, chat.read(cx).unread_mentions.clone()));
+        assert_eq!((marker, count), (Some(mention.id), 2));
+        assert_eq!(mentions, [mention.id]);
+        let row = bounds(&mut cx, format!("row-{}", mention.id));
+        assert!(line.bottom() <= row.top(), "the line is above the oldest unread");
+        // Reading it once found.
+        wait_for_messages(&backend, GROUP, 1, |m| m.id == mention.id);
+        let unread = || {
+            let db = backend.db().clone();
+            let id = id.clone();
+            futures::executor::block_on(backend.spawn(async move { db.conversation(&id).await })).unwrap().unwrap().unread_count
+        };
+        for _ in 0..300 {
+            if unread() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(unread(), 0);
+
+        // Scrolled up: the date floats over the top, and "@" waits below.
+        cx.update(|_, cx| {
+            chat.update(cx, |v, cx| {
+                v.list.set_follow_mode(FollowMode::Normal);
+                v.list.scroll_to(ListOffset { item_ix: 1, offset_in_item: px(0.) });
+                cx.notify();
+            })
+        });
+        for _ in 0..50 {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            if !chat.read_with(&cx, |v, _| v.at_end()) {
+                break;
+            }
+        }
+        cx.update(|_, cx| chat.update(cx, |v, cx| v.note_scrolled(cx)));
+        bounds(&mut cx, "floating-date".into());
+        // It goes three seconds after the scroll.
+        cx.executor().advance_clock(FLOATING_DATE_FOR + std::time::Duration::from_millis(100));
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("floating-date").is_none());
+        let at = bounds(&mut cx, "jump-to-mention".into());
+        cx.simulate_click(at.center(), gpui_kit::Modifiers::none());
+        crate::views::test_support::wait(&mut cx, "the jump", &mut |cx| {
+            cx.update(|_, cx| chat.read(cx).highlight == Some(mention.id))
+        });
+        assert!(cx.update(|_, cx| chat.read(cx).unread_mentions.is_empty()));
         backend.shutdown();
     }
 

@@ -321,6 +321,25 @@ async fn delete_edit_attachments_and_search() {
 }
 
 #[tokio::test]
+async fn the_first_unread_message_and_unread_mentions_of_us() {
+    let db = test_db().await;
+    let chat = conv("g:x");
+    db.insert_message(&incoming("g:x", "a", 10, "old")).await.unwrap();
+    db.mark_read(&chat).await.unwrap();
+    assert_eq!(db.first_unread(&chat).await.unwrap(), None);
+    let first = db.insert_message(&incoming("g:x", "a", 20, "@Me look")).await.unwrap();
+    db.set_mentions(first, &[MentionSpan { start: 0, len: 3, aci: "me".into() }]).await.unwrap();
+    let other = db.insert_message(&incoming("g:x", "b", 30, "@Bo hi")).await.unwrap();
+    db.set_mentions(other, &[MentionSpan { start: 0, len: 3, aci: "bo".into() }]).await.unwrap();
+    let again = db.insert_message(&incoming("g:x", "b", 40, "and @Me")).await.unwrap();
+    db.set_mentions(again, &[MentionSpan { start: 4, len: 3, aci: "me".into() }]).await.unwrap();
+    assert_eq!(db.first_unread(&chat).await.unwrap(), Some((first, 3)));
+    assert_eq!(db.unread_mentions(&chat, "me").await.unwrap(), [first, again]);
+    db.mark_read(&chat).await.unwrap();
+    assert!(db.unread_mentions(&chat, "me").await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn edits_keep_the_versions_they_replace() {
     let db = test_db().await;
     let id = db.insert_message(&incoming("g:x", "a", 10, "@Bo meet at 8")).await.unwrap();

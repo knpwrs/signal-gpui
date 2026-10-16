@@ -292,8 +292,10 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
     for (emoji, from) in [("👍", Some(MAYA)), ("👍", Some(JORDAN)), ("❤️", Some(PRIYA)), ("🎉", Some(SAM)), ("🙌", None)] {
         db.set_reaction(plan, react(emoji, from)).await?;
     }
-    // Read up to here; one new message after.
+    // Read up to here; two new messages after, one mentioning us.
     db.mark_read(&ConversationId(GROUP.into())).await?;
+    let map = db.insert_message(&incoming(GROUP, MAYA, now - 23 * MINUTE, "@You can you bring the trail map?")).await?;
+    db.set_mentions(map, &[signal_store::MentionSpan { start: 0, len: "@You".len(), aci: aci(SELF).into() }]).await?;
     db.insert_message(&incoming(GROUP, PRIYA, now - 22 * MINUTE, "Perfect. I'll bring the first aid kit")).await?;
 
     // Maya: catching up, and an article she sent.
