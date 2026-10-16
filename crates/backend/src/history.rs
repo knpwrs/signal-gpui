@@ -101,6 +101,19 @@ pub(crate) async fn download(
 /// Downloads a transferred attachment from the transit tier, checks it
 /// against its digest or plaintext hash, and decrypts it. `size` (when
 /// known) trims the padding.
+/// An attachment that's no longer on Signal's servers: trying again won't
+/// help.
+#[derive(Debug)]
+pub(crate) struct Gone;
+
+impl std::fmt::Display for Gone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("it's no longer on Signal's servers")
+    }
+}
+
+impl std::error::Error for Gone {}
+
 pub(crate) async fn download_attachment(
     manager: &crate::actor::SignalManager,
     remote: &RemoteAttachment,
@@ -113,8 +126,11 @@ pub(crate) async fn download_attachment(
     let service = crate::storage::push_service(manager)?;
     let path = format!("attachments/{}", remote.cdn_key);
     let response = service.request(reqwest::Method::GET, Endpoint::cdn(remote.cdn, path), HttpAuthOverride::Unidentified)?.send().await?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        bail!("it's no longer on Signal's servers");
+    // Desktop's `AttachmentUndownloadableFromTransitTierError`
+    // (`ts/util/downloadAttachment.preload.ts`): a 404, or a 403 from CDN 0.
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND || (status == reqwest::StatusCode::FORBIDDEN && remote.cdn == 0) {
+        return Err(Gone.into());
     }
     let mut data = response.error_for_status()?.bytes().await?.to_vec();
     if let Some(digest) = &remote.digest
@@ -607,6 +623,8 @@ async fn import_item(
                 mentions: mentions.clone(),
                 styles: styles.clone(),
                 state: signal_store::LongTextState::Downloading,
+                attempts: 0,
+                retry_at: None,
             })
         }),
         _ => None,

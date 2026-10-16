@@ -1485,24 +1485,30 @@ async fn a_long_text_replaces_the_start_of_the_body_once() {
         mentions: vec!["m".into()],
         styles: vec![WireStyle { start: 0, len: 2500, style: TextStyle::Bold }],
         state: LongTextState::Downloading,
+        attempts: 0,
+        retry_at: None,
     };
     let first = long_text("first");
     let id = db.insert_message(&incoming("d:a", "a", 1, "the start")).await.unwrap();
     db.set_long_text(id, Some(&first)).await.unwrap();
     assert_eq!(db.message(id).await.unwrap().unwrap().long_text.as_ref(), Some(&first));
-    assert_eq!(db.downloading_long_texts(10).await.unwrap(), [id]);
+    assert_eq!(db.long_texts_to_resume(10).await.unwrap(), [(id, None)]);
 
-    // A failed download can be tried again; only downloads in progress resume.
-    assert!(db.set_long_text_state(id, &first, LongTextState::Failed).await.unwrap());
-    assert_eq!(db.message(id).await.unwrap().unwrap().long_text.unwrap().state, LongTextState::Failed);
-    assert!(db.downloading_long_texts(10).await.unwrap().is_empty());
+    // A failed download is tried again later, and resumes at that time.
+    assert!(db.set_long_text_state(id, &first, LongTextState::Failed, 1, Some(500)).await.unwrap());
+    let failed = db.message(id).await.unwrap().unwrap().long_text.unwrap();
+    assert_eq!((failed.state, failed.attempts, failed.retry_at), (LongTextState::Failed, 1, Some(500)));
+    assert_eq!(db.long_texts_to_resume(10).await.unwrap(), [(id, Some(500))]);
+    // Out of tries, it waits to be asked for.
+    assert!(db.set_long_text_state(id, &first, LongTextState::Failed, 5, None).await.unwrap());
+    assert!(db.long_texts_to_resume(10).await.unwrap().is_empty());
 
     // An edit since brings its own text: the old one no longer applies.
     db.edit_message(id, "edited start", 2).await.unwrap();
     assert_eq!(db.message(id).await.unwrap().unwrap().long_text, None, "an edit clears it");
     let second = long_text("second");
     db.set_long_text(id, Some(&second)).await.unwrap();
-    assert!(!db.set_long_text_state(id, &first, LongTextState::Failed).await.unwrap());
+    assert!(!db.set_long_text_state(id, &first, LongTextState::Failed, 1, None).await.unwrap());
     assert!(!db.apply_long_text(id, &first, "old whole text", &[], &[]).await.unwrap());
 
     let whole = format!("whole {} and the rest", "x".repeat(2500));
@@ -1528,7 +1534,7 @@ async fn a_long_text_replaces_the_start_of_the_body_once() {
     db.mark_deleted(gone).await.unwrap();
     assert_eq!(db.message(gone).await.unwrap().unwrap().long_text, None);
     assert!(!db.apply_long_text(gone, &first, "whole", &[], &[]).await.unwrap());
-    assert!(db.downloading_long_texts(10).await.unwrap().is_empty());
+    assert!(db.long_texts_to_resume(10).await.unwrap().is_empty());
 }
 
 fn vote(author: Option<&str>, options: &[u32], vote_count: u32, sent_at: i64) -> PollVote {

@@ -21,6 +21,25 @@ pub fn max_receive_bytes() -> u64 {
     ciphertext_size(MAX_TEXT_BYTES as u64)
 }
 
+/// Downloads of a long text tried on their own before it waits for a
+/// click, as Desktop's attachment download job (`DEFAULT_RETRY_CONFIG` in
+/// `ts/jobs/AttachmentDownloadManager.preload.ts`).
+pub const MAX_ATTEMPTS: u32 = 5;
+
+/// How long to wait after `failures` failed downloads before the next, or
+/// `None` when that was the last try: 30 seconds, 5 minutes, 50 minutes,
+/// then 6 hours (Desktop's `exponentialBackoffSleepTime` with a first
+/// backoff of 30 seconds, a multiplier of 10 and a cap of 6 hours).
+pub fn retry_delay_ms(failures: u32) -> Option<i64> {
+    const FIRST_MS: f64 = 30_000.;
+    const MULTIPLIER: f64 = 10.;
+    const MAX_MS: f64 = 6. * 60. * 60. * 1000.;
+    if failures == 0 || failures >= MAX_ATTEMPTS {
+        return None;
+    }
+    Some(((FIRST_MS / MULTIPLIER) * MULTIPLIER.powi(failures as i32)).min(MAX_MS) as i64)
+}
+
 /// Whether `body` is too long to send inline (Desktop's `isBodyTooLong`).
 pub fn is_too_long(body: &str) -> bool {
     body.len() > MAX_BODY_BYTES
@@ -65,6 +84,13 @@ mod tests {
         assert_eq!(log_pad(67_789), 67_789, "padding twice changes nothing");
         assert_eq!(max_receive_bytes(), 67_840);
         assert_eq!(log_pad(10), 541, "at least 541 bytes");
+    }
+
+    #[test]
+    fn failed_downloads_are_retried_as_desktops_are() {
+        let delays: Vec<_> = (0..=MAX_ATTEMPTS).map(retry_delay_ms).collect();
+        let minute = 60_000;
+        assert_eq!(delays, [None, Some(30_000), Some(5 * minute), Some(50 * minute), Some(360 * minute), None]);
     }
 
     #[test]

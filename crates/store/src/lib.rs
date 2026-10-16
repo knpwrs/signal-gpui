@@ -416,6 +416,18 @@ pub struct LongText {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub styles: Vec<WireStyle>,
     pub state: LongTextState,
+    /// Downloads that failed since the last one asked for (Desktop's
+    /// download job `attempts`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub attempts: u32,
+    /// After a failure, when it's tried again on its own (unix millis,
+    /// Desktop's `retryAfter`); `None` when it isn't.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at: Option<i64>,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// Where the whole text of a [`LongText`] message stands.
@@ -1925,16 +1937,23 @@ impl AppDb {
         Ok(())
     }
 
-    /// Moves the message's long text to `state`, if it's still waiting for
-    /// the same text (an edit since may have replaced it). Returns whether it
-    /// did.
-    pub async fn set_long_text_state(&self, message_id: i64, expected: &LongText, state: LongTextState) -> Result<bool> {
+    /// Moves the message's long text to `state`, with its failed `attempts`
+    /// and when it's tried again, if it's still waiting for the same text
+    /// (an edit since may have replaced it). Returns whether it did.
+    pub async fn set_long_text_state(
+        &self,
+        message_id: i64,
+        expected: &LongText,
+        state: LongTextState,
+        attempts: u32,
+        retry_at: Option<i64>,
+    ) -> Result<bool> {
         let mut tx = self.write().await?;
         let Some(current) = current_long_text(&mut tx, message_id).await? else { return Ok(false) };
         if current.remote != expected.remote {
             return Ok(false);
         }
-        let json = serde_json::to_string(&LongText { state, ..current })?;
+        let json = serde_json::to_string(&LongText { state, attempts, retry_at, ..current })?;
         sqlx::query("UPDATE messages SET long_text = ? WHERE id = ?").bind(json).bind(message_id).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(true)
@@ -1973,8 +1992,9 @@ impl AppDb {
     }
 
     /// Messages whose long text was being downloaded (when the app last
-    /// quit, say), newest first, at most `limit`.
-    pub async fn downloading_long_texts(&self, limit: usize) -> Result<Vec<i64>> {
+    /// quit, say), or is to be tried again at a time given, newest first,
+    /// at most `limit`.
+    pub async fn long_texts_to_resume(&self, limit: usize) -> Result<Vec<(i64, Option<i64>)>> {
         let rows: Vec<(i64, String)> = sqlx::query_as(
             "SELECT id, long_text FROM messages WHERE long_text IS NOT NULL AND deleted = 0 ORDER BY id DESC",
         )
@@ -1982,10 +2002,14 @@ impl AppDb {
         .await?;
         Ok(rows
             .into_iter()
-            .filter(|(_, json)| {
-                serde_json::from_str::<LongText>(json).is_ok_and(|l| l.state == LongTextState::Downloading)
+            .filter_map(|(id, json)| {
+                let long_text = serde_json::from_str::<LongText>(&json).ok()?;
+                match (long_text.state, long_text.retry_at) {
+                    (LongTextState::Downloading, _) => Some((id, None)),
+                    (LongTextState::Failed, Some(at)) => Some((id, Some(at))),
+                    _ => None,
+                }
             })
-            .map(|(id, _)| id)
             .take(limit)
             .collect())
     }

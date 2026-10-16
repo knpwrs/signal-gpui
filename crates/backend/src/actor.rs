@@ -166,6 +166,17 @@ enum Outbound {
     Story { recipient: String, body: ContentBody, timestamp: u64, job: u64 },
 }
 
+/// Why a long text is being downloaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LongTextTry {
+    /// It came, or its download was cut off.
+    First,
+    /// "Download Full Message" was clicked.
+    Asked,
+    /// A retry after a failure, scheduled for this time.
+    Scheduled(i64),
+}
+
 struct Actor {
     config: Config,
     db: AppDb,
@@ -229,6 +240,9 @@ struct Actor {
     storage_synced: RefCell<bool>,
     /// Long texts cut off last time have been tried again this session.
     long_texts_resumed: RefCell<bool>,
+    /// Long texts with a retry scheduled, and its time (only the newest
+    /// counts).
+    long_text_retries: RefCell<HashMap<i64, i64>>,
     /// Held across a story list edit's read and write of the saved lists,
     /// so two edits at once don't undo each other.
     story_lists_edit: tokio::sync::Mutex<()>,
@@ -302,6 +316,7 @@ pub(crate) async fn run(
         linking: RefCell::new(false),
         storage_synced: RefCell::new(false),
         long_texts_resumed: RefCell::new(false),
+        long_text_retries: RefCell::default(),
         story_lists_edit: tokio::sync::Mutex::new(()),
         expiry: tokio::sync::Notify::new(),
         last_sent_at: std::cell::Cell::new(0),
@@ -486,7 +501,7 @@ impl Actor {
                 tokio::task::spawn_local(async move {
                     // One at a time: they're small, and there can be many.
                     for id in long_texts {
-                        this.download_long_text(&manager, id).await;
+                        this.download_long_text(&manager, id, LongTextTry::First).await;
                     }
                 });
             }
@@ -594,7 +609,7 @@ impl Actor {
                 }
                 Command::FetchLongText { message_id } => {
                     if let Some(manager) = self.manager() {
-                        self.download_long_text(&manager, message_id).await;
+                        self.download_long_text(&manager, message_id, LongTextTry::Asked).await;
                     }
                 }
                 Command::SetPinned { conversation, pinned } => self.set_pinned(conversation, pinned).await,
@@ -3851,27 +3866,38 @@ impl Actor {
             mentions,
             styles,
             state: signal_store::LongTextState::Downloading,
+            attempts: 0,
+            retry_at: None,
         };
         if let Err(error) = self.db.set_long_text(message_id, Some(&long_text)).await {
             return self.error("failed to store message", error);
         }
         let this = self.clone();
         let manager = manager.clone();
-        tokio::task::spawn_local(async move { this.download_long_text(&manager, message_id).await });
+        tokio::task::spawn_local(async move { this.download_long_text(&manager, message_id, LongTextTry::First).await });
     }
 
     /// Downloads a message's whole text and puts it in place of the body's
     /// start, with its mentions and formatting (Desktop's
     /// `addAttachmentToMessage` for a `long-message`,
     /// `ts/messageModifiers/AttachmentDownloads.preload.ts`). One over
-    /// Desktop's size limit isn't downloaded.
-    async fn download_long_text(self: &Rc<Self>, manager: &SignalManager, message_id: i64) {
+    /// Desktop's size limit isn't downloaded. A failed download is tried
+    /// again on its own a few times, as Desktop's download job does
+    /// (`crate::long_text::retry_delay_ms`), unless it's gone from the
+    /// server; until then it can be asked for ("Download Full Message").
+    async fn download_long_text(self: &Rc<Self>, manager: &SignalManager, message_id: i64, attempt: LongTextTry) {
         use signal_store::LongTextState;
         let Ok(Some(message)) = self.db.message(message_id).await else { return };
         let Some(long_text) = message.long_text else { return };
+        // A retry that was asked for (or rescheduled) since has nothing to do.
+        if let LongTextTry::Scheduled(at) = attempt
+            && long_text.retry_at != Some(at)
+        {
+            return;
+        }
         let conversation = message.conversation_id;
-        let set_state = async |state: LongTextState| {
-            match self.db.set_long_text_state(message_id, &long_text, state).await {
+        let set_state = async |state: LongTextState, attempts: u32, retry_at: Option<i64>| {
+            match self.db.set_long_text_state(message_id, &long_text, state, attempts, retry_at).await {
                 Ok(true) => self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id }),
                 Ok(false) => {}
                 Err(error) => self.error("failed to store message", error),
@@ -3879,16 +3905,25 @@ impl Actor {
         };
         if long_text.size > crate::long_text::max_receive_bytes() {
             info!(size = long_text.size, "not downloading a long text over the limit");
-            return set_state(LongTextState::TooBig).await;
+            return set_state(LongTextState::TooBig, 0, None).await;
         }
-        if long_text.state != LongTextState::Downloading {
-            set_state(LongTextState::Downloading).await;
+        // Asking starts the count again, as a new Desktop job does.
+        let attempts = if attempt == LongTextTry::Asked { 0 } else { long_text.attempts };
+        if long_text.state != LongTextState::Downloading || long_text.retry_at.is_some() || attempts != long_text.attempts {
+            set_state(LongTextState::Downloading, attempts, None).await;
         }
         let bytes = match crate::history::download_attachment(manager, &long_text.remote, long_text.size).await {
             Ok(bytes) => bytes,
             Err(error) => {
-                warn!(error = %format!("{error:#}"), "couldn't download a long text");
-                return set_state(LongTextState::Failed).await;
+                let failures = attempts + 1;
+                let gone = error.downcast_ref::<crate::history::Gone>().is_some();
+                let retry_at = if gone { None } else { crate::long_text::retry_delay_ms(failures).map(|delay| now_millis() + delay) };
+                warn!(error = %format!("{error:#}"), failures, retry_at, "couldn't download a long text");
+                set_state(LongTextState::Failed, failures, retry_at).await;
+                if let Some(at) = retry_at {
+                    self.retry_long_text_at(manager, message_id, at);
+                }
+                return;
             }
         };
         let text = String::from_utf8_lossy(&bytes);
@@ -3904,19 +3939,48 @@ impl Actor {
         }
     }
 
-    /// Long texts whose download was cut off (the app quit, say): tried
-    /// again, a few at a time, once connected.
+    /// Tries a long text again at `at` (unix millis).
+    fn retry_long_text_at(self: &Rc<Self>, manager: &SignalManager, message_id: i64, at: i64) {
+        // Only the newest time counts: a retry scheduled later replaces an
+        // older one still waiting, which then wakes to nothing.
+        if self.long_text_retries.borrow_mut().insert(message_id, at) == Some(at) {
+            return;
+        }
+        let (this, manager) = (self.clone(), manager.clone());
+        tokio::task::spawn_local(async move {
+            let wait = u64::try_from(at - now_millis()).unwrap_or(0);
+            tokio::time::sleep(Duration::from_millis(wait)).await;
+            let current = {
+                let mut retries = this.long_text_retries.borrow_mut();
+                let current = retries.get(&message_id) == Some(&at);
+                if current {
+                    retries.remove(&message_id);
+                }
+                current
+            };
+            if current {
+                this.download_long_text(&manager, message_id, LongTextTry::Scheduled(at)).await;
+            }
+        });
+    }
+
+    /// Long texts whose download was cut off (the app quit, say), tried
+    /// again, a few at a time, once connected; and ones waiting to be
+    /// tried again, at their time.
     async fn resume_long_texts(self: Rc<Self>, manager: SignalManager) {
         const PER_RUN: usize = 50;
-        let ids = match self.db.downloading_long_texts(PER_RUN).await {
+        let ids = match self.db.long_texts_to_resume(PER_RUN).await {
             Ok(ids) => ids,
             Err(error) => return self.error("failed to read messages", error),
         };
         if !ids.is_empty() {
             info!(count = ids.len(), "downloading long texts again");
         }
-        for id in ids {
-            self.download_long_text(&manager, id).await;
+        for (id, retry_at) in ids {
+            match retry_at {
+                Some(at) => self.retry_long_text_at(&manager, id, at),
+                None => self.download_long_text(&manager, id, LongTextTry::First).await,
+            }
         }
     }
 

@@ -3845,6 +3845,8 @@ mod tests {
                 mentions: vec![],
                 styles: vec![],
                 state: signal_store::LongTextState::Failed,
+                attempts: 0,
+                retry_at: None,
             };
             db.set_long_text(id, Some(&long_text)).await?;
             Ok::<_, signal_store::Error>(id)
