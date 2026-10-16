@@ -128,6 +128,7 @@ impl<S: Store> Manager<S, Linking> {
                 account_entropy_pool,
                 ephemeral_backup_key,
                 read_receipts,
+                media_root_backup_key,
             }) => {
                 let registration_data = RegistrationData {
                     signal_servers,
@@ -141,6 +142,7 @@ impl<S: Store> Manager<S, Linking> {
                     profile_key,
                     ephemeral_backup_key,
                     read_receipts,
+                    media_root_backup_key,
                 };
 
                 store

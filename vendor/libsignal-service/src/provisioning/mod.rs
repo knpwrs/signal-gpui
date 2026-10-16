@@ -171,6 +171,10 @@ pub struct NewDeviceRegistration {
     /// The primary's read receipts setting (`ProvisionMessage.readReceipts`),
     /// which Signal Desktop takes as its own when linked.
     pub read_receipts: Option<bool>,
+    /// The account's media root backup key (`mediaRootBackupKey`, field
+    /// 16): derives the ids and keys of media in the backup tier.
+    #[debug(ignore)]
+    pub media_root_backup_key: Option<[u8; 32]>,
 }
 
 pub async fn link_device<
@@ -272,6 +276,12 @@ pub async fn link_device<
             .transpose()?;
 
         let read_receipts = message.read_receipts;
+        // Desktop keeps it only when it's there (`AccountManager`'s
+        // `isNotEmpty` check); one of the wrong length is dropped rather
+        // than failing the link.
+        let media_root_backup_key = message
+            .media_root_backup_key
+            .and_then(|key| <[u8; 32]>::try_from(key).ok());
 
         let phone_number = message
             .number
@@ -390,6 +400,7 @@ pub async fn link_device<
                 account_entropy_pool,
                 ephemeral_backup_key,
                 read_receipts,
+                media_root_backup_key,
             },
         ))
         .await

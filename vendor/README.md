@@ -39,6 +39,10 @@ upstream workspace). Changes:
   `Manager::send_story_with_sender_key` sends a story to many at once.
   `Manager::group_send_endorsements` fetches the group with its
   endorsements (`GET /v2/groups/`) and saves the group.
+- `src/manager/{registered,linking,confirmation}.rs`: `RegistrationData`
+  carries the media root backup key from linking
+  (`RegistrationData::media_root_backup_key`), not persisted, like the
+  ephemeral backup key; the app saves it. Upstream drops it.
 
 ## libsignal-service
 
@@ -80,3 +84,7 @@ whisperfish/libsignal-service-rs at `fb92b13c82fde40ba4d10696cf79aa4f36ce25f1`
   `GroupsManager::fetch_group_send_endorsements` and
   `PushService::get_group_with_endorsements` (`GET /v2/groups/`, a
   `GroupResponse`).
+- `src/provisioning/mod.rs`: `NewDeviceRegistration::media_root_backup_key`,
+  from the provisioning message's `mediaRootBackupKey` (one that isn't 32
+  bytes is dropped rather than failing the link). Upstream ignores it when
+  linking.

@@ -186,6 +186,10 @@ pub struct RegistrationData {
     /// right after linking, so not persisted.
     #[serde(skip)]
     pub(crate) read_receipts: Option<bool>,
+    /// The media root backup key from linking. Not persisted: the app keeps
+    /// it (and a key sync can replace it).
+    #[serde(skip)]
+    pub(crate) media_root_backup_key: Option<[u8; 32]>,
 }
 
 impl RegistrationData {
@@ -209,6 +213,12 @@ impl RegistrationData {
     /// when the primary device sent its read receipts setting.
     pub fn read_receipts(&self) -> Option<bool> {
         self.read_receipts
+    }
+
+    /// Set right after [`Manager::link_secondary_device`][crate::Manager::link_secondary_device]
+    /// if the primary device sent the account's media root backup key.
+    pub fn media_root_backup_key(&self) -> Option<[u8; 32]> {
+        self.media_root_backup_key
     }
 }
 

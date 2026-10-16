@@ -131,6 +131,7 @@ impl<S: Store> Manager<S, Confirmation> {
                 profile_key,
                 ephemeral_backup_key: None,
                 read_receipts: None,
+                media_root_backup_key: None,
             }),
         };
 
