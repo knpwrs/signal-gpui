@@ -3098,7 +3098,11 @@ fn render_video(
 ) -> AnyElement {
     let (w, h) = media_size(attachment.width, attachment.height);
     let path = attachment.local_path.as_ref().map(std::path::PathBuf::from);
-    let poster = path.as_ref().and_then(|p| state.update(cx, |state, cx| state.poster(p, cx)));
+    // Its first frame once downloaded; before that, its backup thumbnail.
+    let poster: Option<gpui_kit::ImageSource> = match &path {
+        Some(p) => state.update(cx, |state, cx| state.poster(p, cx)).map(Into::into),
+        None => attachment.thumbnail_path.as_ref().map(|t| std::path::PathBuf::from(t).into()),
+    };
     let white = gpui_kit::hsla(0., 0., 1., 1.);
     let badge = |icon: IconName| {
         div()
@@ -3114,6 +3118,7 @@ fn render_video(
     let size = attachment.size;
     div()
         .id(SharedString::from(format!("video-{message_id}-{index}")))
+        .debug_selector(move || format!("video-{message_id}-{index}"))
         .relative()
         .w(px(w))
         .h(px(h))
@@ -3186,6 +3191,45 @@ fn render_attachment(
                 }))
             })
             .child(img(std::path::PathBuf::from(path)).w(px(w)).h(px(h)).rounded_lg())
+            .into_any_element();
+    }
+    // Not downloaded, but its backup thumbnail is: shown at the image's
+    // size with the download button over it, as Desktop does.
+    if let (true, Some(thumbnail)) = (is_image, attachment.thumbnail_path.as_ref()) {
+        let (w, h) = media_size(attachment.width, attachment.height);
+        let white = gpui_kit::hsla(0., 0., 1., 1.);
+        return div()
+            .id(SharedString::from(format!("attachment-{message_id}-{index}")))
+            .debug_selector(move || format!("thumbnail-{message_id}-{index}"))
+            .relative()
+            .w(px(w))
+            .h(px(h))
+            .rounded_lg()
+            .overflow_hidden()
+            .cursor_pointer()
+            .child(img(std::path::PathBuf::from(thumbnail)).absolute().inset_0().size_full().object_fit(gpui_kit::ObjectFit::Cover))
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .size(px(48.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(gpui_kit::hsla(0., 0., 0., 0.55))
+                            .child(Icon::new(IconName::Download).size_6().text_color(white)),
+                    )
+                    .child(div().text_xs().text_color(white).child(crate::views::common::format_size(attachment.size))),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| this.state.read(cx).send(Command::FetchAttachment { message_id, index })))
             .into_any_element();
     }
     let name = attachment
@@ -4226,6 +4270,52 @@ mod tests {
         let long = bounds(&mut cx, format!("bubble-{}", photos[2].id));
         assert_eq!(long.size.width, px(300.));
         assert!(long.size.height > px(500.), "caption should wrap to the photo's width: {long:?}");
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn backup_thumbnails_stand_in_until_the_file_comes(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        let photos = wait_for_messages(&backend, NOTE_TO_SELF, 1, |m| !m.attachments.is_empty());
+        // The demo's drawn photo stands in for a thumbnail.
+        let thumbnail = photos[0].attachments[0].local_path.clone();
+        assert!(thumbnail.is_some());
+        let not_downloaded = |content_type: &str, width: u32, height: u32| AttachmentMeta {
+            content_type: content_type.into(),
+            file_name: None,
+            size: 2_000_000,
+            width: Some(width),
+            height: Some(height),
+            local_path: None,
+            sticker: false,
+            gif: false,
+            voice: false,
+            remote: None,
+            thumbnail_path: thumbnail.clone(),
+        };
+        let db = backend.db().clone();
+        let sent_at = chrono::Utc::now().timestamp_millis();
+        let message = signal_store::NewMessage {
+            conversation_id: ConversationId(NOTE_TO_SELF.into()),
+            sent_at,
+            received_at: sent_at,
+            direction: Direction::Outgoing,
+            author: None,
+            author_name: None,
+            body: "From the backup".into(),
+            status: DeliveryStatus::Sent,
+            quote: None,
+            attachments: vec![not_downloaded("image/jpeg", 800, 600), not_downloaded("video/mp4", 600, 800)],
+            link_preview: None,
+            expires_in: 0,
+        };
+        let id = futures::executor::block_on(backend.spawn(async move { db.insert_message(&message).await })).unwrap();
+        let mut cx = open(cx, &backend, NOTE_TO_SELF);
+        // The image's box at its own proportions, not the file row.
+        let image = bounds(&mut cx, format!("thumbnail-{id}-0"));
+        assert_eq!((image.size.width, image.size.height), (px(300.), px(225.)));
+        let video = bounds(&mut cx, format!("video-{id}-1"));
+        assert_eq!((video.size.width, video.size.height), (px(300.), px(400.)));
         backend.shutdown();
     }
 
