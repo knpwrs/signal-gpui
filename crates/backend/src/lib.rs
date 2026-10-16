@@ -318,6 +318,16 @@ pub enum Command {
     /// whole account (Desktop's Privacy settings, kept in the
     /// `AccountRecord`).
     SetAccountSetting { setting: AccountSetting, on: bool },
+    /// Adds groups' stories to the list we post to (`Always`, Desktop's
+    /// "New group story") or removes them (`Never`, "Remove group story"),
+    /// for the whole account (`GroupV2Record.storySendMode`).
+    SetStorySendMode { groups: Vec<ConversationId>, mode: signal_store::StorySendMode },
+    /// Deletes one of our stories for everyone who got it (Desktop's
+    /// `deleteStoryForEveryone`).
+    DeleteStory { id: i64 },
+    /// Deletes a reply to a group story: here only, or (ours) for everyone
+    /// in the group (Desktop's "Delete for me" / "Delete for everyone").
+    DeleteStoryReply { story: i64, author: Option<String>, sent_at: i64, for_everyone: bool },
     /// Calls a 1:1 chat (Desktop's call buttons, after the lobby).
     StartCall { conversation: ConversationId, video: bool },
     /// Answers the ringing call, with our camera on or off.

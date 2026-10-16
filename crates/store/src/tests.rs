@@ -1444,12 +1444,20 @@ async fn stories_last_a_day_and_keep_views_and_replies() {
     assert!(db.add_story_view(now - 500, "b", now - 400).await.unwrap());
     assert!(db.add_story_view(now - 500, "b", now - 300).await.unwrap());
     assert!(!db.add_story_view(now - 1_000, "b", now).await.unwrap(), "not ours");
-    let reply = StoryReply { author: Some("b".into()), author_name: None, sent_at: now, body: "nice".into(), emoji: None };
+    let reply = StoryReply { author: Some("b".into()), author_name: None, sent_at: now, body: "nice".into(), emoji: None, deleted: false };
     assert_eq!(db.add_story_reply(Some("a"), now - 1_000, &reply).await.unwrap(), Some(theirs));
     assert_eq!(db.add_story_reply(Some("a"), 1, &reply).await.unwrap(), None, "no such story");
     let theirs_now = db.story(theirs).await.unwrap().unwrap();
     assert!(theirs_now.read);
-    assert_eq!(theirs_now.replies, [reply]);
+    assert_eq!(theirs_now.replies, std::slice::from_ref(&reply));
+    // Deleted by its author for everyone: kept, marked; for me: gone.
+    assert!(db.remove_story_reply(theirs, Some("b"), now, true).await.unwrap());
+    let kept = &db.story(theirs).await.unwrap().unwrap().replies[0];
+    assert!(kept.deleted && kept.body.is_empty());
+    assert!(!db.remove_story_reply(theirs, Some("c"), now, false).await.unwrap(), "no such reply");
+    assert!(db.remove_story_reply(theirs, Some("b"), now, false).await.unwrap());
+    assert!(db.story(theirs).await.unwrap().unwrap().replies.is_empty());
+    db.add_story_reply(Some("a"), now - 1_000, &reply).await.unwrap();
     assert_eq!(db.story(ours).await.unwrap().unwrap().views, [StoryView { viewer: "b".into(), at: Some(now - 400) }], "the first time");
 
     // A day after: gone, with the photo's file to delete.

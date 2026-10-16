@@ -84,6 +84,11 @@ pub(crate) struct StorageSnapshot {
     pub my_story_privacy_set: Option<bool>,
     /// Call links we made (on any of our devices), deleted ones too.
     pub call_links: Vec<StorageCallLink>,
+    /// Whether we share our profile with each contact and group that has a
+    /// record (`whitelisted`, Desktop's `profileSharing`).
+    pub profile_sharing: Vec<(ConversationId, bool)>,
+    /// Each group's story send mode (`storySendMode`).
+    pub story_send_modes: Vec<(ConversationId, signal_store::StorySendMode)>,
 }
 
 /// A call link record (Desktop's `mergeCallLinkRecord`): only links we're
@@ -144,16 +149,24 @@ pub(crate) async fn fetch(manager: &SignalManager) -> anyhow::Result<StorageSnap
             match record.record {
                 Some(Record::Contact(contact)) => {
                     snapshot.chats.extend(contact_chat(&contact));
-                    if contact.hide_story
-                        && let Some(aci) = record_aci(&contact)
-                    {
-                        snapshot.hidden_stories.push(ConversationId::direct(&Aci::from(aci).service_id_string()));
+                    if let Some(aci) = record_aci(&contact) {
+                        let chat = ConversationId::direct(&Aci::from(aci).service_id_string());
+                        if contact.hide_story {
+                            snapshot.hidden_stories.push(chat.clone());
+                        }
+                        snapshot.profile_sharing.push((chat, contact.whitelisted));
                     }
                     snapshot.contacts.extend(from_record(&contact));
                 }
                 Some(Record::GroupV2(group)) => {
-                    if group.hide_story && group.master_key.len() == 32 {
-                        snapshot.hidden_stories.push(ConversationId::group(&group.master_key));
+                    if group.master_key.len() == 32 {
+                        let chat = ConversationId::group(&group.master_key);
+                        if group.hide_story {
+                            snapshot.hidden_stories.push(chat.clone());
+                        }
+                        snapshot.profile_sharing.push((chat.clone(), group.whitelisted));
+                        let mode = signal_store::StorySendMode::from_wire(i64::from(group.story_send_mode));
+                        snapshot.story_send_modes.push((chat, mode));
                     }
                     snapshot.chats.extend(group_chat(&group));
                 }
@@ -310,19 +323,27 @@ pub(crate) enum ChatEdit {
     Blocked(bool),
     /// Their stories hidden (`hideStory`).
     HideStory(bool),
+    /// We share our profile with them (`whitelisted`).
+    ProfileSharing(bool),
+    /// A group's story send mode (`storySendMode`); contact records have
+    /// none.
+    StorySendMode(signal_store::StorySendMode),
 }
 
 impl ChatEdit {
     /// The field number in a `ContactRecord` or `GroupV2Record`, and its value.
-    fn field(self, group: bool) -> (u32, u64) {
+    /// `None` for a field the record doesn't have.
+    fn field(self, group: bool) -> Option<(u32, u64)> {
         let (contact, group_field, value) = match self {
-            ChatEdit::Blocked(on) => (9, 2, u64::from(on)),
-            ChatEdit::Archived(on) => (11, 4, u64::from(on)),
-            ChatEdit::MarkedUnread(on) => (12, 5, u64::from(on)),
-            ChatEdit::MutedUntil(until) => (13, 6, until),
-            ChatEdit::HideStory(on) => (14, 8, u64::from(on)),
+            ChatEdit::Blocked(on) => (Some(9), 2, u64::from(on)),
+            ChatEdit::Archived(on) => (Some(11), 4, u64::from(on)),
+            ChatEdit::MarkedUnread(on) => (Some(12), 5, u64::from(on)),
+            ChatEdit::MutedUntil(until) => (Some(13), 6, until),
+            ChatEdit::HideStory(on) => (Some(14), 8, u64::from(on)),
+            ChatEdit::ProfileSharing(on) => (Some(10), 3, u64::from(on)),
+            ChatEdit::StorySendMode(mode) => (None, 10, mode.to_wire() as u64),
         };
-        (if group { group_field } else { contact }, value)
+        Some((if group { group_field } else { contact? }, value))
     }
 }
 
@@ -335,7 +356,7 @@ pub(crate) fn edit_chat_record(record: &[u8], edit: ChatEdit) -> anyhow::Result<
         .find(|f| f.payload.is_some() && matches!(f.number, RECORD_CONTACT | RECORD_GROUP_V2))
         .map(|f| f.number)
         .context("storage record is not a contact or group")?;
-    let (number, value) = edit.field(kind == RECORD_GROUP_V2);
+    let (number, value) = edit.field(kind == RECORD_GROUP_V2).context("a contact record has no such field")?;
     edit_inner(record, kind, |chat| set_varint(chat, number, value))
 }
 
@@ -1276,6 +1297,25 @@ mod tests {
         let Some(Record::Contact(c)) = StorageRecord::decode(unarchived.as_slice()).unwrap().record else { panic!() };
         assert!(!c.archived);
         assert_eq!(edit_chat_record(&unarchived, ChatEdit::Archived(false)).unwrap(), None);
+    }
+
+    #[test]
+    fn profile_sharing_and_story_send_mode_write_their_fields() {
+        let contact = StorageRecord { record: Some(Record::Contact(ContactRecord { aci: ACI.into(), ..Default::default() })) };
+        let shared = edit_chat_record(&contact.encode_to_vec(), ChatEdit::ProfileSharing(true)).unwrap().unwrap();
+        let Some(Record::Contact(c)) = StorageRecord::decode(shared.as_slice()).unwrap().record else { panic!() };
+        assert!(c.whitelisted);
+        // A contact has no story send mode.
+        assert!(edit_chat_record(&contact.encode_to_vec(), ChatEdit::StorySendMode(signal_store::StorySendMode::Never)).is_err());
+
+        let group = StorageRecord { record: Some(Record::GroupV2(GroupV2Record { master_key: vec![1; 32], ..Default::default() })) };
+        let removed =
+            edit_chat_record(&group.encode_to_vec(), ChatEdit::StorySendMode(signal_store::StorySendMode::Never)).unwrap().unwrap();
+        let Some(Record::GroupV2(g)) = StorageRecord::decode(removed.as_slice()).unwrap().record else { panic!() };
+        assert_eq!(g.story_send_mode(), presage::proto::group_v2_record::StorySendMode::Disabled);
+        let shared = edit_chat_record(&removed, ChatEdit::ProfileSharing(true)).unwrap().unwrap();
+        let Some(Record::GroupV2(g)) = StorageRecord::decode(shared.as_slice()).unwrap().record else { panic!() };
+        assert!(g.whitelisted && g.story_send_mode() == presage::proto::group_v2_record::StorySendMode::Disabled);
     }
 
     #[test]

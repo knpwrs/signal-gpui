@@ -28,11 +28,11 @@ impl Actor {
         }
     }
 
-    /// Whether we'd see their story: Desktop shows one-to-one stories only
-    /// from people it shares its profile with; here, someone we have a
-    /// chat with or in our contacts, not blocked. A group's, only from a
-    /// member of a group we're in.
-    async fn takes_story_from(&self, author: &str, group: Option<&ConversationId>) -> bool {
+    /// Whether we'd see their story: one to one, only from someone we share
+    /// our profile with (Desktop's `MessageReceiver`: "Dropping story
+    /// message - !profileSharing for sender"), not blocked. A group's,
+    /// only from a member of a group we're in.
+    pub(super) async fn takes_story_from(&self, author: &str, group: Option<&ConversationId>) -> bool {
         if self.is_blocked(&ConversationId::direct(author)).await {
             return false;
         }
@@ -44,11 +44,32 @@ impl Actor {
                 .ok()
                 .flatten()
                 .is_some_and(|g| !g.blocked && !g.left && g.members.iter().any(|m| m == author)),
-            None => {
-                self.db.conversation(&ConversationId::direct(author)).await.ok().flatten().is_some()
-                    || self.db.people().await.unwrap_or_default().iter().any(|p| p.id.as_direct() == Some(author))
-            }
+            None => self.db.profile_sharing(&ConversationId::direct(author)).await.unwrap_or(false),
         }
+    }
+
+    /// We share our profile with this chat from now on (Desktop's
+    /// `enableProfileSharing` when we send to it), here and, the first
+    /// time, in its Storage Service record (`whitelisted`).
+    pub(super) async fn share_profile_with(self: &Rc<Self>, chat: &ConversationId) {
+        if chat.as_direct().is_none() || chat.is_signal() || self.is_note_to_self(chat) {
+            return;
+        }
+        match self.db.set_profile_sharing(chat, true).await {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => return warn!(error = %format!("{error:#}"), "failed to save profile sharing"),
+        }
+        let Some(manager) = self.manager() else { return };
+        let (this, chat) = (self.clone(), chat.clone());
+        tokio::task::spawn_local(async move {
+            match storage::write_chat(&manager, &chat, storage::ChatEdit::ProfileSharing(true)).await {
+                Ok(()) => this.storage_written(),
+                // Here it's shared either way; the next sync says what
+                // Storage Service has.
+                Err(error) => warn!(error = %format!("{error:#}"), "couldn't save profile sharing to Storage Service"),
+            }
+        });
     }
 
     pub(super) async fn apply_story(self: &Rc<Self>, manager: &SignalManager, mut story: NewStory, pointer: Option<AttachmentPointer>) {
@@ -146,16 +167,15 @@ impl Actor {
         }
     }
 
-    /// A VIEWED receipt: counted on our story, if it's one (and we share
-    /// view receipts, as Desktop only counts them then).
-    pub(super) async fn apply_story_viewed(&self, viewer: String, sent_at: Vec<i64>) {
+    /// A VIEWED receipt, sent `at`: counted on our story, if it's one (and
+    /// we share view receipts, as Desktop only counts them then).
+    pub(super) async fn apply_story_viewed(&self, viewer: String, sent_at: Vec<i64>, at: i64) {
         if !self.story_view_receipts().await {
             return;
         }
         let mut changed = false;
-        let now = now_millis();
-        for at in sent_at {
-            changed |= self.db.add_story_view(at, &viewer, now).await.unwrap_or(false);
+        for story in sent_at {
+            changed |= self.db.add_story_view(story, &viewer, at).await.unwrap_or(false);
         }
         if changed {
             self.emit(Event::StoriesChanged);
@@ -273,7 +293,6 @@ impl Actor {
     /// (`storyContext`), shown with Desktop's "Story" quote.
     pub(super) async fn reply_to_story(&self, id: i64, body: String, emoji: Option<String>) {
         let Ok(Some(story)) = self.db.story(id).await else { return };
-        let Some(author) = story.author.clone() else { return };
         if !story.allows_replies {
             return self.error("can't reply", "this story doesn't take replies");
         }
@@ -284,9 +303,12 @@ impl Actor {
         if body.is_empty() {
             return;
         }
+        // A group's story takes replies from everyone in it, us included
+        // when it's ours (Desktop's `StoryViewsNRepliesModal`).
         if let Some(group) = story.group.clone() {
-            return self.reply_to_group_story(&story, &author, group, body, emoji).await;
+            return self.reply_to_group_story(&story, group, body, emoji).await;
         }
+        let Some(author) = story.author.clone() else { return };
         let conversation = ConversationId::direct(&author);
         let timestamp = self.next_timestamp();
         let thumbnail = match &story.content {
@@ -405,15 +427,19 @@ impl Actor {
     async fn reply_to_group_story(
         &self,
         story: &signal_store::Story,
-        author: &str,
         group: ConversationId,
         body: String,
         emoji: Option<String>,
     ) {
+        if self.db.conversation(&group).await.ok().flatten().is_none_or(|g| g.left) {
+            return self.error("can't reply", "you're no longer a member of this group");
+        }
         let Some(context) = self.group_context(&group).await else { return };
+        let me = self.self_aci();
+        let author = story.author.as_deref().unwrap_or(&me);
         let timestamp = self.next_timestamp();
-        let reply = StoryReply { author: None, author_name: None, sent_at: timestamp, body: body.clone(), emoji: emoji.clone() };
-        if let Err(error) = self.db.add_story_reply(Some(author), story.sent_at, &reply).await {
+        let reply = StoryReply { author: None, author_name: None, sent_at: timestamp, body: body.clone(), emoji: emoji.clone(), deleted: false };
+        if let Err(error) = self.db.add_story_reply(story.author.as_deref(), story.sent_at, &reply).await {
             return self.error("failed to keep the reply", error);
         }
         self.emit(Event::StoriesChanged);
@@ -713,6 +739,78 @@ impl Actor {
         self.write_account(&[storage::AccountEdit::StoryViewReceipts(on)]).await;
     }
 
+    /// Desktop's `toggleGroupsForStorySend` (and what posting to a group
+    /// does): groups' story send modes here, then in their Storage Service
+    /// records, one at a time.
+    pub(super) async fn set_story_send_mode(self: Rc<Self>, groups: Vec<ConversationId>, mode: signal_store::StorySendMode) {
+        let groups: Vec<ConversationId> = groups.into_iter().filter(|g| g.as_group().is_some()).collect();
+        let modes: Vec<_> = groups.iter().map(|g| (g.clone(), mode)).collect();
+        match self.db.set_story_send_modes(&modes).await {
+            Ok(true) => self.emit(Event::StorySettingsChanged),
+            Ok(false) => return,
+            Err(error) => return self.error("couldn't change the group stories", error),
+        }
+        let Some(manager) = self.manager() else { return };
+        let mut written = false;
+        for group in &groups {
+            match storage::write_chat(&manager, group, storage::ChatEdit::StorySendMode(mode)).await {
+                Ok(()) => written = true,
+                Err(error) => {
+                    self.error("couldn't update the group story on your other devices", format!("{error:#}"));
+                    self.sync_storage(&manager).await;
+                    break;
+                }
+            }
+        }
+        if written {
+            self.storage_written();
+        }
+    }
+
+    /// Desktop's "Delete for me" (`deleteGroupStoryReply`) and, for ours,
+    /// "Delete for everyone" (`deleteGroupStoryReplyForEveryone`: a delete
+    /// sent to the group as a group message).
+    pub(super) async fn delete_story_reply(&self, story_id: i64, author: Option<String>, sent_at: i64, for_everyone: bool) {
+        let Ok(Some(story)) = self.db.story(story_id).await else { return };
+        if for_everyone {
+            let Some(group) = story.group.clone().filter(|_| author.is_none()) else {
+                return self.error("can't delete the reply", "only your own replies can be deleted for everyone");
+            };
+            let timestamp = self.next_timestamp();
+            let data = DataMessage {
+                timestamp: Some(timestamp as u64),
+                group_v2: self.group_context(&group).await,
+                delete: Some(presage::proto::data_message::Delete { target_sent_timestamp: Some(sent_at as u64) }),
+                ..Default::default()
+            };
+            self.enqueue(Outbound::Send { conversation: group, body: data.into(), timestamp: timestamp as u64, message: None });
+        }
+        match self.db.remove_story_reply(story_id, author.as_deref(), sent_at, for_everyone).await {
+            Ok(true) => self.emit(Event::StoriesChanged),
+            Ok(false) => {}
+            Err(error) => self.error("couldn't delete the reply", error),
+        }
+    }
+
+    /// A delete for everyone naming a group story's reply: kept as deleted,
+    /// as Desktop shows it. Returns whether it was one.
+    pub(super) async fn apply_story_reply_delete(&self, group: &ConversationId, author: Option<&str>, sent_at: i64) -> bool {
+        let Ok(Some(id)) = self.db.find_story_reply(group, author, sent_at).await else { return false };
+        match self.db.remove_story_reply(id, author, sent_at, true).await {
+            Ok(changed) => {
+                if changed {
+                    self.emit(Event::StoriesChanged);
+                }
+                true
+            }
+            Err(error) => {
+                warn!(error = %format!("{error:#}"), "couldn't delete a story reply");
+                true
+            }
+        }
+    }
+
+    /// Writes story settings to the account record; if that fails,
     /// Writes settings to the account record; if that fails,
     /// re-reading Storage Service puts things back.
     pub(super) async fn write_account(self: &Rc<Self>, edits: &[storage::AccountEdit]) {

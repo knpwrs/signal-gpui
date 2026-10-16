@@ -994,7 +994,7 @@ fn our_stories_keep_who_they_went_to_and_recipient_updates() {
 fn viewed_receipts_count_story_views() {
     let receipt = ReceiptMessage { r#type: Some(receipt_message::Type::Viewed.into()), timestamp: vec![300] };
     let actions = map_content(&content(ALICE, receipt), &ctx());
-    assert!(actions.iter().any(|a| matches!(a, Action::StoryViewed { viewer, sent_at } if viewer == ALICE && sent_at == &[300])));
+    assert!(actions.iter().any(|a| matches!(a, Action::StoryViewed { viewer, sent_at, at: 500 } if viewer == ALICE && sent_at == &[300])));
     let sync = SyncMessage {
         viewed: vec![sync_message::Viewed { sender_aci: Some(ALICE.into()), timestamp: Some(400), ..Default::default() }],
         ..Default::default()

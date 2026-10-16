@@ -71,6 +71,10 @@ pub struct StoryReply {
     pub body: String,
     /// A reaction rather than a reply.
     pub emoji: Option<String>,
+    /// Deleted for everyone by its author: shown as Desktop's "This
+    /// message was deleted."
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 /// Someone one of our stories went to (Desktop's `StoryMessageRecipient`):
@@ -309,6 +313,57 @@ impl AppDb {
         }
         tx.commit().await?;
         Ok(Some(id))
+    }
+
+    /// A reply (or reaction) to story `id`: gone (`deleted_for_everyone`
+    /// false, Desktop's "Delete for me"), or kept as deleted (its author
+    /// deleted it for everyone). Returns whether there was one.
+    pub async fn remove_story_reply(
+        &self,
+        id: i64,
+        author: Option<&str>,
+        sent_at: i64,
+        deleted_for_everyone: bool,
+    ) -> Result<bool> {
+        let mut tx = self.write().await?;
+        let replies: Option<Option<String>> =
+            sqlx::query_scalar("SELECT replies FROM stories WHERE id = ?").bind(id).fetch_optional(&mut *tx).await?;
+        let mut replies: Vec<StoryReply> =
+            replies.flatten().map(|r| serde_json::from_str(&r)).transpose()?.unwrap_or_default();
+        let matches = |r: &StoryReply| r.author.as_deref() == author && r.sent_at == sent_at;
+        let Some(at) = replies.iter().position(matches) else { return Ok(false) };
+        if deleted_for_everyone {
+            let reply = &mut replies[at];
+            reply.deleted = true;
+            reply.body.clear();
+            reply.emoji = None;
+        } else {
+            replies.remove(at);
+        }
+        sqlx::query("UPDATE stories SET replies = ? WHERE id = ?")
+            .bind(serde_json::to_string(&replies)?)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// The story in `group` with a reply by `author` (`None`: ours) sent at
+    /// `sent_at`, for a delete that names the reply.
+    pub async fn find_story_reply(&self, group: &ConversationId, author: Option<&str>, sent_at: i64) -> Result<Option<i64>> {
+        let rows: Vec<(i64, Option<String>)> =
+            sqlx::query_as("SELECT id, replies FROM stories WHERE group_id = ? AND replies IS NOT NULL")
+                .bind(&group.0)
+                .fetch_all(&self.pool)
+                .await?;
+        for (id, replies) in rows {
+            let replies: Vec<StoryReply> = replies.map(|r| serde_json::from_str(&r)).transpose()?.unwrap_or_default();
+            if replies.iter().any(|r| r.author.as_deref() == author && r.sent_at == sent_at) {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
     }
 
     /// Takes away the stories whose day is up, returning their saved

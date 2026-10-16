@@ -278,6 +278,22 @@ impl Delivery {
     }
 }
 
+impl Outbound {
+    /// The one-to-one chat a message of ours goes to (not a receipt,
+    /// typing indicator or sync), with which Desktop shares our profile
+    /// from then on (`enqueueMessageForSend`'s "mandatoryProfileSharing").
+    fn message_to(&self) -> Option<&ConversationId> {
+        let conversation = match self {
+            Outbound::Send { conversation, message: Some(_), .. }
+            | Outbound::SendImages { conversation, .. }
+            | Outbound::SendGif { conversation, .. }
+            | Outbound::SendSticker { conversation, .. } => conversation,
+            _ => return None,
+        };
+        conversation.as_direct().is_some().then_some(conversation)
+    }
+}
+
 struct Actor {
     config: Config,
     db: AppDb,
@@ -786,7 +802,21 @@ impl Actor {
                 Command::ReplyToStory { id, body, emoji } => self.reply_to_story(id, body, emoji).await,
                 Command::PostStory { story, targets } => {
                     let this = self.clone();
-                    tokio::task::spawn_local(async move { this.post_story(story, targets).await });
+                    tokio::task::spawn_local(async move {
+                        let groups: Vec<ConversationId> = targets
+                            .iter()
+                            .filter_map(|t| match t {
+                                crate::StoryTarget::Group(group) => Some(group.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        this.post_story(story, targets).await;
+                        // Desktop's `sendStoryMessage`: a group posted to
+                        // stays on the list (`StorySendMode.Always`).
+                        if !groups.is_empty() {
+                            this.set_story_send_mode(groups, signal_store::StorySendMode::Always).await;
+                        }
+                    });
                 }
                 Command::SaveStoryList(list) => self.save_story_list(list).await,
                 Command::DeleteStoryList { id } => self.delete_story_list(id).await,
@@ -795,6 +825,18 @@ impl Actor {
                 Command::SetAccountSetting { setting, on } => self.set_account_setting(setting, on).await,
                 Command::StartCall { conversation, video } if conversation.as_call_link().is_some() => {
                     self.start_link_call(conversation, video).await
+                }
+                Command::SetStorySendMode { groups, mode } => self.set_story_send_mode(groups, mode).await,
+                Command::DeleteStory { id } => match self.db.story(id).await {
+                    Ok(Some(story)) if story.author.is_none() => {
+                        self.delete_story_for_everyone(&story, None).await;
+                        self.emit(Event::StoriesChanged);
+                    }
+                    Ok(_) => {}
+                    Err(error) => self.error("couldn't delete the story", error),
+                },
+                Command::DeleteStoryReply { story, author, sent_at, for_everyone } => {
+                    self.delete_story_reply(story, author, sent_at, for_everyone).await
                 }
                 Command::StartCall { conversation, video } => self.start_call(conversation, video),
                 Command::AcceptCall { video } => self.accept_call(video),
@@ -1052,6 +1094,17 @@ impl Actor {
                 if sender != self_aci && self.is_blocked(&ConversationId::direct(&sender)).await {
                     return;
                 }
+                // A one-to-one story reply, like a story, only from someone
+                // we share our profile with (Desktop's `MessageReceiver`).
+                if let ContentBody::DataMessage(dm) = &content.body
+                    && dm.story_context.is_some()
+                    && dm.group_v2.is_none()
+                    && sender != self_aci
+                    && !self.takes_story_from(&sender, None).await
+                {
+                    debug!("story reply from someone we don't share our profile with");
+                    return;
+                }
                 let ctx = MapContext { self_aci: &self_aci, now: now_millis() };
                 for action in mapping::map_content(&content, &ctx) {
                     // Nor from a blocked group (our own sync messages still apply).
@@ -1158,6 +1211,17 @@ impl Actor {
                     Ok(id) => {
                         if view_once == Some(signal_store::ViewOnce::Ready) {
                             self.view_once_expiry.notify_one();
+                        }
+                        // Sent from another of our devices: Desktop shares
+                        // our profile with that chat from then on
+                        // (`handleDataMessage`); that device saves it to
+                        // Storage Service.
+                        if message.direction == Direction::Outgoing
+                            && message.conversation_id.as_direct().is_some()
+                            && !repeat
+                            && let Err(error) = self.db.set_profile_sharing(&message.conversation_id, true).await
+                        {
+                            warn!(error = %format!("{error:#}"), "failed to save profile sharing");
                         }
                         if !spans.is_empty() {
                             let _ = self.db.set_mentions(id, &spans).await;
@@ -1281,7 +1345,7 @@ impl Actor {
             Action::StoryReply { group, story_author, story_sent_at, reply } => {
                 self.apply_story_reply(group, story_author, story_sent_at, reply).await
             }
-            Action::StoryViewed { viewer, sent_at } => self.apply_story_viewed(viewer, sent_at).await,
+            Action::StoryViewed { viewer, sent_at, at } => self.apply_story_viewed(viewer, sent_at, at).await,
             Action::StoryRecipientUpdate { sent_at, recipients } => self.apply_story_recipient_update(sent_at, recipients).await,
             Action::ViewedSync(viewed) => self.apply_viewed_sync(viewed).await,
             Action::ViewOnceOpen { .. } => {
@@ -2122,6 +2186,8 @@ impl Actor {
             story_view_receipts,
             my_story_privacy_set,
             call_links,
+            profile_sharing,
+            story_send_modes,
         } = match storage::fetch(manager).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -2153,6 +2219,14 @@ impl Actor {
             .await;
         }
         self.apply_storage_call_links(call_links).await;
+        if let Err(error) = self.db.apply_profile_sharing(&profile_sharing).await {
+            warn!(error = %format!("{error:#}"), "failed to save profile sharing");
+        }
+        match self.db.set_story_send_modes(&story_send_modes).await {
+            Ok(true) => self.emit(Event::StorySettingsChanged),
+            Ok(false) => {}
+            Err(error) => warn!(error = %format!("{error:#}"), "failed to save groups' story send modes"),
+        }
         match self.db.apply_chat_states(&chats).await {
             Ok(true) => self.emit(Event::ConversationsChanged),
             Ok(false) => {}
@@ -3896,6 +3970,9 @@ impl Actor {
                 }
                 continue;
             };
+            if let Some(chat) = job.message_to() {
+                self.share_profile_with(chat).await;
+            }
             match job {
                 Outbound::Send { conversation, body, timestamp, message } => {
                     let delivery = self.deliver_to(&mut manager, &conversation, body, timestamp, None).await;

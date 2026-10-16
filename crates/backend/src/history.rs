@@ -292,6 +292,24 @@ fn who(recipient: &proto::Recipient) -> Who {
     }
 }
 
+/// A contact's or group's profile sharing (`Contact.profileSharing`,
+/// `Group.whitelisted`) and a group's story send mode, as Desktop's backup
+/// import reads them (`ts/services/backups/import`).
+fn story_state(recipient: &proto::Recipient) -> Option<(ConversationId, bool, Option<signal_store::StorySendMode>)> {
+    use proto::recipient::Destination;
+    match &recipient.destination {
+        Some(Destination::Contact(contact)) => {
+            let sid = contact.aci.as_deref().and_then(uuid_sid)?;
+            Some((ConversationId::direct(&sid), contact.profileSharing, None))
+        }
+        Some(Destination::Group(group)) if group.masterKey.len() == 32 => {
+            let mode = signal_store::StorySendMode::from_wire(i64::from(group.storySendMode.value()));
+            Some((ConversationId::group(&group.masterKey), group.whitelisted, Some(mode)))
+        }
+        _ => None,
+    }
+}
+
 /// Imports a decrypted backup's chats and messages for account `me`.
 /// `progress` gets the bytes of `plain` imported so far.
 pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: impl FnMut(u64)) -> anyhow::Result<Imported> {
@@ -299,6 +317,9 @@ pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: imp
     let mut chats: HashMap<u64, ConversationId> = HashMap::new();
     let mut pinned: Vec<(u32, ConversationId)> = Vec::new();
     let mut states: Vec<ChatState> = Vec::new();
+    // Whom we share our profile with, and groups' story send modes.
+    let mut sharing: Vec<(ConversationId, bool)> = Vec::new();
+    let mut modes: Vec<(ConversationId, signal_store::StorySendMode)> = Vec::new();
     let mut imported = Imported::default();
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64;
     let mut frames = delimited(plain);
@@ -312,6 +333,10 @@ pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: imp
         let frame = proto::Frame::parse_from_bytes(frame)?;
         match frame.item {
             Some(proto::frame::Item::Recipient(recipient)) => {
+                if let Some((chat, on, mode)) = story_state(&recipient) {
+                    sharing.push((chat.clone(), on));
+                    modes.extend(mode.map(|mode| (chat, mode)));
+                }
                 people.insert(recipient.id, who(&recipient));
             }
             Some(proto::frame::Item::Chat(chat)) => {
@@ -378,6 +403,8 @@ pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: imp
         }
     }
     db.apply_chat_states(&states).await?;
+    db.apply_profile_sharing(&sharing).await?;
+    db.set_story_send_modes(&modes).await?;
     if !pinned.is_empty() {
         pinned.sort_by_key(|(order, _)| *order);
         db.replace_pinned(&pinned.into_iter().map(|(_, id)| id).collect::<Vec<_>>()).await?;
@@ -876,9 +903,11 @@ mod tests {
         contact.profileGivenName = Some("Alice".into());
         contact.profileFamilyName = Some("Liddell".into());
         contact.e164 = Some(15550100);
+        contact.profileSharing = true;
         push(recipient(2, Destination::Contact(contact)));
         let mut group = proto::Group::new();
         group.masterKey = vec![9; 32];
+        group.storySendMode = proto::group::StorySendMode::ENABLED.into();
         let mut snapshot = proto::group::GroupSnapshot::new();
         let mut title = proto::group::GroupAttributeBlob::new();
         title.content = Some(proto::group::group_attribute_blob::Content::Title("Hikers".into()));
@@ -1067,6 +1096,10 @@ mod tests {
         let group = db.conversation(&ConversationId::group(&[9; 32])).await.unwrap().unwrap();
         assert_eq!((group.title.as_str(), group.archived, group.members.clone()), ("Hikers", true, vec![alice_sid.clone()]));
         assert!(group.ended, "the snapshot says it was ended");
+        // Whose stories we take, and the group's story kept on the list.
+        assert!(db.profile_sharing(&alice.id).await.unwrap());
+        assert!(!db.profile_sharing(&group.id).await.unwrap());
+        assert_eq!(db.story_send_mode(&group.id).await.unwrap(), signal_store::StorySendMode::Always);
         let note = db.conversation(&ConversationId::direct(&me)).await.unwrap().unwrap();
         assert_eq!(note.kind, ConversationKind::NoteToSelf);
         assert_eq!(db.messages(&note.id, None, 10).await.unwrap().len(), 0, "the disappeared message isn't imported");

@@ -603,7 +603,7 @@ async fn seed_stories(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
     }
     let group = story(Some(PRIYA), Some("Priya Natarajan"), 3 * HOUR, Some(GROUP), text("Who's in for Saturday?", StoryFont::Serif, StoryBackground::Color(0xff2c5f45)));
     db.insert_story(&group, now).await?;
-    let reply = StoryReply { author: Some(aci(SAM).into()), author_name: Some("Sam Okafor".into()), sent_at: now - 2 * HOUR, body: "Me!".into(), emoji: None };
+    let reply = StoryReply { author: Some(aci(SAM).into()), author_name: Some("Sam Okafor".into()), sent_at: now - 2 * HOUR, body: "Me!".into(), emoji: None, deleted: false };
     db.add_story_reply(Some(aci(PRIYA)), group.sent_at, &reply).await?;
     // Ours, to My Story: seen by two, with a reply and a reaction.
     let mine = NewStory {
@@ -626,6 +626,7 @@ async fn seed_stories(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
         sent_at: now - ago,
         body: body.into(),
         emoji: emoji.then(|| body.into()),
+        deleted: false,
     };
     db.add_story_reply(None, mine.sent_at, &reply(MAYA, "Maya Chen", 45 * MINUTE, "Where to?", false)).await?;
     db.add_story_reply(None, mine.sent_at, &reply(JORDAN, "Jordan Reyes", 15 * MINUTE, "😮", true)).await?;
@@ -1663,8 +1664,27 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     emit(Event::StoriesChanged);
                 }
             }
-            // Demo stories are here already, and replies go nowhere.
-            Command::FetchStory { .. } | Command::ReplyToStory { .. } => {}
+            // Demo stories are here already.
+            Command::FetchStory { .. } => {}
+            // A group story's reply shows with it; one to one, it goes nowhere.
+            Command::ReplyToStory { id, body, emoji } => {
+                if let Ok(Some(story)) = db.story(id).await
+                    && story.group.is_some()
+                {
+                    let body = emoji.clone().unwrap_or_else(|| body.trim().to_owned());
+                    let reply = signal_store::StoryReply {
+                        author: None,
+                        author_name: None,
+                        sent_at: next_sent_at(),
+                        body,
+                        emoji,
+                        deleted: false,
+                    };
+                    if db.add_story_reply(story.author.as_deref(), story.sent_at, &reply).await.is_ok() {
+                        emit(Event::StoriesChanged);
+                    }
+                }
+            }
             // A posted story is ours here at once; nothing is sent. Story
             // lists share one story (and timestamp), as in `post_story`.
             Command::PostStory { story, targets } => {
@@ -1699,6 +1719,11 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                             }),
                         }
                     }
+                }
+                // Groups posted to stay on the list, as in `post_story`.
+                let modes: Vec<_> = groups.iter().map(|g| (g.clone(), signal_store::StorySendMode::Always)).collect();
+                if db.set_story_send_modes(&modes).await.unwrap_or(false) {
+                    emit(Event::StorySettingsChanged);
                 }
                 let to_lists = targets.iter().any(|t| !matches!(t, crate::StoryTarget::Group(_)));
                 let rows = to_lists.then_some(None).into_iter().chain(groups.into_iter().map(Some));
@@ -1784,6 +1809,30 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
             Command::SetStoryViewReceipts(on) => {
                 let _ = db.set_setting(crate::SETTING_STORY_VIEW_RECEIPTS, if on { "true" } else { "false" }).await;
                 emit(Event::StorySettingsChanged);
+            }
+            Command::SetStorySendMode { groups, mode } => {
+                let modes: Vec<_> = groups.into_iter().map(|g| (g, mode)).collect();
+                if db.set_story_send_modes(&modes).await.unwrap_or(false) {
+                    emit(Event::StorySettingsChanged);
+                }
+            }
+            // Gone here; there's no one to tell.
+            Command::DeleteStory { id } => {
+                if let Ok(Some(story)) = db.story(id).await
+                    && story.author.is_none()
+                    && let Ok(file) = db.remove_story(id).await
+                {
+                    if let Some(file) = file {
+                        let _ = std::fs::remove_file(file);
+                    }
+                    emit(Event::StoriesChanged);
+                }
+            }
+            Command::DeleteStoryReply { story, author, sent_at, for_everyone } => {
+                let for_everyone = for_everyone && author.is_none();
+                if db.remove_story_reply(story, author.as_deref(), sent_at, for_everyone).await.unwrap_or(false) {
+                    emit(Event::StoriesChanged);
+                }
             }
             Command::PressMegaphone { id, .. } => {
                 if megaphone.as_ref().is_some_and(|m| m.id == id) {

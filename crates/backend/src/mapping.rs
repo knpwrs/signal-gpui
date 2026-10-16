@@ -121,8 +121,10 @@ pub enum Action {
         reply: signal_store::StoryReply,
     },
     #[serde(skip)]
-    /// `viewer` viewed our stories sent at these times (a VIEWED receipt).
-    StoryViewed { viewer: String, sent_at: Vec<i64> },
+    /// `viewer` viewed our stories sent at these times (a VIEWED receipt
+    /// sent `at`: Desktop dates a view by the receipt's own timestamp,
+    /// `MessageReceipts`' `receiptTimestamp`).
+    StoryViewed { viewer: String, sent_at: Vec<i64>, at: i64 },
     #[serde(skip)]
     /// Who our story sent at `sent_at` goes to now, from another device.
     StoryRecipientUpdate { sent_at: i64, recipients: Vec<signal_store::StoryRecipient> },
@@ -455,7 +457,11 @@ pub fn map_content(content: &Content, ctx: &MapContext) -> Vec<Action> {
             let mut out: Vec<Action> = map_receipt(receipt).into_iter().collect();
             // A VIEWED receipt is also how a story's views are counted.
             if receipt.r#type() == receipt_message::Type::Viewed && !receipt.timestamp.is_empty() {
-                out.push(Action::StoryViewed { viewer: sender, sent_at: receipt.timestamp.iter().map(|t| *t as i64).collect() });
+                out.push(Action::StoryViewed {
+                    viewer: sender,
+                    sent_at: receipt.timestamp.iter().map(|t| *t as i64).collect(),
+                    at: envelope_ts,
+                });
             }
             out
         }
@@ -1079,7 +1085,7 @@ fn map_story_reply(
             group: conversation,
             story_author,
             story_sent_at,
-            reply: signal_store::StoryReply { author, author_name: None, sent_at: ts, body, emoji },
+            reply: signal_store::StoryReply { author, author_name: None, sent_at: ts, body, emoji, deleted: false },
         }];
     }
     let outgoing = author.is_none();
@@ -1091,7 +1097,7 @@ fn map_story_reply(
             group: conversation.clone(),
             story_author: None,
             story_sent_at,
-            reply: signal_store::StoryReply { author: author.clone(), author_name: None, sent_at: ts, body: body.clone(), emoji: emoji.clone() },
+            reply: signal_store::StoryReply { author: author.clone(), author_name: None, sent_at: ts, body: body.clone(), emoji: emoji.clone(), deleted: false },
         });
     }
     let text = match (&emoji, story_author.is_none()) {

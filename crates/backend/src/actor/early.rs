@@ -217,6 +217,8 @@ impl Actor {
         let message = match self.db.find_message(conversation, target_author.as_deref(), *target_sent_at).await {
             Ok(Some(message)) => message,
             Ok(None) if self.apply_story_delete(target_author.as_deref(), *target_sent_at).await => return Outcome::Applied,
+            // Or a reply to a group story.
+            Ok(None) if self.apply_story_reply_delete(conversation, target_author.as_deref(), *target_sent_at).await => return Outcome::Applied,
             Ok(None) => {
                 info!("keeping a delete for everyone until its message comes");
                 return Outcome::Missing;
