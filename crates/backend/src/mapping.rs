@@ -410,9 +410,15 @@ pub fn map_content(content: &Content, ctx: &MapContext) -> Vec<Action> {
     match &content.body {
         ContentBody::DataMessage(dm) => {
             let ts = dm.timestamp.map(|t| t as i64).unwrap_or(envelope_ts);
+            if body_too_long(dm, "message", ts) {
+                return Vec::new();
+            }
             map_data_message(dm, Origin::Incoming { sender }, ts, ctx)
         }
         ContentBody::EditMessage(edit) => {
+            if edit.data_message.as_ref().is_some_and(|dm| body_too_long(dm, "edit", envelope_ts)) {
+                return Vec::new();
+            }
             map_edit(edit, Origin::Incoming { sender }, envelope_ts, ctx).into_iter().collect()
         }
         ContentBody::SynchronizeMessage(sync) => map_sync(sync, envelope_ts, ctx),
@@ -428,6 +434,17 @@ pub fn map_content(content: &Content, ctx: &MapContext) -> Vec<Action> {
         ContentBody::TypingMessage(typing) => vec![map_typing(typing, sender)],
         _ => Vec::new(),
     }
+}
+
+/// Desktop's `MessageReceiver` drops a message or edit whose inline body is
+/// over 2 KiB (`isBodyTooLong`, in `handleDataMessage`, `handleEditMessage`,
+/// `handleSentMessage` and the sent edit's handler): a longer text comes as
+/// an attachment, so one that doesn't isn't from a Signal client. Logged,
+/// as Desktop logs it.
+fn body_too_long(dm: &DataMessage, what: &str, sent_at: i64) -> bool {
+    let Some(body) = dm.body.as_deref().filter(|body| crate::long_text::is_too_long(body)) else { return false };
+    tracing::warn!(length = body.len(), sent_at, "dropping a too-long {what}");
+    true
 }
 
 fn conversation_for(dm: &DataMessage, origin: &Origin) -> Option<ConversationId> {
@@ -1076,7 +1093,7 @@ fn map_sync(sync: &SyncMessage, envelope_ts: i64, ctx: &MapContext) -> Vec<Actio
     if let Some(sync_message::Content::Sent(sent)) = &sync.content {
         let destination = sent.parse_destination_service_id().map(|s| s.service_id_string());
         let ts = sent.timestamp.map(|t| t as i64).unwrap_or(envelope_ts);
-        if let Some(dm) = &sent.message {
+        if let Some(dm) = sent.message.as_ref().filter(|dm| !body_too_long(dm, "sent message", ts)) {
             out.extend(map_data_message(
                 dm,
                 Origin::Outgoing { destination: destination.clone() },
@@ -1084,7 +1101,9 @@ fn map_sync(sync: &SyncMessage, envelope_ts: i64, ctx: &MapContext) -> Vec<Actio
                 ctx,
             ));
         }
-        if let Some(edit) = &sent.edit_message {
+        if let Some(edit) = &sent.edit_message
+            && !edit.data_message.as_ref().is_some_and(|dm| body_too_long(dm, "sent edit", ts))
+        {
             out.extend(map_edit(edit, Origin::Outgoing { destination }, ts, ctx));
         }
         let recipients = story_recipients(&sent.story_message_recipients);

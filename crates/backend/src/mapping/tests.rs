@@ -242,6 +242,32 @@ fn incoming_edit() {
 }
 
 #[test]
+fn bodies_over_2_kib_are_dropped_as_desktop_drops_them() {
+    let limit = crate::long_text::MAX_BODY_BYTES;
+    let long = "a".repeat(limit + 1);
+    assert_eq!(map_content(&content(ALICE, text(&long, 300)), &ctx()), vec![]);
+    let edit = EditMessage { target_sent_timestamp: Some(100), data_message: Some(text(&long, 300)) };
+    assert_eq!(map_content(&content(ALICE, edit), &ctx()), vec![]);
+    let sync = |message: Option<DataMessage>, edit_message: Option<EditMessage>| SyncMessage {
+        content: Some(sync_message::Content::Sent(sync_message::Sent {
+            destination_service_id: Some(ALICE.into()),
+            timestamp: Some(700),
+            message,
+            edit_message,
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    assert_eq!(map_content(&content(ME, sync(Some(text(&long, 700)), None)), &ctx()), vec![]);
+    let edit = EditMessage { target_sent_timestamp: Some(100), data_message: Some(text(&long, 700)) };
+    assert_eq!(map_content(&content(ME, sync(None, Some(edit))), &ctx()), vec![]);
+    // Exactly 2 KiB is fine.
+    let most = "a".repeat(limit);
+    assert_eq!(map_content(&content(ALICE, text(&most, 300)), &ctx()).len(), 1);
+    assert_eq!(map_content(&content(ME, sync(Some(text(&most, 700)), None)), &ctx()).len(), 1);
+}
+
+#[test]
 fn sync_sent_transcript_is_outgoing() {
     let sync = SyncMessage {
         content: Some(sync_message::Content::Sent(sync_message::Sent {
