@@ -14,6 +14,7 @@ mod notifications;
 mod platform;
 mod prefs;
 mod recorder;
+mod reminders;
 mod sidebar_width;
 mod sounds;
 mod ringtone;

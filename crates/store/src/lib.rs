@@ -19,6 +19,7 @@ mod message_requests;
 mod nickname;
 mod poll;
 mod profile;
+mod reminders;
 mod stories;
 mod view_once;
 pub use call_history::*;
@@ -28,6 +29,7 @@ pub use message_requests::*;
 pub use nickname::*;
 pub use poll::*;
 pub use profile::*;
+pub use reminders::*;
 pub use stories::*;
 pub use view_once::*;
 

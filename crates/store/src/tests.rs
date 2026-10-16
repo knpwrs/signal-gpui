@@ -2269,3 +2269,37 @@ async fn user_messages_are_told_from_notices() {
     db.insert_message(&incoming("d:new", "alice", 20, "hi")).await.unwrap();
     assert!(db.has_user_messages(&chat).await.unwrap());
 }
+
+#[tokio::test]
+async fn unread_reminders_find_who_wrote_mentioned_and_replied() {
+    let db = test_db().await;
+    let chat = conv("g:aa");
+    let quote = |author: Option<&str>| Quote {
+        author: author.map(Into::into),
+        author_name: String::new(),
+        sent_at: 1,
+        text: "q".into(),
+        thumbnail: None,
+        attachment: None,
+        story: false,
+    };
+    // received_at is sent_at + 5.
+    db.insert_message(&incoming("g:aa", "alice", 100, "hi")).await.unwrap();
+    let mention = db.insert_message(&incoming("g:aa", "bob", 200, "@me")).await.unwrap();
+    db.set_mentions(mention, &[MentionSpan { start: 0, len: 1, aci: "me".into() }]).await.unwrap();
+    db.insert_message(&NewMessage { quote: Some(quote(None)), ..incoming("g:aa", "carol", 300, "re: yours") }).await.unwrap();
+    db.insert_message(&NewMessage { quote: Some(quote(Some("alice"))), ..incoming("g:aa", "dave", 400, "re: alice") }).await.unwrap();
+    db.insert_message(&outgoing("g:aa", 500, "mine")).await.unwrap();
+    db.insert_notice(&chat, 600, &Notice::Timer { by: None, seconds: 60 }).await.unwrap();
+
+    let ranges = db.unreminded_unread_ranges(&[(chat.clone(), 0), (conv("d:none"), 0)]).await.unwrap();
+    assert_eq!(ranges, vec![UnreadRange { conversation: chat.clone(), oldest_unreminded: 105, newest_unread: 405 }]);
+    // Since a reminder at 250, only what came after.
+    let ranges = db.unreminded_unread_ranges(&[(chat.clone(), 250)]).await.unwrap();
+    assert_eq!((ranges[0].oldest_unreminded, ranges[0].newest_unread), (305, 405));
+
+    let data = db.unread_reminder_data(&chat, "me").await.unwrap();
+    assert_eq!((data.unread, data.mentions, data.replies), (4, 1, 1));
+    assert_eq!(data.senders, ["dave", "carol", "bob", "alice"]);
+    assert_eq!((data.mentioners, data.repliers), (vec!["bob".to_owned()], vec!["carol".to_owned()]));
+}

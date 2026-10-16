@@ -328,3 +328,54 @@ fn muted_chats_let_through_what_desktop_does() {
     assert!(!allowed_while_muted(false, reply, &off) && allowed_while_muted(false, mention, &off));
     assert_eq!(crate::state::reaction_text("Maya", "👍", "See you at 9"), "Maya reacted 👍 to: See you at 9");
 }
+
+#[gpui_kit::test]
+fn an_unread_muted_chat_is_due_a_reminder(cx: &mut TestAppContext) {
+    use signal_store::{ChatState, ConversationId, DeliveryStatus, Direction, NewMessage};
+    let h = Harness::open(cx, Page::Notifications);
+    let now = chrono::Utc::now().timestamp_millis();
+    let day = 24 * 60 * 60 * 1000;
+    // A made-up muted group with two unread messages from five days ago,
+    // and reminders started a week ago.
+    let chat = ConversationId("g:0000000000000000000000000000000000000000000000000000000000000003".into());
+    let db = h.backend.db().clone();
+    let id = chat.clone();
+    futures::executor::block_on(h.backend.spawn(async move {
+        db.set_setting(crate::reminders::ENABLED_AT_KEY, &(now - 7 * day).to_string()).await?;
+        for (n, author) in [(1, "made-up-a"), (2, "made-up-b")] {
+            let at = now - 5 * day + n;
+            db.insert_message(&NewMessage {
+                conversation_id: id.clone(),
+                sent_at: at,
+                received_at: at,
+                direction: Direction::Incoming,
+                author: Some(author.into()),
+                author_name: None,
+                body: "old news".into(),
+                status: DeliveryStatus::Delivered,
+                quote: None,
+                attachments: Vec::new(),
+                link_preview: None,
+                expires_in: 0,
+            })
+            .await?;
+        }
+        db.apply_chat_states(&[ChatState { id: id.clone(), archived: false, muted_until: i64::MAX, marked_unread: false, blocked: false }])
+            .await
+    }))
+    .unwrap();
+    h.state.update(cx, |s, cx| s.reload_conversations(cx));
+    assert!(wait(cx, |cx| h.state.read_with(cx, |s, _| s.conversation(&chat).is_some_and(|c| c.muted && c.unread_count >= 2))));
+    let pick = |cx: &mut TestAppContext| {
+        let picked = h.state.read_with(cx, |s, _| s.pick_unread_reminder(now));
+        futures::executor::block_on(picked)
+    };
+    // Off by default.
+    assert_eq!(pick(cx), None);
+    h.click(cx, "unread-reminders");
+    let (due, data) = pick(cx).expect("a reminder is due");
+    assert_eq!(due, chat);
+    // (The demo's own unread messages there count too.)
+    assert!(data.senders.iter().any(|s| s == "made-up-b"), "{:?}", data.senders);
+    assert!(data.unread >= 2);
+}

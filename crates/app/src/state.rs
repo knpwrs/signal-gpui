@@ -372,6 +372,8 @@ pub struct AppState {
     /// Reaction notifications on screen per chat, taken down once it's
     /// opened (they don't make it unread).
     reaction_notifications: HashMap<ConversationId, Vec<String>>,
+    /// Checks for unread reminders hourly while an account is linked.
+    reminder_task: Option<Task<()>>,
 }
 
 impl EventEmitter<AppEvent> for AppState {}
@@ -389,6 +391,10 @@ pub enum ContactSync {
     /// They didn't come in time (Desktop's `syncFailed`).
     Failed,
 }
+
+/// The chat due an unread reminder, and its unread messages.
+pub type PickedReminder =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Option<(ConversationId, signal_store::ReminderData)>> + Send>>;
 
 /// What a new message says about us, for notifications in muted chats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -487,6 +493,7 @@ impl AppState {
             catching_up: None,
             held_notification: None,
             reaction_notifications: HashMap::new(),
+            reminder_task: None,
         };
         this.load_emoji_usage(cx);
         this.start_notifications(cx);
@@ -709,6 +716,139 @@ impl AppState {
         .detach();
     }
 
+    /// Desktop's unread reminder service: a first check a minute in, then
+    /// hourly (`UNREAD_REMINDER_POLL_INTERVAL`).
+    fn start_unread_reminders(&mut self, cx: &mut Context<Self>) {
+        self.reminder_task = Some(cx.spawn(async move |this, cx| {
+            let mut wait = std::time::Duration::from_secs(60);
+            loop {
+                cx.background_executor().timer(wait).await;
+                wait = crate::reminders::POLL_INTERVAL;
+                if this.update(cx, |this, cx| this.check_unread_reminders(cx)).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Desktop's `#doRefresh`: with notifications and unread reminders on,
+    /// reminds of one muted chat's unread messages, if one is due.
+    fn check_unread_reminders(&mut self, cx: &mut Context<Self>) {
+        let setting = self.notification_setting;
+        if self.notifier.is_none() || setting == crate::notifications::NotificationSetting::Off || self.catching_up.is_some() {
+            return;
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let pick = self.pick_unread_reminder(now);
+        cx.spawn(async move |this, cx| {
+            let Some((chat, data)) = pick.await else { return };
+            let _ = this.update(cx, |this, _| this.post_unread_reminder(chat, data, now));
+        })
+        .detach();
+    }
+
+    /// Desktop's `#isEligible`, `filterForConversationsDueReminder` and
+    /// `#getSummary`: the muted, unarchived chat (not Note to Self, not
+    /// blocked or left) whose unread messages are due a reminder, and what
+    /// they are. Also marks when reminders started, the first time.
+    pub fn pick_unread_reminder(&self, now: i64) -> PickedReminder {
+        use crate::reminders::{ENABLED_AT_KEY, MIN_INTERVAL_MS, REMINDED_KEY, Reminded};
+        let on = self.prefs.flag(signal_backend::AccountSetting::ShowUnreadReminders);
+        let eligible: Vec<ConversationId> = self
+            .conversations
+            .iter()
+            .filter(|c| {
+                c.kind != signal_store::ConversationKind::NoteToSelf
+                    && !c.id.is_signal()
+                    && !c.left
+                    && !c.blocked
+                    && !c.archived
+                    && c.muted
+                    && c.unread_count > 0
+            })
+            .map(|c| c.id.clone())
+            .collect();
+        let me = self.account.as_ref().map(|a| a.aci.clone()).unwrap_or_default();
+        let db = self.backend.db().clone();
+        let query = self.backend.spawn(async move {
+            let enabled_at = match db.setting(ENABLED_AT_KEY).await.ok().flatten().and_then(|v| v.parse::<i64>().ok()) {
+                Some(at) => at,
+                None => {
+                    let _ = db.set_setting(ENABLED_AT_KEY, &now.to_string()).await;
+                    now
+                }
+            };
+            if !on || eligible.is_empty() {
+                return None;
+            }
+            let reminded: Reminded =
+                db.setting(REMINDED_KEY).await.ok().flatten().and_then(|json| serde_json::from_str(&json).ok()).unwrap_or_default();
+            let chats: Vec<(ConversationId, i64)> = eligible
+                .into_iter()
+                .filter(|c| reminded.get(&c.0).is_none_or(|at| *at <= now - MIN_INTERVAL_MS))
+                .map(|c| {
+                    let since = reminded.get(&c.0).copied().unwrap_or(enabled_at);
+                    (c, since)
+                })
+                .collect();
+            let ranges = db.unreminded_unread_ranges(&chats).await.ok()?;
+            for chat in crate::reminders::due(ranges, now) {
+                if let Ok(data) = db.unread_reminder_data(&chat, &me).await
+                    && data.unread > 0
+                {
+                    return Some((chat, data));
+                }
+            }
+            None
+        });
+        Box::pin(query)
+    }
+
+    /// Shows an unread reminder and records it (Desktop's `#markReminded`).
+    fn post_unread_reminder(&mut self, chat: ConversationId, data: signal_store::ReminderData, now: i64) {
+        use crate::notifications::NotificationSetting;
+        use signal_backend::AccountSetting;
+        let Some(notifier) = self.notifier.clone() else { return };
+        // Desktop's short titles: a first name.
+        let name = |sid: &String| {
+            self.conversation(&ConversationId::direct(sid))
+                .and_then(|c| c.title.split_whitespace().next().map(str::to_owned))
+                .unwrap_or_else(|| "Unknown contact".into())
+        };
+        let summary = crate::reminders::Summary {
+            title: self.conversation(&chat).map(|c| c.title.clone()).unwrap_or_default(),
+            unread: data.unread,
+            mentions: if self.prefs.flag(AccountSetting::NotifyMentionsIfMuted) { data.mentions } else { 0 },
+            replies: if self.prefs.flag(AccountSetting::NotifyRepliesIfMuted) { data.replies } else { 0 },
+            senders: data.senders.iter().map(name).collect(),
+            mentioners: data.mentioners.iter().map(name).collect(),
+            repliers: data.repliers.iter().map(name).collect(),
+        };
+        let full = matches!(self.notification_setting, NotificationSetting::NameAndMessage | NotificationSetting::NameOnly);
+        let (title, body) = crate::reminders::content(&summary, full);
+        let id = format!("{}:unread-reminder", chat.0);
+        notifier.post(&crate::notifications::Notification {
+            id: &id,
+            conversation: &chat,
+            title: &title,
+            subtitle: None,
+            body: &body,
+            sound: self.prefs.on(crate::prefs::Toggle::NotificationSounds),
+        });
+        self.shown_notifications.entry(chat.clone()).or_default().push(id);
+        let db = self.backend.db().clone();
+        let save = self.backend.spawn(async move {
+            use crate::reminders::{REMINDED_KEY, Reminded};
+            let mut reminded: Reminded =
+                db.setting(REMINDED_KEY).await.ok().flatten().and_then(|json| serde_json::from_str(&json).ok()).unwrap_or_default();
+            reminded.insert(chat.0, now);
+            let json = serde_json::to_string(&reminded).unwrap_or_default();
+            db.set_setting(REMINDED_KEY, &json).await
+        });
+        // It runs on the backend whether or not this waits for it.
+        drop(save);
+    }
+
     /// Takes down notifications for chats that have been read (here or on
     /// another device) and updates the Dock's unread count.
     fn sync_notifications(&mut self) {
@@ -832,6 +972,7 @@ impl AppState {
                 self.reload_own_profile(cx);
                 self.reload_badges(cx);
                 self.start_catch_up(cx);
+                self.start_unread_reminders(cx);
             }
             Event::Connection(state) => {
                 // Desktop shows the app once the queue is drained, or when it
@@ -1067,6 +1208,7 @@ impl AppState {
                 self.history = None;
                 self.catching_up = None;
                 self.held_notification = None;
+                self.reminder_task = None;
                 self.screen = Screen::Link { url: None, error: None };
                 self.backend.send(Command::Link);
                 cx.emit(AppEvent::SelectionChanged);
