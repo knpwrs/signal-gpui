@@ -102,6 +102,8 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
                 .into(),
             ),
             can_label: Some(true),
+            // Any member may add people (Desktop's default).
+            can_add_members: Some(true),
             ..Default::default()
         },
     )
@@ -1100,11 +1102,32 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     members: Some(members),
                     admins: Some(vec![SELF.trim_start_matches("d:").into()]),
                     can_label: Some(true),
+                    can_add_members: Some(true),
                     ..Default::default()
                 };
                 let _ = db.upsert_conversation(&conversation, update).await;
                 let _ = events.unbounded_send(Event::ConversationsChanged);
                 emit(Event::GroupCreated(conversation));
+            }
+            Command::AddGroupMembers { conversation, members } => {
+                if let Ok(Some(chat)) = db.conversation(&conversation).await {
+                    let mut all = chat.members.clone();
+                    for member in members {
+                        if !all.contains(&member) {
+                            all.push(member.clone());
+                            let notice = signal_store::Notice::Group {
+                                by: None,
+                                change: signal_store::GroupNotice::Added { member: Some(member) },
+                            };
+                            if let Ok(Some(id)) = db.insert_notice(&conversation, now(), &notice).await {
+                                emit(Event::MessageChanged { conversation: conversation.clone(), message_id: id });
+                            }
+                        }
+                    }
+                    let update = ConversationUpdate { members: Some(all), ..Default::default() };
+                    let _ = db.upsert_conversation(&conversation, update).await;
+                }
+                let _ = events.unbounded_send(Event::ConversationsChanged);
             }
             Command::LeaveGroup { conversation } => {
                 let _ = db.set_left(&conversation, true).await;

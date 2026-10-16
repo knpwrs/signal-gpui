@@ -204,6 +204,14 @@ pub fn open(state: Entity<AppState>, conversation: Conversation, window: &mut Wi
                 )
             })
             .child(field("Members"))
+            // Desktop's `canAddNewMembers`.
+            .when(conversation.can_add_members && !conversation.left && !conversation.ended, |d| {
+                let (state, chat) = (state.clone(), conversation.clone());
+                d.child(div().child(Button::new("group-add-members").label("Add members").outline().on_click(move |_, window, cx| {
+                    window.close_all_dialogs(cx);
+                    crate::views::new_group::open_add_members(state.clone(), chat.clone(), window, cx);
+                })))
+            })
             .child(div().id("group-members").max_h(px(260.)).overflow_y_scroll().children(member_rows))
             .when(!conversation.left, |d| {
                 d.child(Button::new("group-leave").label("Leave group").danger().on_click(move |_, window, cx| {

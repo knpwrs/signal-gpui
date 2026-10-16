@@ -90,6 +90,10 @@ pub struct Conversation {
     pub member_labels: std::collections::BTreeMap<String, MemberLabel>,
     /// We may set our own member label.
     pub can_label: bool,
+    /// We may add people to the group (Desktop's `canAddNewMembers`).
+    pub can_add_members: bool,
+    /// An admin ended the group for everyone (Desktop's `terminated`).
+    pub ended: bool,
     /// Decrypted avatar image on disk, if one has been downloaded.
     pub avatar_path: Option<String>,
     /// Delivery status of the latest message when it is ours (for the
@@ -616,6 +620,9 @@ pub struct ConversationUpdate {
     pub admins: Option<Vec<String>>,
     pub member_labels: Option<std::collections::BTreeMap<String, MemberLabel>>,
     pub can_label: Option<bool>,
+    pub can_add_members: Option<bool>,
+    /// The group was ended for everyone.
+    pub ended: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -786,7 +793,7 @@ fn fts_query(input: &str) -> Option<String> {
 
 const CONVERSATION_COLUMNS: &str = "id, kind, title, phone, color, members, last_message_preview, \
      last_message_at, unread_count, pinned, (muted_until > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)) AS muted, muted_until, archived, \
-     marked_unread, blocked, draft, expire_timer, expire_timer_version, can_edit_info, left_group, description, admins, member_labels, can_label, avatar_path, \
+     marked_unread, blocked, draft, expire_timer, expire_timer_version, can_edit_info, left_group, description, admins, member_labels, can_label, can_add_members, group_ended, avatar_path, \
      (SELECT CASE WHEN m.direction = 1 AND m.deleted = 0 THEN m.status END FROM messages m \
       WHERE m.conversation_id = conversations.id AND m.notice IS NULL ORDER BY m.sent_at DESC, m.id DESC LIMIT 1) \
       AS last_outgoing_status";
@@ -951,6 +958,8 @@ fn conversation_from_row(row: &SqliteRow) -> Result<Conversation> {
             .transpose()?
             .unwrap_or_default(),
         can_label: row.try_get("can_label")?,
+        can_add_members: row.try_get("can_add_members")?,
+        ended: row.try_get("group_ended")?,
         avatar_path: row.try_get("avatar_path")?,
         last_outgoing_status: row.try_get::<Option<i64>, _>("last_outgoing_status")?.map(status_from_i64),
     })
@@ -1336,7 +1345,9 @@ impl AppDb {
                 description = CASE WHEN ? IS NULL THEN description ELSE NULLIF(?, '') END, \
                 admins = COALESCE(?, admins), \
                 member_labels = COALESCE(?, member_labels), \
-                can_label = COALESCE(?, can_label) \
+                can_label = COALESCE(?, can_label), \
+                can_add_members = COALESCE(?, can_add_members), \
+                group_ended = COALESCE(?, group_ended) \
              WHERE id = ?",
         )
         .bind(update.kind.map(kind_to_str))
@@ -1351,6 +1362,8 @@ impl AppDb {
         .bind(update.admins.map(|a| serde_json::to_string(&a)).transpose()?)
         .bind(update.member_labels.map(|l| serde_json::to_string(&l)).transpose()?)
         .bind(update.can_label)
+        .bind(update.can_add_members)
+        .bind(update.ended)
         .bind(&id.0)
         .execute(&mut *tx)
         .await?;

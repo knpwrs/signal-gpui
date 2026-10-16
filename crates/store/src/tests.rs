@@ -93,6 +93,20 @@ async fn conversation_upsert_and_ordering() {
 }
 
 #[tokio::test]
+async fn groups_keep_who_may_add_and_whether_they_ended() {
+    let db = test_db().await;
+    let group = conv("g:0a");
+    db.upsert_conversation(&group, ConversationUpdate { can_add_members: Some(true), ..Default::default() }).await.unwrap();
+    let stored = db.conversation(&group).await.unwrap().unwrap();
+    assert!(stored.can_add_members);
+    assert!(!stored.ended, "a group hasn't ended until an admin ends it");
+    // Unset fields keep their values.
+    db.upsert_conversation(&group, ConversationUpdate { ended: Some(true), ..Default::default() }).await.unwrap();
+    let stored = db.conversation(&group).await.unwrap().unwrap();
+    assert!(stored.can_add_members && stored.ended);
+}
+
+#[tokio::test]
 async fn insert_dedupes_and_tracks_unread_and_preview() {
     let db = test_db().await;
     let id1 = db.insert_message(&incoming("g:aa", "bob", 10, "first")).await.unwrap();
@@ -843,6 +857,8 @@ async fn drop_later_migrations(db: &AppDb) {
     sqlx::query("ALTER TABLE messages DROP COLUMN poll").execute(&db.writer).await.unwrap();
     sqlx::query("DROP TABLE contact_nicknames").execute(&db.writer).await.unwrap();
     sqlx::query("DROP TABLE early_events").execute(&db.writer).await.unwrap();
+    sqlx::query("ALTER TABLE conversations DROP COLUMN can_add_members").execute(&db.writer).await.unwrap();
+    sqlx::query("ALTER TABLE conversations DROP COLUMN group_ended").execute(&db.writer).await.unwrap();
 }
 
 /// Rewrites the migration history to look like a pre-squash database that

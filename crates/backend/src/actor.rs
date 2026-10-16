@@ -659,6 +659,7 @@ impl Actor {
                 Command::ClearCallHistory => self.clear_call_history().await,
                 Command::Unlink => self.unlink().await,
                 Command::SkipHistory => self.skip_history().await,
+                Command::AddGroupMembers { conversation, members } => self.add_group_members(conversation, members).await,
                 Command::RefreshRemoteConfig => self.maybe_refresh_remote_config().await,
             }
         });
@@ -1294,6 +1295,12 @@ impl Actor {
             let key = self.store.profile_key(&ServiceId::from(aci)).await.ok().flatten();
             candidates.push((aci, key));
         }
+        // Desktop's `createGroupV2` refuses more than the hard limit,
+        // counting us (the UI stops picking people before that).
+        let limit = crate::remote_config().group_size_hard_limit();
+        if candidates.len() + 1 > limit {
+            return self.emit(Event::Error(format!("Signal groups can have a maximum of {limit} members.")));
+        }
         let key: [u8; 32] = rand::Rng::random(&mut rand::rng());
         let created = async {
             let session = crate::groups::GroupSession::new(&manager, key).await?;
@@ -1318,6 +1325,52 @@ impl Actor {
             ..Default::default()
         };
         self.enqueue(Outbound::Send { conversation, body: data.into(), timestamp, message: None });
+    }
+
+    /// Desktop's "Add members" (`addMembersToGroup`): people we have a
+    /// profile key for join, the rest are invited. Past the group size hard
+    /// limit, counting members and invitations, nothing is changed.
+    async fn add_group_members(self: Rc<Self>, conversation: ConversationId, members: Vec<String>) {
+        let result = async {
+            let manager = self.manager().ok_or_else(|| anyhow::anyhow!("not connected"))?;
+            let key: [u8; 32] =
+                conversation.as_group().and_then(|k| k.try_into().ok()).ok_or_else(|| anyhow::anyhow!("not a group"))?;
+            let me = Aci::parse_from_service_id_string(&self.self_aci()).ok_or_else(|| anyhow::anyhow!("no account"))?;
+            let session = crate::groups::GroupSession::new(&manager, key).await?;
+            let current = session.fetch().await?;
+            if current.terminated {
+                anyhow::bail!("the group has ended");
+            }
+            let mut people = Vec::new();
+            for sid in &members {
+                let Some(aci) = Aci::parse_from_service_id_string(sid) else { continue };
+                let already = current.members.iter().any(|m| m.aci == aci)
+                    || current.members_pending_profile_key.iter().any(|m| m.address == ServiceId::from(aci));
+                if !already {
+                    people.push((aci, self.store.profile_key(&ServiceId::from(aci)).await.ok().flatten()));
+                }
+            }
+            if people.is_empty() {
+                return Ok(());
+            }
+            let limit = crate::remote_config().group_size_hard_limit();
+            if current.members.len() + current.members_pending_profile_key.len() + people.len() > limit {
+                anyhow::bail!("Signal groups can have a maximum of {limit} members.");
+            }
+            let mut adds = presage::proto::group_change::Actions::default();
+            session.add_members_actions(&current, me, &people, &mut adds).await?;
+            self.change_group_in(&session, &conversation, key, &current, move |_, actions| {
+                actions.add_members = adds.add_members;
+                actions.add_members_pending_profile_key = adds.add_members_pending_profile_key;
+                actions.delete_members_banned = adds.delete_members_banned;
+                Ok(())
+            })
+            .await
+        }
+        .await;
+        if let Err(error) = result {
+            self.error("couldn't add members", format!("{error:#}"));
+        }
     }
 
     /// Our label in a group (Signal's member labels), encrypted like other
@@ -1397,6 +1450,22 @@ impl Actor {
             conversation.as_group().and_then(|k| k.try_into().ok()).ok_or_else(|| anyhow::anyhow!("not a group"))?;
         let session = crate::groups::GroupSession::new(&manager, key).await?;
         let current = session.fetch().await?;
+        self.change_group_in(&session, conversation, key, &current, build).await
+    }
+
+    /// [`Self::change_group`] with the session and the group as it is now
+    /// already in hand.
+    async fn change_group_in(
+        self: &Rc<Self>,
+        session: &crate::groups::GroupSession,
+        conversation: &ConversationId,
+        key: [u8; 32],
+        current: &presage::libsignal_service::groups_v2::Group,
+        build: impl FnOnce(
+            &presage::libsignal_service::groups_v2::GroupOperations,
+            &mut presage::proto::group_change::Actions,
+        ) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         let mut actions = presage::proto::group_change::Actions { version: current.version + 1, ..Default::default() };
         build(&session.operations, &mut actions)?;
         let signed = session.modify(actions).await?;
@@ -2349,7 +2418,9 @@ impl Actor {
             members.sort();
             let me = self.self_aci();
             // Our stored copy of a group we've left still lists us.
-            let left = self.db.conversation(conversation).await.ok().flatten().is_some_and(|c| c.left);
+            let stored = self.db.conversation(conversation).await.ok().flatten();
+            let left = stored.as_ref().is_some_and(|c| c.left);
+            let ended = stored.as_ref().is_some_and(|c| c.ended);
             let can_edit_info = !left && mapping::can_edit_group_info(&group, &me);
             let admins: Vec<String> = group
                 .members
@@ -2366,7 +2437,9 @@ impl Actor {
                 })
                 .collect();
             let can_label = !left && mapping::can_set_member_label(&group, &me);
+            let can_add_members = !left && !ended && mapping::can_add_group_members(&group, &me);
             return Some(ConversationUpdate {
+                can_add_members: Some(can_add_members),
                 kind: Some(ConversationKind::Group),
                 member_labels: Some(member_labels),
                 can_label: Some(can_label),
@@ -2418,6 +2491,8 @@ impl Actor {
             admins: None,
             member_labels: None,
             can_label: None,
+            can_add_members: None,
+            ended: None,
         })
     }
 
@@ -2451,6 +2526,7 @@ impl Actor {
                     || update.expire_timer.is_some_and(|t| t != conversation.expire_timer)
                     || update.can_edit_info.is_some_and(|v| v != conversation.can_edit_info)
                     || update.can_label.is_some_and(|v| v != conversation.can_label)
+                    || update.can_add_members.is_some_and(|v| v != conversation.can_add_members)
                     || update.admins.as_ref().is_some_and(|a| *a != conversation.admins)
                     || update.member_labels.as_ref().is_some_and(|l| *l != conversation.member_labels)
                     || update.description.as_ref().is_some_and(|d| Some(d).filter(|d| !d.is_empty()) != conversation.description.as_ref());

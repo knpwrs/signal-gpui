@@ -171,6 +171,49 @@ impl GroupSession {
         Ok(())
     }
 
+    /// Actions adding people to this group, as Desktop's
+    /// `buildAddMembersChange` (`ts/groups.preload.ts`): those whose profile
+    /// key we have (and whose credential we get) join at once, the rest are
+    /// invited; anyone banned is unbanned.
+    pub(crate) async fn add_members_actions(
+        &self,
+        current: &Group,
+        me: Aci,
+        people: &[(Aci, Option<ProfileKey>)],
+        actions: &mut proto::group_change::Actions,
+    ) -> anyhow::Result<()> {
+        use presage::libsignal_service::groups_v2::Role;
+        for (aci, key) in people {
+            let credential = match key {
+                Some(key) => self.profile_key_credential(*aci, *key).await.ok(),
+                None => None,
+            };
+            match credential {
+                Some(credential) => actions.add_members.push(self.operations.build_add_member_action_with_credential(
+                    &credential,
+                    Role::Default,
+                    &self.params,
+                )),
+                None => actions.add_members_pending_profile_key.push(
+                    self.operations
+                        .build_add_pending_member_action((*aci).into(), me, Role::Default)
+                        .map_err(|e| anyhow!("{e:?}"))?,
+                ),
+            }
+            let service_id: presage::libsignal_service::protocol::ServiceId = (*aci).into();
+            if current.members_banned.iter().any(|b| b.user_id == service_id) {
+                // The encrypted id, as an invitation's removal names it.
+                let deleted_user_id = self
+                    .operations
+                    .build_remove_pending_member_action(service_id)
+                    .map_err(|e| anyhow!("{e:?}"))?
+                    .deleted_user_id;
+                actions.delete_members_banned.push(proto::group_change::actions::DeleteMemberBannedAction { deleted_user_id });
+            }
+        }
+        Ok(())
+    }
+
     /// The group as the server has it now.
     pub(crate) async fn fetch(&self) -> anyhow::Result<Group> {
         let response = self.request(reqwest::Method::GET)?.send().await?.error_for_status()?;

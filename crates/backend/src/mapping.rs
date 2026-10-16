@@ -316,6 +316,16 @@ pub fn can_edit_group_info(group: &presage::model::groups::Group, me: &str) -> b
     }
 }
 
+/// Whether `me` may add people to the group (Desktop's `canAddNewMembers`,
+/// `ts/util/canAddNewMembers.preload.ts`): admins, or anyone when its member
+/// access is "members". Leaving and ended groups are the caller's to check.
+pub fn can_add_group_members(group: &presage::model::groups::Group, me: &str) -> bool {
+    use presage::libsignal_service::groups_v2::{AccessRequired, Role};
+    let Some(member) = group.members.iter().find(|m| m.aci.service_id_string() == me) else { return false };
+    member.role == Role::Administrator
+        || group.access_control.as_ref().is_some_and(|a| a.members == AccessRequired::Member)
+}
+
 /// The new `(timer, version)` after someone else's timer (Desktop's
 /// `updateExpirationTimer`), or `None` to leave `current` alone. In 1:1
 /// chats a message's timer applies only if its version is at least ours

@@ -219,7 +219,8 @@ pub(crate) struct Imported {
 enum Who {
     Me,
     Contact { sid: String, name: String, e164: Option<String>, blocked: bool },
-    Group { key: Vec<u8>, title: String, members: Vec<String>, blocked: bool },
+    /// `ended`: an admin ended it for everyone (`GroupSnapshot.terminated`).
+    Group { key: Vec<u8>, title: String, members: Vec<String>, blocked: bool, ended: bool },
     Other,
 }
 
@@ -275,7 +276,8 @@ fn who(recipient: &proto::Recipient) -> Who {
             let mut members: Vec<String> =
                 snapshot.map(|s| s.members.iter().filter_map(|m| uuid_sid(&m.userId)).collect()).unwrap_or_default();
             members.sort();
-            Who::Group { key: group.masterKey.clone(), title, members, blocked: group.blocked }
+            let ended = snapshot.is_some_and(|s| s.terminated);
+            Who::Group { key: group.masterKey.clone(), title, members, blocked: group.blocked, ended }
         }
         // The phone's release notes chat is Desktop's Signal chat.
         Some(Destination::ReleaseNotes(_)) => Who::Contact {
@@ -333,12 +335,14 @@ pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: imp
                         },
                         *blocked,
                     ),
-                    Who::Group { key, title, members, blocked } => (
+                    Who::Group { key, title, members, blocked, ended } => (
                         ConversationId::group(key),
                         ConversationUpdate {
                             kind: Some(ConversationKind::Group),
                             title: Some(title.clone()).filter(|t| !t.is_empty()),
                             members: Some(members.clone()),
+                            // Never un-ends one ended while importing.
+                            ended: ended.then_some(true),
                             ..Default::default()
                         },
                         *blocked,
@@ -830,6 +834,8 @@ mod tests {
         let mut member = proto::group::Member::new();
         member.userId = alice.to_vec();
         snapshot.members.push(member);
+        // An admin ended it.
+        snapshot.terminated = true;
         group.snapshot = Some(snapshot).into();
         push(recipient(3, Destination::Group(group)));
         push(recipient(4, Destination::ReleaseNotes(Default::default())));
@@ -993,6 +999,7 @@ mod tests {
         assert_eq!((alice.title.as_str(), alice.phone.as_deref(), alice.pinned), ("Alice Liddell", Some("+15550100"), true));
         let group = db.conversation(&ConversationId::group(&[9; 32])).await.unwrap().unwrap();
         assert_eq!((group.title.as_str(), group.archived, group.members.clone()), ("Hikers", true, vec![alice_sid.clone()]));
+        assert!(group.ended, "the snapshot says it was ended");
         let note = db.conversation(&ConversationId::direct(&me)).await.unwrap().unwrap();
         assert_eq!(note.kind, ConversationKind::NoteToSelf);
         assert_eq!(db.messages(&note.id, None, 10).await.unwrap().len(), 0, "the disappeared message isn't imported");

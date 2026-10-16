@@ -1115,3 +1115,40 @@ fn polls_votes_and_ends_follow_desktop() {
         vec![Action::PollEnd { conversation: ConversationId::group(&group_key()), by: Some(ALICE.into()), target_sent_at: 100, sent_at: 300 }]
     );
 }
+
+#[test]
+fn who_may_add_members_follows_member_access() {
+    use presage::libsignal_service::groups_v2::{AccessRequired, Role};
+    use presage::libsignal_service::prelude::ProfileKey;
+    use presage::libsignal_service::protocol::Aci;
+    use presage::model::groups::{AccessControl, Group, Member};
+    let member = |sid: &str, role| Member {
+        aci: Aci::parse_from_service_id_string(sid).unwrap(),
+        role,
+        profile_key: ProfileKey::create([0; 32]),
+        joined_at_revision: 0,
+        label: None,
+        label_emoji: None,
+    };
+    let group = |members_access| Group {
+        title: "Hikers".into(),
+        avatar: String::new(),
+        disappearing_messages_timer: None,
+        access_control: Some(AccessControl {
+            attributes: AccessRequired::Member,
+            members: members_access,
+            add_from_invite_link: AccessRequired::Unsatisfiable,
+            member_label: AccessRequired::Member,
+        }),
+        revision: 1,
+        members: vec![member(ME, Role::Default), member(ALICE, Role::Administrator)],
+        pending_members: vec![],
+        requesting_members: vec![],
+        invite_link_password: vec![],
+        description: None,
+    };
+    assert!(can_add_group_members(&group(AccessRequired::Member), ME));
+    assert!(!can_add_group_members(&group(AccessRequired::Administrator), ME), "admins only");
+    assert!(can_add_group_members(&group(AccessRequired::Administrator), ALICE), "an admin always may");
+    assert!(!can_add_group_members(&group(AccessRequired::Member), BOB), "not in the group");
+}

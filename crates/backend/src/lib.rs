@@ -206,6 +206,9 @@ pub enum Command {
     LeaveGroup { conversation: ConversationId },
     /// Creates a group with us as its admin; answered with `Event::GroupCreated`.
     CreateGroup { title: String, members: Vec<String> },
+    /// Adds people (ACIs) to a group, inviting those whose profile key we
+    /// don't have (Desktop's "Add members").
+    AddGroupMembers { conversation: ConversationId, members: Vec<String> },
     /// Sets (or with an empty `text`, clears) our label in a group.
     SetMemberLabel { conversation: ConversationId, emoji: Option<String>, text: String },
     /// Computes a 1:1 chat's safety number; answered with `Event::SafetyNumber`.
