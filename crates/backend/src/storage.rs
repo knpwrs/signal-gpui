@@ -1112,10 +1112,11 @@ mod tests {
 
     #[test]
     fn pin_limit_counts_every_entry() {
-        let pins = (0..crate::remote_config().pinned_chat_limit() as u8).map(|i| pin_for(&ConversationId::group(&[i; 32])).unwrap()).collect();
+        let limit = crate::remote_config().pinned_chat_limit();
+        let pins = (0..limit as u8).map(|i| pin_for(&ConversationId::group(&[i; 32])).unwrap()).collect();
         let record = account_record(&AccountRecord { pinned_conversations: pins, ..Default::default() });
         let error = edit_pins(&record, &PinEdit::Pin(ConversationId::direct(ACI))).unwrap_err();
-        assert!(error.to_string().contains("up to 4"), "{error}");
+        assert!(error.to_string().contains(&format!("up to {limit}")), "{error}");
         // Unpinning still works at the limit.
         assert!(edit_pins(&record, &PinEdit::Unpin(ConversationId::group(&[0; 32]))).unwrap().is_some());
     }
