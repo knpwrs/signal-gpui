@@ -61,6 +61,8 @@ pub(crate) struct StorageContact {
     /// The record has a name from the phone's address book (Desktop's
     /// `isInSystemContacts`: `systemGivenName` and the rest).
     pub system_name: bool,
+    /// Their username (Desktop's `contactRecord.username`).
+    pub username: Option<String>,
 }
 
 /// What we read from the Storage Service.
@@ -97,6 +99,45 @@ pub(crate) struct StorageSnapshot {
     pub backup_tier: Option<u64>,
     /// What key transparency needs from the account record.
     pub identifiers: Option<AccountIdentifiers>,
+    /// Our profile as the account record has it.
+    pub own_profile: Option<OwnProfileRecord>,
+}
+
+/// What the account record says about our profile and username (Desktop's
+/// `mergeAccountRecord`): our name, our photo's CDN path, our profile key
+/// (the primary's, which a linked device follows), our username link and
+/// whether our number is shared with everybody.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct OwnProfileRecord {
+    pub given_name: String,
+    pub family_name: String,
+    pub avatar_url_path: Option<String>,
+    pub profile_key: Option<[u8; 32]>,
+    pub username_link: Option<crate::usernames::UsernameLink>,
+    /// Desktop's `phoneNumberSharingMode` merge: unset or EVERYBODY share,
+    /// UNKNOWN and NOBODY don't. proto3 can't tell unset from UNKNOWN (0),
+    /// so 0 shares, as an unset field would.
+    pub sharing_number: bool,
+}
+
+impl OwnProfileRecord {
+    pub(crate) fn from_record(account: &AccountRecord) -> Self {
+        use presage::proto::account_record::PhoneNumberSharingMode;
+        let link = account.username_link.as_ref().filter(|l| !l.entropy.is_empty() && !l.server_id.is_empty());
+        Self {
+            given_name: account.given_name.trim().to_owned(),
+            family_name: account.family_name.trim().to_owned(),
+            avatar_url_path: Some(account.avatar_url_path.clone()).filter(|p| !p.is_empty()),
+            profile_key: account.profile_key.as_slice().try_into().ok(),
+            username_link: link.map(|l| crate::usernames::UsernameLink {
+                entropy: l.entropy.clone(),
+                server_id: l.server_id.clone(),
+                // Desktop: a color it doesn't know is 0.
+                color: if (0..=8).contains(&l.color) { l.color } else { 0 },
+            }),
+            sharing_number: account.phone_number_sharing_mode != PhoneNumberSharingMode::Nobody as i32,
+        }
+    }
 }
 
 /// A call link record (Desktop's `mergeCallLinkRecord`): only links we're
@@ -206,6 +247,7 @@ pub(crate) async fn fetch(manager: &SignalManager) -> anyhow::Result<StorageSnap
                     snapshot.pinned = Some(pinned(&account));
                     snapshot.settings = account_settings(&account);
                     snapshot.identifiers = Some(AccountIdentifiers::from_record(&account));
+                    snapshot.own_profile = Some(OwnProfileRecord::from_record(&account));
                     snapshot.stories_disabled = Some(account.stories_disabled);
                     snapshot.my_story_privacy_set = Some(account.has_set_my_stories_privacy);
                     // Desktop's `saveBackupTier(toNumber(backupTier))`:
@@ -500,6 +542,102 @@ pub(crate) fn edit_account(record: &[u8], edits: &[AccountEdit]) -> anyhow::Resu
 
 /// Changes settings in the account record, for the whole account.
 pub(crate) async fn write_account(manager: &SignalManager, edits: &[AccountEdit]) -> anyhow::Result<()> {
+    write_account_with(manager, |record| edit_account(record, edits)).await
+}
+
+/// A change to one of the account record's string or message fields.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum AccountFieldEdit {
+    /// `givenName` and `familyName` (Desktop's `toAccountRecord` writes
+    /// our profile name there).
+    Name { given: String, family: String },
+    /// `avatarUrlPath`: our photo's CDN path (`None`: no photo).
+    AvatarPath(Option<String>),
+    /// `username`.
+    Username(Option<String>),
+    /// `usernameLink`.
+    UsernameLink(Option<crate::usernames::UsernameLink>),
+}
+
+const ACCOUNT_GIVEN_NAME: u32 = 2;
+const ACCOUNT_FAMILY_NAME: u32 = 3;
+const ACCOUNT_AVATAR_URL_PATH: u32 = 4;
+const ACCOUNT_USERNAME: u32 = 33;
+const ACCOUNT_USERNAME_LINK: u32 = 35;
+
+impl AccountFieldEdit {
+    /// The fields it sets and their encoded values (empty: left out).
+    fn fields(&self) -> Vec<(u32, Vec<u8>)> {
+        match self {
+            Self::Name { given, family } => {
+                vec![(ACCOUNT_GIVEN_NAME, given.as_bytes().to_vec()), (ACCOUNT_FAMILY_NAME, family.as_bytes().to_vec())]
+            }
+            Self::AvatarPath(path) => vec![(ACCOUNT_AVATAR_URL_PATH, path.clone().unwrap_or_default().into_bytes())],
+            Self::Username(username) => vec![(ACCOUNT_USERNAME, username.clone().unwrap_or_default().into_bytes())],
+            Self::UsernameLink(link) => {
+                let encoded = link
+                    .as_ref()
+                    .map(|l| {
+                        presage::proto::account_record::UsernameLink {
+                            entropy: l.entropy.clone(),
+                            server_id: l.server_id.clone(),
+                            color: l.color,
+                        }
+                        .encode_to_vec()
+                    })
+                    .unwrap_or_default();
+                vec![(ACCOUNT_USERNAME_LINK, encoded)]
+            }
+        }
+    }
+}
+
+/// Sets length-delimited field `number` of an encoded message to `value`
+/// (empty leaves it out, as proto3 writes it), keeping every other byte.
+/// `Ok(None)` when it's already that.
+fn set_bytes(message: &[u8], number: u32, value: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+    let fields = wire::fields(message).context("malformed record")?;
+    let current = fields.iter().rev().find(|f| f.number == number).and_then(|f| f.payload).unwrap_or_default();
+    if current == value {
+        return Ok(None);
+    }
+    let mut edited = Vec::with_capacity(message.len() + value.len() + 4);
+    for field in fields.iter().filter(|f| f.number != number) {
+        edited.extend_from_slice(field.raw);
+    }
+    if !value.is_empty() {
+        wire::put_len(&mut edited, number, value);
+    }
+    Ok(Some(edited))
+}
+
+/// Applies `edits` to an encoded `StorageRecord` holding the account
+/// record, changing only those fields. `Ok(None)` when they're all set.
+pub(crate) fn edit_account_fields(record: &[u8], edits: &[AccountFieldEdit]) -> anyhow::Result<Option<Vec<u8>>> {
+    edit_inner(record, RECORD_ACCOUNT, |account| {
+        let mut current = account.to_vec();
+        let mut changed = false;
+        for (number, value) in edits.iter().flat_map(AccountFieldEdit::fields) {
+            if let Some(edited) = set_bytes(&current, number, &value)? {
+                current = edited;
+                changed = true;
+            }
+        }
+        Ok(changed.then_some(current))
+    })
+}
+
+/// Changes our profile's fields in the account record, for the whole account.
+pub(crate) async fn write_account_fields(manager: &SignalManager, edits: &[AccountFieldEdit]) -> anyhow::Result<()> {
+    write_account_with(manager, |record| edit_account_fields(record, edits)).await
+}
+
+/// Rewrites the account record with `edit`, retrying when another device
+/// wrote first.
+async fn write_account_with(
+    manager: &SignalManager,
+    edit: impl Fn(&[u8]) -> anyhow::Result<Option<Vec<u8>>>,
+) -> anyhow::Result<()> {
     let session = Session::new(manager).await?;
     for _ in 0..3 {
         let manifest = session.manifest().await?;
@@ -511,7 +649,7 @@ pub(crate) async fn write_account(manager: &SignalManager, edits: &[AccountEdit]
             .map(|id| id.raw.clone())
             .context("storage has no account record")?;
         let record = session.read_raw(&old_key, ikm).await?;
-        let Some(record) = edit_account(&record, edits)? else { return Ok(()) };
+        let Some(record) = edit(&record)? else { return Ok(()) };
         if session.commit(manager, &manifest, Some(&old_key), IdentifierType::Account, &record).await? {
             return Ok(());
         }
@@ -1121,6 +1259,7 @@ pub(crate) fn from_record(record: &ContactRecord) -> Option<StorageContact> {
             .iter()
             .any(|n| !n.trim().is_empty()),
         nickname,
+        username: Some(record.username.trim().to_owned()).filter(|u| !u.is_empty()),
     })
 }
 
@@ -1307,6 +1446,61 @@ mod tests {
         assert!(error.to_string().contains(&format!("up to {limit}")), "{error}");
         // Unpinning still works at the limit.
         assert!(edit_pins(&record, &PinEdit::Unpin(ConversationId::group(&[0; 32]))).unwrap().is_some());
+    }
+
+    #[test]
+    fn profile_field_edits_keep_unknown_fields() {
+        use crate::usernames::UsernameLink;
+        let contains = |haystack: &[u8], needle: &[u8]| haystack.windows(needle.len()).any(|w| w == needle);
+        let account = AccountRecord { given_name: "Old".into(), read_receipts: true, ..Default::default() };
+        let mut account_bytes = account.encode_to_vec();
+        wire::put_len(&mut account_bytes, 999, b"future account field");
+        let mut record = Vec::new();
+        wire::put_len(&mut record, RECORD_ACCOUNT, &account_bytes);
+        let link = UsernameLink { entropy: vec![1; 32], server_id: vec![2; 16], color: 5 };
+        let edits = [
+            AccountFieldEdit::Name { given: "Sam".into(), family: "Rivera".into() },
+            AccountFieldEdit::AvatarPath(Some("profiles/abc".into())),
+            AccountFieldEdit::Username(Some("trail_mix.42".into())),
+            AccountFieldEdit::UsernameLink(Some(link.clone())),
+        ];
+        let edited = edit_account_fields(&record, &edits).unwrap().unwrap();
+        let account = decode_account(&edited);
+        assert_eq!((account.given_name.as_str(), account.family_name.as_str()), ("Sam", "Rivera"));
+        assert_eq!((account.avatar_url_path.as_str(), account.username.as_str()), ("profiles/abc", "trail_mix.42"));
+        assert!(account.read_receipts);
+        assert!(contains(&edited, b"future account field"));
+        let own = OwnProfileRecord::from_record(&account);
+        assert_eq!(own.username_link, Some(link));
+        assert_eq!(own.avatar_url_path.as_deref(), Some("profiles/abc"));
+        assert!(own.sharing_number, "unset shares, as Desktop merges it");
+        // Again changes nothing; clearing leaves the fields out.
+        assert_eq!(edit_account_fields(&edited, &edits).unwrap(), None);
+        let cleared = edit_account_fields(
+            &edited,
+            &[AccountFieldEdit::Username(None), AccountFieldEdit::UsernameLink(None), AccountFieldEdit::AvatarPath(None)],
+        )
+        .unwrap()
+        .unwrap();
+        let account = decode_account(&cleared);
+        assert_eq!((account.username.as_str(), account.username_link, account.avatar_url_path.as_str()), ("", None, ""));
+        assert!(contains(&cleared, b"future account field"));
+    }
+
+    #[test]
+    fn contact_records_carry_usernames() {
+        let record = ContactRecord {
+            aci: ACI.into(),
+            system_given_name: "Maya".into(),
+            system_family_name: "Chen".into(),
+            username: "maya.42".into(),
+            ..Default::default()
+        };
+        let contact = from_record(&record).unwrap();
+        assert_eq!((contact.system_name, contact.username.as_deref()), (true, Some("maya.42")));
+        let record = ContactRecord { aci: ACI.into(), given_name: "Maya".into(), ..Default::default() };
+        let contact = from_record(&record).unwrap();
+        assert_eq!((contact.system_name, contact.username), (false, None));
     }
 
     #[test]

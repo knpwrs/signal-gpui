@@ -791,6 +791,14 @@ impl AppState {
             Event::AuthorNamesChanged(names) => cx.emit(AppEvent::AuthorNamesChanged(names.into())),
             // Limits and features read it when drawn: just redraw.
             Event::RemoteConfigChanged => cx.emit(AppEvent::ConversationsChanged),
+            // Shown by the profile and contact views, added next.
+            Event::ProfileChanged(_)
+            | Event::OwnProfileChanged
+            | Event::BadgesChanged
+            | Event::ProfileSaved(_)
+            | Event::UsernameReserved { .. }
+            | Event::UsernameSaved(_)
+            | Event::UsernameLinkReset(_) => {}
             Event::Error(error) => {
                 tracing::warn!("backend error: {error}");
                 self.report_error(error, cx);

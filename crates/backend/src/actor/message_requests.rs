@@ -107,7 +107,7 @@ impl Actor {
                 self.download_held(conversation).await;
             }
             if local && !group {
-                self.send_profile_key(conversation);
+                self.send_profile_key(conversation).await;
             }
         } else {
             let block = answer.blocks();
@@ -199,12 +199,13 @@ impl Actor {
 
     /// Our profile key, to someone whose request we accepted (Desktop's
     /// `sendProfileKeyUpdate`: a data message with `PROFILE_KEY_UPDATE`).
-    fn send_profile_key(&self, conversation: &ConversationId) {
+    async fn send_profile_key(&self, conversation: &ConversationId) {
         let Some(manager) = self.manager() else { return };
+        let key = self.our_profile_key(&manager).await;
         let timestamp = self.next_timestamp() as u64;
         let data = DataMessage {
             flags: Some(data_message::Flags::ProfileKeyUpdate as u32),
-            profile_key: Some(manager.registration_data().profile_key().get_bytes().to_vec()),
+            profile_key: Some(key.get_bytes().to_vec()),
             timestamp: Some(timestamp),
             ..Default::default()
         };

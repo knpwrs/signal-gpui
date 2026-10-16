@@ -15,6 +15,7 @@ mod message_requests;
 mod release_notes;
 mod remote_config;
 mod view_once;
+mod profile;
 
 pub(crate) use view_once::VIEW_ONCE_DIR;
 
@@ -435,6 +436,15 @@ struct Actor {
     kt_contact: RefCell<Option<tokio::task::JoinHandle<()>>>,
     /// Runs the weekly self check.
     kt_task: RefCell<Option<tokio::task::JoinHandle<()>>>,
+    /// When each person's profile was last fetched for being shown
+    /// (`Command::LoadProfile`), to fetch it at most every five minutes.
+    profile_shown: RefCell<HashMap<String, Instant>>,
+    /// Badge images are being downloaded (`profile.rs`).
+    badge_downloads: std::cell::Cell<bool>,
+    /// The username reservation in flight; a newer one aborts it.
+    username_reservation: RefCell<Option<tokio::task::JoinHandle<()>>>,
+    /// Held across a profile or username write, so two don't interleave.
+    profile_edit: tokio::sync::Mutex<()>,
 }
 
 pub(crate) async fn run(
@@ -521,6 +531,10 @@ pub(crate) async fn run(
         kt_self: RefCell::new(None),
         kt_schedule: tokio::sync::Notify::new(),
         kt_contact: RefCell::new(None),
+        profile_shown: RefCell::default(),
+        badge_downloads: std::cell::Cell::new(false),
+        username_reservation: RefCell::new(None),
+        profile_edit: tokio::sync::Mutex::new(()),
         kt_task: RefCell::new(None),
     });
 
@@ -956,6 +970,13 @@ impl Actor {
                 Command::AddGroupMembers { conversation, members } => self.add_group_members(conversation, members).await,
                 Command::EndGroup { conversation } => self.end_group(conversation).await,
                 Command::RefreshRemoteConfig => self.maybe_refresh_remote_config().await,
+                Command::LoadProfile { service_id } => self.load_profile(service_id).await,
+                Command::SetProfile(edit) => self.set_profile(edit).await,
+                Command::ReserveUsername { nickname, discriminator } => self.reserve_username(nickname, discriminator),
+                Command::ConfirmUsername(reservation) => self.confirm_username(reservation).await,
+                Command::DeleteUsername => self.delete_username().await,
+                Command::ResetUsernameLink => self.reset_username_link().await,
+                Command::SetUsernameLinkColor(color) => self.set_username_link_color(color).await,
             }
         });
     }
@@ -1507,6 +1528,7 @@ impl Actor {
             // is nothing to refresh.
             Action::StorageChanged if *self.storage_synced.borrow() => self.spawn_storage_sync(manager),
             Action::StorageChanged => {}
+            Action::LocalProfileChanged => self.local_profile_changed(manager),
             Action::AccountSettings(settings) => self.save_account_settings(settings).await,
             Action::ExpireTimer { conversation, seconds, version, by, at } => {
                 self.apply_timer(&conversation, seconds, version, true, by, at).await;
@@ -1697,7 +1719,7 @@ impl Actor {
         }
         let Some(manager) = self.manager() else { return };
         let Some(me) = Aci::parse_from_service_id_string(&self.self_aci()) else { return };
-        let mine = manager.registration_data().profile_key();
+        let mine = self.our_profile_key(&manager).await;
         let mut candidates = Vec::new();
         for sid in &members {
             let Some(aci) = Aci::parse_from_service_id_string(sid) else { continue };
@@ -2400,6 +2422,7 @@ impl Actor {
             story_send_modes,
             backup_tier,
             identifiers,
+            own_profile,
         } = match storage::fetch(manager).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -2445,6 +2468,9 @@ impl Actor {
         if let Some(identifiers) = &identifiers {
             self.apply_account_identifiers(identifiers).await;
         }
+        if let Some(own_profile) = own_profile {
+            self.apply_own_profile_record(manager, own_profile).await;
+        }
         match self.db.apply_chat_states(&chats).await {
             Ok(true) => self.emit(Event::ConversationsChanged),
             Ok(false) => {}
@@ -2466,6 +2492,13 @@ impl Actor {
             if let Some(name) = &contact.name {
                 names.push((service_id, name.clone()));
             }
+        }
+        let usernames: Vec<(String, String)> = contacts
+            .iter()
+            .filter_map(|c| Some((Aci::from(c.aci).service_id_string(), c.username.clone()?)))
+            .collect();
+        if let Err(error) = self.db.replace_usernames(&usernames).await {
+            warn!(%error, "failed to save contacts' usernames");
         }
         if let Err(error) = self.db.replace_contacts(&names, &nicknames).await {
             self.error("failed to save contact names", error);
@@ -2726,6 +2759,8 @@ impl Actor {
             }
         }
         let (people_changed, more) = self.sync_person_avatars(&manager, &conversations, &dir).await;
+        // Those profiles named badges; fetch their images.
+        self.download_badges();
         if changed || people_changed {
             self.emit(Event::ConversationsChanged);
         }
@@ -2834,20 +2869,37 @@ impl Actor {
         let ours = sid == self.self_aci();
         // Ours is our own; someone known only from a group has theirs in
         // the group.
-        let key = if ours { Some(manager.registration_data().profile_key()) } else { self.profile_key_of(&ServiceId::from(aci)).await };
+        let key = if ours { Some(self.our_profile_key(manager).await) } else { self.profile_key_of(&ServiceId::from(aci)).await };
         let Some(key) = key else { return PhotoOutcome::NoKey };
-        // Our "chat" is Note to Self, which keeps its own icon (Desktop's).
-        let chat = if ours { None } else { Some(ConversationId::direct(sid)) };
         // Failures count as a check too, so a profile we can't read (or a
         // rate limit) isn't asked for again until tomorrow.
         let _ = self.db.set_setting(&format!("{SETTING_AVATAR_CHECKED}{sid}"), &now_millis().to_string()).await;
-        let path = match crate::profiles::avatar_path(manager, aci, key).await {
-            Ok(path) => path,
+        let remote = match crate::profiles::fetch(manager, aci, key).await {
+            Ok(remote) => remote,
             Err(error) => {
                 debug!(error = %format!("{error:#}"), member = %sid, "profile fetch failed");
                 return PhotoOutcome::ProfileFailed;
             }
         };
+        // The same fetch brings their name, about and badges up to date.
+        self.save_remote_profile(sid, &remote).await;
+        self.apply_person_photo(manager, sid, remote.avatar, key, saved, dir).await
+    }
+
+    /// Brings their saved photo in line with `path`, their profile's
+    /// avatar: downloaded when it differs from the one saved, removed when
+    /// there's none. Kept for their 1:1 chat and wherever they appear.
+    async fn apply_person_photo(
+        &self,
+        manager: &SignalManager,
+        sid: &str,
+        path: Option<String>,
+        key: ProfileKey,
+        saved: Option<&str>,
+        dir: &std::path::Path,
+    ) -> PhotoOutcome {
+        // Our "chat" is Note to Self, which keeps its own icon (Desktop's).
+        let chat = if sid == self.self_aci() { None } else { Some(ConversationId::direct(sid)) };
         let Some(path) = path else {
             // No photo: drop ours, and their chat's (which can predate ours).
             let chat_had = match &chat {

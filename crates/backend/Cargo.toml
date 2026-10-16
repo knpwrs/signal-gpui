@@ -46,7 +46,8 @@ backup-account-keys = { package = "libsignal-account-keys", git = "https://githu
 # Key transparency (automatic key verification in safety numbers): libsignal's
 # client and verifier, driven over presage's unauthenticated websocket.
 libsignal-net-chat = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
-libsignal-keytrans = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
+usernames = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
+libsignal-keytrans = {git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
 libsignal-net = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
 async-trait = "0.1"
 protobuf = "3"

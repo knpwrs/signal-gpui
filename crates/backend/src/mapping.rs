@@ -160,6 +160,10 @@ pub enum Action {
     /// Our primary device changed the Storage Service (pins, names, ...).
     StorageChanged,
     #[serde(skip)]
+    /// Another of our devices changed our profile (Desktop's
+    /// `FetchLatest.LOCAL_PROFILE`): fetch it again.
+    LocalProfileChanged,
+    #[serde(skip)]
     /// Our primary device's privacy settings (a configuration sync).
     AccountSettings(crate::AccountSettings),
     /// "Delete for me" on another of our devices: these messages
@@ -1680,10 +1684,13 @@ fn map_sync(sync: &SyncMessage, envelope_ts: i64, ctx: &MapContext) -> Vec<Actio
             None => tracing::warn!("message request answer for no chat we can name"),
         }
     }
-    if let Some(sync_message::Content::FetchLatest(fetch)) = &sync.content
-        && fetch.r#type() == sync_message::fetch_latest::Type::StorageManifest
-    {
-        out.push(Action::StorageChanged);
+    if let Some(sync_message::Content::FetchLatest(fetch)) = &sync.content {
+        match fetch.r#type() {
+            sync_message::fetch_latest::Type::StorageManifest => out.push(Action::StorageChanged),
+            // Desktop's `onFetchLatestSync`: our profile, fetched again.
+            sync_message::fetch_latest::Type::LocalProfile => out.push(Action::LocalProfileChanged),
+            _ => {}
+        }
     }
     out
 }

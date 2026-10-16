@@ -24,7 +24,8 @@ mod safety;
 mod key_transparency;
 mod calling;
 mod call_links;
-mod profiles;
+pub mod profiles;
+pub mod usernames;
 pub mod media;
 pub mod link_preview;
 pub mod debug_log;
@@ -472,6 +473,27 @@ pub enum Command {
     /// The window became active: fetches the remote config again if it's
     /// been two hours (Desktop's `maybeRefreshRemoteConfig`).
     RefreshRemoteConfig,
+    /// Someone's profile is being shown (their chat, About or contact
+    /// details): fetched again unless it was in the last five minutes
+    /// (Desktop's `throttledGetProfiles`). Answered with
+    /// `Event::ProfileChanged` when anything shown changed.
+    LoadProfile { service_id: String },
+    /// Writes our profile (Desktop's profile editor); answered with
+    /// `Event::ProfileSaved`.
+    SetProfile(profiles::ProfileEdit),
+    /// Reserves a username (Desktop's username editor, after its half
+    /// second pause): `discriminator` when digits were typed. Answered with
+    /// `Event::UsernameReserved`; a newer one cancels an older one.
+    ReserveUsername { nickname: String, discriminator: Option<String> },
+    /// Makes a reservation ours; answered with `Event::UsernameSaved`.
+    ConfirmUsername(usernames::Reservation),
+    /// Deletes our username (and its link); answered with `Event::UsernameSaved`.
+    DeleteUsername,
+    /// Makes a new username link (the old one stops working); answered
+    /// with `Event::UsernameLinkReset`.
+    ResetUsernameLink,
+    /// Sets our username link's QR code color (`UsernameLink.Color`).
+    SetUsernameLinkColor(i32),
 }
 
 /// A per-chat setting kept in the Storage Service.
@@ -944,8 +966,82 @@ pub enum Event {
     /// The remote config changed (see [`remote_config()`]): limits and
     /// features may have too.
     RemoteConfigChanged,
+    /// Someone's profile (name, about, badges) or contact details changed.
+    ProfileChanged(String),
+    /// Our profile, username or username link changed: read [`own_profile`]
+    /// again.
+    OwnProfileChanged,
+    /// Badge descriptions or images arrived or changed.
+    BadgesChanged,
+    /// Answer to `Command::SetProfile`: Desktop's "Your profile could not
+    /// be updated" on failure.
+    ProfileSaved(Result<(), String>),
+    /// Answer to `Command::ReserveUsername`, for that nickname and digits.
+    UsernameReserved {
+        nickname: String,
+        discriminator: Option<String>,
+        result: Result<usernames::Reservation, usernames::UsernameProblem>,
+    },
+    /// Answer to `Command::ConfirmUsername` (the username now ours) and
+    /// `Command::DeleteUsername` (`None`).
+    UsernameSaved(Result<Option<String>, usernames::UsernameProblem>),
+    /// Answer to `Command::ResetUsernameLink`.
+    UsernameLinkReset(Result<(), String>),
     Error(String),
     Unlinked,
+}
+
+/// Our profile as the app shows it (Desktop's own conversation and items).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct OwnProfile {
+    pub given_name: String,
+    pub family_name: String,
+    pub about: String,
+    pub about_emoji: String,
+    /// Our downloaded profile photo.
+    pub photo: Option<PathBuf>,
+    pub username: Option<String>,
+    pub username_link: Option<usernames::UsernameLink>,
+    /// Our profile's badges, visible or not.
+    pub badges: Vec<signal_store::ProfileBadge>,
+}
+
+impl OwnProfile {
+    /// Our profile name, given and family name combined.
+    pub fn name(&self) -> Option<String> {
+        signal_store::combine_names(&self.given_name, &self.family_name)
+    }
+}
+
+/// Reads our profile from the database (`aci`: ours).
+pub async fn own_profile(db: &AppDb, aci: &str) -> OwnProfile {
+    let profile = db.person_profile(aci).await.ok().flatten().unwrap_or_default();
+    let photo = db
+        .person_avatars()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(sid, _)| sid == aci)
+        .map(|(_, path)| PathBuf::from(path))
+        .filter(|p| p.exists());
+    let username = db.setting(key_transparency::SETTING_USERNAME).await.ok().flatten().filter(|u| !u.is_empty());
+    let username_link = db
+        .setting(usernames::SETTING_USERNAME_LINK)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .filter(|_| username.is_some());
+    OwnProfile {
+        given_name: profile.given_name,
+        family_name: profile.family_name,
+        about: profile.about,
+        about_emoji: profile.about_emoji,
+        photo,
+        username,
+        username_link,
+        badges: profile.badges,
+    }
 }
 
 /// The backend thread's stack (see `Backend::start`).

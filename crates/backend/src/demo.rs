@@ -764,6 +764,9 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
     if let Err(e) = seed_stories(&db, &data_dir).await {
         emit(Event::Error(format!("seeding demo stories: {e}")));
     }
+    if let Err(e) = seed_profiles(&db, &data_dir).await {
+        emit(Event::Error(format!("seeding demo profiles: {e}")));
+    }
     emit(Event::Ready {
         phone: Some("+1 555 0123 (demo)".into()),
         aci: SELF.trim_start_matches("d:").into(),
@@ -1979,6 +1982,53 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 emit(Event::StorySettingsChanged);
             }
             Command::CancelKeyTransparency => {}
+            // Profiles and usernames are saved here and go nowhere.
+            Command::LoadProfile { .. } => {}
+            Command::SetProfile(edit) => {
+                let result = demo_set_profile(&db, &data_dir, &edit).await;
+                if result.is_ok() {
+                    emit(Event::OwnProfileChanged);
+                }
+                emit(Event::ProfileSaved(result));
+            }
+            Command::ReserveUsername { nickname, discriminator } => {
+                let result = demo_reserve(&db, &nickname, discriminator.as_deref()).await;
+                emit(Event::UsernameReserved { nickname, discriminator, result });
+            }
+            Command::ConfirmUsername(reservation) => {
+                let current = demo_username(&db).await;
+                let result = if current != reservation.previous {
+                    Err(crate::usernames::UsernameProblem::General)
+                } else {
+                    let color = demo_username_link(&db).await.map_or(0, |l| l.color);
+                    demo_save_username(&db, Some(&reservation.username), Some(demo_link(1, color))).await;
+                    Ok(Some(reservation.username))
+                };
+                emit(Event::OwnProfileChanged);
+                emit(Event::UsernameSaved(result));
+            }
+            Command::DeleteUsername => {
+                demo_save_username(&db, None, None).await;
+                emit(Event::OwnProfileChanged);
+                emit(Event::UsernameSaved(Ok(None)));
+            }
+            Command::ResetUsernameLink => {
+                let username = demo_username(&db).await;
+                let old = demo_username_link(&db).await;
+                let seed = old.as_ref().map_or(1, |l| l.entropy[0].wrapping_add(1));
+                let link = demo_link(seed, old.map_or(0, |l| l.color));
+                demo_save_username(&db, username.as_deref(), Some(link)).await;
+                emit(Event::OwnProfileChanged);
+                emit(Event::UsernameLinkReset(Ok(())));
+            }
+            Command::SetUsernameLinkColor(color) => {
+                if let Some(mut link) = demo_username_link(&db).await {
+                    link.color = color;
+                    let username = demo_username(&db).await;
+                    demo_save_username(&db, username.as_deref(), Some(link)).await;
+                    emit(Event::OwnProfileChanged);
+                }
+            }
             // Group administration is `demo_groups::handle`'s.
             Command::SetGroupAvatar { .. }
             | Command::RemoveFromGroup { .. }
@@ -2000,6 +2050,164 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
             | Command::RefreshRemoteConfig => {}
         }
     }
+}
+
+/// The demo's badge: made up, its images drawn here.
+pub(crate) const DEMO_BADGE: &str = "DEMO_SUSTAINER";
+
+/// Profiles for the made-up people and for us, a badge, and our username.
+async fn seed_profiles(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
+    use signal_store::{Badge, BadgeCategory, BadgeImage, FetchedProfile, ProfileBadge};
+    let me = aci(SELF);
+    if db.person_profile(me).await?.is_some_and(|p| p.fetched_at > 0) {
+        return Ok(());
+    }
+    // Badge images: a heart in a ring, as SVG.
+    let dir = data_dir.join("badges");
+    std::fs::create_dir_all(&dir).map_err(|e| signal_store::Error::Schema(e.to_string()))?;
+    let url = |name: &str| format!("https://updates2.signal.org/static/badges/{name}.svg");
+    let mut images = Vec::new();
+    for (size, name) in [(16, "demo-16"), (24, "demo-24"), (36, "demo-36")] {
+        let image = BadgeImage { light: Some(url(&format!("{name}-light"))), dark: Some(url(&format!("{name}-dark"))), transparent: None };
+        for (theme, ring) in [("light", "#2c58c3"), ("dark", "#a3c0ff")] {
+            let path = dir.join(format!("{name}-{theme}.svg"));
+            std::fs::write(&path, demo_badge_svg(size, ring)).map_err(|e| signal_store::Error::Schema(e.to_string()))?;
+            db.set_badge_image_file(&url(&format!("{name}-{theme}")), &path.to_string_lossy()).await?;
+        }
+        images.push(image);
+    }
+    let big = dir.join("demo-160.svg");
+    std::fs::write(&big, demo_badge_svg(160, "#2c58c3")).map_err(|e| signal_store::Error::Schema(e.to_string()))?;
+    db.set_badge_image_file(&url("demo-160"), &big.to_string_lossy()).await?;
+    images.push(BadgeImage { transparent: Some(url("demo-160")), ..Default::default() });
+    db.save_badges(&[Badge {
+        id: DEMO_BADGE.into(),
+        category: BadgeCategory::Donor,
+        name: "Signal Sustainer".into(),
+        description: "{short_name} supports Signal with a monthly donation. Signal is a nonprofit with no advertisers or investors, supported only by people like you.".into(),
+        images,
+    }])
+    .await?;
+
+    let at = now();
+    let badge = ProfileBadge { id: DEMO_BADGE.into(), expires_at: None, visible: None };
+    let profiles = [
+        (MAYA, "Maya", "Chen", "Planning Saturday's route", "🥾", vec![badge.clone()]),
+        (JORDAN, "Jordan", "Reyes", "", "", vec![]),
+        (PRIYA, "Priya", "Natarajan", "Coffee lover", "☕", vec![]),
+        (SAM, "Sam", "Okafor", "", "", vec![]),
+        (ANA, "Ana", "Souza", "Taking a break", "📵", vec![]),
+        (LEO, "Leonardo", "Martin", "", "", vec![]),
+    ];
+    for (id, given, family, about, emoji, badges) in profiles {
+        let profile = FetchedProfile {
+            given_name: given.into(),
+            family_name: family.into(),
+            about: about.into(),
+            about_emoji: emoji.into(),
+            badges,
+        };
+        db.save_fetched_profile(aci(id), &profile, at).await?;
+    }
+    db.replace_usernames(&[(aci(MAYA).into(), "maya.42".into())]).await?;
+    let ours = FetchedProfile {
+        given_name: "Riley".into(),
+        family_name: "Park".into(),
+        about: "Making trail maps".into(),
+        about_emoji: "🗺️".into(),
+        badges: vec![ProfileBadge { id: DEMO_BADGE.into(), expires_at: Some(at + 30 * DAY), visible: Some(true) }],
+    };
+    db.save_fetched_profile(me, &ours, at).await?;
+    demo_save_username(db, Some("riley.07"), Some(demo_link(1, 0))).await;
+    Ok(())
+}
+
+/// A badge image: a ring with a heart.
+fn demo_badge_svg(size: u32, ring: &str) -> String {
+    format!(
+        "<svg xmlns='http://www.w3.org/2000/svg' width='{size}' height='{size}' viewBox='0 0 24 24'>\
+         <circle cx='12' cy='12' r='11' fill='#ffffff' stroke='{ring}' stroke-width='2'/>\
+         <path d='M12 18 L6.5 12.5 A3 3 0 0 1 12 8 A3 3 0 0 1 17.5 12.5 Z' fill='#e53e5c'/></svg>"
+    )
+}
+
+/// A made-up username link (entropy and handle from `seed`).
+fn demo_link(seed: u8, color: i32) -> crate::usernames::UsernameLink {
+    crate::usernames::UsernameLink { entropy: vec![seed; 32], server_id: vec![seed.wrapping_add(100); 16], color }
+}
+
+async fn demo_username(db: &AppDb) -> Option<String> {
+    db.setting(crate::key_transparency::SETTING_USERNAME).await.ok().flatten().filter(|u| !u.is_empty())
+}
+
+async fn demo_username_link(db: &AppDb) -> Option<crate::usernames::UsernameLink> {
+    db.setting(crate::usernames::SETTING_USERNAME_LINK).await.ok().flatten().and_then(|json| serde_json::from_str(&json).ok())
+}
+
+async fn demo_save_username(db: &AppDb, username: Option<&str>, link: Option<crate::usernames::UsernameLink>) {
+    let _ = db.set_setting(crate::key_transparency::SETTING_USERNAME, username.unwrap_or_default()).await;
+    let _ = match link.and_then(|l| serde_json::to_string(&l).ok()) {
+        Some(json) => db.set_setting(crate::usernames::SETTING_USERNAME_LINK, &json).await,
+        None => db.remove_setting(crate::usernames::SETTING_USERNAME_LINK).await,
+    };
+}
+
+/// Reserving here: Desktop's checks, then the first candidate, except
+/// "taken", which someone has.
+async fn demo_reserve(
+    db: &AppDb,
+    nickname: &str,
+    discriminator: Option<&str>,
+) -> Result<crate::usernames::Reservation, crate::usernames::UsernameProblem> {
+    use crate::usernames::{ReserveRequest, Reservation, UsernameProblem};
+    let previous = demo_username(db).await;
+    match crate::usernames::reserve_request(nickname, discriminator, previous.as_deref(), crate::usernames::limits(), &mut rand::rng())? {
+        ReserveRequest::CaseChange(reservation) => Ok(reservation),
+        ReserveRequest::Candidates(_) if nickname.eq_ignore_ascii_case("taken") => Err(UsernameProblem::UsernameNotAvailable),
+        ReserveRequest::Candidates(candidates) => {
+            // The demo's digits are always the same, so tests can know them.
+            let username = match discriminator {
+                Some(_) => candidates[0].clone(),
+                None => format!("{nickname}.42"),
+            };
+            let hash = usernames::Username::new(&username).map_err(|_| UsernameProblem::CheckCharacters)?.hash();
+            Ok(Reservation { username, previous, hash })
+        }
+    }
+}
+
+/// Saves our profile as the editor wrote it; a new photo is kept locally.
+async fn demo_set_profile(db: &AppDb, data_dir: &Path, edit: &crate::profiles::ProfileEdit) -> Result<(), String> {
+    use crate::profiles::AvatarChange;
+    let me = aci(SELF);
+    if edit.given_name.trim().is_empty() {
+        return Err("Your profile could not be updated. Please try again.".into());
+    }
+    let badges = db.person_profile(me).await.ok().flatten().map(|p| p.badges).unwrap_or_default();
+    let profile = signal_store::FetchedProfile {
+        given_name: edit.given_name.trim().into(),
+        family_name: edit.family_name.trim().into(),
+        about: edit.about.trim().into(),
+        about_emoji: if edit.about.trim().is_empty() { String::new() } else { edit.about_emoji.clone() },
+        badges,
+    };
+    db.save_fetched_profile(me, &profile, now()).await.map_err(|e| e.to_string())?;
+    match &edit.avatar {
+        AvatarChange::Keep => {}
+        AvatarChange::Remove => {
+            let _ = db.remove_person_avatar(me).await;
+        }
+        AvatarChange::New(bytes) => {
+            let dir = data_dir.join("avatars");
+            let ext = if bytes.starts_with(b"\x89PNG") { "png" } else { "jpg" };
+            // A new name each time, so the image cache shows the new one.
+            let path = dir.join(format!("demo-self-{}.{ext}", now()));
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            std::fs::write(&path, bytes.as_slice()).map_err(|e| e.to_string())?;
+            db.set_person_avatar(me, &path.to_string_lossy()).await.map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 fn demo_safety_number(conversation: &ConversationId, verified: bool, auto_verify: crate::AutoVerify) -> crate::SafetyNumber {

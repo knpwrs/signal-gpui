@@ -351,7 +351,7 @@ impl Actor {
         };
         let has_badges = match (self.manager(), Aci::parse_from_service_id_string(&self.self_aci())) {
             (Some(manager), Some(aci)) => {
-                let key = manager.registration_data().profile_key();
+                let key = self.our_profile_key(&manager).await;
                 crate::profiles::has_badges(&manager, aci, key)
                     .await
                     .inspect_err(|error| warn!(error = %format!("{error:#}"), "megaphones: couldn't read our badges"))

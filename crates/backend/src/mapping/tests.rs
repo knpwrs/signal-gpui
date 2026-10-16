@@ -368,7 +368,7 @@ fn attachment_extension() {
 }
 
 #[test]
-fn storage_fetch_latest_requests_a_resync() {
+fn fetch_latest_requests_a_resync_or_our_profile() {
     let fetch = |kind: sync_message::fetch_latest::Type| SyncMessage {
         content: Some(sync_message::Content::FetchLatest(sync_message::FetchLatest { r#type: Some(kind as i32) })),
         ..Default::default()
@@ -376,6 +376,8 @@ fn storage_fetch_latest_requests_a_resync() {
     let actions = map_content(&content(ME, fetch(sync_message::fetch_latest::Type::StorageManifest)), &ctx());
     assert!(matches!(actions.as_slice(), [Action::StorageChanged]), "{actions:?}");
     let actions = map_content(&content(ME, fetch(sync_message::fetch_latest::Type::LocalProfile)), &ctx());
+    assert!(matches!(actions.as_slice(), [Action::LocalProfileChanged]), "{actions:?}");
+    let actions = map_content(&content(ME, fetch(sync_message::fetch_latest::Type::SubscriptionStatus)), &ctx());
     assert!(actions.is_empty(), "{actions:?}");
 }
 
