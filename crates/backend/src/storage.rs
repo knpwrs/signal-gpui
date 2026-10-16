@@ -103,6 +103,32 @@ pub(crate) struct StorageSnapshot {
     pub own_profile: Option<OwnProfileRecord>,
     /// Chat folders, deleted ones too.
     pub chat_folders: Vec<signal_store::ChatFolder>,
+    /// Installed (and uninstalled) sticker packs.
+    pub sticker_packs: Vec<StorageStickerPack>,
+}
+
+/// An `InstalledStickerPackRecord` (Desktop's `mergeInstalledStickerPackRecord`).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StorageStickerPack {
+    pub id: Vec<u8>,
+    /// Its key, while installed.
+    pub key: Option<Vec<u8>>,
+    pub position: u32,
+    /// Unix millis; uninstalled then.
+    pub deleted_at: Option<i64>,
+}
+
+fn sticker_pack(record: &presage::proto::InstalledStickerPackRecord) -> Option<StorageStickerPack> {
+    if record.pack_id.is_empty() {
+        return None;
+    }
+    let deleted_at = (record.deleted_at_timestamp != 0).then(|| clamp_millis(record.deleted_at_timestamp));
+    let key = Some(record.pack_key.clone()).filter(|k| !k.is_empty());
+    // An installed one needs its key (Desktop throws without).
+    if deleted_at.is_none() && key.is_none() {
+        return None;
+    }
+    Some(StorageStickerPack { id: record.pack_id.clone(), key, position: record.position, deleted_at })
 }
 
 /// What the account record says about our profile and username (Desktop's
@@ -213,6 +239,7 @@ pub(crate) async fn fetch(manager: &SignalManager) -> anyhow::Result<StorageSnap
                     | IdentifierType::StoryDistributionList
                     | IdentifierType::CallLink
                     | IdentifierType::ChatFolder
+                    | IdentifierType::StickerPack
             )
         })
         .map(|id| id.raw.clone())
@@ -265,6 +292,7 @@ pub(crate) async fn fetch(manager: &SignalManager) -> anyhow::Result<StorageSnap
                 Some(Record::StoryDistributionList(list)) => snapshot.story_lists.extend(story_list(&list)),
                 Some(Record::CallLink(link)) => snapshot.call_links.extend(call_link(&link)),
                 Some(Record::ChatFolder(folder)) => snapshot.chat_folders.extend(chat_folder(&folder)),
+                Some(Record::InstalledStickerPack(pack)) => snapshot.sticker_packs.extend(sticker_pack(&pack)),
                 _ => {}
             }
         }
@@ -872,6 +900,74 @@ pub(crate) async fn write_call_link(
             None => (None, new_call_link_record(root_key)),
         };
         let Some(record) = edit_call_link(&record, admin_key, deleted_at)? else { return Ok(()) };
+        if session.commit(manager, &manifest, old_key.as_deref(), kind, &record).await? {
+            return Ok(());
+        }
+    }
+    bail!("storage kept changing on another device; try again")
+}
+
+const RECORD_STICKER_PACK: u32 = 6; // StorageRecord.installedStickerPack
+const PACK_KEY: u32 = 2;
+const PACK_POSITION: u32 = 3;
+const PACK_DELETED_AT: u32 = 4;
+
+/// Sets an installed sticker pack record (Desktop's
+/// `toInstalledStickerPackRecord`): its key and position, or (uninstalled
+/// at `deleted_at`) neither, keeping its id and fields this client doesn't
+/// know. `Ok(None)` when nothing changes.
+pub(crate) fn edit_sticker_pack(record: &[u8], key: &[u8], position: u32, deleted_at: u64) -> anyhow::Result<Option<Vec<u8>>> {
+    edit_inner(record, RECORD_STICKER_PACK, |inner| {
+        let fields = wire::fields(inner).context("malformed sticker pack record")?;
+        let mut out = Vec::with_capacity(inner.len() + 48);
+        for field in fields.iter().filter(|f| !matches!(f.number, PACK_KEY | PACK_POSITION | PACK_DELETED_AT)) {
+            out.extend_from_slice(field.raw);
+        }
+        if deleted_at == 0 {
+            wire::put_len(&mut out, PACK_KEY, key);
+            if position != 0 {
+                wire::put_varint_field(&mut out, PACK_POSITION, u64::from(position));
+            }
+        } else {
+            wire::put_varint_field(&mut out, PACK_DELETED_AT, deleted_at);
+        }
+        let decode = |bytes: &[u8]| presage::proto::InstalledStickerPackRecord::decode(bytes).ok();
+        let same = decode(inner).zip(decode(&out)).is_some_and(|(old, new)| {
+            (old.pack_key, old.position, old.deleted_at_timestamp) == (new.pack_key, new.position, new.deleted_at_timestamp)
+        });
+        Ok((!same).then_some(out))
+    })
+}
+
+fn new_sticker_pack_record(id: &[u8]) -> Vec<u8> {
+    let pack = presage::proto::InstalledStickerPackRecord { pack_id: id.to_vec(), ..Default::default() };
+    StorageRecord { record: Some(Record::InstalledStickerPack(pack)) }.encode_to_vec()
+}
+
+/// Saves an installed (or, with `deleted_at`, uninstalled) sticker pack for
+/// the whole account, adding its record if Storage Service has none.
+pub(crate) async fn write_sticker_pack(manager: &SignalManager, id: &[u8], key: &[u8], position: u32, deleted_at: u64) -> anyhow::Result<()> {
+    let session = Session::new(manager).await?;
+    let kind = IdentifierType::StickerPack;
+    for _ in 0..3 {
+        let manifest = session.manifest().await?;
+        let ikm = manifest_ikm(&manifest);
+        let keys: Vec<Vec<u8>> =
+            manifest.identifiers.iter().filter(|k| k.r#type() == kind).map(|k| k.raw.clone()).collect();
+        let mut existing = None;
+        for batch in keys.chunks(READ_BATCH) {
+            existing = session.read_many(batch, ikm).await?.into_iter().find(|(_, raw)| {
+                matches!(StorageRecord::decode(raw.as_slice()), Ok(StorageRecord { record: Some(Record::InstalledStickerPack(p)) }) if p.pack_id == id)
+            });
+            if existing.is_some() {
+                break;
+            }
+        }
+        let (old_key, record) = match existing {
+            Some((k, raw)) => (Some(k), raw),
+            None => (None, new_sticker_pack_record(id)),
+        };
+        let Some(record) = edit_sticker_pack(&record, key, position, deleted_at)? else { return Ok(()) };
         if session.commit(manager, &manifest, old_key.as_deref(), kind, &record).await? {
             return Ok(());
         }
@@ -2023,6 +2119,34 @@ mod tests {
         assert!(is_story_list(&StorageRecord::decode(fresh.as_slice()).unwrap(), &Uuid::nil()));
         let saved = decode(&edit_story_list(&fresh, &my_story, 0).unwrap().unwrap());
         assert_eq!(story_list(&saved).unwrap(), my_story);
+    }
+
+    #[test]
+    fn sticker_pack_records_read_and_write_as_desktops() {
+        let (id, key) = (vec![0xab; 16], vec![0xcd; 32]);
+        let mut inner = presage::proto::InstalledStickerPackRecord { pack_id: id.clone(), ..Default::default() }.encode_to_vec();
+        wire::put_varint_field(&mut inner, 99, 1);
+        let mut record = Vec::new();
+        wire::put_len(&mut record, RECORD_STICKER_PACK, &inner);
+        let installed = edit_sticker_pack(&record, &key, 3, 0).unwrap().expect("changed");
+        assert!(edit_sticker_pack(&installed, &key, 3, 0).unwrap().is_none());
+        let read = |bytes: &[u8]| match StorageRecord::decode(bytes).unwrap().record {
+            Some(Record::InstalledStickerPack(pack)) => pack,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            sticker_pack(&read(&installed)),
+            Some(StorageStickerPack { id: id.clone(), key: Some(key.clone()), position: 3, deleted_at: None })
+        );
+        // Uninstalled: no key, no position, when (Desktop's record).
+        let removed = edit_sticker_pack(&installed, &key, 3, 500).unwrap().expect("changed");
+        let pack = read(&removed);
+        assert!(pack.pack_key.is_empty() && pack.position == 0 && pack.deleted_at_timestamp == 500);
+        assert_eq!(sticker_pack(&pack).unwrap().deleted_at, Some(500));
+        let inner = wire::fields(&removed).unwrap()[0].payload.unwrap().to_vec();
+        assert!(wire::fields(&inner).unwrap().iter().any(|f| f.number == 99), "unknown field kept");
+        // Installed without a key: not a pack Desktop would take.
+        assert_eq!(sticker_pack(&presage::proto::InstalledStickerPackRecord { pack_id: id, ..Default::default() }), None);
     }
 
     #[test]

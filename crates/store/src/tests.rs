@@ -942,6 +942,7 @@ async fn drop_later_migrations(db: &AppDb) {
     sqlx::query("DROP TABLE message_send_states").execute(&db.writer).await.unwrap();
     sqlx::query("ALTER TABLE messages DROP COLUMN viewed").execute(&db.writer).await.unwrap();
     sqlx::query("ALTER TABLE messages DROP COLUMN content").execute(&db.writer).await.unwrap();
+    sqlx::query("DROP TABLE sticker_packs").execute(&db.writer).await.unwrap();
 }
 
 /// Rewrites the migration history to look like a pre-squash database that
@@ -2587,4 +2588,31 @@ fn folders_hold_chats_as_desktops_do() {
     assert!(!ChatFolderParams::defaults().valid());
     assert!(ChatFolderParams { name: "x".repeat(32), ..Default::default() }.valid());
     assert!(!ChatFolderParams { name: "x".repeat(33), ..Default::default() }.valid());
+}
+
+#[tokio::test]
+async fn sticker_packs_are_known_installed_and_ordered() {
+    let db = test_db().await;
+    assert!(db.sticker_pack_seen("aa", "k1", 1).await.unwrap());
+    assert!(!db.sticker_pack_seen("aa", "other", 2).await.unwrap(), "a known pack keeps its key");
+    db.sticker_pack_seen("bb", "k2", 3).await.unwrap();
+    db.set_sticker_pack_meta("aa", "Dots", "Ana", Some("/tmp/c.webp"), 12).await.unwrap();
+    let rows = db.sticker_pack_rows().await.unwrap();
+    assert_eq!(rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["bb", "aa"], "newest first");
+    let aa = rows.iter().find(|r| r.id == "aa").unwrap();
+    assert_eq!((aa.key.as_str(), aa.title.as_deref(), aa.sticker_count, aa.installed), ("k1", Some("Dots"), 12, false));
+
+    // Installing puts it after every installed pack.
+    assert_eq!(db.install_sticker_pack_row("aa", "k1", None, 4).await.unwrap(), (0, true));
+    assert_eq!(db.install_sticker_pack_row("cc", "k3", None, 5).await.unwrap(), (1, true));
+    assert_eq!(db.install_sticker_pack_row("aa", "k1", Some(7), 6).await.unwrap(), (7, false));
+    db.set_sticker_pack_order(&["cc".into(), "aa".into()]).await.unwrap();
+    let position = |rows: &[StickerPackRow], id: &str| rows.iter().find(|r| r.id == id).unwrap().position;
+    let rows = db.sticker_pack_rows().await.unwrap();
+    assert_eq!((position(&rows, "cc"), position(&rows, "aa")), (Some(0), Some(1)));
+
+    assert!(db.uninstall_sticker_pack_row("aa", 9).await.unwrap());
+    assert!(!db.uninstall_sticker_pack_row("aa", 10).await.unwrap(), "already uninstalled");
+    let aa = db.sticker_pack_rows().await.unwrap().into_iter().find(|r| r.id == "aa").unwrap();
+    assert_eq!((aa.installed, aa.position, aa.uninstalled_at), (false, None, Some(9)));
 }

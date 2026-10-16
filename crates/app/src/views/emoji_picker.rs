@@ -414,14 +414,26 @@ impl EmojiPicker {
         let empty = if !self.query.trim().is_empty() {
             "No stickers found"
         } else {
-            "No sticker packs installed. Packs you install in Signal on your phone appear here."
+            "No sticker packs installed. Add some with + or in Signal on your phone."
         };
+        let manage_state = self.state.clone();
         div()
             .id("sticker-grid")
             .h(px(PANEL_HEIGHT))
             .overflow_y_scroll()
             .px_2()
             .pb_2()
+            // Desktop's "+" in the sticker picker opens the sticker manager.
+            .child(
+                div().flex().justify_end().pt_1().child(
+                    gpui_kit::component::button::Button::new("sticker-manager-open")
+                        .map(gpui_kit::component::button::ButtonVariants::ghost)
+                        .map(gpui_kit::component::Sizable::small)
+                        .icon(gpui_kit::assets::IconName::Plus)
+                        .tooltip("Add stickers")
+                        .on_click(move |_, window, cx| crate::views::sticker_manager::open(manage_state.clone(), window, cx)),
+                ),
+            )
             .when(sections.is_empty(), |d| {
                 d.child(div().p_4().text_sm().text_color(palette.text_secondary).child(empty))
             })

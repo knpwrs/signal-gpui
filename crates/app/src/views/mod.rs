@@ -33,6 +33,7 @@ pub mod settings;
 pub mod shortcut_guide;
 pub mod sidebar;
 pub mod sticker_creator;
+pub mod sticker_manager;
 pub mod stories;
 pub mod story_creator;
 pub mod story_privacy;

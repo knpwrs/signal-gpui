@@ -164,6 +164,7 @@ impl Sidebar {
                 | AppEvent::CaptchaDone
                 | AppEvent::CriticalAlertModal
                 | AppEvent::GroupLinkPreview(_)
+                | AppEvent::OpenStickerPack
                 | AppEvent::Alert { .. }
                 | AppEvent::Info(_)
                 | AppEvent::ProfileChanged(_)

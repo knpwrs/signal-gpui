@@ -1710,3 +1710,34 @@ fn gift_badges_read_their_receipt() {
     };
     assert!(map_content(&content(ALICE, junk), &ctx()).is_empty());
 }
+
+#[test]
+fn stickers_name_their_pack_and_syncs_install_packs() {
+    let sticker = data_message::Sticker {
+        pack_id: Some(vec![1; 16]),
+        pack_key: Some(vec![2; 32]),
+        sticker_id: Some(3),
+        emoji: Some("🌱".into()),
+        data: Some(AttachmentPointer { content_type: Some("image/webp".into()), ..Default::default() }),
+    };
+    let dm = DataMessage { sticker: Some(sticker), timestamp: Some(100), ..Default::default() };
+    let actions = map_content(&content(ALICE, dm), &ctx());
+    let [Action::Insert { sticker_pack, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+    assert_eq!(sticker_pack, &Some((vec![1; 16], vec![2; 32])));
+
+    use sync_message::{StickerPackOperation, sticker_pack_operation::Type};
+    let sync = SyncMessage {
+        sticker_pack_operation: vec![
+            StickerPackOperation { pack_id: Some(vec![1; 16]), pack_key: Some(vec![2; 32]), r#type: Some(Type::Install as i32) },
+            StickerPackOperation { pack_id: Some(vec![4; 16]), pack_key: None, r#type: Some(Type::Remove as i32) },
+            // An install without a key can't be.
+            StickerPackOperation { pack_id: Some(vec![5; 16]), pack_key: None, r#type: Some(Type::Install as i32) },
+        ],
+        ..Default::default()
+    };
+    let actions = map_content(&content(ME, sync), &ctx());
+    assert!(
+        actions.contains(&Action::StickerPackSync(vec![(vec![1; 16], Some(vec![2; 32])), (vec![4; 16], None)])),
+        "{actions:?}"
+    );
+}

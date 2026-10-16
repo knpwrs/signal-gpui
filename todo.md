@@ -244,9 +244,6 @@ with headless windows. Not done, or not checked:
   hear it.
 - **Username links** (`signal.me/#eu/`) are read with a new presage call
   (`Manager::lookup_username_link`) that hasn't run against the server.
-- **Sticker pack links** (`signal.art/addstickers`, `sgnl://addstickers`)
-  say installing from links isn't supported: Desktop opens the pack's
-  preview to install it, and this app has no sticker pack manager.
 - **Links Desktop handles that this app can't:** its notification tokens (`show-conversation`,
   `start-call-lobby`), linking a device and donations, which show
   Desktop's "didn't make sense" error.
@@ -637,4 +634,37 @@ Storage Service. Left:
 - **Following the open chat:** Desktop switches to "All chats" when a chat
   outside the shown folder is opened from elsewhere; here the open chat
   just stays listed.
+
+## Sticker manager
+
+Desktop's sticker manager (All: the Signal Artist Series and "Shared With
+You"; My Stickers in order), its pack preview with Add Stickers, Link and
+Remove, the uninstall warning, the sticker picker's "+", and sticker pack
+link previews (title, "Sticker Pack by …" and cover, drawn small; clicking
+opens the pack). `AppState::open_sticker_pack(id, key)` opens a pack;
+`signal.art` and `sgnl://addstickers` links reach it through
+`open_signal_link`. A
+sticker we receive makes its pack known; installs and uninstalls send
+`StickerPackOperation` syncs and write `InstalledStickerPackRecord`s, our
+other devices' syncs are followed, and records are merged as Desktop's
+`mergeInstalledStickerPackRecord` does. Tested with store, wire-format,
+mapping and link tests and a demo-mode UI test; nothing here has been
+run against Signal's servers (manifests, covers, the record writes). Left:
+
+- **Reordering:** Desktop drags installed packs; here a pack's menu moves
+  it up or down.
+- **Downloads:** Desktop downloads every sticker of the Artist Series and of
+  received packs once the manager opens; here only manifests and covers
+  (at most 24 packs each time), and stickers when a pack is previewed or
+  installed. Preview caches (`stickers/preview/`) aren't cleaned up.
+- **A failed record write** is reported and not retried until the next
+  change (Desktop keeps `storageNeedsSync`). An uninstall's record is kept
+  for good; Desktop drops it after the message queue time.
+- **Transferred history:** packs from the link-time backup are installed
+  as before (with a sync message each, which Desktop doesn't send).
+- **A synced install** downloads in presage's background task; the picker
+  shows it the next time it opens.
+- **Desktop's manager is a chat panel** with a segmented header; here it's
+  a dialog with two tab buttons. Recent stickers of an uninstalled pack
+  aren't cleared.
 

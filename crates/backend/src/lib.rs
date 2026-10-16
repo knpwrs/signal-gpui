@@ -32,6 +32,7 @@ pub mod debug_log;
 pub mod recipients;
 pub mod giphy;
 pub mod sticker_upload;
+pub mod stickers;
 pub mod deletes;
 pub mod edits;
 pub mod long_text;
@@ -300,6 +301,20 @@ pub enum Command {
     SendGif { conversation: ConversationId, gif: giphy::Gif, quote: Option<i64> },
     /// Lists installed sticker packs; answered with `Event::Stickers`.
     LoadStickers,
+    /// Desktop's sticker manager opened: answered with
+    /// `Event::StickerManager`, again as packs' titles and covers arrive.
+    LoadStickerManager,
+    /// Opens a pack (Desktop's `StickerPreviewModal`, from the manager or a
+    /// `signal.art` link): answered with `Event::StickerPackPreview`.
+    PreviewStickerPack { id: Vec<u8>, key: Vec<u8> },
+    /// Installs a pack, here and on our other devices (a
+    /// `StickerPackOperation` sync and its `InstalledStickerPackRecord`).
+    InstallStickerPack { id: Vec<u8>, key: Vec<u8> },
+    /// Uninstalls a pack, here and on our other devices.
+    UninstallStickerPack { id: Vec<u8>, key: Vec<u8> },
+    /// Installed packs in this order (Desktop's drag to reorder), saved for
+    /// our other devices.
+    OrderStickerPacks(Vec<Vec<u8>>),
     /// Uploads a new sticker pack and installs it; answered with
     /// `Event::StickerUpload`.
     UploadStickerPack(sticker_upload::NewStickerPack),
@@ -1091,6 +1106,11 @@ pub enum Event {
     Stickers(Vec<StickerPackView>),
     /// How a `Command::UploadStickerPack` is going.
     StickerUpload(sticker_upload::StickerUpload),
+    /// What the sticker manager lists (answer to `Command::LoadStickerManager`).
+    StickerManager(stickers::StickerManagerView),
+    /// A pack opened, or why it couldn't be (Desktop's "Error opening
+    /// sticker pack").
+    StickerPackPreview { id: Vec<u8>, result: Result<stickers::StickerPackPreview, String> },
     /// Answer to `Command::FindRecipient`: who it is, or why not.
     RecipientFound { query: String, result: Result<signal_store::DirectoryEntry, String> },
     /// Answer to `Command::FetchLinkPreview` (`None`: no preview for it).

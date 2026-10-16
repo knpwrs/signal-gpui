@@ -59,6 +59,9 @@ pub enum Action {
         content: Option<signal_store::MessageContent>,
         /// A shared contact's photo, for downloading.
         content_image: Option<AttachmentPointer>,
+        /// A sticker's pack, `(id, key)`: known from now on (Desktop's
+        /// `savePackMetadata`).
+        sticker_pack: Option<(Vec<u8>, Vec<u8>)>,
     },
     React {
         conversation: ConversationId,
@@ -150,6 +153,10 @@ pub enum Action {
     #[serde(skip)]
     /// We viewed these on another device: `(author, sent_at)`.
     ViewedSync(Vec<(Option<String>, i64)>),
+    #[serde(skip)]
+    /// Sticker packs installed (`Some(key)`) or removed on another device
+    /// (`StickerPackOperation`; presage downloads or removes the pack).
+    StickerPackSync(Vec<(Vec<u8>, Option<Vec<u8>>)>),
     #[serde(skip)]
     /// Someone (`None`: us, on another device) started a group call.
     GroupCallStarted { conversation: ConversationId, by: Option<String>, era: Option<String>, at: i64 },
@@ -1288,6 +1295,11 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
         sent_to: Vec::new(),
         content,
         content_image,
+        sticker_pack: dm
+            .sticker
+            .as_ref()
+            .filter(|_| is_sticker)
+            .and_then(|s| Some((s.pack_id.clone().filter(|i| i.len() == 16)?, s.pack_key.clone().filter(|k| k.len() == 32)?))),
     }]
 }
 
@@ -1590,6 +1602,7 @@ fn map_story_reply(
         sent_to: Vec::new(),
         content: None,
         content_image: None,
+        sticker_pack: None,
     });
     out
 }
@@ -1710,6 +1723,21 @@ fn map_sync(sync: &SyncMessage, envelope_ts: i64, ctx: &MapContext) -> Vec<Actio
             // deleted, or the story was deleted for everyone.
             out.push(Action::StoryRecipientUpdate { sent_at: ts, recipients });
         }
+    }
+    let packs: Vec<(Vec<u8>, Option<Vec<u8>>)> = sync
+        .sticker_pack_operation
+        .iter()
+        .filter_map(|op| {
+            use sync_message::sticker_pack_operation::Type;
+            let id = op.pack_id.clone().filter(|i| !i.is_empty())?;
+            match op.r#type() {
+                Type::Install => Some((id, Some(op.pack_key.clone().filter(|k| !k.is_empty())?))),
+                Type::Remove => Some((id, None)),
+            }
+        })
+        .collect();
+    if !packs.is_empty() {
+        out.push(Action::StickerPackSync(packs));
     }
     let viewed: Vec<(Option<String>, i64)> = sync
         .viewed

@@ -1755,6 +1755,55 @@ impl<S: Store> Manager<S, Registered> {
         Ok(())
     }
 
+    /// Downloads a sticker pack (its manifest and every sticker) and saves
+    /// it as installed, without telling our other devices (for one they
+    /// installed, as Storage Service says).
+    pub async fn download_sticker_pack(
+        &mut self,
+        pack_id: &[u8],
+        pack_key: &[u8],
+    ) -> Result<StickerPack, Error<S::Error>> {
+        let operation = StickerPackOperation {
+            pack_id: Some(pack_id.to_vec()),
+            pack_key: Some(pack_key.to_vec()),
+            r#type: Some(sticker_pack_operation::Type::Install as i32),
+        };
+        let unidentified_websocket = self.unidentified_websocket().await?;
+        download_sticker_pack(self.store.clone(), unidentified_websocket, &operation).await
+    }
+
+    /// Downloads and decrypts a sticker pack's manifest (its title, author,
+    /// cover and stickers, without their images), saving nothing.
+    pub async fn sticker_pack_manifest(
+        &mut self,
+        pack_id: &[u8],
+        pack_key: &[u8],
+    ) -> Result<StickerPackManifest, Error<S::Error>> {
+        let mut unidentified_websocket = self.unidentified_websocket().await?;
+        let key = derive_key(pack_key)?;
+        let mut ciphertext = Vec::new();
+        unidentified_websocket
+            .get_sticker_pack_manifest(&hex::encode(pack_id))
+            .await?
+            .read_to_end(&mut ciphertext)
+            .await?;
+        decrypt_in_place(key, &mut ciphertext)?;
+        Ok(libsignal_service::proto::Pack::decode(ciphertext.as_slice())
+            .map_err(ProvisioningError::from)?
+            .into())
+    }
+
+    /// Downloads and decrypts one sticker's image, saving nothing.
+    pub async fn sticker_image(
+        &mut self,
+        pack_id: &[u8],
+        pack_key: &[u8],
+        sticker_id: u32,
+    ) -> Result<Vec<u8>, Error<S::Error>> {
+        let mut unidentified_websocket = self.unidentified_websocket().await?;
+        download_sticker::<S>(&mut unidentified_websocket, pack_id, pack_key, sticker_id).await
+    }
+
     /// Removes an installed sticker pack
     pub async fn remove_sticker_pack(
         &mut self,

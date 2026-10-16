@@ -148,6 +148,9 @@ pub enum AppEvent {
     CriticalAlertModal,
     /// Desktop's join dialog for a group link (`GroupV2JoinDialog`).
     GroupLinkPreview(std::rc::Rc<signal_backend::GroupLinkPreview>),
+    /// A sticker pack is opening (`AppState::open_sticker_pack`): show
+    /// Desktop's `StickerPreviewModal`.
+    OpenStickerPack,
     /// Desktop's error dialog: a title and what went wrong.
     Alert { title: SharedString, description: SharedString },
     /// A short note to show (Desktop's toasts).
@@ -284,6 +287,10 @@ pub struct AppState {
     pub sticker_packs: Vec<std::sync::Arc<signal_backend::StickerPackView>>,
     /// Chat colors: the default, custom colors, and each chat's own.
     pub chat_colors: signal_store::ChatColors,
+    /// What Desktop's sticker manager lists, once loaded.
+    pub sticker_manager: Option<signal_backend::stickers::StickerManagerView>,
+    /// The sticker pack open in Desktop's `StickerPreviewModal`.
+    pub sticker_preview: Option<StickerPreview>,
     /// Chat folders, deleted ones too (see [`Self::current_folders`]).
     pub chat_folders: Vec<signal_store::ChatFolder>,
     /// The folder the chat list shows (Desktop's `selectedChatFolderId`);
@@ -509,6 +516,8 @@ impl AppState {
             chat_colors: Default::default(),
             chat_folders: Vec::new(),
             selected_folder: None,
+            sticker_manager: None,
+            sticker_preview: None,
             has_giphy_key: std::env::var_os("GIPHY_API_KEY").is_some(),
             loops: Default::default(),
             audio: None,
@@ -1215,6 +1224,24 @@ impl AppState {
             Event::Gifs { query, offset, result } => cx.emit(AppEvent::Gifs { query, offset, result }),
             Event::Stickers(packs) => {
                 self.sticker_packs = packs.into_iter().map(std::sync::Arc::new).collect();
+                // The open pack follows an install or removal.
+                if let Some(StickerPreview::Ready(preview)) = &mut self.sticker_preview {
+                    preview.pack.installed = self.sticker_packs.iter().any(|p| p.id == preview.pack.id);
+                }
+                cx.notify();
+            }
+            Event::StickerManager(view) => {
+                self.sticker_manager = Some(view);
+                cx.notify();
+            }
+            Event::StickerPackPreview { id, result } => {
+                if matches!(&self.sticker_preview, Some(StickerPreview::Loading(loading)) if *loading == id) {
+                    self.sticker_preview = Some(match result {
+                        Ok(preview) => StickerPreview::Ready(Box::new(preview)),
+                        Err(error) => StickerPreview::Failed(error),
+                    });
+                    cx.notify();
+                }
             }
             Event::StickerUpload(upload) => cx.emit(AppEvent::StickerUpload(upload)),
             Event::RecipientFound { query, result } if self.link_lookup.as_ref() == Some(&query) => {
@@ -1306,6 +1333,17 @@ impl AppState {
                 self.emoji_usage = EmojiUsageCache::default();
                 self.recent_stickers.clear();
                 self.sticker_packs.clear();
+                self.sticker_manager = None;
+                self.sticker_preview = None;
+                self.unverified.clear();
+                self.captcha_pending = false;
+                self.server_alerts = Default::default();
+                self.clock_skew = false;
+                self.chat_colors = Default::default();
+                self.chat_folders.clear();
+                self.selected_folder = None;
+                self.link_lookup = None;
+                self.pending_links.clear();
                 self.has_giphy_key = std::env::var_os("GIPHY_API_KEY").is_some();
                 self.image_optimization = Default::default();
                 self.prefs = Default::default();
@@ -1458,6 +1496,17 @@ impl AppState {
         self.load_prefs(cx);
         self.reload_chat_colors(cx);
         self.reload_chat_folders(cx);
+    }
+
+    /// Opens a sticker pack by its id and key (from the sticker manager, or
+    /// a `signal.art` or `sgnl://addstickers` link through
+    /// [`Self::open_signal_link`]): Desktop's
+    /// `StickerPreviewModal` shows while its stickers load.
+    pub fn open_sticker_pack(&mut self, id: Vec<u8>, key: Vec<u8>, cx: &mut Context<Self>) {
+        self.sticker_preview = Some(StickerPreview::Loading(id.clone()));
+        self.send(Command::PreviewStickerPack { id, key });
+        cx.emit(AppEvent::OpenStickerPack);
+        cx.notify();
     }
 
     /// Reads the chat folders again.
@@ -1726,11 +1775,14 @@ impl AppState {
             }
             Route::GroupInvite(code) => self.open_group_link(Route::group_link(&code)),
             Route::LinkCall(key) => self.open_call_link(Route::call_link(&key)),
-            // Desktop shows the pack's preview (`showStickerPackPreview`);
-            // this app has no sticker pack manager yet.
-            Route::AddStickers { .. } => {
-                cx.emit(AppEvent::Info("Installing sticker packs from links isn't supported yet".into()))
-            }
+            // Desktop shows the pack's preview (`showStickerPackPreview`).
+            Route::AddStickers { pack_id, pack_key } => match signal_backend::stickers::pack_of(&pack_id, &pack_key) {
+                Some((id, key)) => self.open_sticker_pack(id, key, cx),
+                None => cx.emit(AppEvent::Alert {
+                    title: "Sticker Pack".into(),
+                    description: "Error opening sticker pack. Check your internet connection and try again.".into(),
+                }),
+            },
             // The window is shown by whoever handed us the link.
             Route::ShowWindow => {}
             // A solved captcha goes to the server (`challenge.rs`).
@@ -2843,6 +2895,15 @@ impl AppState {
     }
 }
 
+/// The sticker pack shown in Desktop's `StickerPreviewModal`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StickerPreview {
+    /// Its stickers are loading (its id).
+    Loading(Vec<u8>),
+    Ready(Box<signal_backend::stickers::StickerPackPreview>),
+    Failed(String),
+}
+
 /// A notification's text for a message: its text, or what it holds.
 /// What a poll notification says, in Desktop's words: a vote names the
 /// sender as the title does ("Alice in Hikers") and quotes the poll's
@@ -2999,12 +3060,20 @@ mod link_tests {
         });
         state.update(cx, |s, cx| s.close_call_lobby(cx));
 
-        // Links Desktop knows but this app can't use say so.
+        // A sticker pack's link opens the pack (the demo's Garden dots);
+        // one that isn't a pack's says so.
+        let garden = format!("https://signal.art/addstickers/#pack_id={}&pack_key={}", "9a".repeat(16), "00".repeat(32));
+        assert!(open(cx, &garden));
+        wait(cx, "the pack", &mut |cx| {
+            state.read_with(cx, |s, _| matches!(&s.sticker_preview, Some(StickerPreview::Ready(p)) if p.pack.title == "Garden dots"))
+        });
         assert!(open(cx, "sgnl://addstickers/?pack_id=0123&pack_key=ffee"));
+        // Links Desktop knows but this app can't use say so.
         assert!(open(cx, "sgnl://linkdevice?uuid=a&pub_key=b"));
         cx.run_until_parked();
         let seen = events.borrow().join("\n");
-        assert!(seen.contains("Installing sticker packs from links isn't supported yet"), "{seen}");
+        assert!(seen.contains("OpenStickerPack"), "{seen}");
+        assert!(seen.contains("Error opening sticker pack"), "{seen}");
         assert!(seen.contains("didn't make sense"), "{seen}");
         backend.shutdown();
     }

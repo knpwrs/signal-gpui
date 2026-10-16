@@ -24,6 +24,7 @@ mod poll;
 mod profile;
 mod reminders;
 mod send_states;
+mod sticker_packs;
 mod stories;
 mod view_once;
 pub use call_history::*;
@@ -38,6 +39,7 @@ pub use poll::*;
 pub use profile::*;
 pub use reminders::*;
 pub use send_states::*;
+pub use sticker_packs::*;
 pub use stories::*;
 pub use view_once::*;
 

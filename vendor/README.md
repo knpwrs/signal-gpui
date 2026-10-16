@@ -62,6 +62,13 @@ upstream workspace). Modified by Ken Powers for signal-gpui since
   (they couldn't decrypt ours) is the new `Received::RetryRequest`.
   Upstream reports both as `DecryptionError`.
 
+- `src/manager/registered.rs`: `Manager::download_sticker_pack` downloads
+  and saves a pack without the sync message `install_sticker_pack` sends
+  (for packs Storage Service says another device installed), and
+  `Manager::sticker_pack_manifest` and `Manager::sticker_image` fetch a
+  pack's manifest or one sticker without saving (for previews). Upstream
+  only installs, always telling our other devices.
+
 ## libsignal-service
 
 whisperfish/libsignal-service-rs at `fb92b13c82fde40ba4d10696cf79aa4f36ce25f1`
@@ -130,3 +137,6 @@ Powers for signal-gpui since 2026-10-15. Changes:
   (`aciBinary`, `nickname` as a `SignalNickname`, `note`), from Signal
   Desktop's `protos/SignalService.proto`, so a shared contact's Signal
   account, nickname and note can be shown.
+- `protobuf/StorageService.proto`: `InstalledStickerPackRecord` and its
+  identifier and record type (6), from Signal Desktop's
+  `protos/SignalStorage.proto`, for installed sticker packs.

@@ -600,30 +600,77 @@ fn new_demo_link_key() -> Vec<u8> {
 const STICKER_SIZE: u32 = 256;
 
 /// A pack of abstract round "stickers" (drawn here, so no artwork ships).
-fn demo_stickers(data_dir: &Path) -> Vec<crate::StickerPackView> {
-    let dir = data_dir.join("stickers").join("demo");
-    if std::fs::create_dir_all(&dir).is_err() {
-        return Vec::new();
+/// The demo's packs, drawn in code: "Demo shapes" (installed at first) and
+/// "Garden dots", received from Maya.
+fn demo_all_stickers(data_dir: &Path) -> Vec<crate::StickerPackView> {
+    let pack = |dir: &str, id: Vec<u8>, title: &str, emoji: &[&str], shift: f32| {
+        let dir = data_dir.join("stickers").join(dir);
+        std::fs::create_dir_all(&dir).ok()?;
+        let stickers = emoji
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, emoji)| {
+                let path = dir.join(format!("{ix}.png"));
+                if !path.exists() {
+                    write_demo_sticker(&path, (ix as f32 / emoji.len() as f32 + shift) % 1.).ok()?;
+                }
+                Some(crate::StickerView { id: ix as u32, emoji: Some((*emoji).into()), path })
+            })
+            .collect();
+        Some(crate::StickerPackView { id, key: vec![0; 32], title: title.into(), author: "signal-gpui".into(), stickers })
+    };
+    [
+        pack("demo", vec![0xde, 0x70], "Demo shapes", &["😀", "😎", "🎉", "❤️", "👍", "🔥", "🌄", "☕"], 0.),
+        pack("demo-garden", DEMO_GARDEN_PACK.to_vec(), "Garden dots", &["🌱", "🌻", "🐝", "🍓"], 0.3),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+const DEMO_GARDEN_PACK: [u8; 16] = [0x9a; 16];
+/// Settings key: the demo's installed packs (hex ids, JSON).
+const DEMO_INSTALLED_STICKERS: &str = "demo.installed_stickers";
+
+async fn demo_installed_ids(db: &AppDb) -> Vec<String> {
+    db.setting(DEMO_INSTALLED_STICKERS)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|j| serde_json::from_str(&j).ok())
+        .unwrap_or_else(|| vec![hex::encode([0xde, 0x70])])
+}
+
+async fn demo_stickers_installed(db: &AppDb, data_dir: &Path) -> Vec<crate::StickerPackView> {
+    let ids = demo_installed_ids(db).await;
+    let mut packs: Vec<_> = demo_all_stickers(data_dir).into_iter().filter(|p| ids.contains(&hex::encode(&p.id))).collect();
+    packs.sort_by_key(|p| ids.iter().position(|i| *i == hex::encode(&p.id)));
+    packs
+}
+
+fn demo_summary(pack: &crate::StickerPackView, installed: bool) -> crate::stickers::StickerPackSummary {
+    crate::stickers::StickerPackSummary {
+        id: pack.id.clone(),
+        key: pack.key.clone(),
+        title: pack.title.clone(),
+        author: pack.author.clone(),
+        cover: pack.stickers.first().map(|s| s.path.clone()),
+        sticker_count: pack.stickers.len() as u32,
+        installed,
+        blessed: false,
     }
-    let emoji = ["😀", "😎", "🎉", "❤️", "👍", "🔥", "🌄", "☕"];
-    let stickers = emoji
-        .iter()
-        .enumerate()
-        .filter_map(|(ix, emoji)| {
-            let path = dir.join(format!("{ix}.png"));
-            if !path.exists() {
-                write_demo_sticker(&path, ix as f32 / emoji.len() as f32).ok()?;
-            }
-            Some(crate::StickerView { id: ix as u32, emoji: Some((*emoji).into()), path })
-        })
-        .collect();
-    vec![crate::StickerPackView {
-        id: vec![0xde, 0x70],
-        key: vec![0; 32],
-        title: "Demo shapes".into(),
-        author: "signal-gpui".into(),
-        stickers,
-    }]
+}
+
+/// The demo's manager: no Artist Series (nothing is fetched), both packs
+/// shared with us.
+async fn demo_sticker_manager(db: &AppDb, data_dir: &Path) -> crate::stickers::StickerManagerView {
+    let ids = demo_installed_ids(db).await;
+    let installed = demo_stickers_installed(db, data_dir).await;
+    crate::stickers::StickerManagerView {
+        installed: installed.iter().map(|p| demo_summary(p, true)).collect(),
+        blessed: Vec::new(),
+        received: demo_all_stickers(data_dir).iter().map(|p| demo_summary(p, ids.contains(&hex::encode(&p.id)))).collect(),
+    }
 }
 
 /// A soft disc of colour on a transparent background.
@@ -1638,7 +1685,43 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     emit(Event::MessageChanged { conversation, message_id: id });
                 }
             }
-            Command::LoadStickers => emit(Event::Stickers(demo_stickers(&data_dir))),
+            Command::LoadStickers => emit(Event::Stickers(demo_stickers_installed(&db, &data_dir).await)),
+            Command::LoadStickerManager => emit(Event::StickerManager(demo_sticker_manager(&db, &data_dir).await)),
+            Command::PreviewStickerPack { id, key: _ } => {
+                let installed = demo_installed_ids(&db).await;
+                let result = demo_all_stickers(&data_dir)
+                    .into_iter()
+                    .find(|p| p.id == id)
+                    .map(|p| crate::stickers::StickerPackPreview {
+                        pack: demo_summary(&p, installed.contains(&hex::encode(&p.id))),
+                        stickers: p.stickers.clone(),
+                    })
+                    .ok_or_else(|| "Error opening sticker pack. Check your internet connection and try again.".to_owned());
+                emit(Event::StickerPackPreview { id, result });
+            }
+            Command::InstallStickerPack { id, .. } => {
+                let mut ids = demo_installed_ids(&db).await;
+                let hex = hex::encode(&id);
+                if !ids.contains(&hex) {
+                    ids.push(hex);
+                }
+                let _ = db.set_setting(DEMO_INSTALLED_STICKERS, &serde_json::to_string(&ids).unwrap_or_default()).await;
+                emit(Event::Stickers(demo_stickers_installed(&db, &data_dir).await));
+                emit(Event::StickerManager(demo_sticker_manager(&db, &data_dir).await));
+            }
+            Command::UninstallStickerPack { id, .. } => {
+                let mut ids = demo_installed_ids(&db).await;
+                ids.retain(|i| *i != hex::encode(&id));
+                let _ = db.set_setting(DEMO_INSTALLED_STICKERS, &serde_json::to_string(&ids).unwrap_or_default()).await;
+                emit(Event::Stickers(demo_stickers_installed(&db, &data_dir).await));
+                emit(Event::StickerManager(demo_sticker_manager(&db, &data_dir).await));
+            }
+            Command::OrderStickerPacks(order) => {
+                let ids: Vec<String> = order.iter().map(hex::encode).collect();
+                let _ = db.set_setting(DEMO_INSTALLED_STICKERS, &serde_json::to_string(&ids).unwrap_or_default()).await;
+                emit(Event::Stickers(demo_stickers_installed(&db, &data_dir).await));
+                emit(Event::StickerManager(demo_sticker_manager(&db, &data_dir).await));
+            }
             // Pretends to upload, a sticker at a time; nothing is installed.
             Command::UploadStickerPack(pack) => {
                 use crate::sticker_upload::{StickerUpload, share_url};

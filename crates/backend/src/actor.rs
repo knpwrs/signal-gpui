@@ -10,6 +10,7 @@ mod early;
 mod group_admin;
 mod group_calls;
 mod polls;
+mod stickers;
 mod stories;
 mod sender_keys;
 mod key_transparency;
@@ -884,6 +885,11 @@ impl Actor {
                     let packs = self.load_stickers().await;
                     self.emit(Event::Stickers(packs));
                 }
+                Command::LoadStickerManager => self.load_sticker_manager().await,
+                Command::PreviewStickerPack { id, key } => self.preview_sticker_pack(id, key).await,
+                Command::InstallStickerPack { id, key } => self.install_sticker_pack_ui(id, key).await,
+                Command::UninstallStickerPack { id, key } => self.uninstall_sticker_pack_ui(id, key).await,
+                Command::OrderStickerPacks(ids) => self.order_sticker_packs(ids).await,
                 Command::SendSticker { conversation, pack, sticker, quote } => {
                     self.send_sticker(conversation, &pack, sticker, quote).await
                 }
@@ -893,13 +899,15 @@ impl Actor {
                     self.emit(Event::RecipientFound { query, result });
                 }
                 Command::FetchLinkPreview { url } => {
-                    let preview = if self.setting_on(AccountSetting::LinkPreviews).await {
+                    let preview = if !self.setting_on(AccountSetting::LinkPreviews).await {
+                        None
+                    } else if crate::stickers::is_sticker_pack_link(&url) {
+                        self.sticker_pack_link_preview(&url).await
+                    } else {
                         crate::link_preview::fetch(&url, self.image_optimization().await).await.unwrap_or_else(|error| {
                             debug!(error = %format!("{error:#}"), "no link preview");
                             None
                         })
-                    } else {
-                        None
                     };
                     self.emit(Event::LinkPreview { url, preview });
                 }
@@ -1403,7 +1411,11 @@ impl Actor {
                 sent_to,
                 content,
                 content_image,
+                sticker_pack,
             } => {
+                if let Some((id, key)) = &sticker_pack {
+                    self.sticker_pack_seen(id, key).await;
+                }
                 let mut spans = Vec::new();
                 let mut style_spans = Vec::new();
                 // Every 1:1 message carries the sender's timer (groups take
@@ -1664,6 +1676,7 @@ impl Actor {
             }
             Action::StoryViewed { viewer, sent_at, at } => self.apply_story_viewed(viewer, sent_at, at).await,
             Action::StoryRecipientUpdate { sent_at, recipients } => self.apply_story_recipient_update(sent_at, recipients).await,
+            Action::StickerPackSync(packs) => self.apply_sticker_pack_sync(packs).await,
             Action::ViewedSync(viewed) => {
                 self.gift_badges_viewed(&viewed).await;
                 self.apply_viewed_sync(viewed).await
@@ -2606,6 +2619,7 @@ impl Actor {
             identifiers,
             own_profile,
             chat_folders,
+            sticker_packs,
         } = match storage::fetch(manager).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -2641,6 +2655,7 @@ impl Actor {
         }
         self.apply_storage_call_links(call_links).await;
         self.apply_storage_chat_folders(chat_folders).await;
+        self.apply_storage_sticker_packs(sticker_packs).await;
         if let Err(error) = self.db.apply_profile_sharing(&profile_sharing).await {
             warn!(error = %format!("{error:#}"), "failed to save profile sharing");
         }
@@ -2698,9 +2713,14 @@ impl Actor {
     /// `stickers/<pack>/<id>.<ext>` once so it can be shown from disk.
     async fn load_stickers(&self) -> Vec<crate::StickerPackView> {
         let Ok(packs) = self.store.sticker_packs().await else { return Vec::new() };
+        // In Desktop's order: by position, then by id.
+        let rows = self.db.sticker_pack_rows().await.unwrap_or_default();
+        let position = |id: &[u8]| rows.iter().find(|r| r.id == hex_of(id)).and_then(|r| r.position).unwrap_or(u32::MAX);
+        let mut packs: Vec<_> = packs.flatten().collect();
+        packs.sort_by(|a, b| position(&a.id).cmp(&position(&b.id)).then_with(|| a.id.cmp(&b.id)));
         let root = self.config.data_dir.join("stickers");
         let mut views = Vec::new();
-        for pack in packs.flatten() {
+        for pack in packs {
             let dir = root.join(hex_of(&pack.id));
             if std::fs::create_dir_all(&dir).is_err() {
                 continue;
@@ -5509,7 +5529,12 @@ impl Actor {
                 continue;
             }
             match manager.install_sticker_pack(&id, &key).await {
-                Ok(()) => added += 1,
+                Ok(()) => {
+                    added += 1;
+                    if let Err(error) = self.db.install_sticker_pack_row(&hex_of(&id), &hex_of(&key), None, now_millis()).await {
+                        warn!(%error, "failed to save a transferred sticker pack");
+                    }
+                }
                 Err(error) => warn!(%error, "couldn't install a transferred sticker pack"),
             }
         }

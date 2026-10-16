@@ -123,6 +123,9 @@ impl RootView {
                     use gpui_kit::component::WindowExt as _;
                     window.push_notification(gpui_kit::component::notification::Notification::error(message.clone()), cx);
                 }
+                if let AppEvent::OpenStickerPack = event {
+                    crate::views::sticker_manager::open_preview(state.clone(), window, cx);
+                }
                 if let AppEvent::GroupLinkPreview(preview) = event {
                     crate::views::group_admin::open_join(state.clone(), preview.clone(), window, cx);
                 }

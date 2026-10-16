@@ -2922,6 +2922,11 @@ const STICKER_SIZE: f32 = 200.;
 /// `shouldUseFullSizeLinkPreviewImage`: both sides ≥ 200 and not roughly
 /// square), with its path and display size.
 fn full_size_preview_image(preview: &signal_store::LinkPreview) -> Option<(String, (f32, f32))> {
+    // A sticker pack's cover stays small (Desktop's
+    // `shouldUseFullSizeLinkPreviewImage`).
+    if signal_backend::stickers::is_sticker_pack_link(&preview.url) {
+        return None;
+    }
     let image = preview.image.as_ref()?;
     let (width, height) = (image.width?, image.height?);
     let roughly_square = (1. - width as f32 / height.max(1) as f32).abs() < 0.05;
