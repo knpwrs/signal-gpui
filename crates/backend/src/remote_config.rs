@@ -156,6 +156,14 @@ impl RemoteConfig {
         self.max_age_ms("global.adminDeleteMaxAgeInSeconds")
     }
 
+    /// How long the server keeps undelivered messages, in millis
+    /// (`global.messageQueueTimeInSeconds`; Desktop's `getMessageQueueTime`:
+    /// never under 30 days). View-once messages left unviewed go after it.
+    pub fn message_queue_time_ms(&self) -> i64 {
+        let floor = signal_store::VIEW_ONCE_MIN_AGE_MS / 1000;
+        self.int("global.messageQueueTimeInSeconds").unwrap_or(floor).max(floor).saturating_mul(1000)
+    }
+
     fn max_age_ms(&self, key: &str) -> i64 {
         // Desktop's `safeParseInteger`: the whole value must be a number.
         self.value(key)
@@ -355,6 +363,16 @@ mod tests {
         assert_eq!((empty.username_nickname_min(), empty.username_nickname_max()), (3, 32));
         assert!(empty.auto_downloads(200 * MIB - 1));
         assert!(!empty.auto_downloads(200 * MIB));
+    }
+
+    #[test]
+    fn the_message_queue_time_is_never_under_30_days() {
+        let month = 30 * DAY_MS;
+        let queue = |v: &str| RemoteConfig::from_pairs([("global.messageQueueTimeInSeconds", v)]).message_queue_time_ms();
+        assert_eq!(RemoteConfig::default().message_queue_time_ms(), month);
+        assert_eq!(queue("5184000"), 2 * month);
+        assert_eq!(queue("60"), month);
+        assert_eq!(queue("soon"), month);
     }
 
     #[test]

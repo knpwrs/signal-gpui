@@ -42,6 +42,9 @@ pub enum Action {
         timer_version: Option<u32>,
         /// A poll (`message.body` is its question).
         poll: Option<signal_store::Poll>,
+        /// A view-once message: ready to view once, or (ours, or not one
+        /// that can be viewed) already erased, with nothing kept.
+        view_once: Option<signal_store::ViewOnce>,
     },
     React {
         conversation: ConversationId,
@@ -97,6 +100,8 @@ pub enum Action {
     },
     /// Our other device read these incoming messages: `(author, sent_at)`.
     ReadSync(Vec<(String, i64)>),
+    /// We opened their view-once message on another device.
+    ViewOnceOpen { author: String, sent_at: i64 },
     #[serde(skip)]
     /// A story, someone's or ours (posted from another device).
     Story {
@@ -809,21 +814,35 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
         }
         None => None,
     };
+    let outgoing = matches!(origin, Origin::Outgoing { .. });
+    // View-once (Desktop's `handleDataMessage`): ours are erased as soon
+    // as they're sent, so nothing of one from another device is kept;
+    // theirs keep their one photo or video if it's a valid one
+    // (`isValidTapToView`), else nothing.
+    let view_once = (dm.is_view_once == Some(true)).then(|| match () {
+        _ if outgoing => signal_store::ViewOnce::Gone,
+        _ if valid_view_once(dm) => signal_store::ViewOnce::Ready,
+        _ => signal_store::ViewOnce::Invalid,
+    });
+    let erased = view_once.is_some_and(|v| v != signal_store::ViewOnce::Ready);
     let body = match &poll {
+        _ if view_once.is_some() => String::new(),
         Some(poll) => poll.question.clone(),
         None => body_text(dm),
     };
-    let sticker = dm.sticker.as_ref().and_then(|s| s.data.clone()).filter(|_| dm.body.is_none());
+    let sticker = dm.sticker.as_ref().and_then(|s| s.data.clone()).filter(|_| dm.body.is_none() && view_once.is_none());
     let is_sticker = sticker.is_some();
-    let pointers: Vec<AttachmentPointer> = normal_attachments(dm).cloned().chain(sticker).collect();
+    let pointers: Vec<AttachmentPointer> =
+        if erased { Vec::new() } else { normal_attachments(dm).cloned().chain(sticker).collect() };
     // A poll's body is its question, never a long text.
-    let long_text = if poll.is_some() { None } else { long_text_of(dm) };
-    if body.is_empty() && pointers.is_empty() && long_text.is_none() {
+    let long_text = if poll.is_some() || view_once.is_some() { None } else { long_text_of(dm) };
+    // (A view-once message stays, even with nothing left of it.)
+    if body.is_empty() && pointers.is_empty() && long_text.is_none() && view_once.is_none() {
         // Profile key updates, group changes, call updates, etc.
         return Vec::new();
     }
 
-    let quote = dm.quote.as_ref().and_then(|q| {
+    let quote = dm.quote.as_ref().filter(|_| view_once.is_none()).and_then(|q| {
         Some(Quote {
             author: other(aci_string(q.parse_author_aci()), ctx),
             author_name: String::new(),
@@ -848,6 +867,7 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
     let preview = dm
         .preview
         .first()
+        .filter(|_| view_once.is_none())
         .filter(|p| p.url.as_deref().is_some_and(|url| crate::link_preview::is_valid(&body, url)));
     let link_preview = preview.map(|p| LinkPreview {
         url: p.url.clone().unwrap_or_default(),
@@ -858,7 +878,6 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
     });
     let preview_image = preview.and_then(|p| p.image.clone());
 
-    let outgoing = matches!(origin, Origin::Outgoing { .. });
     vec![Action::Insert {
         message: NewMessage {
             conversation_id: conversation,
@@ -887,7 +906,45 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
         preview_image,
         timer_version: dm.expire_timer_version,
         poll,
+        view_once,
     }]
+}
+
+/// Desktop's `isValidTapToView` (`ts/util/isValidTapToView.std.ts`): no
+/// text, one photo or video of a type it can show, and nothing else (no
+/// quote, sticker, contact or link preview).
+pub fn valid_view_once(dm: &DataMessage) -> bool {
+    let mut attachments = normal_attachments(dm);
+    let (Some(only), None) = (attachments.next(), attachments.next()) else { return false };
+    dm.body.as_deref().unwrap_or_default().is_empty()
+        && long_text_of(dm).is_none()
+        && can_view_once(only.content_type.as_deref().unwrap_or_default())
+        && dm.quote.is_none()
+        && dm.sticker.is_none()
+        && dm.contact.is_empty()
+        && dm.preview.is_empty()
+}
+
+/// The photos and videos Desktop can show (`ts/util/GoogleChrome.std.ts`).
+pub fn can_view_once(content_type: &str) -> bool {
+    matches!(
+        content_type,
+        "image/avif"
+            | "image/bmp"
+            | "image/gif"
+            | "image/jpeg"
+            | "image/webp"
+            | "image/x-xbitmap"
+            | "image/vnd.microsoft.icon"
+            | "image/ico"
+            | "image/icon"
+            | "image/x-icon"
+            | "image/apng"
+            | "image/png"
+            | "video/mp4"
+            | "video/ogg"
+            | "video/webm"
+    )
 }
 
 /// A story (Desktop's `#handleStoryMessage`): the first attachment or a
@@ -1065,6 +1122,7 @@ fn map_story_reply(
         preview_image: None,
         timer_version: dm.expire_timer_version,
         poll: None,
+        view_once: None,
     });
     out
 }
@@ -1160,6 +1218,14 @@ fn map_sync(sync: &SyncMessage, envelope_ts: i64, ctx: &MapContext) -> Vec<Actio
         .collect();
     if !reads.is_empty() {
         out.push(Action::ReadSync(reads));
+    }
+    // Desktop's `ViewOnceOpenSyncs`: the message is named by its sender
+    // and timestamp.
+    if let Some(sync_message::Content::ViewOnceOpen(open)) = &sync.content
+        && let Some(aci) = parse_aci_with_fallback(open.sender_aci_binary.as_deref(), open.sender_aci.as_deref())
+        && let Some(sent_at) = open.timestamp
+    {
+        out.push(Action::ViewOnceOpen { author: aci.service_id_string(), sent_at: sent_at as i64 });
     }
     if let Some(sync_message::Content::CallEvent(event)) = &sync.content {
         if let Some(sync) = call_event(event) {

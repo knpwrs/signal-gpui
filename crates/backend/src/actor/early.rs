@@ -1,8 +1,8 @@
 //! Events that change a message, and what to do when they come before it.
 //!
 //! Desktop keeps a delete for everyone, an edit, a reaction, a poll vote or
-//! end, a receipt, a read sync or a "delete for me" sync whose message
-//! isn't here yet, and applies it when the message comes
+//! end, a receipt, a read sync, a view-once open or a "delete for me" sync
+//! whose message isn't here yet, and applies it when the message comes
 //! (`ts/util/modifyTargetMessage.preload.ts`, with `Deletes.forMessage`,
 //! `Edits.forMessage`, `Reactions.findReactionsForMessage` and the rest in
 //! `ts/messageModifiers/`). It keeps them in memory and keeps what they came
@@ -51,6 +51,8 @@ fn target(action: &Action) -> Option<(Option<&str>, i64, EarlyKeep)> {
         Action::PollEnd { by, target_sent_at, .. } => (by.as_deref(), *target_sent_at, Envelope),
         Action::Receipt { sent_at, .. } if sent_at.len() == 1 => (None, sent_at[0], SyncTask),
         Action::ReadSync(entries) if entries.len() == 1 => (Some(entries[0].0.as_str()), entries[0].1, SyncTask),
+        // Desktop's `ViewOnceOpenSyncs` is a sync task too.
+        Action::ViewOnceOpen { author, sent_at } => (Some(author.as_str()), *sent_at, SyncTask),
         Action::DeleteForMe { messages, conversations } if messages.len() == 1 && conversations.is_empty() => {
             (messages[0].1.as_deref(), messages[0].2, SyncTask)
         }
@@ -91,6 +93,7 @@ impl Actor {
             Action::PollEnd { .. } => self.apply_poll_end(action).await,
             Action::Receipt { sent_at, status } if sent_at.len() == 1 => self.apply_receipt(sent_at[0], *status).await,
             Action::ReadSync(entries) if entries.len() == 1 => self.apply_read_sync(&entries[0].0, entries[0].1).await,
+            Action::ViewOnceOpen { author, sent_at } => self.apply_view_once_open(author, *sent_at).await,
             Action::DeleteForMe { messages, conversations } if messages.len() == 1 && conversations.is_empty() => {
                 let (thread, author, sent_at) = &messages[0];
                 self.apply_delete_for_me(manager, thread, author.as_deref(), *sent_at).await
@@ -142,7 +145,8 @@ impl Actor {
                         debug!("applied an event that came before its message");
                         changed = true;
                         match action {
-                            Action::ReadSync(_) => early.read = true,
+                            // Viewing one reads it too (`markViewOnceMessageViewed`).
+                            Action::ReadSync(_) | Action::ViewOnceOpen { .. } => early.read = true,
                             Action::Delete { .. } | Action::AdminDelete { .. } => early.deleted = true,
                             _ => {}
                         }
@@ -225,6 +229,8 @@ impl Actor {
             info!("ignoring a delete for everyone that came too late");
             return Outcome::Refused;
         }
+        // A view-once message's media goes too.
+        self.erase_view_once(message.id, signal_store::ViewOnce::Gone).await;
         match self.db.mark_deleted(message.id).await {
             Ok(()) => {
                 self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id: message.id });
@@ -267,6 +273,7 @@ impl Actor {
             info!(reason, "ignoring an admin delete");
             return Outcome::Refused;
         }
+        self.erase_view_once(message.id, signal_store::ViewOnce::Gone).await;
         match self.db.mark_deleted_by_admin(message.id, &signal_store::DeletedByAdmin { by: by.clone() }).await {
             Ok(true) => {
                 self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id: message.id });
@@ -286,6 +293,11 @@ impl Actor {
             return Outcome::Refused;
         };
         let target = match self.db.find_message(conversation, target_author.as_deref(), *target_sent_at).await {
+            // View-once messages can't be edited (Desktop's `handleEditMessage`).
+            Ok(Some(message)) if message.view_once.is_some() => {
+                info!("ignoring an edit to a view-once message");
+                return Outcome::Refused;
+            }
             Ok(Some(message)) => message.id,
             Ok(None) => {
                 debug!("keeping an edit until its message comes");
@@ -435,6 +447,7 @@ mod tests {
             Action::PollEnd { conversation: chat, by: Some("bob".into()), target_sent_at: 10, sent_at: 15 },
             Action::Receipt { sent_at: vec![10], status: signal_store::DeliveryStatus::Read },
             Action::ReadSync(vec![("bob".into(), 10)]),
+            Action::ViewOnceOpen { author: "bob".into(), sent_at: 10 },
             Action::DeleteForMe {
                 messages: vec![(mapping::ThreadRef::GroupId(vec![9; 32]), Some("bob".into()), 10)],
                 conversations: Vec::new(),
@@ -467,6 +480,8 @@ mod tests {
                 // An end names its poll by its author, who ends it.
                 Some((bob(), 10, Envelope)),
                 Some((None, 10, SyncTask)),
+                Some((bob(), 10, SyncTask)),
+                // A view-once open, as Desktop's `ViewOnceOpenSyncs`.
                 Some((bob(), 10, SyncTask)),
                 Some((bob(), 10, SyncTask)),
             ]

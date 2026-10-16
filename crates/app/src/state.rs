@@ -659,6 +659,10 @@ impl AppState {
                 }
             }
             Event::History(progress) => self.on_history(progress, cx),
+            // Nothing shows view-once media yet: its copy goes.
+            Event::ViewOnceOpened(opened) => {
+                let _ = std::fs::remove_file(opened.path);
+            }
             Event::GroupCreated(conversation) => {
                 self.reload_conversations(cx);
                 self.select(Some(conversation), cx);

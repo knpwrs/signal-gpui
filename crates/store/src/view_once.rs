@@ -43,10 +43,10 @@ impl ViewOnce {
     }
 }
 
-/// How long an unviewed view-once message is kept: Desktop's
-/// `getMessageQueueTime`, the server's message queue time, never under 30
-/// days (`global.messageQueueTimeInSeconds` isn't read here).
-pub const VIEW_ONCE_MAX_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+/// The least time an unviewed view-once message is kept: Desktop's
+/// `getMessageQueueTime` follows the server's message queue time, never
+/// under 30 days (the backend's remote config reads the rest).
+pub const VIEW_ONCE_MIN_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 
 /// What a view-once message says in the chat list and notifications, in
 /// Desktop's words (`getNotificationDataForMessage`): its kind while it

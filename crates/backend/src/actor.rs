@@ -9,6 +9,9 @@ mod polls;
 mod stories;
 mod release_notes;
 mod remote_config;
+mod view_once;
+
+pub(crate) use view_once::VIEW_ONCE_DIR;
 
 use std::{
     cell::RefCell,
@@ -212,6 +215,9 @@ struct Actor {
     early_replaying: RefCell<HashSet<i64>>,
     /// Early events have been tried again this session.
     early_retried: RefCell<bool>,
+    /// Erases view-once messages left unviewed; notified when one arrives.
+    view_once_expiry_task: RefCell<Option<tokio::task::JoinHandle<()>>>,
+    view_once_expiry: tokio::sync::Notify,
     /// RingRTC, once a call needs it.
     calls: RefCell<Option<signal_calls::Calls>>,
     /// The call in progress.
@@ -307,6 +313,8 @@ pub(crate) async fn run(
         story_expiry: tokio::sync::Notify::new(),
         early_replaying: RefCell::default(),
         early_retried: RefCell::new(false),
+        view_once_expiry_task: RefCell::new(None),
+        view_once_expiry: tokio::sync::Notify::new(),
         identities_seen: RefCell::default(),
         calls: RefCell::new(None),
         call: RefCell::new(None),
@@ -401,6 +409,9 @@ impl Actor {
         *self.self_aci.borrow_mut() = aci.clone();
         *self.manager.borrow_mut() = Some(manager.clone());
 
+        // No viewer is open yet: copies of view-once media left from last
+        // time go.
+        self.clear_view_once_copies().await;
         // Note to Self is always present, as in Signal Desktop.
         let note = ConversationId::direct(&aci);
         if let Err(error) = self
@@ -469,6 +480,10 @@ impl Actor {
         if let Some(old) = self.story_expiry_task.borrow_mut().replace(task) {
             old.abort();
         }
+        let task = tokio::task::spawn_local(self.clone().view_once_expiry_loop());
+        if let Some(old) = self.view_once_expiry_task.borrow_mut().replace(task) {
+            old.abort();
+        }
     }
 
     /// Link and sync: waits for the phone's upload, then imports it.
@@ -507,6 +522,8 @@ impl Actor {
             {
                 self.save_account_settings(settings).await;
             }
+            // Transferred view-once messages may be old enough to erase.
+            self.view_once_expiry.notify_one();
             let packs = std::mem::take(&mut imported.sticker_packs);
             if !packs.is_empty() {
                 tokio::task::spawn_local(self.clone().install_sticker_packs(manager.clone(), packs));
@@ -629,6 +646,8 @@ impl Actor {
                 Command::FetchAttachment { message_id, index } => {
                     self.fetch_attachment(message_id, index).await
                 }
+                Command::OpenViewOnce { message_id } => self.open_view_once(message_id).await,
+                Command::SendViewOnce { conversation, media } => self.send_view_once(conversation, media).await,
                 Command::FetchLongText { message_id } => {
                     if let Some(manager) = self.manager() {
                         self.download_long_text(&manager, message_id, LongTextTry::Asked).await;
@@ -930,7 +949,7 @@ impl Actor {
 
     async fn apply(self: &Rc<Self>, manager: &SignalManager, action: Action) {
         match action {
-            Action::Insert { mut message, mentions, styles, pointers, long_text, preview_image, timer_version, poll } => {
+            Action::Insert { mut message, mentions, styles, pointers, long_text, preview_image, timer_version, poll, view_once } => {
                 let mut spans = Vec::new();
                 let mut style_spans = Vec::new();
                 // Every 1:1 message carries the sender's timer (groups take
@@ -972,9 +991,14 @@ impl Actor {
                     // preview image beside the quote when we have it.
                     if let Ok(Some(quoted)) = self.db.find_message_any(quote.author.as_deref(), quote.sent_at).await {
                         quote.thumbnail = quoted.thumbnail();
-                        // Ours knows what the wire doesn't: a voice message.
-                        if let Some(attachment) = quoted.attachments.first() {
-                            quote.attachment = Some(signal_store::QuotedAttachment::of(attachment));
+                        // Ours knows what the wire doesn't: a voice message,
+                        // or a view-once message, which says only that
+                        // (Desktop's `copyQuoteContentFromOriginal`).
+                        if let Some(attachment) = quoted_attachment(&quoted) {
+                            if attachment.view_once {
+                                quote.text.clear();
+                            }
+                            quote.attachment = Some(attachment);
                         }
                     }
                 }
@@ -1000,8 +1024,11 @@ impl Actor {
                     .ok()
                     .flatten()
                     .is_some();
-                match self.db.insert_message(&message).await {
+                match self.db.insert_message_view_once(&message, view_once).await {
                     Ok(id) => {
+                        if view_once == Some(signal_store::ViewOnce::Ready) {
+                            self.view_once_expiry.notify_one();
+                        }
                         if !spans.is_empty() {
                             let _ = self.db.set_mentions(id, &spans).await;
                         }
@@ -1125,6 +1152,9 @@ impl Actor {
             Action::StoryViewed { viewer, sent_at } => self.apply_story_viewed(viewer, sent_at).await,
             Action::StoryRecipientUpdate { sent_at, recipients } => self.apply_story_recipient_update(sent_at, recipients).await,
             Action::ViewedSync(viewed) => self.apply_viewed_sync(viewed).await,
+            Action::ViewOnceOpen { .. } => {
+                self.modify(manager, action).await;
+            }
             Action::ReadSync(entries) => {
                 let mut changed = false;
                 for entry in entries {
@@ -2640,6 +2670,8 @@ impl Actor {
     }
 
     async fn remove_message(&self, conversation: &ConversationId, message_id: i64) {
+        // An unviewed view-once message's media goes with it.
+        self.erase_view_once(message_id, signal_store::ViewOnce::Gone).await;
         match self.db.remove_message(message_id).await {
             Ok(_) => {
                 self.emit(Event::MessageRemoved { conversation: conversation.clone(), message_id });
@@ -2877,6 +2909,10 @@ impl Actor {
         };
         let mut data = data;
         polls::poll_data(&mut data, &message);
+        // Ours stays view-once until it's sent.
+        if message.view_once == Some(signal_store::ViewOnce::Ready) {
+            data.is_view_once = Some(true);
+        }
         self.enqueue_with_media(conversation, message_id, data, timestamp, &message.attachments, message.link_preview.as_ref());
     }
 
@@ -2944,9 +2980,11 @@ impl Actor {
                 let Some(message) = self.db.message(*message_id).await.ok().flatten() else { continue };
                 let attachments: Vec<AttachmentMeta> =
                     message.attachments.iter().filter(|a| a.local_path.is_some() && !a.sticker).cloned().collect();
-                // Desktop doesn't forward polls (`canForward`).
+                // Desktop doesn't forward polls or view-once messages
+                // (`canForward`).
                 if message.deleted
                     || message.poll.is_some()
+                    || message.view_once.is_some()
                     || attachments.len() < message.attachments.len()
                     || (message.body.is_empty() && attachments.is_empty())
                 {
@@ -2964,7 +3002,7 @@ impl Actor {
         }
         if skipped > 0 {
             self.emit(Event::Error(
-                "Some messages couldn't be forwarded: polls and stickers can't be, nor attachments that haven't downloaded yet".into(),
+                "Some messages couldn't be forwarded: polls, stickers and view-once media can't be, nor attachments that haven't downloaded yet".into(),
             ));
         }
     }
@@ -3114,6 +3152,21 @@ impl Actor {
 
     /// Saves the images next to downloaded attachments so the message shows
     /// at once; optimizing and uploading happen in the outbound queue.
+    /// Desktop's view-once send: one photo or video, nothing else.
+    async fn send_view_once(self: Rc<Self>, conversation: ConversationId, media: crate::OutgoingViewOnce) {
+        match media {
+            crate::OutgoingViewOnce::Image(image) => {
+                self.send_images_as(conversation, vec![image], String::new(), None, Vec::new(), Vec::new(), true).await
+            }
+            crate::OutgoingViewOnce::Video(file) => {
+                if !mapping::can_view_once(media::content_type_for_file(&file.file_name)) {
+                    return self.error("can't send view-once", "only photos and videos can be viewed once");
+                }
+                self.send_file_as(conversation, file, String::new(), None, Vec::new(), Vec::new(), true).await
+            }
+        }
+    }
+
     async fn send_images(
         self: Rc<Self>,
         conversation: ConversationId,
@@ -3122,6 +3175,20 @@ impl Actor {
         quote: Option<i64>,
         mentions: Vec<String>,
         styles: Vec<signal_store::StyleSpan>,
+    ) {
+        self.send_images_as(conversation, images, caption, quote, mentions, styles, false).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_images_as(
+        self: Rc<Self>,
+        conversation: ConversationId,
+        images: Vec<crate::OutgoingImage>,
+        caption: String,
+        quote: Option<i64>,
+        mentions: Vec<String>,
+        styles: Vec<signal_store::StyleSpan>,
+        view_once: bool,
     ) {
         let stamp = now_millis();
         let dir = self.config.data_dir.join("attachments");
@@ -3165,7 +3232,9 @@ impl Actor {
         let wire_caption = caption.trim_end().to_owned();
         let wire_styles = mapping::wire_styles(&wire_caption, &styles);
         let (caption, spans, style_spans) = self.render_body(&wire_caption, &mentions, &wire_styles).await;
-        let Some((id, mut data, timestamp)) = self.store_outgoing(&conversation, caption, quote, metas, None).await else {
+        let Some((id, mut data, timestamp)) =
+            self.store_outgoing_as(&conversation, caption, quote, metas, None, view_once).await
+        else {
             return;
         };
         self.add_ranges(id, &mut data, wire_caption, &mentions, &spans, &wire_styles, &style_spans).await;
@@ -3189,6 +3258,20 @@ impl Actor {
         quote: Option<i64>,
         mentions: Vec<String>,
         styles: Vec<signal_store::StyleSpan>,
+    ) {
+        self.send_file_as(conversation, file, caption, quote, mentions, styles, false).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_file_as(
+        self: Rc<Self>,
+        conversation: ConversationId,
+        file: crate::OutgoingFile,
+        caption: String,
+        quote: Option<i64>,
+        mentions: Vec<String>,
+        styles: Vec<signal_store::StyleSpan>,
+        view_once: bool,
     ) {
         if crate::too_big_to_send(file.bytes.len()) {
             let limit = crate::size_limit_label(crate::remote_config().attachment_max_bytes());
@@ -3223,7 +3306,9 @@ impl Actor {
         let wire_caption = caption.trim_end().to_owned();
         let wire_styles = mapping::wire_styles(&wire_caption, &styles);
         let (caption, spans, style_spans) = self.render_body(&wire_caption, &mentions, &wire_styles).await;
-        let Some((id, mut data, timestamp)) = self.store_outgoing(&conversation, caption, quote, vec![meta], None).await else {
+        let Some((id, mut data, timestamp)) =
+            self.store_outgoing_as(&conversation, caption, quote, vec![meta], None, view_once).await
+        else {
             return;
         };
         self.add_ranges(id, &mut data, wire_caption, &mentions, &spans, &wire_styles, &style_spans).await;
@@ -3277,6 +3362,20 @@ impl Actor {
         attachments: Vec<AttachmentMeta>,
         link_preview: Option<LinkPreview>,
     ) -> Option<(i64, DataMessage, u64)> {
+        self.store_outgoing_as(conversation, body, quote, attachments, link_preview, false).await
+    }
+
+    /// [`store_outgoing`](Self::store_outgoing), view-once when
+    /// `view_once` says.
+    async fn store_outgoing_as(
+        &self,
+        conversation: &ConversationId,
+        body: String,
+        quote: Option<i64>,
+        attachments: Vec<AttachmentMeta>,
+        link_preview: Option<LinkPreview>,
+        view_once: bool,
+    ) -> Option<(i64, DataMessage, u64)> {
         let conversation = conversation.clone();
         let timestamp = self.next_timestamp();
         let quoted = match quote {
@@ -3293,7 +3392,7 @@ impl Actor {
             // A quoted spoiler stays hidden, here and for them.
             text: signal_store::hide_spoilers(&m.body, &m.styles),
             thumbnail: m.thumbnail(),
-            attachment: m.attachments.first().map(signal_store::QuotedAttachment::of),
+            attachment: quoted_attachment(m),
             story: false,
         });
 
@@ -3319,7 +3418,8 @@ impl Actor {
             link_preview,
             expires_in: expire_timer,
         };
-        let id = match self.db.insert_message(&message).await {
+        let view_once = view_once.then_some(signal_store::ViewOnce::Ready);
+        let id = match self.db.insert_message_view_once(&message, view_once).await {
             Ok(id) => id,
             Err(error) => {
                 self.error("failed to store outgoing message", error);
@@ -3342,9 +3442,7 @@ impl Actor {
                     author_aci: author.string(),
                     author_aci_binary: author.binary(),
                     text: Some(signal_store::hide_spoilers(&m.body, &m.styles)),
-                    attachments: mapping::quoted_attachments(
-                        m.attachments.first().map(signal_store::QuotedAttachment::of).as_ref(),
-                    ),
+                    attachments: mapping::quoted_attachments(quoted_attachment(&m).as_ref()),
                     // Desktop's `makeQuote` marks a quoted poll (`isPoll`).
                     r#type: Some(
                         if m.poll.is_some() { data_message::quote::Type::Poll } else { data_message::quote::Type::Normal }
@@ -3354,6 +3452,7 @@ impl Actor {
                 }
             }),
             group_v2: self.group_context(&conversation).await,
+            is_view_once: view_once.map(|_| true),
             ..Default::default()
         };
         Some((id, data, timestamp as u64))
@@ -3938,6 +4037,14 @@ impl Actor {
         if let Err(error) = self.db.update_status(conversation, timestamp as i64, status).await {
             self.error("failed to update message status", error);
         }
+        // Our view-once message is erased once sent (Desktop's
+        // `sendNormalMessage`); one that failed keeps its media to retry.
+        if status == DeliveryStatus::Sent
+            && let Ok(Some(message)) = self.db.message(id).await
+            && message.view_once == Some(signal_store::ViewOnce::Ready)
+        {
+            self.erase_view_once(id, signal_store::ViewOnce::Gone).await;
+        }
         self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id: id });
     }
 
@@ -4401,6 +4508,16 @@ impl Actor {
             Err(error) => self.error("failed to record link preview image", error),
         }
     }
+}
+
+/// What a quote of `message` says it holds: its first attachment, or for a
+/// view-once message only that (Desktop's `makeQuote`, a JPEG without a
+/// thumbnail).
+fn quoted_attachment(message: &signal_store::Message) -> Option<signal_store::QuotedAttachment> {
+    if message.view_once.is_some() {
+        return Some(signal_store::QuotedAttachment::view_once());
+    }
+    message.attachments.first().map(signal_store::QuotedAttachment::of)
 }
 
 fn hex_of(bytes: &[u8]) -> String {

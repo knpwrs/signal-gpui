@@ -1202,3 +1202,82 @@ fn who_may_add_members_follows_member_access() {
     assert!(can_add_group_members(&group(AccessRequired::Administrator), ALICE), "an admin always may");
     assert!(!can_add_group_members(&group(AccessRequired::Member), BOB), "not in the group");
 }
+
+fn view_once_photo(ts: u64) -> DataMessage {
+    DataMessage {
+        timestamp: Some(ts),
+        is_view_once: Some(true),
+        attachments: vec![AttachmentPointer {
+            content_type: Some("image/jpeg".into()),
+            size: Some(1000),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn view_once_messages_keep_their_one_photo_or_nothing() {
+    use signal_store::ViewOnce;
+    let actions = map_content(&content(ALICE, view_once_photo(100)), &ctx());
+    let [Action::Insert { message, pointers, view_once, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+    assert_eq!((*view_once, pointers.len(), message.attachments.len()), (Some(ViewOnce::Ready), 1, 1));
+
+    // Not one Desktop would show once (`isValidTapToView`): kept, but
+    // nothing of it.
+    let invalid = |dm: DataMessage| {
+        let actions = map_content(&content(ALICE, dm), &ctx());
+        let [Action::Insert { message, pointers, view_once, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+        assert_eq!(*view_once, Some(ViewOnce::Invalid));
+        assert!(pointers.is_empty() && message.attachments.is_empty() && message.body.is_empty() && message.quote.is_none());
+    };
+    invalid(DataMessage { body: Some("look".into()), ..view_once_photo(101) });
+    let mut two = view_once_photo(102);
+    two.attachments.push(two.attachments[0].clone());
+    invalid(two);
+    let mut pdf = view_once_photo(103);
+    pdf.attachments[0].content_type = Some("application/pdf".into());
+    invalid(pdf);
+    invalid(DataMessage {
+        quote: Some(data_message::Quote { id: Some(5), ..Default::default() }),
+        ..view_once_photo(104)
+    });
+    invalid(DataMessage { attachments: vec![], ..view_once_photo(105) });
+
+    // Ours from another device: erased once sent, as Desktop does.
+    let sync = SyncMessage {
+        content: Some(sync_message::Content::Sent(sync_message::Sent {
+            destination_service_id: Some(ALICE.into()),
+            timestamp: Some(200),
+            message: Some(view_once_photo(200)),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let actions = map_content(&content(ME, sync), &ctx());
+    let [Action::Insert { message, pointers, view_once, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+    assert_eq!((*view_once, message.direction), (Some(ViewOnce::Gone), Direction::Outgoing));
+    assert!(pointers.is_empty() && message.attachments.is_empty());
+
+    // An ordinary photo isn't view-once.
+    let photo = DataMessage { is_view_once: None, ..view_once_photo(300) };
+    let actions = map_content(&content(ALICE, photo), &ctx());
+    assert!(matches!(actions.as_slice(), [Action::Insert { view_once: None, .. }]), "{actions:?}");
+}
+
+#[test]
+fn view_once_open_syncs_name_the_message() {
+    let open = |sender_aci: Option<String>, sender_aci_binary: Option<Vec<u8>>| SyncMessage {
+        content: Some(sync_message::Content::ViewOnceOpen(sync_message::ViewOnceOpen {
+            sender_aci,
+            sender_aci_binary,
+            timestamp: Some(100),
+        })),
+        ..Default::default()
+    };
+    let expected = vec![Action::ViewOnceOpen { author: ALICE.into(), sent_at: 100 }];
+    assert_eq!(map_content(&content(ME, open(Some(ALICE.into()), None)), &ctx()), expected);
+    let binary = uuid::Uuid::parse_str(ALICE).unwrap().as_bytes().to_vec();
+    assert_eq!(map_content(&content(ME, open(None, Some(binary))), &ctx()), expected);
+    assert!(map_content(&content(ME, open(None, None)), &ctx()).is_empty());
+}

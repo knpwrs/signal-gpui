@@ -247,6 +247,12 @@ pub enum Command {
     DeleteForEveryone { message_id: i64 },
     /// Downloads attachment `index` of `message_id`.
     FetchAttachment { message_id: i64, index: usize },
+    /// Opens their view-once message, its one time: answered with
+    /// `Event::ViewOnceOpened`, after which it's erased.
+    OpenViewOnce { message_id: i64 },
+    /// Sends a photo or video to be viewed once (Desktop's view-once
+    /// toggle): no caption, no quote.
+    SendViewOnce { conversation: ConversationId, media: OutgoingViewOnce },
     /// Downloads the whole text of a long message whose download failed
     /// (Desktop's "Download Full Message").
     FetchLongText { message_id: i64 },
@@ -514,6 +520,25 @@ pub enum StoryTarget {
     Group(ConversationId),
 }
 
+/// A view-once message's media, opened: a copy only the viewer has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenedViewOnce {
+    pub message_id: i64,
+    /// The copy; the viewer deletes it when it closes.
+    pub path: PathBuf,
+    pub content_type: String,
+    /// Pixel size, when known.
+    pub size: Option<(u32, u32)>,
+}
+
+/// A photo or video to send view-once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutgoingViewOnce {
+    Image(OutgoingImage),
+    /// A video, sent as it is.
+    Video(OutgoingFile),
+}
+
 /// An image picked, pasted or dropped in the composer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutgoingImage {
@@ -732,6 +757,9 @@ pub enum Event {
     /// `Connection(Online)`.
     CatchingUp { first: i64, latest: i64 },
     History(HistoryProgress),
+    /// A view-once message we opened: show it in the viewer, without saving
+    /// or forwarding, and delete the copy when it closes.
+    ViewOnceOpened(OpenedViewOnce),
     /// A new message from someone else arrived (for notifications).
     Incoming { conversation: ConversationId, message_id: i64, mentions_me: bool },
     /// Someone voted in our poll (`ended`: they ended theirs), for

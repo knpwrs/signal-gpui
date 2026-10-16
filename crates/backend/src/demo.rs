@@ -993,6 +993,62 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 }
                 emit(Event::MessageChanged { conversation: m.conversation_id, message_id });
             }
+            // As the real backend does (`actor/view_once.rs`), without
+            // receipts or syncs: a copy for the viewer, the message erased.
+            Command::OpenViewOnce { message_id } => {
+                let Ok(Some(m)) = db.message(message_id).await else { continue };
+                let Some(attachment) = m.attachments.first().cloned() else { continue };
+                let (Some(signal_store::ViewOnce::Ready), Direction::Incoming, Some(local)) =
+                    (m.view_once, m.direction, attachment.local_path.clone())
+                else {
+                    continue;
+                };
+                let dir = data_dir.join(crate::actor::VIEW_ONCE_DIR);
+                let ext = Path::new(&local).extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
+                let copy = dir.join(format!("{}.{ext}", next_sent_at()));
+                if std::fs::create_dir_all(&dir).and_then(|()| std::fs::copy(&local, &copy)).is_err() {
+                    continue;
+                }
+                match db.erase_view_once(message_id, signal_store::ViewOnce::Viewed).await {
+                    Ok(Some(erased)) => {
+                        for file in erased.files {
+                            let _ = std::fs::remove_file(file);
+                        }
+                        emit(Event::MessageChanged { conversation: m.conversation_id, message_id });
+                        emit(Event::ConversationsChanged);
+                        emit(Event::ViewOnceOpened(crate::OpenedViewOnce {
+                            message_id,
+                            path: copy,
+                            content_type: attachment.content_type,
+                            size: attachment.width.zip(attachment.height),
+                        }));
+                    }
+                    _ => {
+                        let _ = std::fs::remove_file(&copy);
+                    }
+                }
+            }
+            // Sent at once, so erased at once, as ours are once sent.
+            Command::SendViewOnce { conversation, .. } => {
+                let sent_at = next_sent_at();
+                let msg = NewMessage {
+                    conversation_id: conversation.clone(),
+                    sent_at,
+                    received_at: sent_at,
+                    direction: Direction::Outgoing,
+                    author: None,
+                    author_name: None,
+                    body: String::new(),
+                    status: DeliveryStatus::Sent,
+                    quote: None,
+                    attachments: Vec::new(),
+                    link_preview: None,
+                    expires_in: 0,
+                };
+                if let Ok(id) = db.insert_message_view_once(&msg, Some(signal_store::ViewOnce::Gone)).await {
+                    emit(Event::MessageChanged { conversation, message_id: id });
+                }
+            }
             Command::DeleteForEveryone { message_id } => {
                 // Someone else's message can only be ours to delete as a
                 // group admin (we are one in the house group).
