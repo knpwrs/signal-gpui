@@ -380,6 +380,35 @@ fn storage_fetch_latest_requests_a_resync() {
 }
 
 #[test]
+fn configuration_syncs_carry_privacy_settings_as_desktop_reads_them() {
+    let configuration = |config: sync_message::Configuration| SyncMessage {
+        content: Some(sync_message::Content::Configuration(config)),
+        ..Default::default()
+    };
+    let all = sync_message::Configuration {
+        read_receipts: Some(true),
+        unidentified_delivery_indicators: Some(true),
+        typing_indicators: Some(false),
+        link_previews: Some(true),
+    };
+    assert_eq!(
+        map_content(&content(ME, configuration(all)), &ctx()),
+        vec![Action::AccountSettings(crate::AccountSettings {
+            read_receipts: Some(true),
+            typing_indicators: Some(false),
+            link_previews: Some(true),
+            sealed_sender_indicators: None,
+        })]
+    );
+    // Read receipts left out are off (Desktop's `Boolean(readReceipts)`);
+    // the others stay as they are.
+    assert_eq!(
+        map_content(&content(ME, configuration(Default::default())), &ctx()),
+        vec![Action::AccountSettings(crate::AccountSettings { read_receipts: Some(false), ..Default::default() })]
+    );
+}
+
+#[test]
 fn link_previews_only_for_links_in_the_message() {
     let preview = |url: &str| presage::proto::Preview {
         url: Some(url.into()),

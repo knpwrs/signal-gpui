@@ -48,7 +48,7 @@ use signal_store::{
 use tracing::{debug, info, warn};
 
 use crate::{
-    Command, Config, ConnectionState, Event, SETTING_LINK_PREVIEWS, SETTING_READ_RECEIPTS, SETTING_TYPING_INDICATORS,
+    AccountSetting, Command, Config, ConnectionState, Event,
     VOICE_CONTENT_TYPE, mapping::{self, Action, MapContext},
     media,
     remote_config::WireServiceId,
@@ -240,6 +240,9 @@ struct Actor {
     linking: RefCell<bool>,
     /// Storage Service contacts have been read this session.
     storage_synced: RefCell<bool>,
+    /// The account record's settings have been read from Storage Service
+    /// this session.
+    account_record_read: std::cell::Cell<bool>,
     /// Long texts cut off last time have been tried again this session.
     long_texts_resumed: RefCell<bool>,
     /// Long texts with a retry scheduled, and its time (only the newest
@@ -319,6 +322,7 @@ pub(crate) async fn run(
         outbound,
         linking: RefCell::new(false),
         storage_synced: RefCell::new(false),
+        account_record_read: Default::default(),
         long_texts_resumed: RefCell::new(false),
         long_text_retries: RefCell::default(),
         story_lists_edit: tokio::sync::Mutex::new(()),
@@ -431,6 +435,11 @@ impl Actor {
             if manager.registration_data().ephemeral_backup_key().is_some() {
                 let _ = self.db.set_setting(SETTING_HISTORY_PENDING, "1").await;
             }
+            // Desktop takes the phone's read receipts setting when linked;
+            // Storage Service has the rest once read.
+            if let Some(on) = manager.registration_data().read_receipts() {
+                self.save_account_settings(crate::AccountSettings { read_receipts: Some(on), ..Default::default() }).await;
+            }
             // Desktop's device age, for a donation megaphone's condition.
             let _ = self.db.set_setting(SETTING_DEVICE_CREATED, &now_millis().to_string()).await;
         }
@@ -491,6 +500,13 @@ impl Actor {
                 }
             })
             .await?;
+            // The phone's settings as of the backup, unless Storage Service
+            // (newer, and what Desktop reads after the backup) came first.
+            if let Some(settings) = imported.settings.take()
+                && !self.account_record_read.get()
+            {
+                self.save_account_settings(settings).await;
+            }
             let packs = std::mem::take(&mut imported.sticker_packs);
             if !packs.is_empty() {
                 tokio::task::spawn_local(self.clone().install_sticker_packs(manager.clone(), packs));
@@ -574,7 +590,7 @@ impl Actor {
                     self.emit(Event::RecipientFound { query, result });
                 }
                 Command::FetchLinkPreview { url } => {
-                    let preview = if self.setting_enabled(SETTING_LINK_PREVIEWS).await {
+                    let preview = if self.setting_on(AccountSetting::LinkPreviews).await {
                         crate::link_preview::fetch(&url, self.image_optimization().await).await.unwrap_or_else(|error| {
                             debug!(error = %format!("{error:#}"), "no link preview");
                             None
@@ -642,6 +658,7 @@ impl Actor {
                 Command::DeleteStoryList { id } => self.delete_story_list(id).await,
                 Command::SetStoriesDisabled(disabled) => self.set_stories_disabled(disabled).await,
                 Command::SetStoryViewReceipts(on) => self.set_story_view_receipts(on).await,
+                Command::SetAccountSetting { setting, on } => self.set_account_setting(setting, on).await,
                 Command::StartCall { conversation, video } => self.start_call(conversation, video),
                 Command::AcceptCall { video } => self.accept_call(video),
                 Command::DeclineCall | Command::HangUp => self.hang_up().await,
@@ -1052,11 +1069,23 @@ impl Actor {
                 self.modify(manager, action).await;
             }
             Action::Receipt { sent_at, status } => {
+                // With read receipts off we don't see others' either:
+                // Desktop drops read and viewed receipts
+                // (`ts/messageModifiers/MessageReceipts.preload.ts`,
+                // `shouldDropReceipt`). Stories' views count apart.
+                if status == DeliveryStatus::Read && !self.setting_on(AccountSetting::ReadReceipts).await {
+                    debug!("read receipts are off; dropping a read receipt");
+                    return;
+                }
                 for ts in sent_at {
                     self.modify(manager, Action::Receipt { sent_at: vec![ts], status }).await;
                 }
             }
             Action::Typing { sender, group_id, started } => {
+                // Nor others' typing (Desktop's `onTyping`).
+                if !self.setting_on(AccountSetting::TypingIndicators).await {
+                    return;
+                }
                 let conversation = match group_id {
                     None => ConversationId::direct(&sender),
                     Some(id) => match self.group_for_id(manager, &id).await {
@@ -1119,6 +1148,7 @@ impl Actor {
             // is nothing to refresh.
             Action::StorageChanged if *self.storage_synced.borrow() => self.spawn_storage_sync(manager),
             Action::StorageChanged => {}
+            Action::AccountSettings(settings) => self.save_account_settings(settings).await,
             Action::ExpireTimer { conversation, seconds, version, by, at } => {
                 self.apply_timer(&conversation, seconds, version, true, by, at).await;
             }
@@ -1912,7 +1942,7 @@ impl Actor {
             contacts,
             pinned,
             chats,
-            link_previews,
+            settings,
             story_lists,
             hidden_stories,
             stories_disabled,
@@ -1933,11 +1963,10 @@ impl Actor {
                 Err(error) => self.error("failed to save pinned conversations", error),
             }
         }
-        if let Some(enabled) = link_previews
-            && let Err(error) = self.db.set_setting(SETTING_LINK_PREVIEWS, if enabled { "true" } else { "false" }).await
-        {
-            warn!(%error, "failed to save link preview setting");
+        if settings != crate::AccountSettings::default() {
+            self.account_record_read.set(true);
         }
+        self.save_account_settings(settings).await;
         {
             let _edit = self.story_lists_edit.lock().await;
             self.save_story_settings(
@@ -3475,7 +3504,7 @@ impl Actor {
             return;
         }
 
-        let send_receipts = self.setting_enabled(SETTING_READ_RECEIPTS).await;
+        let send_receipts = self.setting_on(AccountSetting::ReadReceipts).await;
         let mut by_author: HashMap<String, Vec<u64>> = HashMap::new();
         for (author, sent_at) in &unread {
             by_author.entry(author.clone()).or_default().push(*sent_at as u64);
@@ -3513,7 +3542,7 @@ impl Actor {
     }
 
     async fn typing(self: Rc<Self>, conversation: ConversationId, started: bool) {
-        if !self.setting_enabled(SETTING_TYPING_INDICATORS).await
+        if !self.setting_on(AccountSetting::TypingIndicators).await
             || conversation.as_direct() == Some(self.self_aci().as_str())
         {
             return;
@@ -3537,8 +3566,43 @@ impl Actor {
         media::Optimization::from_setting(value.as_deref())
     }
 
-    async fn setting_enabled(&self, key: &str) -> bool {
-        !matches!(self.db.setting(key).await, Ok(Some(v)) if v == "false")
+    /// Whether an account setting is on (unset: Desktop's default, off).
+    pub(crate) async fn setting_on(&self, setting: AccountSetting) -> bool {
+        crate::setting_on(self.db.setting(setting.key()).await.ok().flatten().as_deref())
+    }
+
+    /// Saves account settings from Storage Service, a configuration sync,
+    /// the link-time backup or linking; tells the UI if one changed.
+    pub(crate) async fn save_account_settings(&self, settings: crate::AccountSettings) {
+        let mut changed = false;
+        for (setting, on) in settings.values() {
+            let value = if on { "true" } else { "false" };
+            if self.db.setting(setting.key()).await.ok().flatten().as_deref() == Some(value) {
+                continue;
+            }
+            match self.db.set_setting(setting.key(), value).await {
+                Ok(()) => changed = true,
+                Err(error) => warn!(%error, ?setting, "failed to save an account setting"),
+            }
+        }
+        if changed {
+            self.emit(Event::AccountSettingsChanged);
+        }
+    }
+
+    /// Desktop's Privacy toggles: here at once, then in the account record
+    /// for our other devices (`captureChange`). If that write fails,
+    /// re-reading Storage Service puts it back.
+    async fn set_account_setting(self: Rc<Self>, setting: AccountSetting, on: bool) {
+        let mut settings = crate::AccountSettings::default();
+        match setting {
+            AccountSetting::ReadReceipts => settings.read_receipts = Some(on),
+            AccountSetting::TypingIndicators => settings.typing_indicators = Some(on),
+            AccountSetting::LinkPreviews => settings.link_previews = Some(on),
+            AccountSetting::SealedSenderIndicators => settings.sealed_sender_indicators = Some(on),
+        }
+        self.save_account_settings(settings).await;
+        self.write_account(&[storage::AccountEdit::Setting(setting, on)]).await;
     }
 
     async fn group_context(&self, conversation: &ConversationId) -> Option<GroupContextV2> {

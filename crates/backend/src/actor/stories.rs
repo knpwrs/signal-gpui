@@ -24,7 +24,7 @@ impl Actor {
     async fn story_view_receipts(&self) -> bool {
         match self.db.setting(SETTING_STORY_VIEW_RECEIPTS).await.ok().flatten() {
             Some(value) => value != "false",
-            None => self.setting_enabled(SETTING_READ_RECEIPTS).await,
+            None => self.setting_on(crate::AccountSetting::ReadReceipts).await,
         }
     }
 
@@ -694,9 +694,9 @@ impl Actor {
         self.write_account(&[storage::AccountEdit::StoryViewReceipts(on)]).await;
     }
 
-    /// Writes story settings to the account record; if that fails,
+    /// Writes settings to the account record; if that fails,
     /// re-reading Storage Service puts things back.
-    async fn write_account(self: &Rc<Self>, edits: &[storage::AccountEdit]) {
+    pub(super) async fn write_account(self: &Rc<Self>, edits: &[storage::AccountEdit]) {
         let Some(manager) = self.manager() else { return };
         match storage::write_account(&manager, edits).await {
             Ok(()) => self.storage_written(),

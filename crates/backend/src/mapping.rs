@@ -142,6 +142,9 @@ pub enum Action {
     #[serde(skip)]
     /// Our primary device changed the Storage Service (pins, names, ...).
     StorageChanged,
+    #[serde(skip)]
+    /// Our primary device's privacy settings (a configuration sync).
+    AccountSettings(crate::AccountSettings),
     /// "Delete for me" on another of our devices: these messages
     /// `(chat, author or None for us, sent at)` and whole chats.
     DeleteForMe { messages: Vec<(ThreadRef, Option<String>, i64)>, conversations: Vec<ChatDelete> },
@@ -1218,12 +1221,29 @@ fn map_sync(sync: &SyncMessage, envelope_ts: i64, ctx: &MapContext) -> Vec<Actio
             out.push(Action::DeleteForMe { messages, conversations });
         }
     }
+    if let Some(sync_message::Content::Configuration(configuration)) = &sync.content {
+        out.push(Action::AccountSettings(account_settings(configuration)));
+    }
     if let Some(sync_message::Content::FetchLatest(fetch)) = &sync.content
         && fetch.r#type() == sync_message::fetch_latest::Type::StorageManifest
     {
         out.push(Action::StorageChanged);
     }
     out
+}
+
+/// A configuration sync's settings, as Desktop's `onConfiguration`
+/// (`ts/background.preload.ts`) takes them: read receipts always (off when
+/// left out), the others only when given. Its
+/// `unidentifiedDeliveryIndicators` is left out: Desktop keeps it apart from
+/// the account record's `sealedSenderIndicators`, for message details only.
+pub(crate) fn account_settings(configuration: &sync_message::Configuration) -> crate::AccountSettings {
+    crate::AccountSettings {
+        read_receipts: Some(configuration.read_receipts.unwrap_or(false)),
+        typing_indicators: configuration.typing_indicators,
+        link_previews: configuration.link_previews,
+        sealed_sender_indicators: None,
+    }
 }
 
 fn map_receipt(receipt: &ReceiptMessage) -> Option<Action> {

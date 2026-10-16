@@ -40,6 +40,8 @@ pub fn open(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
                             .child(field("Phone number", phone, palette))
                             .child(field("Account ID", aci, palette)),
                     )
+                    .child(section("Privacy", palette))
+                    .child(privacy(&state, cx))
                     .child(section("Notifications", palette))
                     .child(notifications(&state, cx))
                     .child(section("Calls", palette))
@@ -102,6 +104,47 @@ fn confirm_unlink(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
                 true
             })
     });
+}
+
+/// Desktop's Privacy page, "Messaging": read receipts and typing
+/// indicators, kept in the account record so the phone and other devices
+/// follow. Off, neither is sent nor shown from others.
+fn privacy(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
+    use signal_backend::AccountSetting;
+    let palette = Palette::get(cx);
+    let (read_receipts, typing) = {
+        let s = state.read(cx);
+        (s.read_receipts, s.typing_indicators)
+    };
+    let toggle = |id: &'static str, label: &'static str, setting: AccountSetting, on: bool| {
+        let state = state.clone();
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(div().text_sm().child(label))
+            .child(
+                Button::new(id)
+                    .label(if on { "On" } else { "Off" })
+                    .small()
+                    .when(on, |b| b.primary())
+                    .when(!on, |b| b.outline())
+                    .on_click(move |_, window, cx| {
+                        state.update(cx, |s, cx| s.set_account_setting(setting, !on, cx));
+                        window.refresh();
+                    }),
+            )
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(toggle("read-receipts", "Read receipts", AccountSetting::ReadReceipts, read_receipts))
+        .child(toggle("typing-indicators", "Typing indicators", AccountSetting::TypingIndicators, typing))
+        .child(div().text_xs().text_color(palette.text_secondary).child(
+            "See and share when messages are being read and typed. If disabled, you won't see read receipts or typing indicators from others.",
+        ))
 }
 
 /// Desktop's notification content choice, plus off.
@@ -318,4 +361,73 @@ fn field(label: &'static str, value: impl Into<SharedString>, palette: Palette) 
         .text_sm()
         .child(div().flex_none().text_color(palette.text_secondary).child(label))
         .child(div().min_w_0().truncate().child(value.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::test::TestWindowExt as _;
+    use gpui_kit::{AppContext as _, TestAppContext, WindowBounds, WindowOptions, px, size};
+    use signal_backend::{Backend, Config};
+
+    /// Waits (a few seconds at most) for `done`.
+    fn wait(cx: &mut TestAppContext, mut done: impl FnMut(&mut TestAppContext) -> bool) -> bool {
+        (0..300).any(|_| {
+            cx.run_until_parked();
+            let ok = done(cx);
+            if !ok {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            ok
+        })
+    }
+
+    #[gpui_kit::test]
+    fn privacy_toggles_turn_read_receipts_and_typing_off(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config { data_dir: dir.path().to_owned(), db_key: [7; 32], device_name: "test".into(), demo: true };
+        let (backend, mut events) = Backend::start(config).unwrap();
+        let state = cx.update(|cx| crate::state::new_state(backend.clone(), cx));
+        cx.update(|cx| {
+            use futures::StreamExt as _;
+            let state = state.clone();
+            cx.spawn(async move |cx| {
+                while let Some(event) = events.next().await {
+                    state.update(cx, |state, cx| state.handle(event, cx));
+                }
+            })
+            .detach();
+        });
+        // The demo account has both on.
+        assert!(wait(cx, |cx| state.read_with(cx, |s, _| s.read_receipts && s.typing_indicators)), "demo settings didn't load");
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(gpui_kit::Bounds { origin: Default::default(), size: size(px(800.), px(1400.)) })),
+            ..Default::default()
+        };
+        let (window, _sidebar) = cx
+            .update(|cx| {
+                let state = state.clone();
+                gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| crate::views::sidebar::Sidebar::new(state, window, cx)))
+            })
+            .unwrap();
+        cx.update_window(window, |_, window, cx| super::open(state.clone(), window, cx)).unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| window.click("read-receipts", cx)).unwrap();
+        cx.update_window(window, |_, window, cx| window.click("typing-indicators", cx)).unwrap();
+        let stored = |key: &'static str| {
+            let db = backend.db().clone();
+            futures::executor::block_on(backend.spawn(async move { db.setting(key).await })).ok().flatten()
+        };
+        assert!(
+            wait(cx, |_| stored(signal_backend::SETTING_READ_RECEIPTS).as_deref() == Some("false")
+                && stored(signal_backend::SETTING_TYPING_INDICATORS).as_deref() == Some("false")),
+            "the settings weren't saved"
+        );
+        // And they stay off once the backend says they changed.
+        assert!(wait(cx, |cx| state.read_with(cx, |s, _| !s.read_receipts && !s.typing_indicators)));
+        // Story view receipts, unset, follow read receipts.
+        assert!(!state.read_with(cx, |s, _| s.story_view_receipts_on()));
+        backend.shutdown();
+    }
 }

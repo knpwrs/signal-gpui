@@ -214,6 +214,8 @@ pub(crate) struct Imported {
     pub long_texts: Vec<i64>,
     /// Installed sticker packs: `(pack id, pack key)`.
     pub sticker_packs: Vec<(Vec<u8>, Vec<u8>)>,
+    /// The account's privacy settings, when the backup has them.
+    pub settings: Option<crate::AccountSettings>,
 }
 
 enum Who {
@@ -361,6 +363,9 @@ pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: imp
                 }
                 chats.insert(chat.id, id);
                 imported.chats += 1;
+            }
+            Some(proto::frame::Item::Account(account)) => {
+                imported.settings = Some(account_settings(&account));
             }
             Some(proto::frame::Item::StickerPack(pack)) => {
                 imported.sticker_packs.push((pack.packId.clone(), pack.packKey.clone()));
@@ -686,6 +691,20 @@ async fn import_item(
     Ok(true)
 }
 
+/// The backup's privacy settings, as Desktop's import
+/// (`ts/services/backups/import.preload.ts`) takes them: each on only when
+/// the backup says so.
+fn account_settings(account: &proto::AccountData) -> crate::AccountSettings {
+    let settings = account.accountSettings.as_ref();
+    let on = |get: fn(&proto::account_data::AccountSettings) -> bool| Some(settings.is_some_and(get));
+    crate::AccountSettings {
+        read_receipts: on(|s| s.readReceipts),
+        typing_indicators: on(|s| s.typingIndicators),
+        link_previews: on(|s| s.linkPreviews),
+        sealed_sender_indicators: on(|s| s.sealedSenderIndicators),
+    }
+}
+
 fn outgoing_status(statuses: &[proto::SendStatus]) -> DeliveryStatus {
     use proto::send_status::DeliveryStatus as S;
     let rank = |s: &proto::SendStatus| match &s.deliveryStatus {
@@ -811,6 +830,13 @@ mod tests {
         }
         put(&mut out, &proto::BackupInfo { version: 1, ..Default::default() });
         let mut push = |frame: proto::Frame| put(&mut out, &frame);
+        // The account: read receipts and typing indicators on.
+        let mut account = proto::AccountData::new();
+        let mut settings = proto::account_data::AccountSettings::new();
+        settings.readReceipts = true;
+        settings.typingIndicators = true;
+        account.accountSettings = Some(settings).into();
+        push(proto::Frame { item: Some(proto::frame::Item::Account(account)), ..Default::default() });
         let recipient = |id, destination| {
             let mut r = proto::Recipient::new();
             r.id = id;
@@ -993,6 +1019,16 @@ mod tests {
         assert_eq!(seen.last(), Some(&(plain.len() as u64)));
         assert_eq!((imported.chats, imported.messages), (4, 6));
         assert_eq!(imported.sticker_packs, vec![(vec![0xab; 16], vec![0xcd; 32])]);
+        // Each setting the backup leaves off is off, as Desktop imports them.
+        assert_eq!(
+            imported.settings,
+            Some(crate::AccountSettings {
+                read_receipts: Some(true),
+                typing_indicators: Some(true),
+                link_previews: Some(false),
+                sealed_sender_indicators: Some(false),
+            })
+        );
 
         let alice_sid = Aci::from_uuid_bytes([0xa1; 16]).service_id_string();
         let alice = db.conversation(&ConversationId::direct(&alice_sid)).await.unwrap().unwrap();

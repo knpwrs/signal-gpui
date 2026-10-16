@@ -1560,7 +1560,7 @@ mod tests {
                 window_bounds: Some(WindowBounds::Windowed(gpui_kit::Bounds {
                     origin: Default::default(),
                     // Tall enough for the whole Settings dialog.
-                    size: size(px(800.), px(900.)),
+                    size: size(px(800.), px(1100.)),
                 })),
                 ..Default::default()
             };

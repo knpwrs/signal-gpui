@@ -68,8 +68,10 @@ pub(crate) struct StorageSnapshot {
     pub pinned: Option<Vec<ConversationId>>,
     /// Archived/muted state of direct and group chats.
     pub chats: Vec<ChatState>,
-    /// The account's "Generate link previews" setting.
-    pub link_previews: Option<bool>,
+    /// The account's privacy settings (read receipts, typing indicators,
+    /// link previews, sealed sender indicators); unset without an account
+    /// record.
+    pub settings: crate::AccountSettings,
     /// Story lists, My Story among them (not deleted ones).
     pub story_lists: Vec<crate::StoryList>,
     /// Chats whose stories are hidden (`hideStory`).
@@ -132,7 +134,7 @@ pub(crate) async fn fetch(manager: &SignalManager) -> anyhow::Result<StorageSnap
                 }
                 Some(Record::Account(account)) => {
                     snapshot.pinned = Some(pinned(&account));
-                    snapshot.link_previews = Some(account.link_previews);
+                    snapshot.settings = account_settings(&account);
                     snapshot.stories_disabled = Some(account.stories_disabled);
                     snapshot.my_story_privacy_set = Some(account.has_set_my_stories_privacy);
                     snapshot.story_view_receipts = match account.story_view_receipts_enabled() {
@@ -147,6 +149,18 @@ pub(crate) async fn fetch(manager: &SignalManager) -> anyhow::Result<StorageSnap
         }
     }
     Ok(snapshot)
+}
+
+/// The account record's privacy settings, as Desktop's
+/// `mergeAccountRecord` (`ts/services/storageRecordOps.preload.ts`) takes
+/// them: every one, false when the record leaves it out.
+pub(crate) fn account_settings(account: &AccountRecord) -> crate::AccountSettings {
+    crate::AccountSettings {
+        read_receipts: Some(account.read_receipts),
+        typing_indicators: Some(account.typing_indicators),
+        link_previews: Some(account.link_previews),
+        sealed_sender_indicators: Some(account.sealed_sender_indicators),
+    }
 }
 
 /// The account's pinned conversations, in order. Legacy (v1) groups, release
@@ -344,9 +358,12 @@ fn set_varint(message: &[u8], number: u32, value: u64) -> anyhow::Result<Option<
     Ok(Some(edited))
 }
 
-/// A change to one of the account record's story settings.
+/// A change to one of the account record's settings.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum AccountEdit {
+    /// `readReceipts`, `typingIndicators`, `linkPreviews` or
+    /// `sealedSenderIndicators`.
+    Setting(crate::AccountSetting, bool),
     /// `storiesDisabled` (Desktop's `hasStoriesDisabled`).
     StoriesDisabled(bool),
     /// `storyViewReceiptsEnabled`, an `OptionalBool`.
@@ -358,7 +375,17 @@ pub(crate) enum AccountEdit {
 impl AccountEdit {
     /// The `AccountRecord` field and its value.
     fn field(self) -> (u32, u64) {
+        use crate::AccountSetting;
         match self {
+            AccountEdit::Setting(setting, on) => {
+                let field = match setting {
+                    AccountSetting::ReadReceipts => 6,
+                    AccountSetting::SealedSenderIndicators => 7,
+                    AccountSetting::TypingIndicators => 8,
+                    AccountSetting::LinkPreviews => 11,
+                };
+                (field, u64::from(on))
+            }
             AccountEdit::HasSetMyStoriesPrivacy(on) => (26, u64::from(on)),
             AccountEdit::StoriesDisabled(on) => (29, u64::from(on)),
             // OptionalBool: ENABLED = 1, DISABLED = 2.
@@ -384,7 +411,7 @@ pub(crate) fn edit_account(record: &[u8], edits: &[AccountEdit]) -> anyhow::Resu
     })
 }
 
-/// Changes story settings in the account record, for the whole account.
+/// Changes settings in the account record, for the whole account.
 pub(crate) async fn write_account(manager: &SignalManager, edits: &[AccountEdit]) -> anyhow::Result<()> {
     let session = Session::new(manager).await?;
     for _ in 0..3 {
@@ -1211,6 +1238,39 @@ mod tests {
         assert_eq!(decoded.story_view_receipts_enabled(), presage::proto::OptionalBool::Enabled);
         assert!(decoded.has_set_my_stories_privacy && decoded.stories_disabled);
         assert!(edit_account(&edited, &[AccountEdit::StoriesDisabled(false)]).unwrap().is_some());
+    }
+
+    #[test]
+    fn privacy_settings_read_and_write_the_account_record() {
+        use crate::AccountSetting;
+        let account = AccountRecord { given_name: "Ken".into(), typing_indicators: true, ..Default::default() };
+        // Desktop takes every one, false when left out.
+        assert_eq!(
+            account_settings(&account),
+            crate::AccountSettings {
+                read_receipts: Some(false),
+                typing_indicators: Some(true),
+                link_previews: Some(false),
+                sealed_sender_indicators: Some(false),
+            }
+        );
+        let mut account_bytes = account.encode_to_vec();
+        wire::put_len(&mut account_bytes, 999, b"future account field");
+        let mut record = Vec::new();
+        wire::put_len(&mut record, RECORD_ACCOUNT, &account_bytes);
+
+        let edits = [
+            AccountEdit::Setting(AccountSetting::ReadReceipts, true),
+            AccountEdit::Setting(AccountSetting::TypingIndicators, false),
+            AccountEdit::Setting(AccountSetting::LinkPreviews, true),
+            AccountEdit::Setting(AccountSetting::SealedSenderIndicators, true),
+        ];
+        let edited = edit_account(&record, &edits).unwrap().unwrap();
+        let decoded = decode_account(&edited);
+        assert!(decoded.read_receipts && !decoded.typing_indicators && decoded.link_previews && decoded.sealed_sender_indicators);
+        assert_eq!(decoded.given_name, "Ken");
+        assert!(edited.windows(20).any(|w| w == b"future account field"));
+        assert_eq!(edit_account(&edited, &edits).unwrap(), None, "already so");
     }
 
     #[test]

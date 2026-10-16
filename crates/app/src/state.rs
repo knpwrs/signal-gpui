@@ -211,6 +211,8 @@ pub struct AppState {
     pub story_view_receipts: Option<bool>,
     /// Read receipts are on (what unset story view receipts follow).
     pub read_receipts: bool,
+    /// Typing indicators are on: ours sent, others' shown.
+    pub typing_indicators: bool,
     /// The story lists: My Story's privacy and custom stories.
     pub story_lists: Vec<signal_backend::StoryList>,
     /// My Story's viewers were chosen (Desktop's `hasSetMyStoriesPrivacy`);
@@ -305,7 +307,8 @@ impl AppState {
             stories_disabled: false,
             seen_admin_delete_education: false,
             story_view_receipts: None,
-            read_receipts: true,
+            read_receipts: false,
+            typing_indicators: false,
             story_lists: Vec::new(),
             my_story_privacy_set: false,
             waveforms: HashMap::new(),
@@ -606,7 +609,7 @@ impl AppState {
             }
             Event::ConversationsChanged => self.reload_conversations(cx),
             Event::StoriesChanged => self.reload_stories(cx),
-            Event::StorySettingsChanged => self.load_settings(cx),
+            Event::StorySettingsChanged | Event::AccountSettingsChanged => self.load_settings(cx),
             Event::Megaphones(megaphones) => {
                 self.megaphones = megaphones;
                 cx.notify();
@@ -837,15 +840,17 @@ impl AppState {
                     db.setting(signal_backend::SETTING_STORY_LISTS).await?,
                     db.setting(signal_backend::SETTING_MY_STORY_PRIVACY_SET).await?,
                     db.setting(ADMIN_DELETE_EDUCATION_SETTING).await?,
+                    db.setting(signal_backend::SETTING_TYPING_INDICATORS).await?,
                 ),
             ))
         });
         cx.spawn(async move |this, cx| {
             let (optimization, recents, giphy, notifications, collapsed, hidden, stories_off, view_receipts, more) =
                 read.await.unwrap_or_default();
-            let (read_receipts, lists, privacy_set, admin_delete_seen) = more;
+            let (read_receipts, lists, privacy_set, admin_delete_seen, typing) = more;
             let _ = this.update(cx, |this, cx| {
-                this.read_receipts = read_receipts.as_deref() != Some("false");
+                this.read_receipts = signal_backend::setting_on(read_receipts.as_deref());
+                this.typing_indicators = signal_backend::setting_on(typing.as_deref());
                 this.story_lists = lists.and_then(|l| serde_json::from_str(&l).ok()).unwrap_or_default();
                 this.my_story_privacy_set = privacy_set.as_deref() == Some("true");
                 this.nav_collapsed = collapsed.as_deref() == Some("true");
@@ -937,6 +942,27 @@ impl AppState {
     pub fn set_story_view_receipts(&mut self, on: bool, cx: &mut Context<Self>) {
         self.story_view_receipts = Some(on);
         self.send(Command::SetStoryViewReceipts(on));
+        cx.notify();
+    }
+
+    /// Desktop's Privacy toggles (read receipts, typing indicators), for
+    /// the whole account.
+    pub fn set_account_setting(&mut self, setting: signal_backend::AccountSetting, on: bool, cx: &mut Context<Self>) {
+        use signal_backend::AccountSetting;
+        match setting {
+            AccountSetting::ReadReceipts => self.read_receipts = on,
+            AccountSetting::TypingIndicators => {
+                self.typing_indicators = on;
+                // Nobody's shown typing any more.
+                if !on {
+                    for conversation in std::mem::take(&mut self.typing).into_keys() {
+                        cx.emit(AppEvent::TypingChanged { conversation });
+                    }
+                }
+            }
+            AccountSetting::LinkPreviews | AccountSetting::SealedSenderIndicators => {}
+        }
+        self.send(Command::SetAccountSetting { setting, on });
         cx.notify();
     }
 

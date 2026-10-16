@@ -35,13 +35,75 @@ pub mod remote_config;
 
 pub use remote_config::{RemoteConfig, current as remote_config};
 
-/// Settings key: when `"false"`, read receipts are not sent.
+/// Settings key: `"true"` when read receipts are on: sent, and others'
+/// shown. See [`AccountSetting`] for where it comes from and its default.
 pub const SETTING_READ_RECEIPTS: &str = "read_receipts";
-/// Settings key: when `"false"`, typing indicators are not sent.
+/// Settings key: `"true"` when typing indicators are on: sent, and others'
+/// shown.
 pub const SETTING_TYPING_INDICATORS: &str = "typing_indicators";
-/// Settings key: when `"false"`, link previews aren't generated (synced from
-/// the account's Storage Service record).
+/// Settings key: `"true"` when link previews are generated.
 pub const SETTING_LINK_PREVIEWS: &str = "link_previews";
+/// Settings key: `"true"` to show which messages came by sealed sender
+/// (Desktop's "Show status icon"). Kept for the account record; nothing
+/// shows it here yet.
+pub const SETTING_SEALED_SENDER_INDICATORS: &str = "sealed_sender_indicators";
+
+/// One of the account's privacy settings that Signal syncs between devices
+/// (the `AccountRecord` in Storage Service, the configuration sync message
+/// and the link-time backup). Like Desktop (`ts/util/Settings.preload.ts`),
+/// each is off until one of those says otherwise; read receipts also take
+/// the phone's setting at linking (`AccountManager`'s `createAccount`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AccountSetting {
+    ReadReceipts,
+    TypingIndicators,
+    LinkPreviews,
+    SealedSenderIndicators,
+}
+
+impl AccountSetting {
+    pub const ALL: [AccountSetting; 4] =
+        [Self::ReadReceipts, Self::TypingIndicators, Self::LinkPreviews, Self::SealedSenderIndicators];
+
+    /// Where it's kept in the app database's settings.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::ReadReceipts => SETTING_READ_RECEIPTS,
+            Self::TypingIndicators => SETTING_TYPING_INDICATORS,
+            Self::LinkPreviews => SETTING_LINK_PREVIEWS,
+            Self::SealedSenderIndicators => SETTING_SEALED_SENDER_INDICATORS,
+        }
+    }
+}
+
+/// Whether a stored [`AccountSetting`] is on: only `"true"` is (unset is
+/// Desktop's default, off).
+pub fn setting_on(value: Option<&str>) -> bool {
+    value == Some("true")
+}
+
+/// Account settings as one source gives them; `None` leaves one as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AccountSettings {
+    pub read_receipts: Option<bool>,
+    pub typing_indicators: Option<bool>,
+    pub link_previews: Option<bool>,
+    pub sealed_sender_indicators: Option<bool>,
+}
+
+impl AccountSettings {
+    /// Each setting this gives a value for.
+    pub fn values(&self) -> impl Iterator<Item = (AccountSetting, bool)> {
+        [
+            (AccountSetting::ReadReceipts, self.read_receipts),
+            (AccountSetting::TypingIndicators, self.typing_indicators),
+            (AccountSetting::LinkPreviews, self.link_previews),
+            (AccountSetting::SealedSenderIndicators, self.sealed_sender_indicators),
+        ]
+        .into_iter()
+        .filter_map(|(setting, on)| Some((setting, on?)))
+    }
+}
 /// Settings key: your Giphy API key for GIF search (`GIPHY_API_KEY` also
 /// works). Not a Signal setting.
 pub const SETTING_GIPHY_API_KEY: &str = "giphy_api_key";
@@ -244,6 +306,10 @@ pub enum Command {
     /// Story view receipts on or off, for the whole account
     /// (`AccountRecord.storyViewReceiptsEnabled`).
     SetStoryViewReceipts(bool),
+    /// Read receipts, typing indicators and the like on or off, for the
+    /// whole account (Desktop's Privacy settings, kept in the
+    /// `AccountRecord`).
+    SetAccountSetting { setting: AccountSetting, on: bool },
     /// Calls a 1:1 chat (Desktop's call buttons, after the lobby).
     StartCall { conversation: ConversationId, video: bool },
     /// Answers the ringing call, with our camera on or off.
@@ -627,6 +693,8 @@ pub enum Event {
     /// Stories' settings changed (hidden stories, stories off, view
     /// receipts, story lists), here or from Storage Service.
     StorySettingsChanged,
+    /// An [`AccountSetting`] changed, here or on another device.
+    AccountSettingsChanged,
     /// A message was inserted or updated (status, reaction, edit, delete, attachment).
     MessageChanged { conversation: ConversationId, message_id: i64 },
     Typing { conversation: ConversationId, author: String, started: bool },

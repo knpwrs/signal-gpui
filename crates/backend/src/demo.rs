@@ -62,6 +62,11 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
     if !db.conversations().await?.is_empty() {
         return Ok(());
     }
+    // The made-up account's phone has these on (as if Storage Service said
+    // so; a real account starts with them off until it's read).
+    for setting in [crate::AccountSetting::ReadReceipts, crate::AccountSetting::TypingIndicators, crate::AccountSetting::LinkPreviews] {
+        db.set_setting(setting.key(), "true").await?;
+    }
     let convs = [
         (MAYA, ConversationKind::Direct, "Maya Chen", Some("+1 555 0100")),
         (JORDAN, ConversationKind::Direct, "Jordan Reyes", Some("+1 555 0199")),
@@ -837,8 +842,12 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
             // The one thing the demo fetches: previews of links you type.
             Command::FetchLinkPreview { url } => {
                 let events = events.clone();
+                let on = crate::setting_on(db.setting(crate::SETTING_LINK_PREVIEWS).await.ok().flatten().as_deref());
                 tokio::task::spawn_local(async move {
-                    let preview = crate::link_preview::fetch(&url, crate::media::Optimization::Max).await.unwrap_or(None);
+                    let preview = match on {
+                        true => crate::link_preview::fetch(&url, crate::media::Optimization::Max).await.unwrap_or(None),
+                        false => None,
+                    };
                     let _ = events.unbounded_send(Event::LinkPreview { url, preview });
                 });
             }
@@ -899,7 +908,14 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 // Receipts trickle in on their own, without holding up commands.
                 let (db, events) = (db.clone(), events.clone());
                 tokio::task::spawn_local(async move {
-                    for status in [DeliveryStatus::Sent, DeliveryStatus::Delivered, DeliveryStatus::Read] {
+                    // Read receipts off: theirs aren't shown either.
+                    let read_receipts = crate::setting_on(db.setting(crate::SETTING_READ_RECEIPTS).await.ok().flatten().as_deref());
+                    let walk: &[DeliveryStatus] = if read_receipts {
+                        &[DeliveryStatus::Sent, DeliveryStatus::Delivered, DeliveryStatus::Read]
+                    } else {
+                        &[DeliveryStatus::Sent, DeliveryStatus::Delivered]
+                    };
+                    for &status in walk {
                         tokio::time::sleep(Duration::from_millis(500)).await;
                         let _ = db.update_status(&conversation, sent_at, status).await;
                         let _ = events.unbounded_send(Event::MessageChanged { conversation: conversation.clone(), message_id: id });
@@ -1523,6 +1539,10 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 }
                 emit(Event::StorySettingsChanged);
                 emit(Event::StoriesChanged);
+            }
+            Command::SetAccountSetting { setting, on } => {
+                let _ = db.set_setting(setting.key(), if on { "true" } else { "false" }).await;
+                emit(Event::AccountSettingsChanged);
             }
             Command::SetStoryViewReceipts(on) => {
                 let _ = db.set_setting(crate::SETTING_STORY_VIEW_RECEIPTS, if on { "true" } else { "false" }).await;
