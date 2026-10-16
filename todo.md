@@ -75,11 +75,12 @@ checked:
   send doesn't report it), nor messages from the link-time backup.
 - **Missed call notifications:** Desktop 8.34 has none (only the incoming
   call notification), so there are none here either.
-- **Not here from Desktop's pages:** language, spell check,
-  text formatting, the default skin tone, chat export, the
+- **Not here from Desktop's pages:** language, the default skin tone,
+  chat export, the
   badge count settings, notification profiles, "Reset" notification
   settings, sent media quality, the device name, and the Account page.
-- **Sounds:** only pop, whoosh and the ringtone; Desktop's hang-up and
+- **Sounds:** only pop, whoosh, the ringtone and the end of consecutive
+  voice messages; Desktop's hang-up and
   hand-raised sounds aren't played.
 
 ## Key transparency
@@ -250,8 +251,7 @@ with headless windows. Not done, or not checked:
 - **Shortcuts left out**, as their features don't exist here: navigate by
   section (⌘T, Desktop's focus cycling), the chat menu (⌘⇧L; GPUI's
   dropdowns can't be opened from code), a message's context menu (⌘F12),
-  the expanded composer (⌘⇧K, ⌘Enter), and a call's expanded preview
-  (⇧P). ⌘N focuses the search box, where new chats start here, rather
+  and a call's expanded preview (⇧P). ⌘N focuses the search box, where new chats start here, rather
   than Desktop's compose pane.
 - **Menus left out:** Desktop's Speech submenu, Go to Release Notes and
   Join the Beta (Desktop's, not this app's), and its developer items.
@@ -468,6 +468,63 @@ the syncs with a phone, and the hangup to a real caller. Left:
   name from ...") aren't tracked.
 - **Address book:** who's in it is refreshed with each Storage Service
   sync, not on contact sync alone.
+
+## Timeline and composer
+
+Done after Desktop 8.34: the edit history (`EditHistoryMessagesModal`),
+the "N Unread Messages" line with the chat opening at it, the floating
+date while scrolling, the "@" scroll-down button for unseen mentions,
+consecutive voice message playback (with Desktop's end sound), the
+lightbox's previous and next through the chat's media with Forward,
+Save and "Go to message", All media's Audio tab and item menus,
+"Download" in the message menu, "Mark as read" in the chat menu, the
+large composer (⌘⇧K), the formatting popover, custom preferred reactions
+(synced through the account record), retrying a failed delete for
+everyone, and spell check with macOS's `NSSpellChecker`. Tested with
+store, storage wire-format and unit tests and demo-mode UI tests; none of
+it was tried with a real account. Left:
+
+- **Reading as you scroll:** Desktop marks messages read as they scroll
+  into view (`markNewestBottomVisibleMessageRead`); here opening a chat
+  still reads all of it, after the unread line and unseen mentions are
+  found. The unread line is where the collapse sets break
+  (`unseen_from`); it goes once the page is loaded again (jumping to a
+  mention, say), as the messages are read by then.
+- **Scroll-down button:** Desktop's first click scrolls to the unread
+  line when it's below the middle; ours goes to the newest.
+- **Unread mentions in the chat list** (Desktop's "@" badge on a chat)
+  aren't shown; the "@" button covers mentions unread when the chat
+  opened and those arriving while scrolled up.
+- **Edit history:** earlier versions keep their text, mentions and
+  formatting only (not link previews or long texts), and versions from
+  before this change weren't kept. Edits arriving out of order may date
+  a version by the wrong edit's timestamp.
+- **Retry delete:** a deleted message's send states are its delete's
+  (Desktop's `deletedForEveryoneSendStatus`); what the message itself
+  reached before is dropped then, where Desktop keeps both. A delete that
+  never went out (not connected) has no recipients, so its retry goes to
+  the whole chat.
+- **Lightbox:** media are read from the chat's newest 500 messages with
+  media; only downloaded photos and videos are stepped to (Desktop shows
+  ones still downloading, and its thumbnails strip). Desktop's lightbox
+  has no "Go to message" (All media's "View in chat" does that).
+- **All media:** videos aren't drawn in the Media tab (photos only),
+  and there's no paging past 500 messages or deleting from it.
+- **Spell check:** the checker uses the system's languages (Desktop
+  picks dictionaries from the locale); Undo and Redo are always offered
+  (the input doesn't say whether either can be done), there's no "Paste
+  and Match Style", and a word broken across lines isn't underlined.
+  The right-click menu is a native menu and wasn't opened in a test.
+- **Large composer:** the tab shows while the pointer is over the
+  composer. ⌘⇧K toggles it and ⌘Enter sends from it (Enter adds a line
+  there, as Desktop's); both are in `shortcuts.rs` and the guide.
+- **Preferred reactions:** Desktop's Reset is enabled only while the
+  draft equals the defaults (which reads backwards); ours once they
+  differ. The account record write hasn't been tried against Storage
+  Service.
+- **Consecutive playback:** the next audio must already be downloaded;
+  Desktop also shows whether each voice message was played (its dot in
+  All media), which isn't tracked here.
 
 ## Voice messages
 
