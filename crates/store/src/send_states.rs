@@ -252,6 +252,13 @@ impl AppDb {
             .await?)
     }
 
+    /// Sets message `id`'s status as it is (a send paused for a captcha,
+    /// or failed once the captcha was skipped).
+    pub async fn set_message_status(&self, id: i64, status: DeliveryStatus) -> Result<()> {
+        sqlx::query("UPDATE messages SET status = ? WHERE id = ?").bind(status_to_i64(status)).bind(id).execute(&self.writer).await?;
+        Ok(())
+    }
+
     /// An incoming voice message was played: whether it wasn't before.
     pub async fn mark_viewed(&self, id: i64) -> Result<bool> {
         let done = sqlx::query("UPDATE messages SET viewed = 1 WHERE id = ? AND viewed = 0").bind(id).execute(&self.writer).await?;

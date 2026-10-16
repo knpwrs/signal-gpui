@@ -162,15 +162,20 @@ impl PushService {
             builder = builder.header(*key, *value);
         }
 
+        let identified = credentials.is_some();
         if let Some(credentials) = credentials {
             builder =
                 builder.basic_auth(credentials.login(), credentials.password);
         }
 
-        let ws = builder
-            .upgrade()
-            .send()
-            .await?
+        let response = builder.upgrade().send().await?;
+        // signal-gpui: the authenticated connection's `X-Signal-Alert`s and
+        // `X-Signal-Timestamp`, as libsignal-net hands Desktop them
+        // (`onReceivedAlerts`, `onServerTimestamp`).
+        if identified {
+            crate::websocket::connection_info::record(response.headers());
+        }
+        let ws = response
             .into_websocket()
             .instrument(span.clone())
             .await?;

@@ -116,6 +116,11 @@ Powers for signal-gpui since 2026-10-15. Changes:
 - `src/groups_v2/mod.rs`: `BannedMember` and `PromotedMember` are exported
   with the other group types (upstream keeps them private to `model`, so a
   `Group`'s `members_banned` couldn't be built in tests).
+- `src/websocket/connection_info.rs` (new), `src/push_service/mod.rs`:
+  as the authenticated websocket opens, its response's `X-Signal-Alert`
+  values and `X-Signal-Timestamp` are kept for the app to take
+  (`connection_info::take`), as libsignal-net hands Signal Desktop them
+  (`onReceivedAlerts`, `onServerTimestamp`). Upstream drops the response.
 - `protobuf/StorageService.proto`: `AccountRecord` fields 55 to 59
   (`reactionNotifications`, `notifyFor{Calls,Mentions,Replies}IfMuted`,
   `showUnreadReminders`), from Signal Desktop's `protos/SignalStorage.proto`,

@@ -16,6 +16,8 @@ mod release_notes;
 mod remote_config;
 mod view_once;
 mod profile;
+mod challenge;
+mod alerts;
 mod receipts;
 mod session_reset;
 mod settings;
@@ -232,6 +234,8 @@ struct Delivery {
     /// Of `failed`, those whose identity key changed (Desktop's
     /// `OutgoingIdentityKeyError`).
     identity: Vec<String>,
+    /// The server wants a captcha before more sends (HTTP 428): its token.
+    challenge: Option<String>,
 }
 
 /// Why a send to someone failed.
@@ -243,6 +247,8 @@ struct SendFailure {
     rejected: bool,
     /// Their identity key changed (Desktop's `OutgoingIdentityKeyError`).
     identity: bool,
+    /// The server wants a captcha first (HTTP 428): its token.
+    challenge: Option<String>,
 }
 
 impl SendFailure {
@@ -255,7 +261,11 @@ impl SendFailure {
             }
             _ => None,
         };
-        Self { message, retry_after, rejected, ..Default::default() }
+        let challenge = match error {
+            ServiceError::ProofRequiredError(proof) if proof.options.iter().any(|o| o == "captcha") => Some(proof.token.clone()),
+            _ => None,
+        };
+        Self { message, retry_after, rejected, challenge, ..Default::default() }
     }
 }
 
@@ -267,6 +277,9 @@ impl From<presage::libsignal_service::prelude::MessageSenderError> for SendFailu
             E::NotFound { .. } => Self { message, unregistered: true, ..Default::default() },
             E::ServiceError(service) => Self::service(service, message),
             E::UntrustedIdentity { .. } => Self { message, identity: true, ..Default::default() },
+            E::ProofRequired { token, options } if options.iter().any(|o| o == "captcha") => {
+                Self { message, challenge: Some(token.clone()), ..Default::default() }
+            }
             _ => Self { message, ..Default::default() },
         }
     }
@@ -288,6 +301,9 @@ impl<S: std::error::Error> From<presage::Error<S>> for SendFailure {
 impl Delivery {
     fn note(&mut self, failure: &SendFailure) {
         self.rejected |= failure.rejected;
+        if failure.challenge.is_some() {
+            self.challenge.clone_from(&failure.challenge);
+        }
         if let Some(wait) = failure.retry_after {
             self.retry_after = Some(self.retry_after.map_or(wait, |w| w.max(wait)));
         }
@@ -487,6 +503,12 @@ struct Actor {
     delivery_receipts: RefCell<Vec<receipts::PendingReceipt>>,
     receipts_ready: std::cell::Cell<bool>,
     receipts_scheduled: std::cell::Cell<bool>,
+    /// The critical server alert's modal, while it waits (`alerts.rs`).
+    alert_modal: RefCell<Option<tokio::task::JoinHandle<()>>>,
+    /// Our clock is too far from the server's.
+    clock_skewed: std::cell::Cell<bool>,
+    /// Held across a captcha challenge's read and write (`challenge.rs`).
+    challenge_lock: tokio::sync::Mutex<()>,
 }
 
 pub(crate) async fn run(
@@ -581,6 +603,9 @@ pub(crate) async fn run(
         delivery_receipts: RefCell::new(Vec::new()),
         receipts_ready: std::cell::Cell::new(false),
         receipts_scheduled: std::cell::Cell::new(false),
+        alert_modal: RefCell::new(None),
+        clock_skewed: std::cell::Cell::new(false),
+        challenge_lock: tokio::sync::Mutex::new(()),
         kt_task: RefCell::new(None),
     });
 
@@ -679,6 +704,9 @@ impl Actor {
 
         let phone_for_notes = phone.clone();
         self.emit(Event::Ready { phone, aci });
+        // A captcha still waiting asks again, and the alerts last seen show.
+        self.resume_challenge().await;
+        self.resume_alerts().await;
         self.refresh_titles().await;
 
         if just_linked {
@@ -889,6 +917,9 @@ impl Actor {
                 Command::EndPoll { message_id } => self.end_poll(message_id).await,
                 Command::MarkRead { conversation } => self.mark_read(conversation).await,
                 Command::MarkViewed { message_id } => self.mark_viewed(message_id).await,
+                Command::SubmitCaptcha(captcha) => self.submit_captcha(captcha).await,
+                Command::SkipCaptcha => self.skip_captcha().await,
+                Command::DismissServerAlert(alert) => self.dismiss_server_alert(alert).await,
                 Command::Typing { conversation, started } => self.typing(conversation, started).await,
                 Command::DeleteForMe { message_ids } => self.delete_for_me(message_ids).await,
                 Command::RetrySend { message_id } => self.retry_send(message_id).await,
@@ -1153,6 +1184,7 @@ impl Actor {
                 Ok(stream) => {
                     // Delivery receipts wait for the queue to drain again.
                     self.receipts_ready.set(false);
+                    self.on_connected().await;
                     self.emit(Event::Connection(ConnectionState::Syncing));
                     pin_mut!(stream);
                     while let Some(received) = stream.next().await {
@@ -4595,19 +4627,27 @@ impl Actor {
     /// couldn't go at all), the send's own status.
     async fn record_delivery(&self, conversation: &ConversationId, id: i64, delivery: &Delivery) -> DeliveryStatus {
         let status = self.report(conversation, delivery);
+        let summary = self.record_send_states(conversation, id, delivery).await.unwrap_or(status);
+        // The server wants a captcha first: held until it's solved.
+        match &delivery.challenge {
+            Some(token) => self.hold_for_challenge(conversation, id, token).await,
+            None => summary,
+        }
+    }
+
+    async fn record_send_states(&self, conversation: &ConversationId, id: i64, delivery: &Delivery) -> Option<DeliveryStatus> {
         if self.is_note_to_self(conversation) {
-            return status;
+            return None;
         }
         let states = delivery.send_states(conversation.as_group().is_some());
         if states.is_empty() {
-            return status;
+            return None;
         }
         match self.db.record_send_states(id, &states, now_millis()).await {
-            Ok(Some(summary)) => summary,
-            Ok(None) => status,
+            Ok(summary) => summary,
             Err(error) => {
                 self.error("failed to save who a message reached", error);
-                status
+                None
             }
         }
     }
@@ -4615,6 +4655,10 @@ impl Actor {
     /// A send's status, showing why it failed: a group send fails when
     /// anyone but an unregistered member missed it, a 1:1 send when they did.
     fn report(&self, conversation: &ConversationId, delivery: &Delivery) -> DeliveryStatus {
+        // A captcha's dialog says what's wrong (`challenge.rs`).
+        if delivery.challenge.is_some() {
+            return DeliveryStatus::Failed;
+        }
         if let Some(error) = &delivery.error {
             self.error("failed to send", error);
             return DeliveryStatus::Failed;

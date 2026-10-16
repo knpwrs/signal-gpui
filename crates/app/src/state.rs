@@ -140,6 +140,12 @@ pub enum AppEvent {
     /// Our own key transparency check started failing: Desktop's
     /// `KeyTransparencyErrorDialog`.
     KeyTransparencyFailed,
+    /// A send needs a captcha first: Desktop's captcha dialog.
+    CaptchaRequired,
+    /// The captcha was answered (accepted or not): its dialog closes.
+    CaptchaDone,
+    /// The critical idle-phone alert's modal is due.
+    CriticalAlertModal,
     /// Desktop's join dialog for a group link (`GroupV2JoinDialog`).
     GroupLinkPreview(std::rc::Rc<signal_backend::GroupLinkPreview>),
     /// Desktop's error dialog: a title and what went wrong.
@@ -254,6 +260,13 @@ pub struct AppState {
     /// People whose safety number changed after we verified it: sends to
     /// them ask first (`signal_backend::unverified_people`).
     pub unverified: std::collections::HashSet<String>,
+    /// A captcha is being solved in the browser (its dialog's Continue
+    /// spins), Desktop's challenge status `pending`.
+    pub captcha_pending: bool,
+    /// The server's alerts as last connected.
+    pub server_alerts: signal_backend::server_alerts::ServerAlerts,
+    /// Our clock is too far from the server's.
+    pub clock_skew: bool,
     /// Our profile, username and link (`None` until read).
     pub own_profile: Option<signal_backend::OwnProfile>,
     pub badges: Badges,
@@ -467,6 +480,9 @@ impl AppState {
             archived: Vec::new(),
             person_avatars: HashMap::new(),
             unverified: Default::default(),
+            captcha_pending: false,
+            server_alerts: Default::default(),
+            clock_skew: false,
             own_profile: None,
             badges: Badges::default(),
             contact_avatars: HashMap::new(),
@@ -1066,6 +1082,24 @@ impl AppState {
                 }
             }
             Event::KeyTransparencyFailed => cx.emit(AppEvent::KeyTransparencyFailed),
+            Event::CaptchaRequired => cx.emit(AppEvent::CaptchaRequired),
+            Event::Captcha(result) => {
+                self.captcha_pending = false;
+                cx.emit(AppEvent::CaptchaDone);
+                if let Err(error) = result {
+                    self.report_error(format!("Verification failed: {error}"), cx);
+                }
+                cx.notify();
+            }
+            Event::ServerAlerts(alerts) => {
+                self.server_alerts = alerts;
+                cx.notify();
+            }
+            Event::CriticalAlertModal => cx.emit(AppEvent::CriticalAlertModal),
+            Event::ClockSkew(skewed) => {
+                self.clock_skew = skewed;
+                cx.notify();
+            }
             Event::Call(update) => self.on_call(update, cx),
             Event::CallLinksChanged => self.reload_call_links(cx),
             Event::CallLinkCreated(room_id) => {
@@ -1576,6 +1610,12 @@ impl AppState {
             }
             // The window is shown by whoever handed us the link.
             Route::ShowWindow => {}
+            // A solved captcha goes to the server (`challenge.rs`).
+            Route::Captcha(captcha) => {
+                self.captcha_pending = true;
+                self.send(Command::SubmitCaptcha(captcha));
+                cx.notify();
+            }
             Route::Unsupported(name) => {
                 tracing::info!(route = name, "unsupported Signal link");
                 cx.emit(AppEvent::Alert { title: routes::UNKNOWN_LINK_TITLE.into(), description: routes::UNKNOWN_LINK.into() });

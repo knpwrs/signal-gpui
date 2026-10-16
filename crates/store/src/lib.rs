@@ -155,6 +155,8 @@ pub enum DeliveryStatus {
     /// It reached some recipients and failed for others (Desktop's
     /// `partial-sent`).
     PartialSent,
+    /// Held until a captcha is solved (Desktop's `paused`, "Send paused").
+    Paused,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1026,6 +1028,7 @@ fn status_to_i64(status: DeliveryStatus) -> i64 {
         DeliveryStatus::Failed => 4,
         DeliveryStatus::Viewed => 5,
         DeliveryStatus::PartialSent => 6,
+        DeliveryStatus::Paused => 7,
     }
 }
 
@@ -1037,6 +1040,7 @@ fn status_from_i64(v: i64) -> DeliveryStatus {
         3 => DeliveryStatus::Read,
         5 => DeliveryStatus::Viewed,
         6 => DeliveryStatus::PartialSent,
+        7 => DeliveryStatus::Paused,
         _ => DeliveryStatus::Failed,
     }
 }
@@ -2183,11 +2187,12 @@ impl AppDb {
     /// A failed message is being sent again.
     pub async fn mark_resending(&self, message_id: i64) -> Result<bool> {
         // Failed, or partly sent (a resend to those it missed).
-        let done = sqlx::query("UPDATE messages SET status = ? WHERE id = ? AND status IN (?, ?)")
+        let done = sqlx::query("UPDATE messages SET status = ? WHERE id = ? AND status IN (?, ?, ?)")
             .bind(status_to_i64(DeliveryStatus::Sending))
             .bind(message_id)
             .bind(status_to_i64(DeliveryStatus::Failed))
             .bind(status_to_i64(DeliveryStatus::PartialSent))
+            .bind(status_to_i64(DeliveryStatus::Paused))
             .execute(&self.writer)
             .await?;
         Ok(done.rows_affected() > 0)

@@ -73,6 +73,7 @@ fn show(state: Entity<AppState>, message: Message, states: Vec<SendState>, windo
             DeliveryStatus::Read => "Read",
             DeliveryStatus::Viewed => "Viewed",
             DeliveryStatus::PartialSent => "Partially sent",
+            DeliveryStatus::Paused => "Send paused",
             DeliveryStatus::Failed => "Not sent",
         };
         let disappears = message.expire_start.map(|start| {

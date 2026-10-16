@@ -3,6 +3,7 @@ pub mod call;
 pub mod calls;
 pub mod all_media;
 pub mod chat_menu;
+pub mod challenge;
 pub mod chat_settings;
 pub mod collapse;
 pub mod common;

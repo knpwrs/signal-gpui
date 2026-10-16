@@ -160,6 +160,9 @@ impl Sidebar {
                 | AppEvent::CallLinkCreated(_)
                 | AppEvent::Gifs { .. }
                 | AppEvent::KeyTransparencyFailed
+                | AppEvent::CaptchaRequired
+                | AppEvent::CaptchaDone
+                | AppEvent::CriticalAlertModal
                 | AppEvent::GroupLinkPreview(_)
                 | AppEvent::Alert { .. }
                 | AppEvent::Info(_)
@@ -1051,6 +1054,7 @@ impl Render for Sidebar {
                         .child(Icon::new(icon).size_5().text_color(palette.text_secondary)),
                 )
             })
+            .children(crate::views::challenge::left_pane_dialog(&self.state, palette, cx).filter(|_| !narrow))
             .when_some(banner.filter(|_| !narrow), |d, (text, icon)| {
                 d.child(
                     div()

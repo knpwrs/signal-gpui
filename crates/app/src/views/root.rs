@@ -138,6 +138,16 @@ impl RootView {
                 if let AppEvent::KeyTransparencyFailed = event {
                     crate::views::safety_number::show_error(state.clone(), window, cx);
                 }
+                if let AppEvent::CaptchaRequired = event {
+                    crate::views::challenge::open_captcha(state.clone(), window, cx);
+                }
+                if let AppEvent::CaptchaDone = event {
+                    use gpui_kit::component::WindowExt as _;
+                    window.close_all_dialogs(cx);
+                }
+                if let AppEvent::CriticalAlertModal = event {
+                    crate::views::challenge::open_critical_modal(state.clone(), window, cx);
+                }
                 if let AppEvent::SelectionChanged = event {
                     let selected = state.read(cx).selected.clone();
                     this.conversation = selected.map(|id| {

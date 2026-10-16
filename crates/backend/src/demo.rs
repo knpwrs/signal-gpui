@@ -1182,6 +1182,9 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     emit(Event::MessageChanged { conversation: m.conversation_id, message_id });
                 }
             }
+            // Nothing asks for a captcha in the demo; one answered is accepted.
+            Command::SubmitCaptcha(_) => emit(Event::Captcha(Ok(()))),
+            Command::SkipCaptcha | Command::DismissServerAlert(_) => {}
             Command::MarkViewed { message_id } => {
                 let _ = db.mark_viewed(message_id).await;
             }

@@ -208,6 +208,8 @@ pub fn status_icon(
         svg().path(SharedString::from(format!("icons/signal/{name}.svg"))).w(px(width)).h(px(12.)).flex_none()
     };
     Some(match status {
+        // Held for a captcha: the sending circle, still.
+        DeliveryStatus::Paused => icon("messagestatus-sending", 12.).text_color(color).into_any_element(),
         DeliveryStatus::Sending => icon("messagestatus-sending", 12.)
             .text_color(color)
             .with_animation(

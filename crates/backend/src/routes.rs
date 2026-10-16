@@ -27,8 +27,11 @@ pub enum Route {
     AddStickers { pack_id: String, pack_key: String },
     /// `sgnl://show-window`.
     ShowWindow,
+    /// `signalcaptcha://<captcha>` (`captchaRoute`, which takes the
+    /// hostname): a solved captcha, for the challenge waiting on it.
+    Captcha(String),
     /// Routes Desktop knows that this app has no use for: linking a device
-    /// (we're never the primary), a captcha (`signalcaptcha://`), its own
+    /// (we're never the primary), its own
     /// notification tokens (`show-conversation`, `start-call-lobby`),
     /// `cancel-presenting` and donations. Desktop shows its "didn't make
     /// sense" error for the ones it doesn't handle.
@@ -103,7 +106,7 @@ pub fn parse(input: &str) -> Option<Route> {
         ("sgnl", "donation-validation-complete" | "paypal") if bare && !search.is_empty() => {
             Some(Route::Unsupported("donation"))
         }
-        ("signalcaptcha", captcha) if !captcha.is_empty() => Some(Route::Unsupported("captcha")),
+        ("signalcaptcha", captcha) if !captcha.is_empty() => Some(Route::Captcha(captcha.to_owned())),
         _ => None,
     }
 }
@@ -204,7 +207,10 @@ mod tests {
         assert_eq!(parse("sgnl://show-window"), Some(Route::ShowWindow));
         assert_eq!(parse("sgnl://show-window/"), Some(Route::ShowWindow));
         assert_eq!(parse("sgnl://linkdevice?uuid=a&pub_key=b"), Some(Route::Unsupported("linkDevice")));
-        assert_eq!(parse("signalcaptcha://signal-hcaptcha.abc"), Some(Route::Unsupported("captcha")));
+        assert_eq!(parse("signalcaptcha://signal-hcaptcha.abc"), Some(Route::Captcha("signal-hcaptcha.abc".into())));
+        // Desktop's own test: a trailing slash is fine.
+        let id = "signal-hcaptcha.Foo-bAr_baz.challenge.fOo-bAR_baZ.fOO-BaR_baz";
+        assert_eq!(parse(&format!("signalcaptcha://{id}/")), Some(Route::Captcha(id.into())));
         assert_eq!(parse("sgnl://show-conversation?token=t"), Some(Route::Unsupported("showConversation")));
         assert_eq!(parse("sgnl://start-call-lobby?token=t"), Some(Route::Unsupported("startCallLobby")));
         assert_eq!(parse("sgnl://cancel-presenting"), Some(Route::Unsupported("cancelPresenting")));

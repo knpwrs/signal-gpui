@@ -247,9 +247,7 @@ with headless windows. Not done, or not checked:
 - **Sticker pack links** (`signal.art/addstickers`, `sgnl://addstickers`)
   say installing from links isn't supported: Desktop opens the pack's
   preview to install it, and this app has no sticker pack manager.
-- **Links Desktop handles that this app can't:** captchas
-  (`signalcaptcha://`, part of the rate-limit challenge, which isn't
-  built), and its notification tokens (`show-conversation`,
+- **Links Desktop handles that this app can't:** its notification tokens (`show-conversation`,
   `start-call-lobby`), linking a device and donations, which show
   Desktop's "didn't make sense" error.
 - **Shortcuts left out**, as their features don't exist here: navigate by

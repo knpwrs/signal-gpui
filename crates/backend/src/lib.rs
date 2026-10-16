@@ -41,6 +41,7 @@ pub mod remote_config;
 pub mod message_requests;
 pub mod auto_download;
 pub mod routes;
+pub mod server_alerts;
 mod sender_keys;
 
 pub use remote_config::{RemoteConfig, current as remote_config};
@@ -607,6 +608,15 @@ pub enum Command {
     ResetUsernameLink,
     /// Sets our username link's QR code color (`UsernameLink.Color`).
     SetUsernameLinkColor(i32),
+    /// The captcha from a `signalcaptcha://` link: sent to the server, and
+    /// the messages a challenge held go again once it's accepted. Answered
+    /// with `Event::Captcha`.
+    SubmitCaptcha(String),
+    /// Desktop's "Skip verification": the held messages fail.
+    SkipCaptcha,
+    /// A server alert closed: the idle warning (for a week), or the
+    /// critical one's modal (for a day).
+    DismissServerAlert(server_alerts::ServerAlert),
 }
 
 /// A per-chat setting kept in the Storage Service.
@@ -1108,6 +1118,16 @@ pub enum Event {
     UsernameSaved(Result<Option<String>, usernames::UsernameProblem>),
     /// Answer to `Command::ResetUsernameLink`.
     UsernameLinkReset(Result<(), String>),
+    /// A send needs a captcha first (HTTP 428): Desktop's captcha dialog.
+    CaptchaRequired,
+    /// Answer to `Command::SubmitCaptcha`: accepted, or why not.
+    Captcha(Result<(), String>),
+    /// The server's alerts as last connected (Desktop's `serverAlerts`).
+    ServerAlerts(server_alerts::ServerAlerts),
+    /// The critical idle-phone alert's modal is due.
+    CriticalAlertModal,
+    /// Our clock is too far from the server's (`true`), or not any more.
+    ClockSkew(bool),
     Error(String),
     Unlinked,
 }

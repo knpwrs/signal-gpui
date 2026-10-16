@@ -54,6 +54,7 @@ impl Actor {
             if skew.abs() > 60 * 60 * 1000 {
                 warn!(server, skew, "remote config: severe clock skew");
             }
+            self.check_clock(server as i64, Instant::now());
         }
         let Some(values) = response.config else {
             return debug!("remote config: unchanged");

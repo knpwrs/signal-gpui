@@ -2773,14 +2773,24 @@ impl ConversationView {
 /// (`MessageMetadata`); the message's menu has its details.
 const PARTIALLY_SENT: &str = "Partially sent, click for details";
 
+/// What shows in place of the time: Desktop's `icu:partiallySent`, and
+/// `icu:sendPaused` for a send held for a captcha.
+fn status_words(status: DeliveryStatus) -> Option<&'static str> {
+    match status {
+        DeliveryStatus::PartialSent => Some(PARTIALLY_SENT),
+        DeliveryStatus::Paused => Some("Send paused"),
+        _ => None,
+    }
+}
+
 fn render_meta(message: &Message, color: Hsla, palette: Palette) -> AnyElement {
     let outgoing = message.direction == Direction::Outgoing;
-    if outgoing && message.status == DeliveryStatus::PartialSent {
+    if let Some(words) = outgoing.then(|| status_words(message.status)).flatten() {
         return div()
-            .debug_selector(|| "partially-sent".into())
+            .debug_selector(move || format!("status-{words}"))
             .text_size(px(META_SIZE))
             .text_color(palette.danger)
-            .child(PARTIALLY_SENT)
+            .child(words)
             .into_any_element();
     }
     let status = outgoing
@@ -3135,8 +3145,8 @@ fn text_width(cx: &App, text: &str, size: f32) -> f32 {
 /// Width of what [`render_meta`] draws.
 fn meta_width(message: &Message, cx: &App) -> f32 {
     let outgoing = message.direction == Direction::Outgoing;
-    if outgoing && message.status == DeliveryStatus::PartialSent {
-        return text_width(cx, PARTIALLY_SENT, META_SIZE);
+    if let Some(words) = outgoing.then(|| status_words(message.status)).flatten() {
+        return text_width(cx, words, META_SIZE);
     }
     let mut parts = vec![text_width(cx, &message_time(message.sent_at), META_SIZE)];
     if message.edited {
