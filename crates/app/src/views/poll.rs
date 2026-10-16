@@ -518,7 +518,7 @@ mod tests {
     #[test]
     fn clicking_an_option_follows_desktop() {
         let mut poll = Poll::new("Q".into(), vec!["A".into(), "B".into(), "C".into()], false);
-        let vote = |options: Vec<u32>, vote_count| signal_store::PollVote { author: None, options, vote_count, sent_at: 1, pending: false };
+        let vote = |options: Vec<u32>, vote_count| signal_store::PollVote { author: None, options, vote_count, sent_at: 1, ..Default::default() };
         poll.apply_vote(vote(vec![0], 1), signal_store::VoteSource::Sync);
         let tally = poll.tally();
         // Single choice: another option replaces ours; unchecking clears it.

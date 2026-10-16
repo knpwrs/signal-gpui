@@ -1163,17 +1163,40 @@ fn story_recipients(recipients: &[sync_message::sent::StoryMessageRecipient]) ->
         .collect()
 }
 
+/// Who a message sent from another device went to (its transcript's
+/// `unidentified_status`), without us.
+fn sent_to(sent: &sync_message::Sent, ctx: &MapContext) -> Vec<String> {
+    sent.unidentified_status
+        .iter()
+        .filter_map(|status| {
+            status
+                .destination_service_id_binary
+                .as_deref()
+                .and_then(ServiceId::parse_from_service_id_binary)
+                .or_else(|| status.destination_service_id.as_deref().and_then(ServiceId::parse_from_service_id_string))
+        })
+        .map(|sid| sid.service_id_string())
+        .filter(|sid| sid != ctx.self_aci)
+        .collect()
+}
+
 fn map_sync(sync: &SyncMessage, envelope_ts: i64, ctx: &MapContext) -> Vec<Action> {
     let mut out = Vec::new();
     if let Some(sync_message::Content::Sent(sent)) = &sync.content {
         let destination = sent.parse_destination_service_id().map(|s| s.service_id_string());
         let ts = sent.timestamp.map(|t| t as i64).unwrap_or(envelope_ts);
         if let Some(dm) = sent.message.as_ref().filter(|dm| !body_too_long(dm, "sent message", ts)) {
-            out.extend(map_data_message(
-                dm,
-                Origin::Outgoing { destination: destination.clone() },
-                ts,
-                ctx,
+            let reached = sent_to(sent, ctx);
+            out.extend(map_data_message(dm, Origin::Outgoing { destination: destination.clone() }, ts, ctx).into_iter().map(
+                |mut action| {
+                    // Our poll from another device reached whoever its
+                    // transcript lists, as Desktop's `createSentMessage`
+                    // keeps them (`sendStateByConversationId`).
+                    if let Action::Insert { poll: Some(poll), .. } = &mut action {
+                        poll.record_reached(reached.iter().cloned());
+                    }
+                    action
+                },
             ));
         }
         if let Some(edit) = &sent.edit_message

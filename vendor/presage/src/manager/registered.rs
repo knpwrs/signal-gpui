@@ -1256,6 +1256,40 @@ impl<S: Store> Manager<S, Registered> {
         message: impl Into<ContentBody>,
         timestamp: u64,
     ) -> Result<(), Error<S::Error>> {
+        let results = self.send_message_to_group_members(master_key_bytes, message, timestamp, None).await?;
+
+        // TODO: Handle the NotFound error in the future by removing all sessions to this UUID and marking it as unregistered, not sending any messages to this contact anymore.
+        results
+            .into_iter()
+            .map(|(_, result)| result)
+            .find(|res| match res {
+                Ok(_) => false,
+                // Ignore any NotFound errors, those mean that e.g. some contact in a group deleted his account.
+                Err(MessageSenderError::NotFound { service_id }) => {
+                    debug!(service_id = %service_id.service_id_string(), "recipient not found, skipping sent message result");
+                    false
+                }
+                // return first error if any
+                Err(_) => true,
+            })
+            .transpose()?;
+        Ok(())
+    }
+
+    /// Sends one message in a group (v2), as [`Self::send_message_to_group`],
+    /// to every other member or only to those in `only` (a retry to the ones
+    /// an earlier send didn't reach). Returns each recipient's result rather
+    /// than the first error, so the caller can keep per-recipient send
+    /// states as Signal Desktop's `sendStateByConversationId` does. As
+    /// before, the message is stored only when no recipient failed (an
+    /// unregistered one aside).
+    pub async fn send_message_to_group_members(
+        &mut self,
+        master_key_bytes: &[u8],
+        message: impl Into<ContentBody>,
+        timestamp: u64,
+        only: Option<&[ServiceId]>,
+    ) -> Result<Vec<(ServiceId, Result<(), MessageSenderError>)>, Error<S::Error>> {
         let mut content_body = message.into();
         let master_key_bytes = master_key_bytes
             .try_into()
@@ -1280,6 +1314,7 @@ impl<S: Store> Manager<S, Registered> {
             .members
             .into_iter()
             .filter(|m| m.aci != self.state.data.service_ids.aci())
+            .filter(|m| only.is_none_or(|only| only.contains(&ServiceId::from(m.aci))))
         {
             let unidentified_access =
                 self.store
@@ -1299,23 +1334,19 @@ impl<S: Store> Manager<S, Registered> {
 
         let online_only = false;
         let results = sender
-            .send_message_to_group(recipients, content_body.clone(), timestamp, online_only)
+            .send_message_to_group(&recipients, content_body.clone(), timestamp, online_only)
             .await;
 
-        // TODO: Handle the NotFound error in the future by removing all sessions to this UUID and marking it as unregistered, not sending any messages to this contact anymore.
-        results
-            .into_iter()
-            .find(|res| match res {
-                Ok(_) => false,
-                // Ignore any NotFound errors, those mean that e.g. some contact in a group deleted his account.
-                Err(MessageSenderError::NotFound { service_id }) => {
-                    debug!(service_id = %service_id.service_id_string(), "recipient not found, skipping sent message result");
-                    false
-                }
-                // return first error if any
-                Err(_) => true,
-            })
-            .transpose()?;
+        let results: Vec<(ServiceId, Result<(), MessageSenderError>)> = recipients
+            .iter()
+            .map(|(recipient, _, _)| *recipient)
+            .zip(results.into_iter().map(|result| result.map(|_| ())))
+            .collect();
+        // As before: nothing is stored when the first failure (other than
+        // an unregistered member) would have failed the whole send.
+        if results.iter().any(|(_, r)| matches!(r, Err(e) if !matches!(e, MessageSenderError::NotFound { .. }))) {
+            return Ok(results);
+        }
 
         let content = Content {
             metadata: Metadata {
@@ -1343,7 +1374,7 @@ impl<S: Store> Manager<S, Registered> {
         )
         .await?;
 
-        Ok(())
+        Ok(results)
     }
 
     async fn restore_thread_timer(&mut self, thread: &Thread, content_body: &mut ContentBody) {

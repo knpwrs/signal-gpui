@@ -854,6 +854,7 @@ async fn drop_later_migrations(db: &AppDb) {
     sqlx::query("ALTER TABLE messages DROP COLUMN deleted_by_admin").execute(&db.writer).await.unwrap();
     sqlx::query("DROP INDEX messages_long_text").execute(&db.writer).await.unwrap();
     sqlx::query("ALTER TABLE messages DROP COLUMN long_text").execute(&db.writer).await.unwrap();
+    sqlx::query("DROP INDEX messages_polls").execute(&db.writer).await.unwrap();
     sqlx::query("ALTER TABLE messages DROP COLUMN poll").execute(&db.writer).await.unwrap();
     sqlx::query("DROP TABLE contact_nicknames").execute(&db.writer).await.unwrap();
     sqlx::query("DROP TABLE early_events").execute(&db.writer).await.unwrap();
@@ -861,6 +862,8 @@ async fn drop_later_migrations(db: &AppDb) {
     sqlx::query("ALTER TABLE conversations DROP COLUMN group_ended").execute(&db.writer).await.unwrap();
     sqlx::query("DROP INDEX messages_view_once").execute(&db.writer).await.unwrap();
     sqlx::query("ALTER TABLE messages DROP COLUMN view_once").execute(&db.writer).await.unwrap();
+    sqlx::query("DROP INDEX messages_unread_poll_votes").execute(&db.writer).await.unwrap();
+    sqlx::query("ALTER TABLE messages DROP COLUMN unread_poll_votes").execute(&db.writer).await.unwrap();
 }
 
 /// Rewrites the migration history to look like a pre-squash database that
@@ -1557,7 +1560,7 @@ async fn a_long_text_replaces_the_start_of_the_body_once() {
 }
 
 fn vote(author: Option<&str>, options: &[u32], vote_count: u32, sent_at: i64) -> PollVote {
-    PollVote { author: author.map(Into::into), options: options.to_vec(), vote_count, sent_at, pending: false }
+    PollVote { author: author.map(Into::into), options: options.to_vec(), vote_count, sent_at, ..Default::default() }
 }
 
 fn lunch() -> Poll {
@@ -1593,29 +1596,70 @@ fn poll_votes_follow_desktops_rules() {
     assert!(!poll.apply_vote(vote(Some("b"), &[0], 1, 60), VoteSource::Other));
 }
 
+/// Ours from here, to `to`.
+fn our_vote(options: &[u32], vote_count: u32, sent_at: i64, to: &[&str]) -> PollVote {
+    PollVote { sends: to.iter().map(|t| (t.to_string(), false)).collect(), ..vote(None, options, vote_count, sent_at) }
+}
+
+fn names(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| s.to_string()).collect()
+}
+
 #[test]
-fn our_votes_count_once_sent() {
+fn our_votes_count_once_sent_to_everyone() {
     let mut poll = Poll { allow_multiple: true, ..lunch() };
     assert_eq!(poll.next_vote_count(), 1);
-    assert!(poll.apply_vote(vote(None, &[0, 2], 1, 10), VoteSource::ThisDevice));
+    assert!(poll.apply_vote(our_vote(&[0, 2], 1, 10, &["a", "b"]), VoteSource::ThisDevice));
     let tally = poll.tally();
     assert_eq!((tally.total_votes, tally.chosen().clone()), (0, [0, 2].into()), "pending: shown, not counted");
-    assert!(poll.finish_our_vote(1, true));
+    // Reaching some keeps it pending, waiting for the rest.
+    assert!(poll.record_vote_sends(1, &names(&["a"]), &[]));
+    assert_eq!(poll.our_pending_vote().map(PollVote::unsent), Some(names(&["b"])));
+    assert!(poll.record_vote_sends(1, &names(&["b"]), &[]));
+    assert_eq!(poll.our_pending_vote(), None);
     assert_eq!(poll.tally().ours, [0, 2].into());
     assert_eq!(poll.next_vote_count(), 2);
     // A second vote waits beside the first, replaces the pending one
-    // before it, and takes over once sent.
-    poll.apply_vote(vote(None, &[1], 2, 20), VoteSource::ThisDevice);
-    poll.apply_vote(vote(None, &[0], 3, 30), VoteSource::ThisDevice);
+    // before it, and takes over once sent. Someone no longer registered
+    // isn't waited for.
+    poll.apply_vote(our_vote(&[1], 2, 20, &["a"]), VoteSource::ThisDevice);
+    poll.apply_vote(our_vote(&[0], 3, 30, &["a", "gone"]), VoteSource::ThisDevice);
     assert_eq!(poll.votes.len(), 2);
     assert_eq!(poll.tally().ours, [0, 2].into());
     assert_eq!(poll.tally().pending, Some([0].into()));
-    assert!(poll.finish_our_vote(3, true));
+    assert!(!poll.record_vote_sends(2, &names(&["a"]), &[]), "replaced");
+    assert!(poll.record_vote_sends(3, &names(&["a"]), &names(&["gone"])));
     assert_eq!(poll.votes, vec![vote(None, &[0], 3, 30)]);
-    // One that fails never reached anyone: it goes.
-    poll.apply_vote(vote(None, &[1], 4, 40), VoteSource::ThisDevice);
-    assert!(poll.finish_our_vote(4, false));
+    // Given up having reached nobody: it goes.
+    poll.apply_vote(our_vote(&[1], 4, 40, &["a", "b"]), VoteSource::ThisDevice);
+    assert!(poll.give_up_vote(4));
     assert_eq!(poll.votes, vec![vote(None, &[0], 3, 30)]);
+    // Given up having reached some: it counts, as Desktop's does.
+    poll.apply_vote(our_vote(&[2], 5, 50, &["a", "b"]), VoteSource::ThisDevice);
+    poll.record_vote_sends(5, &names(&["a"]), &[]);
+    assert!(poll.give_up_vote(5));
+    assert_eq!(poll.tally().ours, [2].into());
+    assert_eq!(poll.our_pending_vote(), None);
+    // One from before recipients were kept is addressed when resent.
+    poll.apply_vote(vote(None, &[1], 6, 60), VoteSource::ThisDevice);
+    assert!(poll.address_our_vote(6, &names(&["a"])));
+    assert!(!poll.address_our_vote(6, &names(&["b"])), "only once");
+    assert_eq!(poll.our_pending_vote().map(PollVote::unsent), Some(names(&["a"])));
+}
+
+#[test]
+fn our_poll_counts_votes_only_from_who_it_reached() {
+    let mut poll = lunch();
+    assert_eq!(poll.reached("a"), None, "not known");
+    assert!(poll.record_reached(names(&["a"])));
+    assert!(!poll.record_reached(names(&["a"])));
+    assert_eq!((poll.reached("a"), poll.reached("b")), (Some(true), Some(false)));
+    // Kept with the poll.
+    let json = serde_json::to_string(&poll).unwrap();
+    assert_eq!(serde_json::from_str::<Poll>(&json).unwrap(), poll);
+    assert!(!serde_json::to_string(&lunch()).unwrap().contains("reached"));
+    assert_eq!(poll_ended_preview(Some("Ana"), "Lunch\ntoday?"), "📊 Ana ended the poll: Lunch today?");
+    assert_eq!(poll_ended_preview(None, "Lunch?"), "📊 You ended the poll: Lunch?");
 }
 
 #[test]
@@ -1780,4 +1824,103 @@ async fn unviewed_view_once_messages_go_after_thirty_days() {
     assert_eq!(db.view_once_to_erase(i64::MAX).await.unwrap(), vec![new]);
     // An unviewed one that went stays unread, as Desktop leaves it.
     assert_eq!(db.conversation(&conv("d:alice")).await.unwrap().unwrap().unread_count, 2);
+}
+
+#[tokio::test]
+async fn votes_in_our_poll_are_unread_until_the_chat_is() {
+    let db = test_db().await;
+    let ours = db.insert_message(&outgoing("g:aa", 10, "Lunch?")).await.unwrap();
+    db.set_poll(ours, &lunch()).await.unwrap();
+    let chat = |db: &AppDb| {
+        let db = db.clone();
+        async move { db.conversation(&conv("g:aa")).await.unwrap().unwrap() }
+    };
+    assert!(!chat(&db).await.unread_poll_votes);
+    // Our own changes don't make it unread; someone else's vote does,
+    // without counting as an unread message (Desktop's isn't either).
+    assert!(db.update_poll(ours, |p| p.apply_vote(vote(None, &[0], 1, 15), VoteSource::Sync)).await.unwrap());
+    assert!(!chat(&db).await.unread_poll_votes);
+    assert!(db.update_poll_unread(ours, |p| p.apply_vote(vote(Some("bob"), &[1], 1, 20), VoteSource::Other)).await.unwrap());
+    let c = chat(&db).await;
+    assert!(c.unread_poll_votes);
+    assert_eq!(c.unread_count, 0);
+    // A vote that doesn't apply leaves it as it was.
+    db.take_unread_poll_votes(&conv("g:aa")).await.unwrap();
+    assert!(!db.update_poll_unread(ours, |p| p.apply_vote(vote(Some("bob"), &[1], 1, 20), VoteSource::Other)).await.unwrap());
+    assert!(!chat(&db).await.unread_poll_votes);
+    // Reading the chat takes them, naming our poll for a read sync.
+    assert!(db.update_poll_unread(ours, |p| p.apply_vote(vote(Some("bob"), &[2], 2, 30), VoteSource::Other)).await.unwrap());
+    assert_eq!(db.take_unread_poll_votes(&conv("g:aa")).await.unwrap(), vec![10]);
+    assert!(db.take_unread_poll_votes(&conv("g:aa")).await.unwrap().is_empty());
+    assert!(!chat(&db).await.unread_poll_votes);
+    // Or a read sync from another device naming it.
+    assert!(db.update_poll_unread(ours, |p| p.apply_vote(vote(Some("bob"), &[0], 3, 40), VoteSource::Other)).await.unwrap());
+    assert_eq!(db.mark_poll_votes_read(10).await.unwrap(), Some(conv("g:aa")));
+    assert_eq!(db.mark_poll_votes_read(10).await.unwrap(), None);
+    // Deleted: nothing left to read.
+    assert!(db.update_poll_unread(ours, |p| p.apply_vote(vote(Some("bob"), &[1], 4, 50), VoteSource::Other)).await.unwrap());
+    db.mark_deleted(ours).await.unwrap();
+    assert!(!chat(&db).await.unread_poll_votes);
+}
+
+#[tokio::test]
+async fn a_polls_end_is_the_preview_and_someone_elses_is_unread() {
+    let db = test_db().await;
+    db.upsert_conversation(&conv("d:bob"), ConversationUpdate { title: Some("Bob Builder".into()), ..Default::default() })
+        .await
+        .unwrap();
+    let poll = db.insert_message(&incoming("g:aa", "bob", 10, "Lunch?")).await.unwrap();
+    db.set_poll(poll, &lunch()).await.unwrap();
+    db.mark_read(&conv("g:aa")).await.unwrap();
+    let ended = Notice::PollEnded { by: Some("bob".into()), question: "Lunch?".into(), sent_at: 10 };
+    db.insert_unread_notice(&conv("g:aa"), 50, &ended).await.unwrap().unwrap();
+    let c = db.conversation(&conv("g:aa")).await.unwrap().unwrap();
+    assert_eq!(c.last_message_preview.as_deref(), Some("📊 Bob Builder ended the poll: Lunch?"));
+    assert_eq!((c.last_message_at, c.unread_count), (50, 1));
+    // A repeat adds nothing.
+    assert_eq!(db.insert_unread_notice(&conv("g:aa"), 50, &ended).await.unwrap(), None);
+    assert_eq!(db.conversation(&conv("g:aa")).await.unwrap().unwrap().unread_count, 1);
+    // Reading names who ended it and when, for receipts and read syncs.
+    assert_eq!(db.mark_read(&conv("g:aa")).await.unwrap(), vec![("bob".into(), 50)]);
+    // A read sync from another device can name it too.
+    db.insert_unread_notice(&conv("g:aa"), 60, &ended).await.unwrap().unwrap();
+    assert_eq!(db.conversation(&conv("g:aa")).await.unwrap().unwrap().unread_count, 1);
+    assert_eq!(db.apply_read_sync("bob", 60).await.unwrap(), ReadSync::Read(conv("g:aa")));
+    assert_eq!(db.conversation(&conv("g:aa")).await.unwrap().unwrap().unread_count, 0);
+    // Ours is read already, and is the preview too; other notices aren't.
+    let mine = Notice::PollEnded { by: None, question: "Lunch?".into(), sent_at: 10 };
+    db.insert_notice(&conv("g:aa"), 70, &mine).await.unwrap();
+    let c = db.conversation(&conv("g:aa")).await.unwrap().unwrap();
+    assert_eq!((c.last_message_preview.as_deref(), c.unread_count), (Some("📊 You ended the poll: Lunch?"), 0));
+    db.insert_notice(&conv("g:aa"), 80, &Notice::Timer { by: None, seconds: 60 }).await.unwrap();
+    assert_eq!(db.conversation(&conv("g:aa")).await.unwrap().unwrap().last_message_at, 70);
+}
+
+#[tokio::test]
+async fn pending_votes_and_unread_votes_are_found_by_index() {
+    let db = test_db().await;
+    let poll = db.insert_message(&incoming("g:aa", "bob", 10, "Lunch?")).await.unwrap();
+    db.set_poll(poll, &lunch()).await.unwrap();
+    db.insert_message(&incoming("g:aa", "bob", 20, "hi")).await.unwrap();
+    assert!(db.polls_with_pending_votes().await.unwrap().is_empty());
+    let pending = PollVote { sends: [("bob".to_owned(), false)].into(), ..vote(None, &[1], 1, 30) };
+    db.update_poll(poll, |p| p.apply_vote(pending, VoteSource::ThisDevice)).await.unwrap();
+    let found = db.polls_with_pending_votes().await.unwrap();
+    assert_eq!(found.iter().map(|m| m.id).collect::<Vec<_>>(), [poll]);
+    db.update_poll(poll, |p| p.record_vote_sends(1, &["bob".into()], &[])).await.unwrap();
+    assert!(db.polls_with_pending_votes().await.unwrap().is_empty());
+
+    let plan = |sql: String| {
+        let db = db.clone();
+        async move {
+            let rows: Vec<(i64, i64, i64, String)> =
+                sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}"))).fetch_all(&db.pool).await.unwrap();
+            rows.into_iter().map(|r| r.3).collect::<Vec<_>>().join("; ")
+        }
+    };
+    let list = plan(format!("SELECT {CONVERSATION_COLUMNS} FROM conversations")).await;
+    assert!(list.contains("messages_unread_poll_votes"), "{list}");
+    let sync =
+        plan("UPDATE messages SET unread_poll_votes = 0 WHERE author_key = '' AND sent_at = 1 AND unread_poll_votes = 1".into()).await;
+    assert!(sync.contains("messages_outgoing_sent_at"), "{sync}");
 }

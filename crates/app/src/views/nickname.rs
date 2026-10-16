@@ -438,6 +438,7 @@ mod tests {
             can_label: false,
             avatar_path: None,
             last_outgoing_status: None,
+            unread_poll_votes: false,
         };
         assert!(can_have_nickname(&chat));
         chat.kind = ConversationKind::NoteToSelf;

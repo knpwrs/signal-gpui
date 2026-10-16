@@ -22,6 +22,11 @@ upstream workspace). Changes:
   the primary's read receipts setting from linking (not persisted, like
   `ephemeral_backup_key`), which Signal Desktop takes as its own
   (`AccountManager`'s `createAccount`).
+- `src/manager/registered.rs`: `Manager::send_message_to_group_members`
+  sends to a group's members, or only some of them, and returns each
+  recipient's result (for Desktop's per-recipient send states and retries
+  to the ones a send missed). `send_message_to_group` now calls it and
+  behaves as before.
 
 ## libsignal-service
 

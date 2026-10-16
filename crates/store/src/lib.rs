@@ -101,6 +101,10 @@ pub struct Conversation {
     /// Delivery status of the latest message when it is ours (for the
     /// conversation list's receipt icon); `None` when the latest is incoming.
     pub last_outgoing_status: Option<DeliveryStatus>,
+    /// Someone voted in one of our polls here since we last read it
+    /// (Desktop's `hasUnreadPollVotes`). It isn't in `unread_count`, as
+    /// Desktop's isn't, but reading the chat clears it.
+    pub unread_poll_votes: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -825,7 +829,9 @@ const CONVERSATION_COLUMNS: &str = "id, kind, title, phone, color, members, last
      marked_unread, blocked, draft, expire_timer, expire_timer_version, can_edit_info, left_group, description, admins, member_labels, can_label, can_add_members, group_ended, avatar_path, \
      (SELECT CASE WHEN m.direction = 1 AND m.deleted = 0 THEN m.status END FROM messages m \
       WHERE m.conversation_id = conversations.id AND m.notice IS NULL ORDER BY m.sent_at DESC, m.id DESC LIMIT 1) \
-      AS last_outgoing_status";
+      AS last_outgoing_status, \
+     EXISTS (SELECT 1 FROM messages m \
+      WHERE m.conversation_id = conversations.id AND m.unread_poll_votes = 1) AS unread_poll_votes";
 
 const MESSAGE_COLUMNS: &str = "id, conversation_id, sent_at, received_at, direction, author, \
      author_name, body, status, reactions, quote, attachments, link_preview, deleted, edited, expires_in, expire_start, edit_count, notice, mentions, styles, cta, deleted_by_admin, long_text, poll, view_once";
@@ -991,6 +997,7 @@ fn conversation_from_row(row: &SqliteRow) -> Result<Conversation> {
         ended: row.try_get("group_ended")?,
         avatar_path: row.try_get("avatar_path")?,
         last_outgoing_status: row.try_get::<Option<i64>, _>("last_outgoing_status")?.map(status_from_i64),
+        unread_poll_votes: row.try_get("unread_poll_votes")?,
     })
 }
 
@@ -1511,14 +1518,16 @@ impl AppDb {
     }
 
     /// Zeroes the unread count; returns `(author, sent_at)` of incoming messages
-    /// that were unread, so read receipts can be sent.
+    /// that were unread, so read receipts can be sent. A poll's end names
+    /// who ended it and when, as Desktop reads its `poll-terminate`.
     pub async fn mark_read(&self, id: &ConversationId) -> Result<Vec<(String, i64)>> {
         let mut tx = self.write().await?;
         let rows = sqlx::query(
             "UPDATE messages SET is_read = 1, \
                 expire_start = CASE WHEN expires_in > 0 THEN CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) END \
              WHERE conversation_id = ? AND is_read = 0 \
-             RETURNING author, sent_at",
+             RETURNING CASE WHEN json_extract(notice, '$.type') = 'poll_ended' THEN json_extract(notice, '$.by') \
+                ELSE author END AS author, sent_at",
         )
         .bind(&id.0)
         .fetch_all(&mut *tx)
@@ -1571,7 +1580,7 @@ impl AppDb {
     /// doesn't send one for each message, and some get lost).
     pub async fn apply_read_sync(&self, author: &str, sent_at: i64) -> Result<ReadSync> {
         let mut tx = self.write().await?;
-        let target: Option<(String, i64, i64)> = sqlx::query_as(AssertSqlSafe(format!(
+        let mut target: Option<(String, i64, i64)> = sqlx::query_as(AssertSqlSafe(format!(
             "SELECT conversation_id, sent_at, id FROM messages \
              WHERE author_key = ?1 AND direction = 0 AND {} ORDER BY sent_at = ?2 DESC LIMIT 1",
             sent_at_matches("?2")
@@ -1580,6 +1589,19 @@ impl AppDb {
         .bind(sent_at)
         .fetch_optional(&mut *tx)
         .await?;
+        // Or someone's end of their poll, named by them and its time
+        // (Desktop's `ReadSyncs.onSync` matches `poll-terminate` too).
+        if target.is_none() {
+            target = sqlx::query_as(
+                "SELECT conversation_id, sent_at, id FROM messages INDEXED BY messages_author \
+                 WHERE author_key = 'notice' AND sent_at = ?2 AND json_extract(notice, '$.type') = 'poll_ended' \
+                   AND json_extract(notice, '$.by') = ?1 LIMIT 1",
+            )
+            .bind(author)
+            .bind(sent_at)
+            .fetch_optional(&mut *tx)
+            .await?;
+        }
         let Some((conversation, target_sent_at, target_id)) = target else {
             return Ok(ReadSync::NotFound);
         };
@@ -1608,6 +1630,37 @@ impl AppDb {
         .await?;
         tx.commit().await?;
         Ok(ReadSync::Read(ConversationId(conversation)))
+    }
+
+    /// Our polls in this chat with votes not yet read (Desktop's
+    /// `getUnreadPollVotesAndMarkRead`): marks them read and returns their
+    /// `sent_at`s, for read syncs to our other devices.
+    pub async fn take_unread_poll_votes(&self, id: &ConversationId) -> Result<Vec<i64>> {
+        let mut tx = self.write().await?;
+        let mut read: Vec<i64> = sqlx::query_scalar(
+            "UPDATE messages INDEXED BY messages_unread_poll_votes SET unread_poll_votes = 0 \
+             WHERE conversation_id = ? AND unread_poll_votes = 1 AND author_key = '' RETURNING sent_at",
+        )
+        .bind(&id.0)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        read.sort_unstable();
+        Ok(read)
+    }
+
+    /// A read sync from another device naming our poll sent at `sent_at`:
+    /// its votes are read (Desktop's `markPollVoteAsRead`). Returns its chat
+    /// when it had unread votes.
+    pub async fn mark_poll_votes_read(&self, sent_at: i64) -> Result<Option<ConversationId>> {
+        let conversation: Option<String> = sqlx::query_scalar(
+            "UPDATE messages SET unread_poll_votes = 0 \
+             WHERE author_key = '' AND sent_at = ? AND unread_poll_votes = 1 RETURNING conversation_id",
+        )
+        .bind(sent_at)
+        .fetch_optional(&self.writer)
+        .await?;
+        Ok(conversation.map(ConversationId))
     }
 
     /// Inserts a message, deduplicating on `(conversation_id, author, sent_at)`.
@@ -1921,7 +1974,7 @@ impl AppDb {
         self.update_and_refresh(
             message_id,
             "UPDATE messages SET deleted = 1, body = '', attachments = '[]', reactions = '[]', \
-             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL, poll = NULL \
+             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL, poll = NULL, unread_poll_votes = 0 \
              WHERE id = ? RETURNING conversation_id",
             None,
         )
@@ -2221,24 +2274,47 @@ impl AppDb {
         Ok(())
     }
 
-    /// Adds a timeline notice at `at` (unix millis). It's already read and
-    /// doesn't become the chat's preview. Repeats of the same event are
-    /// ignored. Returns its row id when new.
+    /// Adds a timeline notice at `at` (unix millis). It's already read.
+    /// Only a poll's end becomes the chat's preview (Desktop's
+    /// `poll-terminate` affects the preview; its other notices here don't).
+    /// Repeats of the same event are ignored. Returns its row id when new.
     pub async fn insert_notice(&self, conversation: &ConversationId, at: i64, notice: &Notice) -> Result<Option<i64>> {
+        self.add_notice(conversation, at, notice, false).await
+    }
+
+    /// Adds a notice that counts as unread until the chat is read, as
+    /// Desktop's "Alice ended the poll" does (`addPollTerminateNotification`).
+    pub async fn insert_unread_notice(&self, conversation: &ConversationId, at: i64, notice: &Notice) -> Result<Option<i64>> {
+        self.add_notice(conversation, at, notice, true).await
+    }
+
+    async fn add_notice(&self, conversation: &ConversationId, at: i64, notice: &Notice, unread: bool) -> Result<Option<i64>> {
         let mut tx = self.write().await?;
         ensure_conversation(&mut tx, conversation).await?;
         let id = sqlx::query_scalar(
             "INSERT INTO messages (conversation_id, sent_at, received_at, direction, author_key, body, status, \
                 attachments, is_read, notice) \
-             VALUES (?1, ?2, ?2, 0, 'notice', '', ?3, '[]', 1, ?4) \
+             VALUES (?1, ?2, ?2, 0, 'notice', '', ?3, '[]', ?4, ?5) \
              ON CONFLICT (conversation_id, author_key, sent_at) DO NOTHING RETURNING id",
         )
         .bind(&conversation.0)
         .bind(at)
         .bind(status_to_i64(DeliveryStatus::Read))
+        .bind(!unread)
         .bind(serde_json::to_string(notice)?)
         .fetch_optional(&mut *tx)
         .await?;
+        if id.is_some() {
+            if unread {
+                sqlx::query("UPDATE conversations SET unread_count = unread_count + 1 WHERE id = ?")
+                    .bind(&conversation.0)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            if matches!(notice, Notice::PollEnded { .. }) {
+                refresh_preview(&mut tx, conversation).await?;
+            }
+        }
         tx.commit().await?;
         Ok(id)
     }
@@ -2649,9 +2725,11 @@ async fn current_long_text(conn: &mut sqlx::SqliteConnection, message_id: i64) -
 
 async fn refresh_preview(conn: &mut sqlx::SqliteConnection, id: &ConversationId) -> Result<()> {
     let row = sqlx::query(
-        "SELECT m.sent_at, m.body, m.styles, m.deleted, m.attachments, m.direction, m.author_name, m.poll, m.view_once, c.kind \
+        "SELECT m.sent_at, m.body, m.styles, m.deleted, m.attachments, m.direction, m.author_name, m.poll, m.view_once, m.notice, c.kind, \
+            (SELECT title FROM conversations p WHERE p.id = 'd:' || json_extract(m.notice, '$.by')) AS notice_by_name \
          FROM messages m JOIN conversations c ON c.id = m.conversation_id \
-         WHERE m.conversation_id = ? AND m.notice IS NULL ORDER BY m.sent_at DESC, m.id DESC LIMIT 1",
+         WHERE m.conversation_id = ? AND (m.notice IS NULL OR json_extract(m.notice, '$.type') = 'poll_ended') \
+         ORDER BY m.sent_at DESC, m.id DESC LIMIT 1",
     )
     .bind(&id.0)
     .fetch_optional(&mut *conn)
@@ -2664,7 +2742,14 @@ async fn refresh_preview(conn: &mut sqlx::SqliteConnection, id: &ConversationId)
             let body = hide_spoilers(&row.try_get::<String, _>("body")?, &styles);
             let poll: Option<Poll> = row.try_get::<Option<String>, _>("poll")?.map(|p| serde_json::from_str(&p)).transpose()?;
             let view_once = row.try_get::<Option<i64>, _>("view_once")?.map(ViewOnce::from_i64);
-            let text = if row.try_get::<bool, _>("deleted")? {
+            let notice: Option<Notice> =
+                row.try_get::<Option<String>, _>("notice")?.map(|n| serde_json::from_str(&n)).transpose()?;
+            let text = if let Some(Notice::PollEnded { by, question, .. }) = &notice {
+                // Desktop's preview of `poll-terminate`: its text after 📊,
+                // with no sender before it.
+                let name: Option<String> = row.try_get("notice_by_name")?;
+                return set_preview(conn, id, Some(poll_ended_preview(by.as_ref().map(|_| name.as_deref().unwrap_or("Someone")), question)), row.try_get("sent_at")?).await;
+            } else if row.try_get::<bool, _>("deleted")? {
                 "This message was deleted".to_owned()
             } else if let Some(view_once) = view_once {
                 let atts: Vec<AttachmentMeta> = serde_json::from_str(row.try_get("attachments")?)?;
@@ -2694,6 +2779,10 @@ async fn refresh_preview(conn: &mut sqlx::SqliteConnection, id: &ConversationId)
             (Some(text), row.try_get::<i64, _>("sent_at")?)
         }
     };
+    set_preview(conn, id, preview, at).await
+}
+
+async fn set_preview(conn: &mut sqlx::SqliteConnection, id: &ConversationId, preview: Option<String>, at: i64) -> Result<()> {
     sqlx::query("UPDATE conversations SET last_message_preview = ?, last_message_at = ? WHERE id = ?")
         .bind(preview)
         .bind(at)

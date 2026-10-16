@@ -21,7 +21,8 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Outcome {
     Applied,
-    /// Its message isn't here (yet).
+    /// Its message isn't here (yet), or (a vote in our poll) hasn't
+    /// reached its voter yet.
     Missing,
     /// It doesn't apply: too late, not allowed, or already done.
     Refused,
@@ -90,7 +91,7 @@ impl Actor {
             Action::AdminDelete { .. } => self.apply_admin_delete(action).await,
             Action::Edit { .. } => self.apply_edit(manager, action).await,
             Action::PollVote { .. } => self.apply_poll_vote(action).await,
-            Action::PollEnd { .. } => self.apply_poll_end(action).await,
+            Action::PollEnd { .. } => self.apply_poll_end(manager, action).await,
             Action::Receipt { sent_at, status } if sent_at.len() == 1 => self.apply_receipt(sent_at[0], *status).await,
             Action::ReadSync(entries) if entries.len() == 1 => self.apply_read_sync(&entries[0].0, entries[0].1).await,
             Action::ViewOnceOpen { author, sent_at } => self.apply_view_once_open(author, *sent_at).await,

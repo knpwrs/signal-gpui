@@ -562,7 +562,7 @@ async fn import_item(
                             options: vec![index as u32],
                             vote_count: voter.voteCount,
                             sent_at: 0,
-                            pending: false,
+                            ..Default::default()
                         }),
                     }
                 }
@@ -570,6 +570,11 @@ async fn import_item(
             let mut imported = signal_store::Poll::new(exported.question.clone(), options, exported.allowMultiple);
             imported.votes = votes;
             imported.ended = exported.hasEnded;
+            // Ours reached whoever the backup has it as sent to; only they
+            // may vote (Desktop imports each recipient's send status).
+            if let Some(DirectionalDetails::Outgoing(details)) = &item.directionalDetails {
+                imported.record_reached(reached(&details.sendStatus, people));
+            }
             poll = Some(imported);
             let message = NewMessage {
                 conversation_id: conversation.clone(),
@@ -710,6 +715,20 @@ fn account_settings(account: &proto::AccountData) -> crate::AccountSettings {
         link_previews: on(|s| s.linkPreviews),
         sealed_sender_indicators: on(|s| s.sealedSenderIndicators),
     }
+}
+
+/// Who an outgoing message reached: the recipients whose status is sent or
+/// beyond, or skipped (Desktop's `isSent`).
+fn reached(statuses: &[proto::SendStatus], people: &HashMap<u64, Who>) -> Vec<String> {
+    use proto::send_status::DeliveryStatus as S;
+    statuses
+        .iter()
+        .filter(|s| matches!(s.deliveryStatus, Some(S::Sent(_) | S::Delivered(_) | S::Read(_) | S::Viewed(_) | S::Skipped(_))))
+        .filter_map(|s| match people.get(&s.recipientId) {
+            Some(Who::Contact { sid, .. }) => Some(sid.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn outgoing_status(statuses: &[proto::SendStatus]) -> DeliveryStatus {
@@ -1002,7 +1021,12 @@ mod tests {
             poll.options.push(option);
         }
         poll.hasEnded = true;
-        push(proto::Frame { item: Some(proto::frame::Item::ChatItem(item(30, 1, 5_000, false, Item::Poll(poll)))), ..Default::default() });
+        // It reached Alice.
+        let mut ours = item(30, 1, 5_000, false, Item::Poll(poll));
+        if let Some(DirectionalDetails::Outgoing(d)) = &mut ours.directionalDetails {
+            d.sendStatus[0].recipientId = 2;
+        }
+        push(proto::Frame { item: Some(proto::frame::Item::ChatItem(ours)), ..Default::default() });
         let mut end = proto::PollTerminateUpdate::new();
         end.targetSentTimestamp = 5_000;
         end.question = "Trail?".into();
@@ -1067,6 +1091,7 @@ mod tests {
         let tally = poll.tally();
         assert_eq!(tally.voters, vec![vec![Some(alice_sid.clone())], vec![Some(alice_sid.clone()), None]]);
         assert_eq!(poll.next_vote_count(), 3, "we had voted twice");
+        assert_eq!(poll.reached(&alice_sid), Some(true), "only who it reached may vote");
         assert_eq!(
             in_group[2].notice,
             Some(signal_store::Notice::PollEnded { by: None, question: "Trail?".into(), sent_at: 5_000 })

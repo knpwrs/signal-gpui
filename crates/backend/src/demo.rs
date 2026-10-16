@@ -25,6 +25,8 @@ const ANA: &str = "d:00000000-0000-4000-8000-0000000000f0";
 const LEO: &str = "d:00000000-0000-4000-8000-0000000000f1";
 const GROUP: &str = "g:0000000000000000000000000000000000000000000000000000000000000001";
 const HOUSE: &str = "g:0000000000000000000000000000000000000000000000000000000000000003";
+/// How long a vote here shows as sending.
+const DEMO_VOTE_SENDING: Duration = Duration::from_millis(800);
 const SELF: &str = "d:00000000-0000-4000-8000-000000000001";
 
 const MINUTE: i64 = 60_000;
@@ -318,7 +320,7 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
     let poll_id = db.insert_message(&incoming(HOUSE, ANA, now - 3 * HOUR, chores)).await?;
     let mut poll = signal_store::Poll::new(chores.into(), vec!["Tuesday".into(), "Wednesday".into(), "Sunday".into()], true);
     for (from, options) in [(LEO, vec![0, 2]), (ANA, vec![2])] {
-        let vote = signal_store::PollVote { author: Some(aci(from).into()), options, vote_count: 1, sent_at: now - 3 * HOUR, pending: false };
+        let vote = signal_store::PollVote { author: Some(aci(from).into()), options, vote_count: 1, sent_at: now - 3 * HOUR, ..Default::default() };
         poll.apply_vote(vote, signal_store::VoteSource::Other);
     }
     db.set_poll(poll_id, &poll).await?;
@@ -941,6 +943,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
             }
             Command::MarkRead { conversation } => {
                 let _ = db.mark_read(&conversation).await;
+                let _ = db.take_unread_poll_votes(&conversation).await;
                 emit(Event::ConversationsChanged);
             }
             Command::SendPoll { conversation, question, options, allow_multiple } => {
@@ -965,25 +968,47 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     expires_in: 0,
                 };
                 let Ok(id) = db.insert_message(&msg).await else { continue };
-                let _ = db.set_poll(id, &signal_store::Poll::new(question, options, allow_multiple)).await;
-                emit(Event::MessageChanged { conversation, message_id: id });
+                let members = db.conversation(&conversation).await.ok().flatten().map(|c| c.members).unwrap_or_default();
+                let poll = signal_store::Poll { reached: Some(members.iter().cloned().collect()), ..signal_store::Poll::new(question, options, allow_multiple) };
+                let _ = db.set_poll(id, &poll).await;
+                emit(Event::MessageChanged { conversation: conversation.clone(), message_id: id });
                 emit(Event::ConversationsChanged);
+                // A moment later the first member votes for the first
+                // option: unread until the chat is read, as Desktop's.
+                let Some(voter) = members.first().cloned() else { continue };
+                let (db, events) = (db.clone(), events.clone());
+                tokio::task::spawn_local(async move {
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    let vote = signal_store::PollVote { author: Some(voter.clone()), options: vec![0], vote_count: 1, sent_at: now(), ..Default::default() };
+                    if let Ok(true) = db.update_poll_unread(id, |poll| poll.apply_vote(vote, signal_store::VoteSource::Other)).await {
+                        let sender = db.conversation(&ConversationId::direct(&voter)).await.ok().flatten().map(|c| c.title).unwrap_or_default();
+                        let _ = events.unbounded_send(Event::MessageChanged { conversation: conversation.clone(), message_id: id });
+                        let _ = events.unbounded_send(Event::ConversationsChanged);
+                        let _ = events.unbounded_send(Event::PollActivity { conversation, message_id: id, sender, ended: false });
+                    }
+                });
             }
-            // A vote sends at once.
+            // A vote shows as sending for a moment (long enough for the
+            // spinner), then counts.
             Command::VotePoll { message_id, options } => {
                 let mut count = 0;
                 let voted = db
                     .update_poll(message_id, |poll| {
                         count = poll.next_vote_count();
-                        let vote = signal_store::PollVote { author: None, options, vote_count: count, sent_at: now(), pending: true };
+                        let vote = signal_store::PollVote { author: None, options, vote_count: count, sent_at: now(), pending: true, ..Default::default() };
                         poll.apply_vote(vote, signal_store::VoteSource::ThisDevice)
                     })
                     .await;
+                let Ok(Some(m)) = db.message(message_id).await else { continue };
+                emit(Event::MessageChanged { conversation: m.conversation_id.clone(), message_id });
                 if let Ok(true) = voted {
-                    let _ = db.update_poll(message_id, |poll| poll.finish_our_vote(count, true)).await;
-                }
-                if let Ok(Some(m)) = db.message(message_id).await {
-                    emit(Event::MessageChanged { conversation: m.conversation_id, message_id });
+                    let (db, events) = (db.clone(), events.clone());
+                    tokio::task::spawn_local(async move {
+                        tokio::time::sleep(DEMO_VOTE_SENDING).await;
+                        if let Ok(true) = db.update_poll(message_id, |poll| poll.record_vote_sends(count, &[], &[])).await {
+                            let _ = events.unbounded_send(Event::MessageChanged { conversation: m.conversation_id, message_id });
+                        }
+                    });
                 }
             }
             Command::EndPoll { message_id } => {

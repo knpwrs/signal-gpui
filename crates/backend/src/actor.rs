@@ -162,9 +162,10 @@ enum Outbound {
         message: i64,
         path: std::path::PathBuf,
     },
-    /// Our vote in a poll; once sent (or not) the vote numbered
-    /// `vote_count` counts (or goes).
-    PollVote { conversation: ConversationId, body: ContentBody, timestamp: u64, message: i64, vote_count: u32 },
+    /// Our vote numbered `vote_count` in poll `message`, to whoever it
+    /// hasn't reached yet; `attempt` counts from 1 (Desktop's job queue
+    /// retries, `polls.rs`).
+    PollVote { message: i64, vote_count: u32, attempt: u32 },
     /// Sync message to our other devices.
     Sync { body: SyncMessage },
     /// A story (or group story reply) to one recipient, part of `job`.
@@ -180,6 +181,93 @@ enum LongTextTry {
     Asked,
     /// A retry after a failure, scheduled for this time.
     Scheduled(i64),
+}
+
+/// How a send went, recipient by recipient (Desktop's
+/// `sendStateByConversationId`, and the errors `handleMultipleSendErrors`
+/// looks at).
+#[derive(Debug, Default)]
+struct Delivery {
+    /// Service ids it reached.
+    reached: Vec<String>,
+    /// No longer registered: it never will reach them.
+    unregistered: Vec<String>,
+    /// Missed this time, with why.
+    failed: Vec<(String, String)>,
+    /// It couldn't go at all (the Signal chat, a failed upload, no group):
+    /// why.
+    error: Option<String>,
+    /// The server said to wait this long first (rate limited).
+    retry_after: Option<Duration>,
+    /// The server refused it (HTTP 508 or 400): Desktop stops retrying.
+    rejected: bool,
+}
+
+/// Why a send to someone failed.
+struct SendFailure {
+    message: String,
+    unregistered: bool,
+    retry_after: Option<Duration>,
+    rejected: bool,
+}
+
+impl SendFailure {
+    fn service(error: &ServiceError, message: String) -> Self {
+        let rejected = matches!(error, ServiceError::ServerRejected)
+            || matches!(error, ServiceError::UnhandledResponseCode { status, .. } if status.as_u16() == 400);
+        let retry_after = match error {
+            ServiceError::RateLimitExceeded { retry_after } => {
+                Some(retry_after.and_then(|d| d.to_std().ok()).unwrap_or(Duration::ZERO))
+            }
+            _ => None,
+        };
+        Self { message, unregistered: false, retry_after, rejected }
+    }
+}
+
+impl From<presage::libsignal_service::prelude::MessageSenderError> for SendFailure {
+    fn from(error: presage::libsignal_service::prelude::MessageSenderError) -> Self {
+        use presage::libsignal_service::prelude::MessageSenderError as E;
+        let message = error.to_string();
+        match &error {
+            E::NotFound { .. } => Self { message, unregistered: true, retry_after: None, rejected: false },
+            E::ServiceError(service) => Self::service(service, message),
+            _ => Self { message, unregistered: false, retry_after: None, rejected: false },
+        }
+    }
+}
+
+impl<S: std::error::Error> From<presage::Error<S>> for SendFailure {
+    fn from(error: presage::Error<S>) -> Self {
+        match error {
+            presage::Error::MessageSenderError(error) => Self::from(*error),
+            presage::Error::ServiceError(service) => {
+                let message = service.to_string();
+                Self::service(&service, message)
+            }
+            other => Self { message: other.to_string(), unregistered: false, retry_after: None, rejected: false },
+        }
+    }
+}
+
+impl Delivery {
+    fn note(&mut self, failure: &SendFailure) {
+        self.rejected |= failure.rejected;
+        if let Some(wait) = failure.retry_after {
+            self.retry_after = Some(self.retry_after.map_or(wait, |w| w.max(wait)));
+        }
+    }
+
+    fn record(&mut self, recipient: String, result: Result<(), SendFailure>) {
+        match result {
+            Ok(()) => self.reached.push(recipient),
+            Err(failure) if failure.unregistered => self.unregistered.push(recipient),
+            Err(failure) => {
+                self.note(&failure);
+                self.failed.push((recipient, failure.message));
+            }
+        }
+    }
 }
 
 struct Actor {
@@ -254,6 +342,8 @@ struct Actor {
     /// Long texts with a retry scheduled, and its time (only the newest
     /// counts).
     long_text_retries: RefCell<HashMap<i64, i64>>,
+    /// Our poll votes still sending when the app last quit were queued again.
+    poll_votes_resumed: RefCell<bool>,
     /// Held across a story list edit's read and write of the saved lists,
     /// so two edits at once don't undo each other.
     story_lists_edit: tokio::sync::Mutex<()>,
@@ -333,6 +423,7 @@ pub(crate) async fn run(
         account_record_read: Default::default(),
         long_texts_resumed: RefCell::new(false),
         long_text_retries: RefCell::default(),
+        poll_votes_resumed: RefCell::new(false),
         story_lists_edit: tokio::sync::Mutex::new(()),
         expiry: tokio::sync::Notify::new(),
         last_sent_at: std::cell::Cell::new(0),
@@ -873,6 +964,9 @@ impl Actor {
                 if !self.long_texts_resumed.replace(true) {
                     tokio::task::spawn_local(self.clone().resume_long_texts(manager.clone()));
                 }
+                if !self.poll_votes_resumed.replace(true) {
+                    self.resume_poll_votes().await;
+                }
                 if !self.storage_synced.replace(true) {
                     self.spawn_storage_sync(manager);
                 }
@@ -1157,7 +1251,18 @@ impl Actor {
             }
             Action::ReadSync(entries) => {
                 let mut changed = false;
+                let me = self.self_aci();
                 for entry in entries {
+                    // One naming our own poll: its votes were read there
+                    // (Desktop's `maybeItIsAPollVoteReadSync`).
+                    if entry.0 == me {
+                        match self.db.mark_poll_votes_read(entry.1).await {
+                            Ok(Some(_)) => changed = true,
+                            Ok(None) => {}
+                            Err(error) => self.error("failed to apply read sync", error),
+                        }
+                        continue;
+                    }
                     changed |= self.modify(manager, Action::ReadSync(vec![entry])).await == early::Outcome::Applied;
                 }
                 if changed {
@@ -3591,6 +3696,16 @@ impl Actor {
             Ok(unread) => unread,
             Err(error) => return self.error("failed to mark read", error),
         };
+        // Votes in our polls are read too; our other devices hear of them
+        // by a read sync naming the poll, and nobody gets a receipt
+        // (Desktop's `markConversationRead`).
+        let poll_votes = match self.db.take_unread_poll_votes(&conversation).await {
+            Ok(polls) => polls,
+            Err(error) => {
+                self.error("failed to mark poll votes read", error);
+                Vec::new()
+            }
+        };
         // Release notes are only here: no receipts to the Signal chat's
         // made-up account, and nothing for our other devices to sync.
         unread.retain(|(author, _)| author != signal_store::SIGNAL_ACI);
@@ -3599,7 +3714,7 @@ impl Actor {
         self.emit(Event::ConversationsChanged);
         // Its calls are read too (Desktop's `markConversationRead`).
         self.mark_calls_read(Some(conversation.clone())).await;
-        if unread.is_empty() {
+        if unread.is_empty() && poll_votes.is_empty() {
             return;
         }
 
@@ -3624,8 +3739,10 @@ impl Actor {
         }
 
         let config = crate::remote_config::current();
+        let me = self.self_aci();
         let read = unread
             .into_iter()
+            .chain(poll_votes.into_iter().map(|sent_at| (me.clone(), sent_at)))
             .map(|(author, sent_at)| {
                 let sender = config.wire_service_id(&author);
                 sync_message::Read {
@@ -3726,8 +3843,9 @@ impl Actor {
                         self.finish_send(&conversation, id, timestamp, DeliveryStatus::Failed).await;
                     }
                     Outbound::Story { recipient, job, .. } => self.story_part_done(job, recipient, Err("not connected".into())),
-                    Outbound::PollVote { conversation, message, vote_count, .. } => {
-                        self.finish_poll_vote(&conversation, message, vote_count, false).await;
+                    // Desktop's job queue waits until it can send.
+                    Outbound::PollVote { message, vote_count, attempt } => {
+                        self.send_poll_vote(None, message, vote_count, attempt).await;
                     }
                     _ => {}
                 }
@@ -3735,8 +3853,11 @@ impl Actor {
             };
             match job {
                 Outbound::Send { conversation, body, timestamp, message } => {
-                    let status = self.deliver(&mut manager, &conversation, body, timestamp).await;
+                    let delivery = self.deliver_to(&mut manager, &conversation, body, timestamp, None).await;
+                    let status = self.report(&conversation, &delivery);
                     if let Some(id) = message {
+                        // Who our poll reached may vote in it.
+                        self.poll_reached(&manager, id, &delivery.reached).await;
                         self.finish_send(&conversation, id, timestamp, status).await;
                     }
                 }
@@ -3794,9 +3915,8 @@ impl Actor {
                 Outbound::Story { recipient, body, timestamp, job } => {
                     self.send_story_part(&mut manager, recipient, body, timestamp, job).await;
                 }
-                Outbound::PollVote { conversation, body, timestamp, message, vote_count } => {
-                    let status = self.deliver(&mut manager, &conversation, body, timestamp).await;
-                    self.finish_poll_vote(&conversation, message, vote_count, status == DeliveryStatus::Sent).await;
+                Outbound::PollVote { message, vote_count, attempt } => {
+                    self.send_poll_vote(Some(&mut manager), message, vote_count, attempt).await;
                 }
                 Outbound::Sync { body } => {
                     let me = self.self_aci();
@@ -3816,32 +3936,83 @@ impl Actor {
         body: ContentBody,
         timestamp: u64,
     ) -> DeliveryStatus {
+        let delivery = self.deliver_to(manager, conversation, body, timestamp, None).await;
+        self.report(conversation, &delivery)
+    }
+
+    /// A send's status, showing why it failed: a group send fails when
+    /// anyone but an unregistered member missed it, a 1:1 send when they did.
+    fn report(&self, conversation: &ConversationId, delivery: &Delivery) -> DeliveryStatus {
+        if let Some(error) = &delivery.error {
+            self.error("failed to send", error);
+            return DeliveryStatus::Failed;
+        }
+        if let Some((_, error)) = delivery.failed.first() {
+            self.error("failed to send", error);
+            return DeliveryStatus::Failed;
+        }
+        if conversation.as_group().is_none() && !delivery.unregistered.is_empty() {
+            self.error("failed to send", "they're no longer on Signal");
+            return DeliveryStatus::Failed;
+        }
+        DeliveryStatus::Sent
+    }
+
+    /// Sends to a chat (to `only` these of its recipients, when given) and
+    /// says how it went for each, as Desktop keeps
+    /// `sendStateByConversationId`. Nothing is shown here; see
+    /// [`Actor::report`].
+    async fn deliver_to(
+        &self,
+        manager: &mut SignalManager,
+        conversation: &ConversationId,
+        body: ContentBody,
+        timestamp: u64,
+        only: Option<&[String]>,
+    ) -> Delivery {
+        let failed = |error: String| Delivery { error: Some(error), ..Default::default() };
         // Its account is made up (as Desktop's): nothing goes to it.
         if conversation.is_signal() {
             warn!("not sending to the Signal chat");
-            return DeliveryStatus::Failed;
+            return failed("the Signal chat can't be sent to".into());
         }
         let mut body = self.stamp_timer(conversation, body).await;
         if let Err(error) = self.attach_long_text(manager, &mut body).await {
-            self.error("failed to send", format!("{error:#}"));
-            return DeliveryStatus::Failed;
+            return failed(format!("{error:#}"));
         }
         self.attach_quote_thumbnail(manager, &mut body).await;
-        let result = match (conversation.as_group(), mapping::service_id_of(conversation)) {
-            (Some(key), _) => manager.send_message_to_group(&key, body, timestamp).await,
-            (None, Some(recipient)) => manager.send_message(recipient, body, timestamp).await,
-            (None, None) => {
-                self.error("cannot send", format!("invalid conversation {conversation}"));
-                return DeliveryStatus::Failed;
+        let mut delivery = Delivery::default();
+        match (conversation.as_group(), mapping::service_id_of(conversation)) {
+            (Some(key), _) => {
+                let only: Option<Vec<ServiceId>> =
+                    only.map(|list| list.iter().filter_map(|s| ServiceId::parse_from_service_id_string(s)).collect());
+                match manager.send_message_to_group_members(&key, body, timestamp, only.as_deref()).await {
+                    Ok(results) => {
+                        for (recipient, result) in results {
+                            delivery.record(recipient.service_id_string(), result.map_err(SendFailure::from));
+                        }
+                    }
+                    Err(error) => {
+                        let failure = SendFailure::from(error);
+                        delivery.note(&failure);
+                        delivery.error = Some(failure.message);
+                    }
+                }
             }
-        };
-        match result {
-            Ok(()) => DeliveryStatus::Sent,
-            Err(error) => {
-                self.error("failed to send", error);
-                DeliveryStatus::Failed
+            (None, Some(recipient)) => {
+                let id = recipient.service_id_string();
+                if only.is_some_and(|only| !only.contains(&id)) {
+                    return delivery;
+                }
+                let result = manager.send_message(recipient, body, timestamp).await;
+                delivery.record(id, result.map_err(SendFailure::from));
             }
+            (None, None) => return failed(format!("invalid conversation {conversation}")),
         }
+        for (who, error) in &delivery.failed {
+            warn!(recipient = %who, %error, "send failed");
+        }
+        delivery
     }
 
     /// A body over 2 KiB goes as Desktop sends it (`sendNormalMessage`,

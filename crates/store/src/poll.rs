@@ -4,7 +4,7 @@
 //! The rules follow Desktop's `ts/messageModifiers/Polls.preload.ts`,
 //! `ts/polls/util.std.ts` and `ts/types/Polls.dom.ts`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use unicode_segmentation::UnicodeSegmentation as _;
 
@@ -34,11 +34,17 @@ pub struct Poll {
     /// Its creator ended it: no more votes ("Poll · Final results").
     #[serde(default)]
     pub ended: bool,
+    /// Ours: who it reached (the recipients Desktop's
+    /// `sendStateByConversationId` has as sent). Only they may vote in it.
+    /// `None` when not known: someone else's poll, or ours from before
+    /// this was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reached: Option<BTreeSet<String>>,
 }
 
 /// One person's vote: every option they chose. A new vote replaces their
 /// last one; `vote_count` orders them (Desktop's `voteCount`).
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct PollVote {
     /// The voter's service id; `None` for us.
     pub author: Option<String>,
@@ -46,10 +52,21 @@ pub struct PollVote {
     pub vote_count: u32,
     /// When it was sent (unix millis); 0 when unknown (transferred history).
     pub sent_at: i64,
-    /// Ours, still sending (Desktop's `sendStateByConversationId`). It
-    /// doesn't count until it's sent.
+    /// Ours, still sending. It doesn't count until it's sent.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pending: bool,
+    /// While ours is sending: each recipient (service id) and whether it
+    /// has reached them (Desktop's `sendStateByConversationId` on a vote).
+    /// Retries go only to the ones it hasn't.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sends: BTreeMap<String, bool>,
+}
+
+impl PollVote {
+    /// Who this vote, still sending, hasn't reached yet.
+    pub fn unsent(&self) -> Vec<String> {
+        self.sends.iter().filter(|(_, sent)| !**sent).map(|(who, _)| who.clone()).collect()
+    }
 }
 
 /// Where a vote came from (Desktop's `PollSource`).
@@ -109,6 +126,17 @@ pub fn poll_preview(question: &str) -> String {
     format!("📊 Poll: {question}")
 }
 
+/// What the chat list and notifications say for a poll's end, after
+/// Desktop's 📊 (`icu:PollTerminate--you` and `icu:PollTerminate--other`).
+/// `by`: the name of who ended it, `None` for us.
+pub fn poll_ended_preview(by: Option<&str>, question: &str) -> String {
+    let question: String = question.split_whitespace().collect::<Vec<_>>().join(" ");
+    match by {
+        Some(name) => format!("📊 {name} ended the poll: {question}"),
+        None => format!("📊 You ended the poll: {question}"),
+    }
+}
+
 fn graphemes(text: &str) -> usize {
     text.graphemes(true).count()
 }
@@ -157,7 +185,22 @@ pub fn vote_options(indexes: &[u32]) -> Option<Vec<u32>> {
 
 impl Poll {
     pub fn new(question: String, options: Vec<String>, allow_multiple: bool) -> Self {
-        Self { question, options, allow_multiple, votes: Vec::new(), ended: false }
+        Self { question, options, allow_multiple, votes: Vec::new(), ended: false, reached: None }
+    }
+
+    /// Our poll reached these people. Returns whether that's news.
+    pub fn record_reached(&mut self, who: impl IntoIterator<Item = String>) -> bool {
+        let reached = self.reached.get_or_insert_default();
+        let before = reached.len();
+        reached.extend(who);
+        reached.len() != before
+    }
+
+    /// Whether `voter` may vote in our poll (Desktop's
+    /// `doesVoteModifierMatchMessage`: one it was sent to). `None` when we
+    /// don't know who it reached.
+    pub fn reached(&self, voter: &str) -> Option<bool> {
+        self.reached.as_ref().map(|r| r.contains(voter))
     }
 
     /// Whether a vote for these options counts (Desktop's `handlePollVote`):
@@ -210,22 +253,65 @@ impl Poll {
         self.votes.iter().filter(|v| v.author.is_none()).map(|v| v.vote_count).max().map_or(1, |c| c + 1)
     }
 
-    /// Our vote numbered `vote_count` finished sending (Desktop's
-    /// `markOutgoingPollVoteSent` / `markOutgoingPollVoteFailed`). Sent,
-    /// it counts and replaces our older ones; failed, it never reached
-    /// anyone, so it goes. Returns whether anything changed.
-    pub fn finish_our_vote(&mut self, vote_count: u32, sent: bool) -> bool {
-        let before = self.votes.clone();
-        let target = |v: &PollVote| v.author.is_none() && v.vote_count == vote_count;
-        if sent {
-            self.votes.retain(|v| !(v.author.is_none() && !v.pending && v.vote_count < vote_count));
-            for vote in self.votes.iter_mut().filter(|v| target(v)) {
-                vote.pending = false;
+    /// Our vote that's still sending, if there is one.
+    pub fn our_pending_vote(&self) -> Option<&PollVote> {
+        self.votes.iter().rev().find(|v| v.author.is_none() && v.pending)
+    }
+
+    /// Who our vote numbered `vote_count` goes to, if it doesn't say yet
+    /// (one from before recipients were kept). Returns whether it changed.
+    pub fn address_our_vote(&mut self, vote_count: u32, recipients: &[String]) -> bool {
+        match self.votes.iter_mut().find(|v| v.author.is_none() && v.pending && v.vote_count == vote_count) {
+            Some(vote) if vote.sends.is_empty() && !recipients.is_empty() => {
+                vote.sends = recipients.iter().map(|r| (r.clone(), false)).collect();
+                true
             }
-        } else {
-            self.votes.retain(|v| !(target(v) && v.pending));
+            _ => false,
         }
-        self.votes != before
+    }
+
+    /// A try at sending our vote numbered `vote_count` reached `reached`;
+    /// `unreachable` (no longer registered) never will, so it stops waiting
+    /// for them. Once it has reached everyone it counts and replaces our
+    /// older votes (Desktop's `markOutgoingPollVoteSent`). Returns whether
+    /// anything changed.
+    pub fn record_vote_sends(&mut self, vote_count: u32, reached: &[String], unreachable: &[String]) -> bool {
+        let Some(ix) = self.votes.iter().position(|v| v.author.is_none() && v.pending && v.vote_count == vote_count) else {
+            return false;
+        };
+        let vote = &mut self.votes[ix];
+        for who in reached {
+            if let Some(sent) = vote.sends.get_mut(who) {
+                *sent = true;
+            }
+        }
+        for who in unreachable {
+            vote.sends.remove(who);
+        }
+        if vote.sends.values().all(|sent| *sent) {
+            vote.pending = false;
+            vote.sends.clear();
+            self.votes.retain(|v| !(v.author.is_none() && !v.pending && v.vote_count < vote_count));
+        }
+        true
+    }
+
+    /// We gave up sending our vote numbered `vote_count` (Desktop's
+    /// `markOutgoingPollVoteFailed`): if it reached nobody it goes;
+    /// otherwise it stays as sent, since some have it. Returns whether
+    /// anything changed.
+    pub fn give_up_vote(&mut self, vote_count: u32) -> bool {
+        let Some(ix) = self.votes.iter().position(|v| v.author.is_none() && v.pending && v.vote_count == vote_count) else {
+            return false;
+        };
+        let vote = &mut self.votes[ix];
+        if vote.sends.values().any(|sent| *sent) {
+            vote.pending = false;
+            vote.sends.clear();
+        } else {
+            self.votes.remove(ix);
+        }
+        true
     }
 
     /// Ends the poll; `false` when it already had.
@@ -298,6 +384,30 @@ impl AppDb {
     /// Changes a poll in one transaction; `f` says whether it changed it.
     /// Returns that, or `false` when the message isn't a poll (any more).
     pub async fn update_poll(&self, message_id: i64, f: impl FnOnce(&mut Poll) -> bool) -> Result<bool> {
+        self.change_poll(message_id, false, f).await
+    }
+
+    /// As [`AppDb::update_poll`], and when it changes, its votes are unread
+    /// until the chat is read (someone else voted in our poll; Desktop's
+    /// `hasUnreadPollVotes`).
+    pub async fn update_poll_unread(&self, message_id: i64, f: impl FnOnce(&mut Poll) -> bool) -> Result<bool> {
+        self.change_poll(message_id, true, f).await
+    }
+
+    /// Polls with a vote of ours still sending, to send it again after a
+    /// restart.
+    pub async fn polls_with_pending_votes(&self) -> Result<Vec<Message>> {
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages INDEXED BY messages_polls \
+             WHERE poll IS NOT NULL AND deleted = 0 \
+               AND EXISTS (SELECT 1 FROM json_each(poll, '$.votes') v WHERE json_extract(v.value, '$.pending'))"
+        )))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(message_from_row).collect()
+    }
+
+    async fn change_poll(&self, message_id: i64, unread: bool, f: impl FnOnce(&mut Poll) -> bool) -> Result<bool> {
         let mut tx = self.write().await?;
         let Some(json) = sqlx::query_scalar::<_, Option<String>>("SELECT poll FROM messages WHERE id = ? AND deleted = 0")
             .bind(message_id)
@@ -311,8 +421,9 @@ impl AppDb {
         if !f(&mut poll) {
             return Ok(false);
         }
-        sqlx::query("UPDATE messages SET poll = ? WHERE id = ?")
+        sqlx::query("UPDATE messages SET poll = ?, unread_poll_votes = unread_poll_votes OR ? WHERE id = ?")
             .bind(serde_json::to_string(&poll)?)
+            .bind(unread)
             .bind(message_id)
             .execute(&mut *tx)
             .await?;
