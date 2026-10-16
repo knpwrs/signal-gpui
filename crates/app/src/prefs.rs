@@ -57,6 +57,22 @@ pub fn zoom_label(factor: f32) -> String {
     format!("{}%", (factor * 100.).round() as i64)
 }
 
+/// The zoom range `apply` draws.
+const MIN_ZOOM: f32 = 0.5;
+const MAX_ZOOM: f32 = 3.;
+
+/// The View menu's Zoom In and Zoom Out, as Desktop's `ZoomFactorService`
+/// does them: one Chromium zoom level (a factor of 1.2) in or out from
+/// wherever the zoom is, so 90% zooms in to 108%. Kept within 50% to 300%.
+pub fn zoom_step(factor: f32, levels: i32) -> f32 {
+    const RATIO: f32 = 1.2;
+    let current = if factor.is_finite() && factor > 0. { factor } else { 1. };
+    let level = current.ln() / RATIO.ln() + levels as f32;
+    // Rounded to a tenth of a percent, so steps back land where they began.
+    let next = (RATIO.powf(level) * 1000.).round() / 1000.;
+    next.clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
 /// The base text size the theme starts from; zoom scales it.
 const BASE_FONT_SIZE: f32 = 16.;
 
@@ -254,5 +270,17 @@ mod tests {
             assert_eq!(ThemeSetting::from_setting(Some(theme.as_setting())), theme);
         }
         assert_eq!(ZOOM_FACTORS.map(zoom_label), ["75%", "90%", "100%", "110%", "125%", "150%", "200%"]);
+    }
+
+    #[test]
+    fn zoom_steps_by_chromium_levels() {
+        assert_eq!(zoom_step(1., 1), 1.2);
+        assert_eq!(zoom_step(1.2, 1), 1.44);
+        assert_eq!(zoom_step(1.44, -2), 1.);
+        assert_eq!(zoom_step(1., -1), 0.833);
+        assert_eq!(zoom_step(0.9, 1), 1.08, "from a Settings choice");
+        assert_eq!(zoom_step(2.5, 1), 3., "no further than 300%");
+        assert_eq!(zoom_step(0.55, -1), 0.5);
+        assert_eq!(zoom_step(f32::NAN, 1), 1.2);
     }
 }

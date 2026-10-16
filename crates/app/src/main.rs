@@ -10,6 +10,7 @@ mod image_cache;
 mod keys;
 mod login_item;
 mod main_window;
+mod menus;
 mod loop_cache;
 mod notifications;
 mod platform;
@@ -32,7 +33,7 @@ use std::path::PathBuf;
 use anyhow::{Context as _, Result};
 use futures::StreamExt as _;
 use gpui_kit::component::Theme;
-use gpui_kit::{App, KeyBinding, Menu, MenuItem};
+use gpui_kit::{App, KeyBinding};
 use signal_backend::{Backend, Config};
 
 
@@ -135,25 +136,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-y", views::composer::RecordVoice, Some("Composer")),
     ]);
 
-    cx.set_menus(vec![Menu {
-        name: "Signal GPUI".into(),
-        items: vec![
-            MenuItem::action("About Signal GPUI", About),
-            MenuItem::separator(),
-            MenuItem::action("Settings…", OpenSettings),
-            MenuItem::separator(),
-            MenuItem::action("Quit Signal GPUI", Quit),
-        ],
-        disabled: false,
-    }, Menu {
-        name: "File".into(),
-        items: vec![MenuItem::action("Create/upload sticker pack", CreateStickerPack)],
-        disabled: false,
-    }, Menu {
-        name: "Help".into(),
-        items: vec![MenuItem::action("Debug Log…", ShowDebugLog)],
-        disabled: false,
-    }]);
+    menus::bind_keys(cx);
 }
 
 fn main() -> Result<()> {
@@ -184,6 +167,7 @@ fn main() -> Result<()> {
         fonts::register(cx);
         Theme::sync_system_appearance(None, cx);
         bind_keys(cx);
+        menus::install(cx);
 
         let state = state::new_state(backend, cx);
         cx.on_action(|_: &Quit, cx| main_window::quit(cx));

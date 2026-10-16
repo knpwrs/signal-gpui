@@ -96,6 +96,11 @@ fn open_window(bounds: WindowBounds, cx: &mut App) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The app's state, once the window has been opened.
+pub fn state(cx: &App) -> Option<Entity<AppState>> {
+    cx.try_global::<MainWindow>().map(|main| main.state.clone())
+}
+
 /// The main window, if it's open (shown or hidden).
 fn handle(cx: &App) -> Option<AnyWindowHandle> {
     let window = cx.try_global::<MainWindow>()?.window?;
@@ -143,6 +148,16 @@ fn should_close(window: &mut Window, cx: &mut App) -> bool {
         hide(window, cx);
     }
     false
+}
+
+/// File → Close Window (⌘W): the main window hides as its close button
+/// hides it; any other window closes.
+pub fn close(window: &mut Window, cx: &mut App) {
+    if handle(cx) == Some(window.window_handle()) {
+        should_close(window, cx);
+    } else {
+        window.remove_window();
+    }
 }
 
 fn in_call(state: &Entity<AppState>, cx: &App) -> bool {
@@ -294,14 +309,17 @@ fn flush_save(window: &mut Window, cx: &mut App) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use gpui_kit::TestAppContext;
 
     use super::*;
     use crate::views::test_support::wait;
 
-    #[gpui_kit::test]
-    fn closing_hides_and_quitting_asks_during_a_call(cx: &mut TestAppContext) {
+    /// The demo backend pumped into the state, and the main window opened
+    /// from it, saving to `<dir>/window`.
+    pub(crate) fn open_demo(
+        cx: &mut TestAppContext,
+    ) -> (signal_backend::Backend, Entity<AppState>, AnyWindowHandle, tempfile::TempDir) {
         cx.update(gpui_kit::init);
         cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
@@ -320,8 +338,15 @@ mod tests {
         });
         let data_dir = dir.path().join("window");
         std::fs::create_dir_all(&data_dir).unwrap();
-        cx.update(|cx| open(state.clone(), data_dir.clone(), true, cx)).unwrap();
+        cx.update(|cx| open(state.clone(), data_dir, true, cx)).unwrap();
         let window = cx.update(|cx| handle(cx)).expect("the main window");
+        (backend, state, window, dir)
+    }
+
+    #[gpui_kit::test]
+    fn closing_hides_and_quitting_asks_during_a_call(cx: &mut TestAppContext) {
+        let (backend, state, window, dir) = open_demo(cx);
+        let data_dir = dir.path().join("window");
         let mut vcx = gpui_kit::VisualTestContext::from_window(window, cx);
         let vcx = &mut vcx;
 
