@@ -85,6 +85,12 @@ pub const SETTING_PHONE_NUMBER_SHARING: &str = "account.sharing_number";
 /// `phoneNumberDiscoverability`, the account record's
 /// `unlistedPhoneNumber` turned around). Unset counts as not.
 pub const SETTING_PHONE_NUMBER_DISCOVERABLE: &str = key_transparency::SETTING_E164_DISCOVERABLE;
+/// Settings key: `"false"` to turn incoming calls away (Desktop's "Enable
+/// incoming calls", `incoming-call-notification`; on until turned off).
+pub const SETTING_INCOMING_CALLS: &str = "incoming_calls";
+/// Settings key: `"true"` to send every 1:1 call through Signal's relays
+/// (Desktop's "Always relay calls", `always-relay-calls`).
+pub const SETTING_ALWAYS_RELAY_CALLS: &str = "always_relay_calls";
 /// Settings key: when the phone's contacts last came (unix millis),
 /// Desktop's `synced_at`, shown as "Last import at".
 pub const SETTING_CONTACTS_SYNCED_AT: &str = "contacts_synced_at";

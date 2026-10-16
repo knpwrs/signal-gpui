@@ -422,7 +422,8 @@ impl Actor {
                 if let Some(call) = self.call.borrow_mut().as_mut().filter(|c| c.peer == peer) {
                     call.call_id = Some(call_id);
                 }
-                self.proceed(call_id, false).await;
+                let relay = self.always_relay_calls().await;
+                self.proceed(call_id, relay).await;
             }
             State::Incoming { video } => {
                 // One call at a time.
@@ -431,6 +432,14 @@ impl Actor {
                     return;
                 }
                 let conversation = ConversationId::direct(&peer);
+                // Desktop's `handleIncomingCall`: a muted chat doesn't ring
+                // unless calls notify while muted; it's a missed call.
+                if !self.calls_ring_in(&conversation).await {
+                    info!("not ringing for a call in a muted chat");
+                    self.with_calls(|calls| calls.drop_call(call_id));
+                    self.record_missed_call(&conversation, call_id, video).await;
+                    return;
+                }
                 *self.call.borrow_mut() = Some(ActiveCall {
                     peer: peer.clone(),
                     call_id: Some(call_id),
@@ -446,10 +455,12 @@ impl Actor {
                     started_at: now_millis(),
                     connected: false,
                 });
-                // As Desktop: relay everything for someone without a chat (not
-                // a contact), so they don't learn our IP address.
+                // As Desktop: relay everything when asked to, or for someone
+                // without a chat (not a contact), so they don't learn our IP
+                // address.
                 let stranger = self.db.conversation(&conversation).await.ok().flatten().is_none();
-                self.proceed(call_id, stranger).await;
+                let relay = stranger || self.always_relay_calls().await;
+                self.proceed(call_id, relay).await;
                 self.emit_call();
             }
             State::Ringing => {
@@ -528,6 +539,36 @@ impl Actor {
         }
         self.emit(Event::ConversationsChanged);
         self.emit_call();
+    }
+
+    /// A call we didn't ring for: missed, in the chat and the call history.
+    async fn record_missed_call(&self, conversation: &ConversationId, call_id: CallId, video: bool) {
+        let notice =
+            Notice::Call { incoming: true, video, outcome: CallOutcome::Missed, call_id: Some(call_id.as_u64() as i64), unseen: false };
+        match self.db.record_call(conversation, now_millis(), &notice).await {
+            Ok(Some(id)) => self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id: id }),
+            Ok(None) => {}
+            Err(error) => self.error("failed to record the call", error),
+        }
+        self.emit(Event::ConversationsChanged);
+    }
+
+    /// Desktop's "Enable incoming calls".
+    pub(super) async fn incoming_calls_on(&self) -> bool {
+        self.db.setting(crate::SETTING_INCOMING_CALLS).await.ok().flatten().as_deref() != Some("false")
+    }
+
+    /// Desktop's "Always relay calls".
+    async fn always_relay_calls(&self) -> bool {
+        crate::setting_on(self.db.setting(crate::SETTING_ALWAYS_RELAY_CALLS).await.ok().flatten().as_deref())
+    }
+
+    /// Whether a call in `conversation` rings: not when it's muted, unless
+    /// calls notify while muted (Desktop's `notifyForCallsIfMuted`, off by
+    /// default).
+    pub(super) async fn calls_ring_in(&self, conversation: &ConversationId) -> bool {
+        let muted = self.db.conversation(conversation).await.ok().flatten().is_some_and(|c| c.muted);
+        !muted || self.setting_on(AccountSetting::NotifyCallsIfMuted).await
     }
 
     /// Desktop's call event sync: how a 1:1 call went, for our other devices'
@@ -633,8 +674,12 @@ impl Actor {
         }
         let keys = self.call_keys(&peer).await;
         let our_device = u32::from(manager.device_id());
+        // Desktop drops offers silently with incoming calls off
+        // (`handleCallingMessage`).
+        let incoming_calls = self.incoming_calls_on().await;
         for message in incoming {
             match message {
+                Incoming::Offer { .. } if !incoming_calls => info!("incoming calls are off; ignoring a call offer"),
                 Incoming::Offer { call_id, video, opaque } => {
                     if !self.takes_calls_from(&peer).await {
                         self.refuse_call(&peer, sender_device, call_id, video, server_timestamp).await;

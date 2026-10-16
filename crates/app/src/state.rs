@@ -315,6 +315,8 @@ pub struct AppState {
     pub image_optimization: signal_backend::media::Optimization,
     /// Settings' other values (theme, zoom, the account's on/off settings).
     pub prefs: crate::prefs::Prefs,
+    /// Settings' values being saved (see `save_pref`).
+    pending_prefs: HashMap<&'static str, String>,
     /// Open at computer login, as the system last said.
     pub open_at_login: bool,
     /// The system's login item (a stand-in in tests).
@@ -410,6 +412,7 @@ impl AppState {
             image_optimization: Default::default(),
             prefs: Default::default(),
             open_at_login: false,
+            pending_prefs: HashMap::new(),
             login_item: Default::default(),
             sticker_packs: Vec::new(),
             has_giphy_key: std::env::var_os("GIPHY_API_KEY").is_some(),
@@ -1099,8 +1102,12 @@ impl AppState {
             Ok::<_, signal_store::Error>(values)
         });
         cx.spawn(async move |this, cx| {
-            let Ok(values) = read.await else { return };
+            let Ok(mut values) = read.await else { return };
             let _ = this.update(cx, |this, cx| {
+                // A setting still being saved may have been read as it was.
+                for (key, value) in &this.pending_prefs {
+                    values.insert((*key).to_owned(), Some(value.clone()));
+                }
                 this.prefs = crate::prefs::Prefs::from_values(&values);
                 crate::prefs::apply(this.prefs.theme, this.prefs.zoom, cx);
                 cx.notify();
@@ -1109,11 +1116,27 @@ impl AppState {
         .detach();
     }
 
+    /// Saves one of Settings' values; until it's written, a reload of the
+    /// settings keeps the new value rather than reading the old one back.
+    fn save_pref(&mut self, key: &'static str, value: String, cx: &mut Context<Self>) {
+        self.pending_prefs.insert(key, value.clone());
+        let db = self.backend.db().clone();
+        let save = self.backend.spawn(async move { db.set_setting(key, &value).await });
+        // It stays pending until a reload reads it back as saved: a reload
+        // that read before the write landed may finish after it.
+        cx.background_spawn(async move {
+            if let Err(error) = save.await {
+                tracing::warn!(%error, key, "failed to save a setting");
+            }
+        })
+        .detach();
+    }
+
     /// Desktop's Theme choice (Appearance).
     pub fn set_theme(&mut self, theme: crate::prefs::ThemeSetting, cx: &mut Context<Self>) {
         self.prefs.theme = theme;
         crate::prefs::apply(theme, self.prefs.zoom, cx);
-        self.save_setting(signal_backend::SETTING_THEME, theme.as_setting().into(), cx);
+        self.save_pref(signal_backend::SETTING_THEME, theme.as_setting().into(), cx);
         cx.notify();
     }
 
@@ -1121,7 +1144,7 @@ impl AppState {
     pub fn set_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {
         self.prefs.zoom = zoom;
         crate::prefs::apply(self.prefs.theme, zoom, cx);
-        self.save_setting(crate::prefs::ZOOM_KEY, zoom.to_string(), cx);
+        self.save_pref(crate::prefs::ZOOM_KEY, zoom.to_string(), cx);
         cx.notify();
     }
 
@@ -1944,7 +1967,9 @@ impl AppState {
         let was_ringing = self.call.as_ref().is_some_and(|c| c.incoming && c.status == signal_backend::CallStatus::Ringing);
         if ringing && !was_ringing {
             self.notify_incoming_call(update.as_ref(), cx);
-            if self.notification_setting != crate::notifications::NotificationSetting::Off {
+            // Desktop's `playRingtone`: with "Play calling sounds" on,
+            // whatever notifications show.
+            if self.prefs.on(crate::prefs::Toggle::CallSounds) {
                 self.ringtone = crate::ringtone::Ringtone::start();
             }
         }
@@ -2096,10 +2121,21 @@ impl AppState {
         cx.notify();
     }
 
+    /// One of this device's on/off settings (Settings).
+    pub fn set_toggle(&mut self, toggle: crate::prefs::Toggle, on: bool, cx: &mut Context<Self>) {
+        self.prefs.toggles.insert(toggle, on);
+        self.save_pref(toggle.key(), on.to_string(), cx);
+        // "Play calling sounds" off quiets a call ringing now.
+        if toggle == crate::prefs::Toggle::CallSounds && !on {
+            self.ringtone = None;
+        }
+        cx.notify();
+    }
+
     /// Desktop's "Convert typed emoticons to emoji".
     pub fn set_auto_convert_emoji(&mut self, on: bool, cx: &mut Context<Self>) {
         self.prefs.auto_convert_emoji = on;
-        self.save_setting(crate::prefs::AUTO_CONVERT_EMOJI_KEY, on.to_string(), cx);
+        self.save_pref(crate::prefs::AUTO_CONVERT_EMOJI_KEY, on.to_string(), cx);
         cx.notify();
     }
 

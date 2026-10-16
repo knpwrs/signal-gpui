@@ -1,10 +1,12 @@
-//! Desktop's Calls page: the call devices.
+//! Desktop's Calls page: incoming calls and their ringtone, the call
+//! devices, and relaying calls.
 
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, App, Entity, div};
 use signal_backend::{Device, DeviceKind};
 
-use super::{Choice, Settings, list, select};
+use super::{Choice, Settings, list, select, switch};
+use crate::prefs::Toggle;
 use crate::theme::Palette;
 
 pub(super) fn render(settings: &Entity<Settings>, palette: Palette, cx: &mut App) -> AnyElement {
@@ -38,5 +40,40 @@ pub(super) fn render(settings: &Entity<Settings>, palette: Palette, cx: &mut App
         }
         None => vec![div().text_sm().text_color(palette.text_secondary).child("Loading devices…").into_any_element()],
     };
-    div().flex().flex_col().gap_5().child(list(Some("Devices"), None, devices, palette)).into_any_element()
+    let prefs = state.read(cx).prefs.clone();
+    let toggle = |id: &'static str, label: &'static str, description: Option<&'static str>, toggle: Toggle| {
+        let state = state.clone();
+        switch(id, label, description.map(Into::into), prefs.on(toggle), false, palette, move |on, _, cx| {
+            state.update(cx, |s, cx| s.set_toggle(toggle, on, cx))
+        })
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap_5()
+        .child(list(
+            None,
+            None,
+            [
+                toggle("incoming-calls", "Enable incoming calls", None, Toggle::IncomingCalls),
+                toggle("calling-sounds", "Play calling sounds", None, Toggle::CallSounds),
+            ],
+            palette,
+        ))
+        .child(list(Some("Devices"), None, devices, palette))
+        .child(list(
+            Some("Advanced"),
+            None,
+            [toggle(
+                "always-relay-calls",
+                "Always relay calls",
+                Some(
+                    "Relay all calls through the Signal server to avoid revealing your IP address to your contact. \
+                     Enabling will reduce call quality.",
+                ),
+                Toggle::AlwaysRelayCalls,
+            )],
+            palette,
+        ))
+        .into_any_element()
 }

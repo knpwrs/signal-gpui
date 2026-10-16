@@ -521,6 +521,12 @@ impl Actor {
                 if self.in_any_call() || self.group_call.borrow().is_some() {
                     self.with_calls(|calls| calls.cancel_group_ring(group_id, ring_id, RingCancelReason::Busy));
                     CallHistoryEvent::Started
+                } else if !self.calls_ring_in(&conversation).await || !self.incoming_calls_on().await {
+                    // Desktop doesn't ring in a muted chat (unless calls
+                    // notify while muted) or with incoming calls off; it's
+                    // still ringing in the call history, missed once over.
+                    info!("not ringing for a group call");
+                    CallHistoryEvent::Ringing
                 } else {
                     *self.group_call.borrow_mut() = Some(GroupCall {
                         ring: Some((group_id, ring_id, ringer.unwrap_or_default())),

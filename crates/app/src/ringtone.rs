@@ -11,9 +11,12 @@ pub struct Ringtone {
 const RINGTONE: &[u8] = include_bytes!("../assets/sounds/ringtone.m4a");
 
 impl Ringtone {
-    /// Starts ringing; `None` where sound isn't available.
+    /// Starts ringing; `None` where sound isn't available, and in tests,
+    /// which never play sound.
     pub fn start() -> Option<Self> {
-        #[cfg(target_os = "macos")]
+        #[cfg(test)]
+        return None;
+        #[cfg(all(target_os = "macos", not(test)))]
         {
             use objc2::AnyThread as _;
             use objc2_app_kit::NSSound;
@@ -24,7 +27,7 @@ impl Ringtone {
             sound.play();
             Some(Self { sound })
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(all(not(target_os = "macos"), not(test)))]
         {
             let _ = RINGTONE;
             None

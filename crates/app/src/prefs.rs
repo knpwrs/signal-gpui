@@ -97,6 +97,34 @@ pub fn appearance_changed(window: &mut Window, cx: &mut App) {
 /// `autoConvertEmoji`, on until turned off).
 pub const AUTO_CONVERT_EMOJI_KEY: &str = "auto_convert_emoji";
 
+/// This device's own on/off settings (Desktop keeps them per device).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Toggle {
+    /// "Enable incoming calls" (the backend turns calls away when off).
+    IncomingCalls,
+    /// "Play calling sounds": the ringtone.
+    CallSounds,
+    /// "Always relay calls" (the backend tells RingRTC).
+    AlwaysRelayCalls,
+}
+
+impl Toggle {
+    pub const ALL: [Toggle; 3] = [Self::IncomingCalls, Self::CallSounds, Self::AlwaysRelayCalls];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::IncomingCalls => signal_backend::SETTING_INCOMING_CALLS,
+            Self::CallSounds => "call_sounds",
+            Self::AlwaysRelayCalls => signal_backend::SETTING_ALWAYS_RELAY_CALLS,
+        }
+    }
+
+    /// Desktop's defaults (`Preferences.preload.tsx`).
+    pub fn default_on(self) -> bool {
+        matches!(self, Self::IncomingCalls | Self::CallSounds)
+    }
+}
+
 /// Every key [`Prefs`] reads.
 pub const KEYS: &[&str] =
     &[signal_backend::SETTING_THEME, ZOOM_KEY, AUTO_CONVERT_EMOJI_KEY, signal_backend::SETTING_CONTACTS_SYNCED_AT];
@@ -112,11 +140,13 @@ pub struct Prefs {
     pub auto_convert_emoji: bool,
     /// When the phone's contacts last came (unix millis).
     pub contacts_synced_at: Option<i64>,
+    /// This device's on/off settings, defaults filled in.
+    pub toggles: BTreeMap<Toggle, bool>,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { theme: ThemeSetting::System, zoom: 1., flags: BTreeMap::new(), auto_convert_emoji: true, contacts_synced_at: None }
+        Self { theme: ThemeSetting::System, zoom: 1., flags: BTreeMap::new(), auto_convert_emoji: true, contacts_synced_at: None, toggles: BTreeMap::new() }
     }
 }
 
@@ -131,7 +161,23 @@ impl Prefs {
             flags,
             auto_convert_emoji: get(AUTO_CONVERT_EMOJI_KEY) != Some("false"),
             contacts_synced_at: get(signal_backend::SETTING_CONTACTS_SYNCED_AT).and_then(|t| t.parse().ok()),
+            toggles: Toggle::ALL
+                .iter()
+                .map(|t| {
+                    let on = match get(t.key()) {
+                        Some("true") => true,
+                        Some("false") => false,
+                        _ => t.default_on(),
+                    };
+                    (*t, on)
+                })
+                .collect(),
         }
+    }
+
+    /// Whether one of this device's settings is on.
+    pub fn on(&self, toggle: Toggle) -> bool {
+        self.toggles.get(&toggle).copied().unwrap_or_else(|| toggle.default_on())
     }
 
     /// Whether an account setting is on (its default until loaded).
@@ -141,7 +187,7 @@ impl Prefs {
 
     /// Every key to read.
     pub fn keys() -> impl Iterator<Item = &'static str> {
-        KEYS.iter().copied().chain(AccountSetting::ALL.iter().map(|s| s.key()))
+        KEYS.iter().copied().chain(AccountSetting::ALL.iter().map(|s| s.key())).chain(Toggle::ALL.iter().map(|t| t.key()))
     }
 }
 
@@ -154,6 +200,7 @@ mod tests {
         let prefs = Prefs::from_values(&HashMap::new());
         assert_eq!((prefs.theme, prefs.zoom), (ThemeSetting::System, 1.));
         assert!(prefs.auto_convert_emoji && prefs.contacts_synced_at.is_none());
+        assert!(prefs.on(Toggle::IncomingCalls) && prefs.on(Toggle::CallSounds) && !prefs.on(Toggle::AlwaysRelayCalls));
         assert!(prefs.flags[&AccountSetting::ReactionNotifications] && !prefs.flags[&AccountSetting::NotifyCallsIfMuted]);
 
         let values: HashMap<String, Option<String>> = [

@@ -186,6 +186,17 @@ fn calls_list_the_devices(cx: &mut TestAppContext) {
     for id in ["call-camera", "call-microphone", "call-speaker"] {
         assert!(h.shown(cx, id), "{id}");
     }
+    // Desktop's defaults: calls ring, with sound, not relayed.
+    assert_eq!(h.value(cx, "incoming-calls").as_deref(), Some("on"));
+    assert_eq!(h.value(cx, "calling-sounds").as_deref(), Some("on"));
+    assert_eq!(h.value(cx, "always-relay-calls").as_deref(), Some("off"));
+    for id in ["incoming-calls", "calling-sounds", "always-relay-calls"] {
+        h.click(cx, id);
+    }
+    assert!(wait(cx, |_| h.stored(signal_backend::SETTING_INCOMING_CALLS).as_deref() == Some("false")
+        && h.stored("call_sounds").as_deref() == Some("false")
+        && h.stored(signal_backend::SETTING_ALWAYS_RELAY_CALLS).as_deref() == Some("true")));
+    assert_eq!(h.value(cx, "always-relay-calls").as_deref(), Some("on"));
 }
 
 #[gpui_kit::test]
