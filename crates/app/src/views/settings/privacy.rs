@@ -1,13 +1,15 @@
-//! Desktop's Privacy page: read receipts and typing indicators, stories,
-//! and automatic key verification.
+//! Desktop's Privacy page (phone number privacy, blocked people and groups,
+//! read receipts and typing indicators, the default disappearing timer,
+//! stories, automatic key verification) and its Phone Number and Blocked
+//! pages.
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::prelude::*;
-use gpui_kit::{AnyElement, App, Entity, Window, div};
+use gpui_kit::{AnyElement, App, Entity, FontWeight, SharedString, TestSupportExt as _, Window, div, px};
 use signal_backend::AccountSetting;
 
-use super::{Settings, action, list, switch};
+use super::{Choice, Page, Settings, action, go, link, list, select, switch};
 use crate::state::AppState;
 use crate::theme::Palette;
 
@@ -33,6 +35,14 @@ pub(super) fn render(settings: &Entity<Settings>, palette: Palette, cx: &mut App
             .label("Turn off stories")
             .on_click(move |_, window, cx| confirm_stories_off(stories_state.clone(), false, window, cx))
     };
+    let (blocked, timer) = {
+        let s = state.read(cx);
+        let blocked = s.blocked();
+        let groups = blocked.iter().filter(|c| c.kind == signal_store::ConversationKind::Group).count();
+        (blocked_count(blocked.len() - groups, groups), s.prefs.universal_timer)
+    };
+    let (pnp_settings, blocked_settings) = (settings.clone(), settings.clone());
+    let none_blocked = blocked.1;
     let mut advanced = Vec::new();
     if signal_backend::key_transparency_on() {
         let kt_state = state.clone();
@@ -66,12 +76,40 @@ pub(super) fn render(settings: &Entity<Settings>, palette: Palette, cx: &mut App
         .flex_col()
         .gap_5()
         .child(list(
+            None,
+            None,
+            [link(
+                "phone-number-privacy",
+                "Phone Number",
+                Some("Choose who can see your phone number and who can contact you on Signal with it.".into()),
+                None,
+                false,
+                palette,
+                move |window, cx| go(&pnp_settings, Page::PhoneNumber, window, cx),
+            )],
+            palette,
+        ))
+        .child(list(
+            None,
+            None,
+            [link("blocked", "Blocked", Some(blocked.0), None, none_blocked, palette, move |window, cx| {
+                go(&blocked_settings, Page::Blocked, window, cx)
+            })],
+            palette,
+        ))
+        .child(list(
             Some("Messaging"),
             Some("See and share when message are being read and typed. If disabled, you won’t see read receipts or typing indicators from others.".into()),
             [
                 flag("read-receipts", "Read receipts", AccountSetting::ReadReceipts, read_receipts),
                 flag("typing-indicators", "Typing indicators", AccountSetting::TypingIndicators, typing),
             ],
+            palette,
+        ))
+        .child(list(
+            Some("Disappearing messages"),
+            None,
+            [timer_select(&state, timer, palette)],
             palette,
         ))
         .child(list(
@@ -86,6 +124,197 @@ pub(super) fn render(settings: &Entity<Settings>, palette: Palette, cx: &mut App
             palette,
         ))
         .when(!advanced.is_empty(), |d| d.child(list(Some("Advanced"), None, advanced, palette)))
+        .into_any_element()
+}
+
+/// Desktop's `Preferences--blocked-count-…-new`, and whether there are none.
+fn blocked_count(people: usize, groups: usize) -> (SharedString, bool) {
+    let plural = |n: usize, one: &str, other: &str| if n == 1 { format!("1 {one}") } else { format!("{n} {other}") };
+    let text = match (people, groups) {
+        (0, 0) => "No users or groups".into(),
+        (p, 0) => plural(p, "user", "users"),
+        (0, g) => plural(g, "group", "groups"),
+        (p, g) => plural(p + g, "user or group", "users or groups"),
+    };
+    (text.into(), people + groups == 0)
+}
+
+/// Desktop's "Default timer for new chats": its choices, then "Custom
+/// time" (or the custom time set).
+fn timer_select(state: &Entity<AppState>, current: u32, palette: Palette) -> AnyElement {
+    use crate::views::chat_menu::{TIMER_CHOICES, format_timer_long};
+    let mut choices: Vec<Choice> = TIMER_CHOICES
+        .into_iter()
+        .map(|seconds| {
+            let state = state.clone();
+            Choice::new(format_timer_long(seconds), seconds == current, move |_, cx| {
+                state.update(cx, |s, cx| s.set_universal_timer(seconds, cx))
+            })
+        })
+        .collect();
+    let custom = !TIMER_CHOICES.contains(&current);
+    let state = state.clone();
+    choices.push(Choice::new(
+        if custom { format_timer_long(current) } else { "Custom time".into() },
+        custom,
+        move |window, cx| {
+            let state = state.clone();
+            crate::views::chat_menu::custom_time(
+                current,
+                move |seconds, _, cx| state.update(cx, |s, cx| s.set_universal_timer(seconds, cx)),
+                window,
+                cx,
+            );
+        },
+    ));
+    select(
+        "universal-timer",
+        "Default timer for new chats",
+        Some("Set a default disappearing message timer for all new chats started by you.".into()),
+        choices,
+        false,
+        palette,
+    )
+}
+
+/// A choice of one (Desktop's `SettingsRadio`).
+fn radio(id: &'static str, label: &'static str, chosen: bool, palette: Palette, on_click: impl Fn(&mut Window, &mut App) + 'static) -> AnyElement {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap_2()
+        .cursor_pointer()
+        .on_click(move |_, window, cx| {
+            on_click(window, cx);
+            window.refresh();
+        })
+        .child(
+            div()
+                .size(px(16.))
+                .flex_none()
+                .rounded_full()
+                .border_2()
+                .border_color(if chosen { palette.accent } else { palette.text_secondary })
+                .when(chosen, |d| d.bg(palette.accent)),
+        )
+        .child(div().text_sm().child(label))
+        .test_support()
+        .into_any_element()
+}
+
+/// Desktop's Phone Number page: who can see our number, and who can find
+/// us by it.
+pub(super) fn render_phone_number(settings: &Entity<Settings>, palette: Palette, cx: &mut App) -> AnyElement {
+    let state = settings.read(cx).state.clone();
+    let (shared, discoverable) = {
+        let prefs = &state.read(cx).prefs;
+        (prefs.number_shared, prefs.number_discoverable)
+    };
+    let sharing = if shared {
+        "Your phone number will be visible to people and groups you message."
+    } else if discoverable {
+        "Your phone number will not be visible to anyone unless they have it saved in their phone’s contacts."
+    } else {
+        "Your phone number will not be visible to anyone."
+    };
+    let finding = if discoverable {
+        "Anyone who has your phone number will see you're on Signal and can start chats with you."
+    } else {
+        "Nobody will be able to see you're on Signal unless you message them or have an existing chat with them."
+    };
+    let see = |id: &'static str, label: &'static str, everybody: bool| {
+        let state = state.clone();
+        radio(id, label, shared == everybody, palette, move |_, cx| state.update(cx, |s, cx| s.set_number_shared(everybody, cx)))
+    };
+    let find_everyone = {
+        let state = state.clone();
+        radio("pnp-find-everyone", "Everyone", discoverable, palette, move |_, cx| {
+            state.update(cx, |s, cx| s.set_number_discoverable(true, cx))
+        })
+    };
+    let find_nobody = {
+        let state = state.clone();
+        radio("pnp-find-nobody", "Nobody", !discoverable, palette, move |window, cx| {
+            if state.read(cx).prefs.number_shared {
+                // Desktop's `WhoCanFindMeReadOnlyToast`.
+                use gpui_kit::component::notification::Notification;
+                window.push_notification(Notification::new().message("To change this setting, set “Who can see my number” to “Nobody”."), cx);
+            } else if state.read(cx).prefs.number_discoverable {
+                confirm_not_discoverable(state.clone(), window, cx);
+            }
+        })
+    };
+    let section = |title: &'static str, rows: Vec<AnyElement>, description: &'static str| {
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(title))
+            .children(rows)
+            .child(div().text_xs().text_color(palette.text_secondary).child(description))
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap_5()
+        .child(section(
+            "Who can see my number",
+            vec![see("pnp-see-everyone", "Everyone", true), see("pnp-see-nobody", "Nobody", false)],
+            sharing,
+        ))
+        .child(section("Who can find me by number", vec![find_everyone, find_nobody], finding))
+        .into_any_element()
+}
+
+/// Desktop's confirmation before nobody can find us by number.
+fn confirm_not_discoverable(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
+    window.open_alert_dialog(cx, move |alert, _, _| {
+        let state = state.clone();
+        alert
+            .title("Are you sure?")
+            .description(
+                "If you change “Who can find me by number” to “Nobody” it will make it harder for people to find you on Signal.",
+            )
+            .confirm()
+            .ok_text("OK")
+            .on_ok(move |_, window, cx| {
+                state.update(cx, |s, cx| s.set_number_discoverable(false, cx));
+                window.refresh();
+                true
+            })
+    });
+}
+
+/// Desktop's Blocked page: blocked people, then groups, each with Unblock
+/// (Desktop lists them without one; unblocking is in the chat there).
+pub(super) fn render_blocked(settings: &Entity<Settings>, palette: Palette, cx: &mut App) -> AnyElement {
+    use crate::views::common::conversation_avatar;
+    let state = settings.read(cx).state.clone();
+    let blocked: Vec<signal_store::Conversation> = state.read(cx).blocked().into_iter().cloned().collect();
+    let row = |ix: usize, chat: &signal_store::Conversation| {
+        let (state, id) = (state.clone(), chat.id.clone());
+        div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(conversation_avatar(chat, px(36.)))
+            .child(div().flex_1().min_w_0().truncate().text_sm().child(chat.title.clone()))
+            .child(Button::new(("unblock", ix)).outline().label("Unblock").on_click(move |_, window, cx| {
+                state.read(cx).set_chat(id.clone(), signal_backend::ChatChange::Blocked(false));
+                window.refresh();
+            }))
+            .into_any_element()
+    };
+    let (groups, people): (Vec<_>, Vec<_>) =
+        blocked.iter().enumerate().partition(|(_, c)| c.kind == signal_store::ConversationKind::Group);
+    div()
+        .flex()
+        .flex_col()
+        .gap_5()
+        .child(div().text_sm().text_color(palette.text_secondary).child("Blocked users will not be able to call you or send you messages"))
+        .when(!people.is_empty(), |d| d.child(list(Some("Blocked Users"), None, people.iter().map(|(ix, c)| row(*ix, c)), palette)))
+        .when(!groups.is_empty(), |d| d.child(list(Some("Blocked Groups"), None, groups.iter().map(|(ix, c)| row(*ix, c)), palette)))
         .into_any_element()
 }
 

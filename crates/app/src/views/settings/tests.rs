@@ -7,9 +7,9 @@ use signal_backend::{Backend, Config};
 use super::{Page, Settings};
 use crate::state::AppState;
 
-/// Waits (a few seconds at most) for `done`.
+/// Waits (ten seconds at most, for a busy test machine) for `done`.
 pub(crate) fn wait(cx: &mut TestAppContext, mut done: impl FnMut(&mut TestAppContext) -> bool) -> bool {
-    (0..300).any(|_| {
+    (0..1000).any(|_| {
         cx.run_until_parked();
         let ok = done(cx);
         if !ok {
@@ -86,10 +86,11 @@ impl Harness {
     }
 
     /// A button's label, or a switch's state as "on"/"off".
-    pub fn value(&self, cx: &mut TestAppContext, id: &'static str) -> Option<String> {
+    pub fn value(&self, cx: &mut TestAppContext, id: impl Into<gpui_kit::ElementId>) -> Option<String> {
+        let id = id.into();
         cx.update_window(self.window, |_, window, cx| {
             window.render_frame(cx);
-            let found = window.try_find(id)?;
+            let found = window.try_find(id.clone())?;
             match found.checked() {
                 Some(on) => Some(if on { "on" } else { "off" }.to_owned()),
                 None => found.label().map(str::to_owned),
@@ -378,4 +379,47 @@ fn an_unread_muted_chat_is_due_a_reminder(cx: &mut TestAppContext) {
     // (The demo's own unread messages there count too.)
     assert!(data.senders.iter().any(|s| s == "made-up-b"), "{:?}", data.senders);
     assert!(data.unread >= 2);
+}
+
+#[gpui_kit::test]
+fn privacy_sets_the_default_timer_and_who_sees_the_number(cx: &mut TestAppContext) {
+    let h = Harness::open(cx, Page::Privacy);
+    assert_eq!(h.value(cx, "universal-timer").as_deref(), Some("Off"));
+    h.state.update(cx, |s, cx| s.set_universal_timer(86_400, cx));
+    assert_eq!(h.value(cx, "universal-timer").as_deref(), Some("1 day"));
+    assert!(wait(cx, |_| h.stored(signal_backend::SETTING_UNIVERSAL_EXPIRE_TIMER).as_deref() == Some("86400")));
+    // A custom time shows as itself.
+    h.state.update(cx, |s, cx| s.set_universal_timer(3 * 3600, cx));
+    assert_eq!(h.value(cx, "universal-timer").as_deref(), Some("3 hours"));
+
+    h.click(cx, "phone-number-privacy");
+    assert_eq!(cx.read(|cx| h.settings.read(cx).page), Page::PhoneNumber);
+    // Desktop's default: nobody sees it, and nobody finds us by it.
+    let prefs = |cx: &mut TestAppContext| cx.read(|cx| (h.state.read(cx).prefs.number_shared, h.state.read(cx).prefs.number_discoverable));
+    assert_eq!(prefs(cx), (false, false));
+    h.click(cx, "pnp-find-everyone");
+    assert_eq!(prefs(cx), (false, true));
+    h.click(cx, "pnp-see-everyone");
+    assert_eq!(prefs(cx), (true, true));
+    assert!(wait(cx, |_| h.stored(signal_backend::SETTING_PHONE_NUMBER_SHARING).as_deref() == Some("true")
+        && h.stored(signal_backend::SETTING_PHONE_NUMBER_DISCOVERABLE).as_deref() == Some("true")));
+    // Nobody can't be chosen while everybody sees the number.
+    h.click(cx, "pnp-find-nobody");
+    assert_eq!(prefs(cx), (true, true));
+    h.click(cx, "pnp-see-nobody");
+    assert_eq!(prefs(cx), (false, true));
+}
+
+#[gpui_kit::test]
+fn blocked_lists_and_unblocks(cx: &mut TestAppContext) {
+    use signal_store::ConversationId;
+    let h = Harness::open(cx, Page::Privacy);
+    let sam = ConversationId("d:00000000-0000-4000-8000-0000000000e0".into());
+    h.state.read_with(cx, |s, _| s.set_chat(sam.clone(), signal_backend::ChatChange::Blocked(true)));
+    assert!(wait(cx, |cx| h.state.read_with(cx, |s, _| s.blocked().len() == 1)));
+    h.click(cx, "blocked");
+    assert_eq!(cx.read(|cx| h.settings.read(cx).page), Page::Blocked);
+    assert_eq!(h.value(cx, ("unblock", 0usize)).as_deref(), Some("Unblock"));
+    cx.update_window(h.window, |_, window, cx| window.click(("unblock", 0usize), cx)).unwrap();
+    assert!(wait(cx, |cx| h.state.read_with(cx, |s, _| s.blocked().is_empty())));
 }

@@ -68,8 +68,20 @@ impl CustomTime {
     }
 }
 
-/// Desktop's "Custom Time" dialog.
+/// Desktop's "Custom Time" dialog for a chat.
 fn custom_timer(state: Entity<AppState>, conversation: ConversationId, current: u32, window: &mut Window, cx: &mut App) {
+    custom_time(
+        current,
+        move |seconds, _, cx| state.read(cx).send(Command::SetExpireTimer { conversation: conversation.clone(), seconds }),
+        window,
+        cx,
+    );
+}
+
+/// Desktop's "Custom Time" dialog (`DisappearingTimeDialog`): `on_set`
+/// gets the time chosen; it closes itself, leaving any dialog below.
+pub(crate) fn custom_time(current: u32, on_set: impl Fn(u32, &mut Window, &mut App) + 'static, window: &mut Window, cx: &mut App) {
+    let on_set = std::rc::Rc::new(on_set);
     use gpui_kit::component::button::{Button, ButtonVariants as _};
     use gpui_kit::component::dialog::DialogFooter;
     use gpui_kit::prelude::*;
@@ -86,7 +98,7 @@ fn custom_timer(state: Entity<AppState>, conversation: ConversationId, current: 
                 window.refresh();
             })
         };
-        let (state, conversation, set) = (state.clone(), conversation.clone(), pick.clone());
+        let (on_set, set) = (on_set.clone(), pick.clone());
         dialog
             .title("Custom Time")
             .w(px(420.))
@@ -121,11 +133,12 @@ fn custom_timer(state: Entity<AppState>, conversation: ConversationId, current: 
             )
             .footer(
                 DialogFooter::new()
-                    .child(Button::new("custom-time-cancel").label("Cancel").outline().on_click(|_, window, cx| window.close_all_dialogs(cx)))
+                    .child(Button::new("custom-time-cancel").label("Cancel").outline().on_click(|_, window, cx| window.close_dialog(cx)))
                     .child(Button::new("custom-time-set").label("Set").primary().on_click(move |_, window, cx| {
                         let seconds = set.read(cx).seconds();
-                        state.read(cx).send(Command::SetExpireTimer { conversation: conversation.clone(), seconds });
-                        window.close_all_dialogs(cx);
+                        on_set(seconds, window, cx);
+                        window.close_dialog(cx);
+                        window.refresh();
                     })),
             )
     });

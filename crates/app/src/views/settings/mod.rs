@@ -37,6 +37,10 @@ pub enum Page {
     DataUsage,
     /// Notifications' "While muted".
     WhileMuted,
+    /// Privacy's Phone Number page.
+    PhoneNumber,
+    /// Privacy's Blocked page.
+    Blocked,
 }
 
 impl Page {
@@ -55,6 +59,8 @@ impl Page {
             Page::Privacy => "Privacy",
             Page::DataUsage => "Data usage",
             Page::WhileMuted => "While muted",
+            Page::PhoneNumber => "Phone Number",
+            Page::Blocked => "Blocked",
         }
     }
 
@@ -68,6 +74,8 @@ impl Page {
             Page::Privacy => "settings-page-privacy",
             Page::DataUsage => "settings-page-data-usage",
             Page::WhileMuted => "settings-page-while-muted",
+            Page::PhoneNumber => "settings-page-phone-number",
+            Page::Blocked => "settings-page-blocked",
         }
     }
 
@@ -75,6 +83,7 @@ impl Page {
     fn parent(self) -> Option<Page> {
         match self {
             Page::WhileMuted => Some(Page::Notifications),
+            Page::PhoneNumber | Page::Blocked => Some(Page::Privacy),
             _ => None,
         }
     }
@@ -144,6 +153,8 @@ fn render(settings: &Entity<Settings>, window: &mut Window, cx: &mut App) -> Any
         Page::Privacy => privacy::render(settings, palette, cx),
         Page::DataUsage => data_usage::render(settings, palette, cx),
         Page::WhileMuted => notifications::render_while_muted(settings, palette, cx),
+        Page::PhoneNumber => privacy::render_phone_number(settings, palette, cx),
+        Page::Blocked => privacy::render_blocked(settings, palette, cx),
     };
     let header = div()
         .flex()

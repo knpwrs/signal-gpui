@@ -122,7 +122,10 @@ fn open_picker(state: Entity<AppState>, adding: Option<Adding>, window: &mut Win
     let alerts = Alerts { maximum: already >= limits.hard, recommended: already >= limits.recommended };
     let name = cx.new(|cx| InputState::new(window, cx).placeholder("Group name (required)"));
     let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search name or number"));
-    let picking = cx.new(|_| Picking { people: Vec::new(), chosen: BTreeSet::new(), alerts, avatar: None, timer: 0 });
+    // Desktop's new group starts with the default timer for new chats
+    // (the composer's `groupExpireTimer`, `universalExpireTimer`).
+    let timer = state.read(cx).prefs.universal_timer;
+    let picking = cx.new(|_| Picking { people: Vec::new(), chosen: BTreeSet::new(), alerts, avatar: None, timer });
     let backend = state.read(cx).backend.clone();
     let db = backend.db().clone();
     let query = backend.spawn(async move { db.people().await });

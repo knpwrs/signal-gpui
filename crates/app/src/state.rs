@@ -2393,6 +2393,41 @@ impl AppState {
         cx.notify();
     }
 
+    /// Desktop's "Default timer for new chats", for the whole account.
+    pub fn set_universal_timer(&mut self, seconds: u32, cx: &mut Context<Self>) {
+        self.prefs.universal_timer = seconds;
+        self.pending_prefs.insert(signal_backend::SETTING_UNIVERSAL_EXPIRE_TIMER, seconds.to_string());
+        self.send(Command::SetUniversalExpireTimer(seconds));
+        cx.notify();
+    }
+
+    /// Desktop's "Who can see my number"; everybody also makes us findable.
+    pub fn set_number_shared(&mut self, everybody: bool, cx: &mut Context<Self>) {
+        self.prefs.number_shared = everybody;
+        self.pending_prefs.insert(signal_backend::SETTING_PHONE_NUMBER_SHARING, everybody.to_string());
+        if everybody {
+            self.prefs.number_discoverable = true;
+            self.pending_prefs.insert(signal_backend::SETTING_PHONE_NUMBER_DISCOVERABLE, "true".into());
+        }
+        self.send(Command::SetPhoneNumberSharing(everybody));
+        cx.notify();
+    }
+
+    /// Desktop's "Who can find me by number".
+    pub fn set_number_discoverable(&mut self, discoverable: bool, cx: &mut Context<Self>) {
+        self.prefs.number_discoverable = discoverable;
+        self.pending_prefs.insert(signal_backend::SETTING_PHONE_NUMBER_DISCOVERABLE, discoverable.to_string());
+        self.send(Command::SetPhoneNumberDiscoverable(discoverable));
+        cx.notify();
+    }
+
+    /// Blocked people and groups (Desktop's Blocked page), people first.
+    pub fn blocked(&self) -> Vec<&signal_store::Conversation> {
+        let mut blocked: Vec<_> = self.conversations.iter().chain(&self.archived).filter(|c| c.blocked).collect();
+        blocked.sort_by_key(|c| (c.kind == signal_store::ConversationKind::Group, c.title.to_lowercase()));
+        blocked
+    }
+
     /// Desktop's "Convert typed emoticons to emoji".
     pub fn set_auto_convert_emoji(&mut self, on: bool, cx: &mut Context<Self>) {
         self.prefs.auto_convert_emoji = on;

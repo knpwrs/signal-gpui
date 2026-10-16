@@ -134,8 +134,15 @@ impl Toggle {
 }
 
 /// Every key [`Prefs`] reads.
-pub const KEYS: &[&str] =
-    &[signal_backend::SETTING_THEME, ZOOM_KEY, AUTO_CONVERT_EMOJI_KEY, signal_backend::SETTING_CONTACTS_SYNCED_AT];
+pub const KEYS: &[&str] = &[
+    signal_backend::SETTING_THEME,
+    ZOOM_KEY,
+    AUTO_CONVERT_EMOJI_KEY,
+    signal_backend::SETTING_CONTACTS_SYNCED_AT,
+    signal_backend::SETTING_UNIVERSAL_EXPIRE_TIMER,
+    signal_backend::SETTING_PHONE_NUMBER_SHARING,
+    signal_backend::SETTING_PHONE_NUMBER_DISCOVERABLE,
+];
 
 /// The settings as stored.
 #[derive(Debug, Clone, PartialEq)]
@@ -150,11 +157,21 @@ pub struct Prefs {
     pub contacts_synced_at: Option<i64>,
     /// This device's on/off settings, defaults filled in.
     pub toggles: BTreeMap<Toggle, bool>,
+    /// The default disappearing timer for new chats, in seconds (0: off).
+    pub universal_timer: u32,
+    /// Everybody can see our number (else nobody can; Desktop's default).
+    pub number_shared: bool,
+    /// People can find us by our number.
+    pub number_discoverable: bool,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { theme: ThemeSetting::System, zoom: 1., flags: BTreeMap::new(), auto_convert_emoji: true, contacts_synced_at: None, toggles: BTreeMap::new() }
+        Self { theme: ThemeSetting::System, zoom: 1., flags: BTreeMap::new(), auto_convert_emoji: true, contacts_synced_at: None, toggles: BTreeMap::new(),
+            universal_timer: 0,
+            number_shared: false,
+            number_discoverable: false,
+        }
     }
 }
 
@@ -180,6 +197,9 @@ impl Prefs {
                     (*t, on)
                 })
                 .collect(),
+            universal_timer: get(signal_backend::SETTING_UNIVERSAL_EXPIRE_TIMER).and_then(|t| t.parse().ok()).unwrap_or(0),
+            number_shared: get(signal_backend::SETTING_PHONE_NUMBER_SHARING) == Some("true"),
+            number_discoverable: get(signal_backend::SETTING_PHONE_NUMBER_DISCOVERABLE) == Some("true"),
         }
     }
 
