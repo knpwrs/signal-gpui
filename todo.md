@@ -3,30 +3,25 @@
 ## Server-gated features (Signal remote config)
 
 Signal Desktop turns some features on and sets some limits from the server's
-remote config (`GET /v2/config`, authenticated), not from its own code. The
-keys are listed in Desktop's `ts/RemoteConfig.dom.ts`.
-
-- **Version flags** (`desktop.<feature>.beta` / `.prod`): the value is the
-  lowest Desktop version that gets the feature. See
-  `ts/util/isFeatureEnabled.dom.ts`.
-- **Scalar keys** (`global.*`): override built-in limits.
-
-We don't read the remote config: libsignal-service-rs has no call for it, so
-every value below is hard-coded to Desktop's default. A `/v2/config` fetch
-(cached, refreshed now and then) would let us follow the live values instead.
-We'd have to pick a Desktop version to compare the flags against, or treat a
-flag as on whenever it's set.
+remote config (`GET /v2/config`), with the keys listed in Desktop's
+`ts/RemoteConfig.dom.ts`. We fetch it as Desktop does
+(`crates/backend/src/remote_config.rs`): at start before the message queue,
+and when the window becomes active, at most every two hours, kept in
+settings with its ETag. Version flags (`desktop.<feature>.prod`) are
+compared with Desktop 8.34.0 as a production build, so `.beta` keys never
+apply. Parsing, flags and limits are unit tested and the demo sets a
+made-up config; the fetch hasn't been run against Signal's server.
 
 ### Version flags
 
 | Flag | What it gates in Desktop | Here |
 |---|---|---|
-| `adminDelete.receive` / `.send` | Group admins deleting anyone's message for everyone. Desktop turns receiving and sending on separately (`isAdminDeleteReceiveEnabled` / `isAdminDeleteSendEnabled`). | Done, both always on. People whose clients don't know `adminDelete` yet still see the message. |
-| `stickerReply.send` | Sending a sticker as a reply (with a quote). | Done, always on. GIFs reply too; Desktop opens a dialog to caption a GIF with the draft first (`DraftGifMessageSendModal`), and here a GIF goes at once, so the draft and the reply stay in the composer, as for a sticker. |
-| `pollSend1to1` | Creating polls in 1:1 chats (groups already have polls). | Off (`signal_backend::POLLS_IN_DIRECT_CHATS`), as Desktop is while the flag isn't set: polls are made in groups only. Received 1:1 polls show and can be voted in. |
-| `groupMemberLabels.edit` | Editing your own member label in a group. | Done (Group settings), always on: whether you may set one follows the group's label access, as Desktop's `getCanAddLabel`. |
-| `groupTerminate.send` | Admins ending a group for everyone. | Not done. We also don't know when a group was ended, so we'd still let you send to it. Desktop blocks sends and delete-for-everyone in ended groups. |
-| `binaryServiceId` | Sending service ids in the binary proto fields (`*Binary`) instead of strings. | We accept both and send strings, which is still valid. |
+| `adminDelete.receive` / `.send` | Group admins deleting anyone's message for everyone. | Done, following both flags. People whose clients don't know `adminDelete` yet still see the message. |
+| `stickerReply.send` | Sending a sticker as a reply (with a quote). | Done, following the flag. GIFs reply too; Desktop opens a dialog to caption a GIF with the draft first (`DraftGifMessageSendModal`), and here a GIF goes at once, so the draft and the reply stay in the composer, as for a sticker. |
+| `pollSend1to1` | Creating polls in 1:1 chats (groups always have polls). | Follows the flag. Received 1:1 polls show and can be voted in either way. |
+| `groupMemberLabels.edit` | Editing your own member label in a group. | Done (Group settings), following the flag: whether you may set one follows the group's label access, as Desktop's `getCanAddLabel`. |
+| `groupTerminate.send` | Admins ending a group for everyone. | Done (Group settings, "End group"), following the flag. A group ended by someone else (received, synced, or in a transferred backup) blocks sending and the rest, as Desktop. Ending a group on Signal's group server hasn't been tried. |
+| `binaryServiceId` | Service ids in the binary proto fields (`*Binary`) instead of strings. | Done for the messages and sync messages we build: only the binary fields with the flag on, only the strings without, as Desktop's `SendMessage.preload.ts`. Sent transcripts built in libsignal-service-rs and the Storage Service records we write (contacts, story lists, pins) carry both forms, which every client reads; Desktop writes one. We accept both. |
 | `retireAccessKeyGroupSend` | Group sends with group send endorsements instead of access keys. | Up to libsignal-service-rs / presage. |
 | `sendMessageViaLibsignal` | Sending through libsignal's network stack. | Not applicable. |
 | `keyTransparency` | Key transparency checks in safety numbers. | Not done: safety numbers are shown and can be verified, without key transparency. |
@@ -36,18 +31,18 @@ flag as on whenever it's set.
 
 ### Limits (`global.*`), with Desktop's defaults
 
+Each falls back to Desktop's default when the key is missing or isn't a
+number.
+
 | Key | Desktop default | Here |
 |---|---|---|
-| `normalDeleteMaxAgeInSeconds` | 1 day (receivers add a day of grace) | Same, hard-coded (`crates/backend/src/deletes.rs`). |
-| `adminDeleteMaxAgeInSeconds` | 1 day (receivers add a day of grace) | Same, hard-coded (`deletes::ADMIN_MAX_AGE_MS`). |
-| `pinnedChatLimit` | 4 | Same (`storage::MAX_PINNED`). |
-| `pinnedMessageLimit` | 3 | Same (`MAX_PINNED_MESSAGES`). |
-| `attachments.maxBytes` | 100 MiB | Same (`MAX_ATTACHMENT_BYTES`). |
-| `attachments.maxReceiveBytes` | 1.25 × the send limit | Same, hard-coded (`MAX_RECEIVE_ATTACHMENT_BYTES`). Desktop marks an attachment too big when a download is tried; here it's judged from the size the sender gave, so the bubble says so from the start. |
-| `attachments.maxAutoDownloadSizeBytes` | 200 MiB | We auto-download up to 25 MiB (`AUTO_DOWNLOAD_MAX`). Raise it, or make it a setting? |
+| `normalDeleteMaxAgeInSeconds`, `adminDeleteMaxAgeInSeconds` | 1 day (receivers add a day of grace) | Follows the config. |
+| `pinnedChatLimit`, `pinnedMessageLimit` | 4, 3 | Follows the config. |
+| `attachments.maxBytes`, `attachments.maxReceiveBytes` | 100 MiB, 1.25 × the send limit | Follows the config. Desktop marks an attachment too big when a download is tried; here it's judged from the size the sender gave, so the bubble says so from the start. |
+| `attachments.maxAutoDownloadSizeBytes` | 200 MiB | Follows the config. |
 | `textAttachmentLimitBytes` | Size of a long-text attachment | Desktop's built-in limits, hard-coded (`crates/backend/src/long_text.rs`): bodies over 2 KiB go as a `text/x-signal-plain` attachment (group story replies too), received ones download and replace the body, a failed download is retried after 30 s, 5 min, 50 min and 6 h as Desktop's download job does, received messages and edits whose inline body is over 2 KiB are dropped and logged, the composer stops at 64 KiB, and a bubble shows 800 characters with "Read more" adding 3,000. Retries and the drop were unit tested; the downloads themselves weren't tried against Signal's CDN. |
-| `groupsv2.maxGroupSize` / `groupSizeHardLimit` | From config | New groups don't enforce a size limit yet; the server rejects one that's too big. |
-| `nicknames.min` / `.max` | 3 / 32 | The length of a username's nickname part (`ts/util/Username.dom.ts`), not contact nicknames. Same, hard-coded in `recipients::username_in`. Contact nicknames and notes use Desktop's built-in limits (`signal_store::NICKNAME_LIMITS`), which no config key sets. |
+| `groupsv2.maxGroupSize` / `groupSizeHardLimit` | 151 / 1001 | Follows the config in New group and Add members, with Desktop's alerts; the backend refuses to go past the hard limit. Not tried against Signal's group server. |
+| `nicknames.min` / `.max` | 3 / 32 | Username nickname limits (`ts/util/Username.dom.ts`), not contact nicknames. Read (`username_nickname_min` / `_max`) but unused: usernames can't be set here. Contact nicknames and notes use Desktop's built-in limits (`signal_store::NICKNAME_LIMITS`), which no config key sets. |
 | `messageQueueTimeInSeconds` | 30 days (never less) | How long the server keeps undelivered messages. Not used. |
 | `videoAttachments.transcodeTargetBytes`, `mediaQuality.levels`, `calling.*`, `clientExpiration`, `maxAllowedClockSkewSeconds` | n/a | Not applicable for now. |
 
