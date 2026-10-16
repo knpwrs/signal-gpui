@@ -5,16 +5,18 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{Disableable as _, Sizable as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_kit::component::{Disableable as _, Sizable as _};
 use gpui_kit::prelude::*;
 use gpui_kit::{
     Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, KeyDownEvent, ObjectFit, Render,
     SharedString, Subscription, Window, div, img, px,
 };
 use signal_backend::{Command, OutgoingStory, StoryTarget};
-use signal_store::{ConversationId, ConversationKind, StoryBackground, StoryFont, TextStory};
+use signal_store::{ConversationId, StoryBackground, StoryFont, StorySendMode, TextStory};
 
 use crate::state::AppState;
 use crate::views::image_viewer::ViewerEvent;
@@ -132,6 +134,9 @@ pub struct StoryCreator {
     text_background: TextBackground,
     background: usize,
     pub(crate) targets: BTreeSet<Target>,
+    /// Desktop's "Choose groups" for a new group story: the groups picked
+    /// so far, while it's open.
+    pub(crate) choosing_groups: Option<BTreeSet<ConversationId>>,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -188,6 +193,7 @@ impl StoryCreator {
             text_background: TextBackground::None,
             background: 0,
             targets: BTreeSet::new(),
+            choosing_groups: None,
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
         }
@@ -245,7 +251,9 @@ impl StoryCreator {
 
     fn on_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         if event.keystroke.key == "escape" {
-            if self.choosing {
+            if self.choosing_groups.take().is_some() {
+                cx.notify();
+            } else if self.choosing {
                 self.choosing = false;
                 cx.notify();
             } else {
@@ -355,13 +363,9 @@ impl StoryCreator {
     fn render_targets(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let (groups, lists, my_story, privacy_set) = {
             let state = self.state.read(cx);
-            let groups: Vec<(String, String)> = state
-                .conversations
-                .iter()
-                .chain(state.archived.iter())
-                .filter(|c| c.kind == ConversationKind::Group && !c.left && !c.blocked && !c.ended)
-                .map(|c| (c.id.0.clone(), c.title.clone()))
-                .collect();
+            // Desktop's `getGroupStories`: groups whose story is on the list.
+            let groups: Vec<(String, String, usize)> =
+                state.group_stories().into_iter().filter(|c| !c.blocked).map(|c| (c.id.0.clone(), c.title.clone(), c.members.len())).collect();
             (groups, state.custom_story_lists(), state.my_story(), state.my_story_privacy_set)
         };
         let white = Hsla { h: 0., s: 0., l: 1., a: 1. };
@@ -416,8 +420,37 @@ impl StoryCreator {
             let detail = format!("Custom story · {}", viewers(list.members.len()));
             rows.push(row(Target::List(list.id), list.name, detail, cx).into_any_element());
         }
-        for (id, title) in groups {
-            rows.push(row(Target::Group(id), title, "Group story".into(), cx).into_any_element());
+        for (id, title, members) in groups {
+            let detail = format!("Group story · {}", viewers(members));
+            let (state, creator, group) = (self.state.clone(), cx.entity().downgrade(), ConversationId(id.clone()));
+            rows.push(
+                row(Target::Group(id), title, detail, cx)
+                    // Desktop's "Delete story" here takes the group's story
+                    // off the list.
+                    .context_menu(move |menu, _, _| {
+                        let (state, creator, group) = (state.clone(), creator.clone(), group.clone());
+                        menu.item(PopupMenuItem::new("Delete story").on_click(move |_, window, cx| {
+                            let (state, creator, group) = (state.clone(), creator.clone(), group.clone());
+                            window.open_alert_dialog(cx, move |alert, _, _| {
+                                let (state, creator, group) = (state.clone(), creator.clone(), group.clone());
+                                alert
+                                    .description("Remove story? This will remove the story from your list, but you will still be able to view stories from this group.")
+                                    .confirm()
+                                    .ok_text("Delete")
+                                    .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
+                                    .on_ok(move |_, _, cx| {
+                                        let _ = creator.update(cx, |c, cx| {
+                                            c.targets.remove(&Target::Group(group.0.clone()));
+                                            cx.notify();
+                                        });
+                                        state.update(cx, |s, cx| s.set_story_send_mode(vec![group.clone()], StorySendMode::Never, cx));
+                                        true
+                                    })
+                            });
+                        }))
+                    })
+                    .into_any_element(),
+            );
         }
         let state = self.state.clone();
         rows.push(
@@ -434,10 +467,115 @@ impl StoryCreator {
             .flex()
             .flex_col()
             .gap_2()
-            .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("Send to"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .child(div().flex_1().text_lg().font_weight(FontWeight::SEMIBOLD).child("Send to"))
+                    .child(self.render_new_menu(cx)),
+            )
             .child(div().id("story-targets").flex().flex_col().overflow_y_scroll().children(rows))
             .into_any_element()
     }
+}
+
+impl StoryCreator {
+    /// Desktop's "New" menu on the send screen: a new custom story, or a
+    /// new group story.
+    fn render_new_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use gpui_kit::component::menu::DropdownMenu as _;
+        let (state, creator) = (self.state.clone(), cx.entity().downgrade());
+        Button::new("story-new").label("New").small().ghost().dropdown_menu(move |menu, _, _| {
+            let (state, creator) = (state.clone(), creator.clone());
+            menu.item(PopupMenuItem::new("New custom story").on_click(move |_, window, cx| {
+                use crate::views::story_privacy::{Page, Pick, show};
+                show(state.clone(), Page::Pick(Pick::NewStory), None, None, window, cx);
+            }))
+            .item(PopupMenuItem::new("New group story").on_click(move |_, _, cx| {
+                let _ = creator.update(cx, |c, cx| {
+                    c.choosing_groups = Some(BTreeSet::new());
+                    cx.notify();
+                });
+            }))
+        })
+    }
+
+    /// Desktop's "Choose groups": groups whose story isn't on the list yet.
+    fn render_choose_groups(&self, chosen: &BTreeSet<ConversationId>, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let white = Hsla { h: 0., s: 0., l: 1., a: 1. };
+        let groups = self.state.read(cx).groups_without_stories();
+        let rows: Vec<gpui_kit::AnyElement> = groups
+            .into_iter()
+            .map(|group| {
+                let on = chosen.contains(&group.id);
+                let key = format!("story-choose-group-{}", group.id.0);
+                let id = group.id.clone();
+                div()
+                    .id(SharedString::from(key.clone()))
+                    .debug_selector(move || key.clone())
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_3()
+                    .py_2()
+                    .rounded(px(8.))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(Hsla { a: 0.1, ..white }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(chosen) = &mut this.choosing_groups
+                            && !chosen.remove(&id)
+                        {
+                            chosen.insert(id.clone());
+                        }
+                        cx.notify();
+                    }))
+                    .child(div().size(px(18.)).flex_none().rounded(px(4.)).border_2().border_color(white).when(on, |d| d.bg(white)))
+                    .child(crate::views::common::conversation_avatar(&group, px(32.)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().truncate().child(group.title.clone()))
+                            .child(div().text_xs().opacity(0.7).child(members_text(group.members.len()))),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        let empty = rows.is_empty();
+        div()
+            .w(px(360.))
+            .max_h(px(480.))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("Choose groups"))
+            .when(empty, |d| d.child(div().text_sm().opacity(0.7).child("No groups to add")))
+            .child(div().id("story-choose-groups").flex().flex_col().overflow_y_scroll().children(rows))
+            .into_any_element()
+    }
+
+    /// The groups chosen become group stories (Desktop's
+    /// `toggleGroupsForStorySend`), and are picked to send to.
+    pub(crate) fn add_chosen_groups(&mut self, cx: &mut Context<Self>) {
+        let Some(chosen) = self.choosing_groups.take() else { return };
+        if chosen.is_empty() {
+            return cx.notify();
+        }
+        self.targets.extend(chosen.iter().map(|g| Target::Group(g.0.clone())));
+        let groups = chosen.into_iter().collect();
+        self.state.update(cx, |s, cx| s.set_story_send_mode(groups, StorySendMode::Always, cx));
+        cx.notify();
+    }
+}
+
+/// A button that tests can find.
+fn tagged(id: &'static str, button: Button) -> gpui_kit::Div {
+    div().debug_selector(move || id.into()).child(button)
+}
+
+/// Desktop's `ConversationHero--members`.
+fn members_text(count: usize) -> String {
+    if count == 1 { "1 member".into() } else { format!("{count} members") }
 }
 
 impl Render for StoryCreator {
@@ -462,30 +600,51 @@ impl Render for StoryCreator {
             .gap_4()
             .bg(Hsla { h: 0., s: 0., l: 0., a: 0.96 })
             .text_color(white)
-            .child(if choosing { self.render_targets(cx) } else { self.render_editor(height, cx) })
+            .child(match (&self.choosing_groups, choosing) {
+                (Some(chosen), _) => self.render_choose_groups(&chosen.clone(), cx),
+                (None, true) => self.render_targets(cx),
+                (None, false) => self.render_editor(height, cx),
+            })
             .child(
                 div()
                     .flex()
                     .gap_2()
                     .child(Button::new("story-cancel").label("Cancel").ghost().on_click(cx.listener(|this, _, _, cx| {
-                        if this.choosing {
+                        if this.choosing_groups.take().is_some() {
+                            cx.notify();
+                        } else if this.choosing {
                             this.choosing = false;
                             cx.notify();
                         } else {
                             cx.emit(ViewerEvent::Close);
                         }
                     })))
-                    .child(if choosing {
-                        Button::new("story-send")
-                            .label("Send story")
-                            .primary()
-                            .disabled(!any_target)
-                            .on_click(cx.listener(|this, _, _, cx| this.send(cx)))
+                    .child(if let Some(chosen) = &self.choosing_groups {
+                        tagged(
+                            "story-groups-chosen",
+                            Button::new("story-groups-chosen")
+                                .label("Done")
+                                .primary()
+                                .disabled(chosen.is_empty())
+                                .on_click(cx.listener(|this, _, _, cx| this.add_chosen_groups(cx))),
+                        )
+                    } else if choosing {
+                        tagged(
+                            "story-send",
+                            Button::new("story-send")
+                                .label("Send story")
+                                .primary()
+                                .disabled(!any_target)
+                                .on_click(cx.listener(|this, _, _, cx| this.send(cx))),
+                        )
                     } else {
-                        Button::new("story-next").label("Next").primary().disabled(!ready).on_click(cx.listener(|this, _, _, cx| {
-                            this.choosing = true;
-                            cx.notify();
-                        }))
+                        tagged(
+                            "story-next",
+                            Button::new("story-next").label("Next").primary().disabled(!ready).on_click(cx.listener(|this, _, _, cx| {
+                                this.choosing = true;
+                                cx.notify();
+                            })),
+                        )
                     }),
             )
     }

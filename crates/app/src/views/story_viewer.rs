@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::Icon;
+use gpui_kit::component::{Icon, WindowExt as _};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
@@ -137,7 +138,8 @@ impl StoryViewer {
         let subscriptions = vec![
             cx.subscribe_in(&reply, window, |this, input, event: &InputEvent, window, cx| match event {
                 InputEvent::Focus => this.set_paused(true, cx),
-                InputEvent::Blur => this.set_paused(false, cx),
+                // The replies stay open (and the story waiting) after.
+                InputEvent::Blur => this.set_paused(this.views_open.is_some(), cx),
                 InputEvent::PressEnter { .. } => {
                     let text = input.read(cx).value().to_string();
                     this.send_reply(text, None, cx);
@@ -146,17 +148,11 @@ impl StoryViewer {
                 }
                 _ => {}
             }),
-            // Stories download and get viewed while open.
+            // Stories download, get viewed and replied to, or are deleted
+            // while open.
             cx.observe(&state, |this, state, cx| {
                 let fresh = state.read(cx).stories.clone();
-                for section in &mut this.sections {
-                    for story in &mut section.stories {
-                        if let Some(new) = fresh.iter().find(|s| s.id == story.id) {
-                            *story = new.clone();
-                        }
-                    }
-                }
-                cx.notify();
+                this.refresh(&fresh, cx);
             }),
         ];
         let tick = cx.spawn(async move |this, cx| {
@@ -186,6 +182,66 @@ impl StoryViewer {
         };
         this.show(cx);
         this
+    }
+
+    /// Takes in the stories as they are now: changed ones updated, deleted
+    /// ones gone (the next one shows if it was the one showing).
+    fn refresh(&mut self, fresh: &[Story], cx: &mut Context<Self>) {
+        let showing = self.current().map(|s| s.id);
+        for section in &mut self.sections {
+            section.stories.retain(|story| fresh.iter().any(|s| s.id == story.id));
+            for story in &mut section.stories {
+                if let Some(new) = fresh.iter().find(|s| s.id == story.id) {
+                    *story = new.clone();
+                }
+            }
+        }
+        let showing_section = self.sections.get(self.section).map(|s| s.chat.clone());
+        self.sections.retain(|s| !s.stories.is_empty());
+        if self.sections.is_empty() {
+            return cx.emit(ViewerEvent::Close);
+        }
+        if let Some(at) = self.sections.iter().position(|s| Some(&s.chat) == showing_section.as_ref()) {
+            self.section = at;
+        } else {
+            self.section = self.section.min(self.sections.len() - 1);
+            self.story = 0;
+        }
+        let stories = &self.sections[self.section].stories;
+        match showing.and_then(|id| stories.iter().position(|s| s.id == id)) {
+            Some(at) => self.story = at,
+            None => {
+                self.story = self.story.min(stories.len() - 1);
+                self.show(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Desktop's "Delete" for our story, after its confirmation.
+    fn confirm_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(story) = self.current().filter(|s| s.author.is_none()) else { return };
+        let (id, state) = (story.id, self.state.clone());
+        self.set_paused(true, cx);
+        let viewer = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (state, viewer) = (state.clone(), viewer.clone());
+            let resume = viewer.clone();
+            alert
+                .description("Delete this story? It will also be deleted for everyone who received it.")
+                .confirm()
+                .ok_text("Delete")
+                .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
+                .on_ok(move |_, _, cx| {
+                    state.update(cx, |s, cx| s.delete_story(id, cx));
+                    let _ = viewer.update(cx, |v, cx| v.set_paused(false, cx));
+                    true
+                })
+                .on_cancel(move |_, _, cx| {
+                    let _ = resume.update(cx, |v, cx| v.set_paused(false, cx));
+                    true
+                })
+        });
     }
 
     fn current(&self) -> Option<&Story> {
@@ -411,13 +467,17 @@ impl StoryViewer {
     fn render_views(&self, story: &Story, tab: ViewsTab, cx: &mut Context<Self>) -> AnyElement {
         let white = Hsla { h: 0., s: 0., l: 1., a: 1. };
         let dim = Hsla { a: 0.7, ..white };
+        let composer = self.render_group_composer(story, cx);
         let state = self.state.read(cx);
         let receipts = state.story_view_receipts_on();
         let name_of = |sid: &str| {
             state.conversation(&ConversationId::direct(sid)).map(|c| c.title.clone()).filter(|t| !t.is_empty()).unwrap_or_else(|| "Unknown".into())
         };
         let empty = |text: &'static str| div().py_8().text_center().text_color(dim).child(text).into_any_element();
-        let views = if !receipts {
+        let ours = story.author.is_none();
+        let views = if !ours {
+            None
+        } else if !receipts {
             Some(
                 div()
                     .py_8()
@@ -467,10 +527,32 @@ impl StoryViewer {
                             Some(sid) => reply.author_name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| name_of(sid)),
                         };
                         let body = match &reply.emoji {
+                            _ if reply.deleted => "This message was deleted.".to_owned(),
                             Some(emoji) => format!("Reacted to the story {emoji}"),
                             None => reply.body.clone(),
                         };
+                        let key = format!("story-reply-{}-{}", reply.author.as_deref().unwrap_or("me"), reply.sent_at);
+                        let (state, story_id, author, sent_at) = (self.state.clone(), story.id, reply.author.clone(), reply.sent_at);
+                        // Desktop's "Delete for everyone" is for ours, in a
+                        // group, not yet deleted.
+                        let for_everyone = reply.author.is_none() && story.group.is_some() && !reply.deleted;
                         div()
+                            .id(SharedString::from(key.clone()))
+                            .debug_selector(move || key.clone())
+                            .context_menu(move |menu, _, _| {
+                                let (state, author) = (state.clone(), author.clone());
+                                let (everyone_state, everyone_author) = (state.clone(), author.clone());
+                                menu.item(PopupMenuItem::new("Delete for me").on_click(move |_, _, cx| {
+                                    let author = author.clone();
+                                    state.update(cx, |s, cx| s.delete_story_reply(story_id, author, sent_at, false, cx));
+                                }))
+                                .when(for_everyone, |menu| {
+                                    menu.item(PopupMenuItem::new("Delete for everyone").on_click(move |_, _, cx| {
+                                        let author = everyone_author.clone();
+                                        everyone_state.update(cx, |s, cx| s.delete_story_reply(story_id, author, sent_at, true, cx));
+                                    }))
+                                })
+                            })
                             .flex()
                             .flex_col()
                             .child(
@@ -480,7 +562,7 @@ impl StoryViewer {
                                     .child(div().flex_1().font_weight(FontWeight::SEMIBOLD).truncate().child(who))
                                     .child(div().text_xs().text_color(dim).child(crate::views::common::short_timestamp(reply.sent_at))),
                             )
-                            .child(div().text_sm().child(body))
+                            .child(div().text_sm().when(reply.deleted, |d| d.italic().text_color(dim)).child(body))
                     }))
                     .into_any_element(),
             )
@@ -545,9 +627,51 @@ impl StoryViewer {
                                 .child(tab_button("story-replies-tab", "Replies", ViewsTab::Replies, cx)),
                         )
                     })
-                    .child(div().id("story-views-list").flex_1().min_h_0().overflow_y_scroll().children(body)),
+                    .child(div().id("story-views-list").flex_1().min_h_0().overflow_y_scroll().children(body))
+                    .when(tab == ViewsTab::Replies || !tabs, |d| d.children(composer)),
             )
             .into_any_element()
+    }
+
+    /// A group story's reply box (Desktop's `StoryViewsNRepliesModal`
+    /// composer), or why there's none.
+    fn render_group_composer(&self, story: &Story, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let group = story.group.as_ref()?;
+        let white = Hsla { h: 0., s: 0., l: 1., a: 1. };
+        let member = self.state.read(cx).conversation(group).is_some_and(|g| !g.left);
+        if !member {
+            return Some(
+                div()
+                    .text_sm()
+                    .text_color(Hsla { a: 0.7, ..white })
+                    .child("You can\u{2019}t reply to this story because you\u{2019}re no longer a member of this group.")
+                    .into_any_element(),
+            );
+        }
+        if !story.allows_replies {
+            return None;
+        }
+        Some(
+            div()
+                .id("story-group-composer")
+                .debug_selector(|| "story-group-composer".into())
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(div().flex().gap_2().children(REACTIONS.iter().map(|emoji| {
+                    let emoji = *emoji;
+                    let key = format!("story-group-react-{emoji}");
+                    div()
+                        .id(SharedString::from(key.clone()))
+                        .debug_selector(move || key.clone())
+                        .cursor_pointer()
+                        .text_lg()
+                        .on_click(cx.listener(move |this, _, _, cx| this.send_reply(String::new(), Some(emoji.into()), cx)))
+                        .child(emoji)
+                })))
+                .child(Input::new(&self.reply))
+                .into_any_element(),
+        )
     }
 }
 
@@ -630,6 +754,13 @@ impl gpui_kit::Render for StoryViewer {
                             .gap_2()
                             .child(div().flex_1().min_w_0().truncate().font_weight(FontWeight::SEMIBOLD).child(name))
                             .child(div().text_sm().opacity(0.8).child(crate::views::common::short_timestamp(story.sent_at)))
+                            .when(!theirs, |d| {
+                                d.child(
+                                    button("story-delete", IconName::Trash)
+                                        .debug_selector(|| "story-delete".into())
+                                        .on_click(cx.listener(|this, _, window, cx| this.confirm_delete(window, cx))),
+                                )
+                            })
                             .child(
                                 button("story-pause", if self.paused { IconName::Play } else { IconName::Pause })
                                     .on_click(cx.listener(|this, _, _, cx| this.set_paused(!this.paused, cx))),
@@ -679,14 +810,28 @@ impl gpui_kit::Render for StoryViewer {
                                 .child(label),
                         )
                     })
-                    // A group's: its replies.
+                    // A group's: Desktop's "Reply to Group", opening its
+                    // replies and the reply box.
                     .when(theirs && story.group.is_some(), |d| {
-                        d.children(story.replies.iter().rev().take(3).rev().map(|reply| {
-                            let who = reply.author_name.clone().unwrap_or_else(|| if reply.author.is_none() { "You".into() } else { String::new() });
+                        let label = if story.replies.is_empty() {
+                            "Reply to Group".to_owned()
+                        } else {
+                            format!("Reply to Group · {}", replies_text(story.replies.len()))
+                        };
+                        d.child(
                             div()
+                                .id("story-group-replies")
+                                .debug_selector(|| "story-group-replies".into())
+                                .self_center()
+                                .px_3()
+                                .py_1()
+                                .rounded_full()
+                                .cursor_pointer()
                                 .text_sm()
-                                .child(format!("{who}: {}", if reply.emoji.is_some() { format!("Reacted {}", reply.body) } else { reply.body.clone() }))
-                        }))
+                                .hover(|d| d.bg(Hsla { a: 0.15, ..white }))
+                                .on_click(cx.listener(|this, _, _, cx| this.open_views(Some(ViewsTab::Replies), cx)))
+                                .child(label),
+                        )
                     })
                     .when(one_to_one, |d| {
                         d.child(

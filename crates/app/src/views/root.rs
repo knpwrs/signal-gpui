@@ -678,6 +678,145 @@ mod tests {
         backend.shutdown();
     }
 
+    /// The demo's hiking group, whose story is up.
+    const HIKERS: &str = "g:0000000000000000000000000000000000000000000000000000000000000001";
+    /// The demo's house group, with no story.
+    const HOUSE: &str = "g:0000000000000000000000000000000000000000000000000000000000000003";
+
+    #[gpui_kit::test]
+    fn group_stories_are_added_removed_and_chosen_on_the_send_screen(cx: &mut TestAppContext) {
+        use signal_store::StorySendMode;
+        let (mut cx, state, root, backend, _dir) = demo_window(cx);
+        let hikers = signal_store::ConversationId(HIKERS.into());
+        let house = signal_store::ConversationId(HOUSE.into());
+        wait(&mut cx, "the demo", &|cx| {
+            state.read_with(cx, |s, _| !s.my_stories().is_empty() && s.conversation(&house).is_some())
+        });
+        // With its story up, the hiking group is a group story; the house isn't.
+        let names = |cx: &VisualTestContext| state.read_with(cx, |s, _| s.group_stories().into_iter().map(|g| g.id).collect::<Vec<_>>());
+        assert_eq!(names(&cx), std::slice::from_ref(&hikers));
+
+        // Story privacy lists it; its page removes it (Desktop's "Remove group story").
+        cx.update(|window, cx| {
+            crate::views::story_privacy::show(state.clone(), crate::views::story_privacy::Page::Lists, None, None, window, cx)
+        });
+        click(&mut cx, Box::leak(format!("privacy-group-{HIKERS}").into_boxed_str()));
+        wait(&mut cx, "its members", &|cx| cx.debug_bounds("privacy-group-members").is_some());
+        click(&mut cx, "privacy-remove-group");
+        cx.update(|window, cx| {
+            gpui_kit::component::WindowExt::close_all_dialogs(window, cx);
+        });
+        // (The confirmation's Delete runs `remove_group_story`.)
+        state.update(&mut cx, |s, cx| s.set_story_send_mode(vec![hikers.clone()], StorySendMode::Never, cx));
+        assert!(names(&cx).is_empty());
+        wait(&mut cx, "the backend to keep it", &|_| {
+            let (db, hikers) = (backend.db().clone(), hikers.clone());
+            futures::executor::block_on(backend.spawn(async move { db.story_send_mode(&hikers).await })).ok() == Some(StorySendMode::Never)
+        });
+
+        // "New group story" on the send screen adds and picks both.
+        state.update(&mut cx, |s, cx| s.create_text_story(cx));
+        wait(&mut cx, "the creator", &|cx| cx.debug_bounds("story-creator").is_some());
+        let creator = root.read_with(&cx, |r, _| r.story_creator.as_ref().map(|(c, _)| c.clone())).unwrap();
+        creator.update(&mut cx, |c, cx| {
+            c.choosing = true;
+            c.choosing_groups = Some(Default::default());
+            cx.notify();
+        });
+        click(&mut cx, Box::leak(format!("story-choose-group-{HOUSE}").into_boxed_str()));
+        click(&mut cx, Box::leak(format!("story-choose-group-{HIKERS}").into_boxed_str()));
+        click(&mut cx, "story-groups-chosen");
+        creator.read_with(&cx, |c, _| {
+            assert!(c.choosing_groups.is_none());
+            assert!(c.targets.contains(&crate::views::story_creator::Target::Group(HOUSE.into())));
+            assert!(c.targets.contains(&crate::views::story_creator::Target::Group(HIKERS.into())));
+        });
+        let mut both = names(&cx);
+        both.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(both, [hikers, house]);
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn a_custom_story_is_renamed(cx: &mut TestAppContext) {
+        let (mut cx, state, _root, backend, _dir) = demo_window(cx);
+        wait(&mut cx, "the demo", &|cx| state.read_with(cx, |s, _| !s.my_stories().is_empty()));
+        let list = signal_backend::StoryList::new_custom("Hikers".into(), vec![MAYA.into()]);
+        state.update(&mut cx, |s, cx| s.save_story_list(list.clone(), cx));
+        let privacy = cx
+            .update(|window, cx| {
+                crate::views::story_privacy::show(
+                    state.clone(),
+                    crate::views::story_privacy::Page::List(list.id.clone()),
+                    None,
+                    None,
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+        click(&mut cx, "privacy-rename");
+        assert_eq!(privacy.read_with(&cx, |p, cx| p.name.read(cx).value().to_string()), "Hikers", "starts with its name");
+        cx.update(|window, cx| {
+            let name = privacy.read(cx).name.clone();
+            name.update(cx, |input, cx| input.set_value("Trail crew", window, cx));
+        });
+        click(&mut cx, "privacy-rename-save");
+        wait(&mut cx, "the new name", &|cx| state.read_with(cx, |s, _| s.custom_story_lists()[0].name == "Trail crew"));
+        assert_eq!(privacy.read_with(&cx, |p, _| p.page.clone()), crate::views::story_privacy::Page::List(list.id.clone()));
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn a_group_story_is_replied_to_from_its_replies_and_a_reply_deleted(cx: &mut TestAppContext) {
+        let (mut cx, state, root, backend, _dir) = demo_window(cx);
+        let hikers = signal_store::ConversationId(HIKERS.into());
+        wait(&mut cx, "the group's story", &|cx| state.read_with(cx, |s, _| s.story_groups().iter().any(|g| g.chat == hikers)));
+        state.update(&mut cx, |s, cx| s.view_stories(Some(hikers.clone()), cx));
+        wait(&mut cx, "the viewer", &|cx| cx.debug_bounds("story-viewer").is_some());
+        let viewer = root.read_with(&cx, |r, _| r.story_viewer.as_ref().map(|(v, _)| v.clone())).unwrap();
+        click(&mut cx, "story-group-replies");
+        wait(&mut cx, "the reply box", &|cx| cx.debug_bounds("story-group-composer").is_some());
+        let story_id = state.read_with(&cx, |s, _| s.story_groups().into_iter().find(|g| g.chat == hikers).unwrap().stories[0].id);
+        let replies = |cx: &VisualTestContext| {
+            state.read_with(cx, |s, _| s.stories.iter().find(|st| st.id == story_id).map(|st| st.replies.clone()).unwrap_or_default())
+        };
+        let before = replies(&cx).len();
+        click(&mut cx, "story-group-react-❤️");
+        wait(&mut cx, "our reaction", &|cx| replies(cx).len() == before + 1);
+        let ours = replies(&cx).into_iter().find(|r| r.author.is_none()).unwrap();
+        assert_eq!(ours.emoji.as_deref(), Some("❤️"));
+        assert!(viewer.read_with(&cx, |v, _| v.views_open.is_some()), "the replies stay open");
+
+        // Deleted for everyone: kept as deleted, as Desktop shows it.
+        state.update(&mut cx, |s, cx| s.delete_story_reply(story_id, None, ours.sent_at, true, cx));
+        wait(&mut cx, "it to be deleted", &|cx| replies(cx).iter().any(|r| r.author.is_none() && r.deleted));
+        // Then for me: gone.
+        state.update(&mut cx, |s, cx| s.delete_story_reply(story_id, None, ours.sent_at, false, cx));
+        wait(&mut cx, "it to go", &|cx| replies(cx).len() == before);
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn our_story_is_deleted_from_the_viewer(cx: &mut TestAppContext) {
+        let (mut cx, state, _root, backend, _dir) = demo_window(cx);
+        wait(&mut cx, "the demo", &|cx| state.read_with(cx, |s, _| !s.my_stories().is_empty()));
+        let before = state.read_with(&cx, |s, _| s.my_stories().len());
+        state.update(&mut cx, |s, cx| s.view_stories(None, cx));
+        wait(&mut cx, "the viewer", &|cx| cx.debug_bounds("story-delete").is_some());
+        let id = state.read_with(&cx, |s, _| s.my_stories()[0].id);
+        // The trash button asks first (Desktop's confirmation); deleting is this.
+        state.update(&mut cx, |s, cx| s.delete_story(id, cx));
+        wait(&mut cx, "it to go", &|cx| state.read_with(cx, |s, _| s.my_stories().len() == before - 1));
+        // The viewer had only it: closed.
+        wait(&mut cx, "the viewer to close", &|cx| cx.debug_bounds("story-viewer").is_none() || before > 1);
+        wait(&mut cx, "the backend to delete it", &|_| {
+            let db = backend.db().clone();
+            matches!(futures::executor::block_on(backend.spawn(async move { db.story(id).await })), Ok(None))
+        });
+        backend.shutdown();
+    }
+
     #[gpui_kit::test]
     fn our_story_shows_who_viewed_and_replied(cx: &mut TestAppContext) {
         let (mut cx, state, root, backend, _dir) = demo_window(cx);

@@ -15,11 +15,11 @@ use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _};
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, App, Entity, FontWeight, SharedString, Window, div, px};
 use signal_backend::StoryList;
-use signal_store::DirectoryEntry;
+use signal_store::{ConversationId, DirectoryEntry};
 
 use crate::state::AppState;
 use crate::theme::{Palette, color_for};
-use crate::views::common::person_avatar;
+use crate::views::common::{conversation_avatar, person_avatar};
 
 /// Runs once the first post's My Story privacy is saved.
 pub type OnSaved = Rc<dyn Fn(&mut Window, &mut App)>;
@@ -36,6 +36,10 @@ pub(crate) enum Page {
     Pick(Pick),
     /// Naming a new custom story with the people chosen.
     Name,
+    /// Renaming a custom story, by id.
+    Rename(String),
+    /// A group's story (Desktop's `GroupStorySettingsModal`).
+    Group(ConversationId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,10 +141,25 @@ impl Privacy {
         self.page = Page::Lists;
     }
 
+    /// Renames a custom story. Desktop has no way to; Android's "Edit
+    /// story name" does, and the name is saved to Storage Service with the
+    /// list, where Desktop reads it.
+    pub(crate) fn rename(&mut self, cx: &mut App) {
+        let Page::Rename(id) = self.page.clone() else { return };
+        let name = self.name.read(cx).value().trim().to_owned();
+        if name.is_empty() {
+            return;
+        }
+        if let Some(list) = self.list(&id, cx) {
+            self.state.update(cx, |s, cx| s.save_story_list(StoryList { name, ..list }, cx));
+        }
+        self.page = Page::List(id);
+    }
+
     fn back(&mut self) {
         self.page = match &self.page {
             Page::Pick(Pick::Exclude | Pick::Only) => Page::MyStory,
-            Page::Pick(Pick::Viewers(id)) => Page::List(id.clone()),
+            Page::Pick(Pick::Viewers(id)) | Page::Rename(id) => Page::List(id.clone()),
             Page::Name => Page::Pick(Pick::NewStory),
             _ => Page::Lists,
         };
@@ -258,6 +277,11 @@ fn render(privacy: &Entity<Privacy>, dialog: Dialog, window: &mut Window, cx: &m
             render_picker(privacy, palette, cx),
         ),
         Page::Name => ("Name story".into(), render_name(privacy, palette, cx)),
+        Page::Rename(_) => ("Edit story name".into(), render_rename(privacy, palette, cx)),
+        Page::Group(group) => {
+            let title = privacy.read(cx).state.read(cx).conversation(group).map(|c| c.title.clone()).unwrap_or_default();
+            (title, render_group(privacy, group, palette, cx))
+        }
     };
     let footer = DialogFooter::new();
     let back = |id: &'static str, label: &'static str| {
@@ -287,7 +311,18 @@ fn render(privacy: &Entity<Privacy>, dialog: Dialog, window: &mut Window, cx: &m
                     }
                 })))
         }
-        Page::MyStory | Page::List(_) => footer.child(back("privacy-back", "Back")),
+        Page::MyStory | Page::List(_) | Page::Group(_) => footer.child(back("privacy-back", "Back")),
+        Page::Rename(_) => {
+            let rename = privacy.clone();
+            let ready = !privacy.read(cx).name.read(cx).value().trim().is_empty();
+            footer.child(back("privacy-back", "Back")).child(tag(
+                "privacy-rename-save",
+                Button::new("privacy-rename-save").label("Save").primary().disabled(!ready).on_click(move |_, window, cx| {
+                    rename.update(cx, |p, cx| p.rename(cx));
+                    window.refresh();
+                }),
+            ))
+        }
         Page::Pick(_) => {
             let done = privacy.clone();
             // Desktop's pickers need someone chosen (an empty "Only share
@@ -326,6 +361,7 @@ fn render_lists(privacy: &Entity<Privacy>, palette: Palette, cx: &App) -> AnyEle
         format!("{} · {}", my_story_label(&my), viewers_text(my_viewers))
     };
     let lists = state.custom_story_lists();
+    let group_stories = state.group_stories();
     let (receipts_state, off_state) = (p.state.clone(), p.state.clone());
     let go = |page: Page| {
         let privacy = privacy.clone();
@@ -360,6 +396,19 @@ fn render_lists(privacy: &Entity<Privacy>, palette: Palette, cx: &App) -> AnyEle
                     .child(div().truncate().child(list.name.clone()))
                     .child(div().text_xs().text_color(palette.text_secondary).child(format!("Custom story · {viewers}"))),
             )
+        }))
+        .children(group_stories.into_iter().map(|group| {
+            let viewers = viewers_text(group.members.len());
+            row(SharedString::from(format!("privacy-group-{}", group.id.0)), palette)
+                .on_click(go(Page::Group(group.id.clone())))
+                .child(conversation_avatar(&group, px(32.)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().truncate().child(group.title.clone()))
+                        .child(div().text_xs().text_color(palette.text_secondary).child(format!("Group story · {viewers}"))),
+                )
         }))
         .child(div().my_2().h(px(1.)).bg(palette.panel_border))
         .child(
@@ -518,10 +567,24 @@ fn render_list(privacy: &Entity<Privacy>, id: &str, palette: Palette, _window: &
     });
     let (replies_state, replies_list) = (state.clone(), list.clone());
     let (delete_state, delete_list, delete_privacy) = (state.clone(), list.clone(), privacy.clone());
+    let (rename, rename_id, rename_name) = (privacy.clone(), list.id.clone(), list.name.clone());
     div()
         .flex()
         .flex_col()
         .gap_1()
+        .child(
+            row("privacy-rename", palette)
+                .on_click(move |_, window, cx| {
+                    rename.update(cx, |p, cx| {
+                        p.name.update(cx, |input, cx| input.set_value(rename_name.clone(), window, cx));
+                        p.page = Page::Rename(rename_id.clone());
+                    });
+                    window.refresh();
+                })
+                .child(div().flex_1().min_w_0().truncate().child(list.name.clone()))
+                .child(div().text_sm().text_color(palette.text_secondary).child("Edit name")),
+        )
+        .child(div().my_1().h(px(1.)).bg(palette.panel_border))
         .child(heading("Who can view this story", palette))
         .child(row("privacy-add-viewer", palette).on_click(move |_, window, cx| {
             add.update(cx, |p, cx| p.pick(Pick::Viewers(add_id.clone()), cx));
@@ -609,4 +672,91 @@ fn render_name(privacy: &Entity<Privacy>, palette: Palette, cx: &App) -> AnyElem
         .child(heading("Viewers", palette))
         .child(div().text_sm().child(names.join(", ")))
         .into_any_element()
+}
+
+/// Renaming a custom story.
+fn render_rename(privacy: &Entity<Privacy>, palette: Palette, cx: &App) -> AnyElement {
+    let p = privacy.read(cx);
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(Input::new(&p.name))
+        .child(div().text_xs().text_color(palette.text_secondary).child("Only you can see the name of this story."))
+        .into_any_element()
+}
+
+/// Desktop's `GroupStorySettingsModal`: who sees the group's story (its
+/// members), and "Remove group story".
+fn render_group(privacy: &Entity<Privacy>, group: &ConversationId, palette: Palette, cx: &App) -> AnyElement {
+    let p = privacy.read(cx);
+    let state = p.state.read(cx);
+    let Some(chat) = state.conversation(group).cloned() else {
+        return div().text_sm().text_color(palette.text_secondary).child("This group is gone.").into_any_element();
+    };
+    let me = state.account.as_ref().map(|a| a.aci.clone()).unwrap_or_default();
+    let rows: Vec<AnyElement> = chat
+        .members
+        .iter()
+        .map(|sid| {
+            let name = if *sid == me {
+                "You".to_owned()
+            } else {
+                state
+                    .conversation(&ConversationId::direct(sid))
+                    .map(|c| c.title.clone())
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| p.name_of(sid))
+            };
+            let photo = state.photo_of(sid).map(std::path::Path::to_path_buf);
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .px_2()
+                .py_1()
+                .child(person_avatar(photo.as_deref(), &name, color_for(&format!("d:{sid}")), px(28.)))
+                .child(div().flex_1().truncate().child(name))
+                .into_any_element()
+        })
+        .collect();
+    let (remove_state, remove_privacy, title, id) = (p.state.clone(), privacy.clone(), chat.title.clone(), chat.id.clone());
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(div().flex().items_center().gap_3().child(conversation_avatar(&chat, px(32.))).child(div().truncate().child(chat.title.clone())))
+        .child(div().my_1().h(px(1.)).bg(palette.panel_border))
+        .child(heading("Who can view this story", palette))
+        .child(div().id("privacy-group-members").debug_selector(|| "privacy-group-members".into()).max_h(px(280.)).overflow_y_scroll().children(rows))
+        .child(div().pt_1().text_xs().text_color(palette.text_secondary).child(format!(
+            "Members of the group chat \u{201c}{}\u{201d} can view and reply to this story. You can update the membership for this chat in the group.",
+            chat.title
+        )))
+        .child(div().pt_2().debug_selector(|| "privacy-remove-group".into()).child(Button::new("privacy-remove-group").label("Remove group story").small().outline().on_click(
+            move |_, window, cx| {
+                let (state, privacy, title, id) = (remove_state.clone(), remove_privacy.clone(), title.clone(), id.clone());
+                window.open_alert_dialog(cx, move |alert, _, _| {
+                    let (state, privacy, id) = (state.clone(), privacy.clone(), id.clone());
+                    alert
+                        .description(format!("Are you sure you want to remove \u{201c}{title}\u{201d}?"))
+                        .confirm()
+                        .ok_text("Delete")
+                        .ok_variant(ButtonVariant::Danger)
+                        .on_ok(move |_, window, cx| {
+                            remove_group_story(&state, &privacy, id.clone(), cx);
+                            window.refresh();
+                            true
+                        })
+                });
+            },
+        )))
+        .into_any_element()
+}
+
+/// Desktop's `toggleGroupsForStorySend` from a group story's settings: off
+/// the list, and back to the lists.
+pub(crate) fn remove_group_story(state: &Entity<AppState>, privacy: &Entity<Privacy>, group: ConversationId, cx: &mut App) {
+    state.update(cx, |s, cx| s.set_story_send_mode(vec![group], signal_store::StorySendMode::Never, cx));
+    privacy.update(cx, |p, _| p.page = Page::Lists);
 }

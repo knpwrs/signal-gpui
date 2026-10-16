@@ -222,6 +222,9 @@ pub struct AppState {
     /// My Story's viewers were chosen (Desktop's `hasSetMyStoriesPrivacy`);
     /// until then, choosing My Story asks.
     pub my_story_privacy_set: bool,
+    /// Groups' story send modes that aren't the default (Desktop's
+    /// `storySendMode`).
+    pub story_send_modes: HashMap<ConversationId, signal_store::StorySendMode>,
     /// Starts recording a voice message (the microphone; a stand-in in
     /// tests).
     pub start_recorder: crate::recorder::StartRecorder,
@@ -317,6 +320,7 @@ impl AppState {
             typing_indicators: false,
             story_lists: Vec::new(),
             my_story_privacy_set: false,
+            story_send_modes: HashMap::new(),
             waveforms: HashMap::new(),
             posters: HashMap::new(),
             recent_stickers: Vec::new(),
@@ -865,18 +869,20 @@ impl AppState {
                     db.setting(signal_backend::SETTING_MY_STORY_PRIVACY_SET).await?,
                     db.setting(ADMIN_DELETE_EDUCATION_SETTING).await?,
                     db.setting(signal_backend::SETTING_TYPING_INDICATORS).await?,
+                    db.story_send_modes().await?,
                 ),
             ))
         });
         cx.spawn(async move |this, cx| {
             let (optimization, recents, giphy, notifications, collapsed, hidden, stories_off, view_receipts, more) =
                 read.await.unwrap_or_default();
-            let (read_receipts, lists, privacy_set, admin_delete_seen, typing) = more;
+            let (read_receipts, lists, privacy_set, admin_delete_seen, typing, send_modes) = more;
             let _ = this.update(cx, |this, cx| {
                 this.read_receipts = signal_backend::setting_on(read_receipts.as_deref());
                 this.typing_indicators = signal_backend::setting_on(typing.as_deref());
                 this.story_lists = lists.and_then(|l| serde_json::from_str(&l).ok()).unwrap_or_default();
                 this.my_story_privacy_set = privacy_set.as_deref() == Some("true");
+                this.story_send_modes = send_modes.into_iter().collect();
                 this.nav_collapsed = collapsed.as_deref() == Some("true");
                 this.hidden_stories = hidden
                     .and_then(|h| serde_json::from_str::<Vec<String>>(&h).ok())
@@ -1057,6 +1063,71 @@ impl AppState {
             self.my_story_privacy_set = true;
         }
         self.send(Command::SaveStoryList(list));
+        cx.notify();
+    }
+
+    /// A group's story send mode (Desktop's `getStorySendMode`).
+    pub fn story_send_mode(&self, group: &ConversationId) -> signal_store::StorySendMode {
+        self.story_send_modes.get(group).copied().unwrap_or_default()
+    }
+
+    /// Desktop's `isGroupInStoryMode`: a group we're in whose story is on
+    /// the list, always or (by default) while it has stories up.
+    pub fn group_in_story_mode(&self, group: &Conversation) -> bool {
+        use signal_store::StorySendMode;
+        if group.kind != signal_store::ConversationKind::Group || group.left || group.ended {
+            return false;
+        }
+        match self.story_send_mode(&group.id) {
+            StorySendMode::Always => true,
+            StorySendMode::Never => false,
+            StorySendMode::IfActive => self.stories.iter().any(|s| s.group.as_ref() == Some(&group.id)),
+        }
+    }
+
+    /// The group stories we can post to (Desktop's `getGroupStories`), by
+    /// title.
+    pub fn group_stories(&self) -> Vec<Conversation> {
+        let mut groups: Vec<Conversation> =
+            self.conversations.iter().chain(&self.archived).filter(|c| self.group_in_story_mode(c)).cloned().collect();
+        groups.sort_by_key(|g| g.title.to_lowercase());
+        groups
+    }
+
+    /// Groups we're in that aren't group stories yet (Desktop's
+    /// `getNonGroupStories`), for "New group story".
+    pub fn groups_without_stories(&self) -> Vec<Conversation> {
+        let mut groups: Vec<Conversation> = self
+            .conversations
+            .iter()
+            .chain(&self.archived)
+            .filter(|c| c.kind == signal_store::ConversationKind::Group && !c.left && !c.ended && !c.blocked && !self.group_in_story_mode(c))
+            .cloned()
+            .collect();
+        groups.sort_by_key(|g| g.title.to_lowercase());
+        groups
+    }
+
+    /// Adds groups' stories to the list (`Always`) or removes them
+    /// (`Never`), here at once and for the whole account.
+    pub fn set_story_send_mode(&mut self, groups: Vec<ConversationId>, mode: signal_store::StorySendMode, cx: &mut Context<Self>) {
+        for group in &groups {
+            self.story_send_modes.insert(group.clone(), mode);
+        }
+        self.send(Command::SetStorySendMode { groups, mode });
+        cx.notify();
+    }
+
+    /// Deletes one of our stories for everyone (Desktop's "Delete story").
+    pub fn delete_story(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.stories.retain(|s| s.id != id);
+        self.send(Command::DeleteStory { id });
+        cx.notify();
+    }
+
+    /// Deletes a reply to a group story, here or (ours) for everyone.
+    pub fn delete_story_reply(&mut self, story: i64, author: Option<String>, sent_at: i64, for_everyone: bool, cx: &mut Context<Self>) {
+        self.send(Command::DeleteStoryReply { story, author, sent_at, for_everyone });
         cx.notify();
     }
 
