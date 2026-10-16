@@ -84,7 +84,7 @@ impl Actor {
                     .map(|all| all.iter().filter(|s| s.author.as_deref() == Some(author)).count())
                     .unwrap_or(0),
             };
-            let small = pointer.size.is_some_and(|size| u64::from(size) <= AUTO_DOWNLOAD_MAX);
+            let small = pointer.size.is_some_and(|size| crate::remote_config().auto_downloads(u64::from(size)));
             if small && (story.author.is_none() || theirs <= MAX_STORIES_TO_PREFETCH) {
                 self.download_story(manager, id, &pointer).await;
             }
@@ -99,7 +99,7 @@ impl Actor {
     async fn download_story(&self, manager: &SignalManager, id: i64, pointer: &AttachmentPointer) {
         let saved = async {
             let size = pointer.size.map_or(0, u64::from);
-            if size > crate::MAX_RECEIVE_ATTACHMENT_BYTES {
+            if size > crate::remote_config().attachment_max_receive_bytes() {
                 anyhow::bail!("{size} bytes is over Signal's receive limit");
             }
             let bytes = manager.get_attachment(pointer).await.map_err(|e| anyhow::anyhow!("{e}"))?;

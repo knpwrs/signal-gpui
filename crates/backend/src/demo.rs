@@ -625,10 +625,22 @@ fn write_demo_photo(path: &Path, width: u32, height: u32) -> std::io::Result<()>
     encoder.write_header().and_then(|mut writer| writer.write_image_data(&pixels)).map_err(std::io::Error::other)
 }
 
+/// The demo's remote config (see `crate::remote_config`).
+const DEMO_REMOTE_CONFIG: &[(&str, &str)] = &[
+    ("desktop.adminDelete.receive.prod", "8.30.0"),
+    ("desktop.adminDelete.send.prod", "8.30.0"),
+    ("desktop.stickerReply.send.prod", "8.30.0"),
+    ("desktop.groupMemberLabels.edit.prod", "8.30.0"),
+];
+
 pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::UnboundedSender<Event>) {
     let emit = |e: Event| {
         let _ = events.unbounded_send(e);
     };
+    // A remote config with the features this client follows turned on
+    // (made-up versions), except 1:1 polls, so the demo shows what an
+    // account sees once the server sets them.
+    crate::remote_config::set_current(crate::RemoteConfig::from_pairs(DEMO_REMOTE_CONFIG.iter().copied()));
     if let Err(e) = seed(&db, &data_dir).await {
         emit(Event::Error(format!("seeding demo data: {e}")));
     }
@@ -987,7 +999,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 if let Ok(Some(m)) = db.message(message_id).await {
                     let at = now();
                     let expires = duration.map(|s| at + i64::from(s) * 1000);
-                    let _ = db.pin_message(&m.conversation_id, message_id, at, expires, crate::MAX_PINNED_MESSAGES).await;
+                    let _ = db.pin_message(&m.conversation_id, message_id, at, expires, crate::remote_config().pinned_message_limit()).await;
                     let notice = signal_store::Notice::Pinned { by: None, author: m.author.clone(), sent_at: m.sent_at };
                     if let Ok(Some(id)) = db.insert_notice(&m.conversation_id, at, &notice).await {
                         emit(Event::MessageChanged { conversation: m.conversation_id.clone(), message_id: id });
@@ -1595,7 +1607,7 @@ async fn demo_quote(db: &AppDb, quote: Option<i64>) -> Option<Quote> {
 async fn set_pinned(db: &AppDb, conversation: ConversationId, pinned: bool) {
     let mut pins = db.pinned_ids().await.unwrap_or_default();
     pins.retain(|id| *id != conversation);
-    if pinned && pins.len() < crate::storage::MAX_PINNED {
+    if pinned && pins.len() < crate::remote_config().pinned_chat_limit() {
         pins.push(conversation);
     }
     let _ = db.replace_pinned(&pins).await;

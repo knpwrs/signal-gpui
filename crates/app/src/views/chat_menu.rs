@@ -239,7 +239,7 @@ pub fn build(
             PopupMenuItem::new("Unpin chat").icon(IconName::PinOff).on_click(move |_, _, cx| state.read(cx).set_pinned(id.clone(), false)),
         );
     } else if !conversation.archived {
-        let full = state.read(cx).pinned_count() >= signal_backend::MAX_PINNED;
+        let full = state.read(cx).pinned_count() >= signal_backend::remote_config().pinned_chat_limit();
         let (state, id) = (state.clone(), id.clone());
         menu = menu.item(
             PopupMenuItem::new("Pin chat")

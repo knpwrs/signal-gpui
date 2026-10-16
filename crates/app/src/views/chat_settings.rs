@@ -178,7 +178,8 @@ pub fn open(state: Entity<AppState>, conversation: Conversation, window: &mut Wi
                     d.child(div().text_sm().text_color(palette.text_secondary).child(SharedString::from(text)))
                 })
             })
-            .when(conversation.can_label && !conversation.left, |d| {
+            // Desktop's `isEditMemberLabelEnabled` (`groupMemberLabels.edit`).
+            .when(conversation.can_label && !conversation.left && signal_backend::remote_config().group_member_labels_edit(), |d| {
                 let (state, id, emoji, text) = (state.clone(), conversation.id.clone(), label_emoji.clone(), label_text.clone());
                 d.child(
                     div()

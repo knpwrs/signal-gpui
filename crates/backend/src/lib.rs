@@ -35,9 +35,6 @@ pub mod remote_config;
 
 pub use remote_config::{RemoteConfig, current as remote_config};
 
-/// Most conversations an account can pin (Signal's limit).
-pub use storage::MAX_PINNED;
-
 /// Settings key: when `"false"`, read receipts are not sent.
 pub const SETTING_READ_RECEIPTS: &str = "read_receipts";
 /// Settings key: when `"false"`, typing indicators are not sent.
@@ -343,18 +340,12 @@ pub const SETTING_MY_STORY_PRIVACY_SET: &str = "my_story_privacy_set";
 /// Settings key: chats whose stories are hidden (JSON conversation ids).
 pub const SETTING_HIDDEN_STORIES: &str = signal_store::HIDDEN_STORIES;
 
-/// Pinned messages per chat (Desktop's `global.pinnedMessageLimit` default).
-pub const MAX_PINNED_MESSAGES: usize = 3;
-
-/// Whether polls can be made in 1:1 chats (Desktop's `pollSend1to1` remote
-/// config flag, `isPollSend1to1Enabled`). Off, as Desktop is while the flag
-/// isn't set: polls are made in groups only. Received ones show anywhere.
-pub const POLLS_IN_DIRECT_CHATS: bool = false;
-
 /// Whether the composer offers "Poll" in this chat (Desktop's
-/// `CompositionArea`: groups, and 1:1 chats behind the flag above).
+/// `CompositionArea`): groups, and 1:1 chats when the remote config's
+/// `pollSend1to1` flag is on ([`RemoteConfig::poll_send_1to1`]). Received
+/// polls show anywhere.
 pub fn can_create_poll(kind: signal_store::ConversationKind) -> bool {
-    kind == signal_store::ConversationKind::Group || POLLS_IN_DIRECT_CHATS
+    kind == signal_store::ConversationKind::Group || remote_config().poll_send_1to1()
 }
 
 /// The history transfer after linking, as shown while it runs.
@@ -583,13 +574,24 @@ pub struct OutgoingFile {
 /// phones send theirs.
 pub const VOICE_CONTENT_TYPE: &str = "audio/aac";
 
-/// Signal's attachment size limit.
-pub const MAX_ATTACHMENT_BYTES: usize = 100 * 1024 * 1024;
+/// Whether `len` bytes are over Signal's attachment size limit
+/// (`global.attachments.maxBytes`, see [`RemoteConfig::attachment_max_bytes`]).
+pub fn too_big_to_send(len: usize) -> bool {
+    len as u64 > remote_config().attachment_max_bytes()
+}
 
-/// Attachments bigger than this aren't downloaded: 1.25 times the send
-/// limit, Desktop's default for `global.attachments.maxReceiveBytes`
-/// (`getMaximumIncomingAttachmentSize` in `ts/types/AttachmentSize.std.ts`).
-pub const MAX_RECEIVE_ATTACHMENT_BYTES: u64 = MAX_ATTACHMENT_BYTES as u64 * 5 / 4;
+/// A size limit as Desktop shows it (`getRenderDetailsForLimit` in
+/// `ts/types/AttachmentSize.std.ts`): whole kB, MB or GB, in steps of 1024.
+pub fn size_limit_label(bytes: u64) -> String {
+    let units = ["kB", "MB", "GB"];
+    let (mut limit, mut unit) = (bytes as f64, 0);
+    limit /= 1024.;
+    while limit >= 1024. && unit < units.len() - 1 {
+        limit /= 1024.;
+        unit += 1;
+    }
+    format!("{} {}", limit.trunc(), units[unit])
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionState {

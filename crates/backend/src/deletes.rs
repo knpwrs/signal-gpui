@@ -1,23 +1,30 @@
 //! Signal's rules for deleting messages for everyone, following Desktop
 //! (`ts/util/canDeleteForEveryone.preload.ts`): only the author, never in
-//! Note to Self, and only while the message is young. Desktop reads the
-//! limit from remote config (`global.normalDeleteMaxAgeInSeconds`) and
-//! defaults to a day; receivers allow a further day for slow delivery.
+//! Note to Self, and only while the message is young. The limit comes from
+//! the remote config (`global.normalDeleteMaxAgeInSeconds`, a day by
+//! default); receivers allow a further day for slow delivery.
 //!
 //! A group admin may also delete anyone's message in the group (Desktop's
-//! admin delete, `DataMessage.adminDelete`), within its own limit
+//! admin delete, `DataMessage.adminDelete`, behind the remote config's
+//! `adminDelete.send` flag), within its own limit
 //! (`global.adminDeleteMaxAgeInSeconds`, also a day by default). Our own
 //! messages use the normal delete while it's allowed, as in Desktop.
 
 use signal_store::{DeliveryStatus, Direction, Message};
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
-/// How long after sending you can delete for everyone.
-pub const MAX_AGE_MS: i64 = DAY_MS;
 /// Extra time a delete may take to arrive.
 pub const RECEIVE_GRACE_MS: i64 = DAY_MS;
+
+/// How long after sending you can delete for everyone.
+pub fn max_age_ms() -> i64 {
+    crate::remote_config().normal_delete_max_age_ms()
+}
+
 /// How long after a message was sent a group admin can delete it.
-pub const ADMIN_MAX_AGE_MS: i64 = DAY_MS;
+pub fn admin_max_age_ms() -> i64 {
+    crate::remote_config().admin_delete_max_age_ms()
+}
 /// Desktop deletes at most this many messages for everyone at once.
 pub const MAX_FOR_EVERYONE: usize = 30;
 
@@ -37,14 +44,28 @@ pub struct Chat {
     pub group: bool,
     /// We're an admin of the group (and still in it).
     pub we_are_admin: bool,
+    /// The remote config lets us send admin deletes
+    /// ([`crate::RemoteConfig::admin_delete_send`]).
+    pub admin_deletes: bool,
+}
+
+impl Chat {
+    /// A chat's rules, with admin deletes as the remote config has them.
+    pub fn new(note_to_self: bool, group: bool, we_are_admin: bool) -> Self {
+        Self { note_to_self, group, we_are_admin, admin_deletes: crate::remote_config().admin_delete_send() }
+    }
 }
 
 /// Which delete for everyone we can send for `message` at `now`, if any:
 /// the normal one for our own messages while it's allowed, else an admin
-/// delete (Desktop's `canSendDeleteForEveryone`).
+/// delete (Desktop's `canSendDeleteForEveryone`) when the remote config
+/// allows those (`isAdminDeleteSendEnabled`).
 pub fn send_kind(message: &Message, chat: Chat, now: i64) -> Option<Kind> {
     if can_send(message, chat.note_to_self, now) {
         return Some(Kind::Normal);
+    }
+    if !chat.admin_deletes {
+        return None;
     }
     can_send_as_admin(message, chat, now).ok().map(|()| Kind::Admin)
 }
@@ -92,7 +113,7 @@ fn admin(group: bool, is_admin: bool, age: i64, grace: i64) -> Result<(), &'stat
     if !is_admin {
         return Err("not an admin");
     }
-    if age.abs() > ADMIN_MAX_AGE_MS + grace {
+    if age.abs() > admin_max_age_ms() + grace {
         return Err("too old");
     }
     Ok(())
@@ -105,13 +126,13 @@ pub fn can_send(message: &Message, note_to_self: bool, now: i64) -> bool {
         && message.direction == Direction::Outgoing
         && !message.deleted
         && matches!(message.status, DeliveryStatus::Sent | DeliveryStatus::Delivered | DeliveryStatus::Read)
-        && (now - message.sent_at).abs() <= MAX_AGE_MS
+        && (now - message.sent_at).abs() <= max_age_ms()
 }
 
 /// Whether a delete sent at `deleted_at` by the target's author applies.
 /// (The author match is by lookup: deletes only find their sender's messages.)
 pub fn can_receive(target: &Message, note_to_self: bool, deleted_at: i64) -> bool {
-    !note_to_self && !target.deleted && (deleted_at - target.sent_at).abs() <= MAX_AGE_MS + RECEIVE_GRACE_MS
+    !note_to_self && !target.deleted && (deleted_at - target.sent_at).abs() <= max_age_ms() + RECEIVE_GRACE_MS
 }
 
 #[cfg(test)]
@@ -171,7 +192,7 @@ mod tests {
         assert!(!can_receive(&target, true, 1));
     }
 
-    const GROUP: Chat = Chat { note_to_self: false, group: true, we_are_admin: true };
+    const GROUP: Chat = Chat { note_to_self: false, group: true, we_are_admin: true, admin_deletes: true };
 
     #[test]
     fn admins_delete_anyones_message_in_a_group() {
@@ -181,6 +202,8 @@ mod tests {
         assert_eq!(send_kind(&theirs, Chat { we_are_admin: false, ..GROUP }, now), None);
         assert_eq!(send_kind(&theirs, Chat { group: false, ..GROUP }, now), None, "only in groups");
         assert_eq!(send_kind(&theirs, Chat { note_to_self: true, ..GROUP }, now), None);
+        // Not without the remote config's `adminDelete.send`.
+        assert_eq!(send_kind(&theirs, Chat { admin_deletes: false, ..GROUP }, now), None);
         let old = message(Direction::Incoming, DeliveryStatus::Read, now - DAY_MS - 1);
         assert_eq!(can_send_as_admin(&old, GROUP, now), Err("too old"));
         let deleted = Message { deleted: true, ..theirs.clone() };

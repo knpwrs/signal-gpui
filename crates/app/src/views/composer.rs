@@ -248,8 +248,11 @@ impl Composer {
                         let (pack, sticker) = (pack.clone(), sticker.clone());
                         // The sticker replies; the reply stays for a draft
                         // still to send, as in Desktop's `sendStickerMessage`
-                        // (`ts/state/ducks/composer.preload.ts`).
-                        let quote = this.take_reply_for_media(cx);
+                        // (`ts/state/ducks/composer.preload.ts`). Without
+                        // the `stickerReply.send` flag it goes on its own
+                        // and the reply stays, as there.
+                        let replies = signal_backend::remote_config().sticker_reply_send();
+                        let quote = this.take_reply_for_media(replies, cx);
                         this.state.update(cx, |state, cx| state.send_sticker(conversation, pack, sticker, quote, cx));
                         this.close_picker(window, cx);
                         cx.emit(ComposerEvent::Sent);
@@ -261,7 +264,7 @@ impl Composer {
                         // also takes the draft as its caption, so its reply
                         // always goes; here the draft stays in the composer,
                         // so the reply stays with it, as for a sticker.
-                        let quote = this.take_reply_for_media(cx);
+                        let quote = this.take_reply_for_media(true, cx);
                         this.state.read(cx).send(Command::SendGif { conversation, gif: gif.clone(), quote });
                         this.close_picker(window, cx);
                         cx.emit(ComposerEvent::Sent);
@@ -749,7 +752,10 @@ impl Composer {
     /// The reply a sticker or GIF sends with: it stays for a draft still to
     /// send, as in Desktop's `sendStickerMessage`
     /// (`ts/state/ducks/composer.preload.ts`).
-    fn take_reply_for_media(&mut self, cx: &App) -> Option<i64> {
+    fn take_reply_for_media(&mut self, replies: bool, cx: &App) -> Option<i64> {
+        if !replies {
+            return None;
+        }
         let quote = self.reply_to.as_ref().map(|m| m.id);
         if self.input.read(cx).value().is_empty() && self.images.is_empty() && self.files.is_empty() {
             self.reply_to = None;
@@ -946,7 +952,7 @@ impl Composer {
     /// Queues a file to send as it is; `false` (with a message) when it's
     /// over Signal's limit.
     fn add_file(&mut self, bytes: Vec<u8>, file_name: Option<String>, cx: &mut Context<Self>) -> bool {
-        if bytes.len() > signal_backend::MAX_ATTACHMENT_BYTES {
+        if signal_backend::too_big_to_send(bytes.len()) {
             return false;
         }
         self.files.push(PendingFile { bytes: Arc::new(bytes), file_name: file_name.unwrap_or_else(|| "file".into()) });
@@ -979,7 +985,8 @@ impl Composer {
                     .count();
                 let mut problems = Vec::new();
                 if too_big > 0 {
-                    problems.push(format!("{too_big} over Signal's 100 MB limit"));
+                    let limit = signal_backend::size_limit_label(signal_backend::remote_config().attachment_max_bytes());
+                    problems.push(format!("{too_big} over Signal's {limit} limit"));
                 }
                 if unreadable > 0 {
                     problems.push(format!("{unreadable} that couldn't be read"));
@@ -1971,7 +1978,7 @@ mod tests {
             assert!(c.add_file(b"%PDF-1.7".to_vec(), Some("notes.pdf".into()), cx));
             assert!(c.add_file(b"a,b".to_vec(), Some("data.csv".into()), cx));
             // Over Signal's limit: refused.
-            assert!(!c.add_file(vec![0; signal_backend::MAX_ATTACHMENT_BYTES + 1], Some("big.bin".into()), cx));
+            assert!(!c.add_file(vec![0; signal_backend::remote_config().attachment_max_bytes() as usize + 1], Some("big.bin".into()), cx));
         });
         cx.run_until_parked();
         assert_eq!(cx.update(|cx| f.composer.read(cx).files.len()), 2);

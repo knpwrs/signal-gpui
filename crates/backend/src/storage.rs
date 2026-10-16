@@ -186,9 +186,6 @@ fn pin_for(id: &ConversationId) -> Option<PinnedConversation> {
     Some(PinnedConversation { identifier: Some(identifier) })
 }
 
-/// Signal's limit (`MAX_PINNED_CONVERSATIONS` in Desktop and Android).
-pub const MAX_PINNED: usize = 4;
-
 const RECORD_ACCOUNT: u32 = 4; // StorageRecord.account
 const ACCOUNT_PINNED: u32 = 14; // AccountRecord.pinnedConversations
 
@@ -220,7 +217,9 @@ fn edit_account_pins(account: &[u8], edit: &PinEdit) -> anyhow::Result<Option<Ve
     if present == pinning {
         return Ok(None);
     }
-    ensure!(!pinning || pins < MAX_PINNED, "you can pin up to {MAX_PINNED} chats");
+    // Desktop's `getPinnedConversationLimit`, from the remote config.
+    let limit = crate::remote_config().pinned_chat_limit();
+    ensure!(!pinning || pins < limit, "you can pin up to {limit} chats");
 
     let mut out = Vec::with_capacity(account.len() + 64);
     for field in &fields {
@@ -1086,7 +1085,7 @@ mod tests {
 
     #[test]
     fn pin_limit_counts_every_entry() {
-        let pins = (0..MAX_PINNED as u8).map(|i| pin_for(&ConversationId::group(&[i; 32])).unwrap()).collect();
+        let pins = (0..crate::remote_config().pinned_chat_limit() as u8).map(|i| pin_for(&ConversationId::group(&[i; 32])).unwrap()).collect();
         let record = account_record(&AccountRecord { pinned_conversations: pins, ..Default::default() });
         let error = edit_pins(&record, &PinEdit::Pin(ConversationId::direct(ACI))).unwrap_err();
         assert!(error.to_string().contains("up to 4"), "{error}");

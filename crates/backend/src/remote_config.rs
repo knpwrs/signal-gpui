@@ -355,6 +355,14 @@ mod tests {
     }
 
     #[test]
+    fn size_limits_read_like_desktop() {
+        assert_eq!(crate::size_limit_label(100 * MIB), "100 MB");
+        assert_eq!(crate::size_limit_label(125 * MIB), "125 MB");
+        assert_eq!(crate::size_limit_label(1536), "1 kB");
+        assert_eq!(crate::size_limit_label(3 * 1024 * MIB), "3 GB");
+    }
+
+    #[test]
     fn round_trips_through_json() {
         let config = RemoteConfig::from_pairs([("global.pinnedChatLimit", "6")]);
         let json = serde_json::to_string(&config).unwrap();

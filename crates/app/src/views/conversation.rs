@@ -1655,11 +1655,7 @@ impl ConversationView {
         let we_are_admin = state
             .conversation(&self.id)
             .is_some_and(|c| !c.left && me.is_some_and(|me| c.admins.iter().any(|a| a == me)));
-        signal_backend::deletes::Chat {
-            note_to_self: self.note_to_self(cx),
-            group: self.id.as_group().is_some(),
-            we_are_admin,
-        }
+        signal_backend::deletes::Chat::new(self.note_to_self(cx), self.id.as_group().is_some(), we_are_admin)
     }
 
     /// What a deleted message says, in Desktop's words (`Message.dom.tsx`):
@@ -3466,7 +3462,7 @@ fn open_pin_dialog(state: Entity<AppState>, message_id: i64, pinned: usize, disa
                     .child(Button::new("pin-confirm").label("Pin").primary().on_click(move |_, window, cx| {
                         let duration = CHOICES[*confirm.read(cx)].1;
                         window.close_all_dialogs(cx);
-                        if pinned < signal_backend::MAX_PINNED_MESSAGES {
+                        if pinned < signal_backend::remote_config().pinned_message_limit() {
                             state.read(cx).send(Command::PinMessage { message_id, duration });
                             return;
                         }
@@ -3492,7 +3488,7 @@ fn open_pin_dialog(state: Entity<AppState>, message_id: i64, pinned: usize, disa
 /// An attachment over Signal's receive limit, which isn't downloaded or
 /// shown (Desktop's `wasTooBig`, `ts/jobs/AttachmentDownloadManager.preload.ts`).
 fn too_big(attachment: &AttachmentMeta) -> bool {
-    attachment.local_path.is_none() && attachment.size > signal_backend::MAX_RECEIVE_ATTACHMENT_BYTES
+    attachment.local_path.is_none() && attachment.size > signal_backend::remote_config().attachment_max_receive_bytes()
 }
 
 /// What stands in for attachments too big to receive, in Desktop's words
@@ -3730,7 +3726,7 @@ mod tests {
     fn admin_deletes_confirm_unless_all_are_ours() {
         use signal_backend::deletes::Chat;
         let now = 10_000;
-        let admin = Chat { note_to_self: false, group: true, we_are_admin: true };
+        let admin = Chat { note_to_self: false, group: true, we_are_admin: true, admin_deletes: true };
         let theirs = message(3, now - 100);
         let ours = Message { direction: Direction::Outgoing, author: None, ..message(4, now - 100) };
         let everyone = |m: &[Message], chat| super::everyone_delete(m, chat, now);
@@ -4008,7 +4004,7 @@ mod tests {
             voice: false,
             remote: None,
         };
-        let limit = signal_backend::MAX_RECEIVE_ATTACHMENT_BYTES;
+        let limit = signal_backend::remote_config().attachment_max_receive_bytes();
         let insert = |sent_at: i64, attachments: Vec<AttachmentMeta>| {
             let db = backend.db().clone();
             let message = signal_store::NewMessage {

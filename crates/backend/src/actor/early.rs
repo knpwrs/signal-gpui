@@ -242,6 +242,11 @@ impl Actor {
         let Action::AdminDelete { conversation, target_author, target_sent_at, by, sent_at } = action else {
             return Outcome::Refused;
         };
+        // Desktop's `isAdminDeleteReceiveEnabled` (`ts/background.preload.ts`).
+        if !crate::remote_config().admin_delete_receive() {
+            info!("ignoring an admin delete: not enabled");
+            return Outcome::Refused;
+        }
         let message = match self.db.find_message(conversation, target_author.as_deref(), *target_sent_at).await {
             Ok(Some(message)) => message,
             Ok(None) => {

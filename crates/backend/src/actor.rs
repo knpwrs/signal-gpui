@@ -100,7 +100,6 @@ const SETTING_VERIFIED: &str = "verified.";
 /// `identity.<ACI>`: their identity key (hex) as last seen, to notice a
 /// change.
 const SETTING_IDENTITY: &str = "identity.";
-pub(crate) const AUTO_DOWNLOAD_MAX: u64 = 25 * 1024 * 1024;
 
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
@@ -959,7 +958,7 @@ impl Actor {
                         let gif = flags & attachment_pointer::Flags::Gif as u32 != 0;
                         let voice = flags & attachment_pointer::Flags::VoiceMessage as u32 != 0;
                         (gif || voice || p.content_type.as_deref().is_some_and(|c| c.starts_with("image/")))
-                            && p.size.is_some_and(|size| u64::from(size) <= AUTO_DOWNLOAD_MAX)
+                            && p.size.is_some_and(|size| crate::remote_config().auto_downloads(u64::from(size)))
                     })
                     .collect();
                 // Re-deliveries are de-duplicated by the store; only notify once.
@@ -1014,7 +1013,7 @@ impl Actor {
                         }
                         if let Some(pointer) = preview_image.filter(|p| {
                             p.content_type.as_deref().is_some_and(|c| c.starts_with("image/"))
-                                && p.size.is_some_and(|size| u64::from(size) <= AUTO_DOWNLOAD_MAX)
+                                && p.size.is_some_and(|size| crate::remote_config().auto_downloads(u64::from(size)))
                         }) {
                             let this = self.clone();
                             let manager = manager.clone();
@@ -1171,7 +1170,7 @@ impl Actor {
         at: i64,
     ) {
         let expires = duration.map(|s| at + i64::from(s) * 1000);
-        match self.db.pin_message(conversation, target, at, expires, crate::MAX_PINNED_MESSAGES).await {
+        match self.db.pin_message(conversation, target, at, expires, crate::remote_config().pinned_message_limit()).await {
             Ok(_) => {
                 let notice = signal_store::Notice::Pinned { by, author: target_author, sent_at: target_sent_at };
                 self.notice(conversation, at, notice).await;
@@ -1658,8 +1657,9 @@ impl Actor {
         let mut pins = self.db.pinned_ids().await.unwrap_or_default();
         pins.retain(|id| *id != conversation);
         if pinned {
-            if pins.len() >= storage::MAX_PINNED {
-                return self.emit(Event::Error(format!("You can pin up to {} chats", storage::MAX_PINNED)));
+            let limit = crate::remote_config().pinned_chat_limit();
+            if pins.len() >= limit {
+                return self.emit(Event::Error(format!("You can pin up to {limit} chats")));
             }
             pins.push(conversation.clone());
         }
@@ -2945,8 +2945,9 @@ impl Actor {
                 Ok(Err(error)) => return self.error("can't send image", format!("{error:#}")),
                 Err(error) => return self.error("can't send image", error),
             };
-            if bytes.len() > crate::MAX_ATTACHMENT_BYTES {
-                return self.error("can't send image", "larger than Signal's 100 MB limit");
+            if crate::too_big_to_send(bytes.len()) {
+                let limit = crate::size_limit_label(crate::remote_config().attachment_max_bytes());
+                return self.error("can't send image", format!("larger than Signal's {limit} limit"));
             }
             let Some((kind, width, height)) = media::probe(&bytes) else {
                 return self.error("can't send file", "only PNG, JPEG, GIF and WebP images can be sent");
@@ -3000,8 +3001,9 @@ impl Actor {
         mentions: Vec<String>,
         styles: Vec<signal_store::StyleSpan>,
     ) {
-        if file.bytes.len() > crate::MAX_ATTACHMENT_BYTES {
-            return self.error("can't send file", "larger than Signal's 100 MB limit");
+        if crate::too_big_to_send(file.bytes.len()) {
+            let limit = crate::size_limit_label(crate::remote_config().attachment_max_bytes());
+            return self.error("can't send file", format!("larger than Signal's {limit} limit"));
         }
         let name = media::safe_file_name(&file.file_name);
         let dir = self.config.data_dir.join("attachments").join(format!("sent-{}", now_millis()));
@@ -3212,11 +3214,11 @@ impl Actor {
         };
         let conversation = &target.conversation_id;
         let left = self.db.conversation(conversation).await.ok().flatten().is_some_and(|c| c.left);
-        let chat = crate::deletes::Chat {
-            note_to_self: self.is_note_to_self(conversation),
-            group: conversation.as_group().is_some(),
-            we_are_admin: !left && self.is_group_admin(conversation, &self.self_aci()).await,
-        };
+        let chat = crate::deletes::Chat::new(
+            self.is_note_to_self(conversation),
+            conversation.as_group().is_some(),
+            !left && self.is_group_admin(conversation, &self.self_aci()).await,
+        );
         let Some(kind) = crate::deletes::send_kind(&target, chat, now_millis()) else {
             return self.error(
                 "cannot delete for everyone",
@@ -4005,7 +4007,7 @@ impl Actor {
     ) {
         // Too big to receive: left undownloaded, as Desktop leaves it.
         let size = pointer.size.map_or(0, u64::from);
-        if size > crate::MAX_RECEIVE_ATTACHMENT_BYTES {
+        if size > crate::remote_config().attachment_max_receive_bytes() {
             return info!(size, "not downloading an attachment over the receive limit");
         }
         let bytes = match manager.get_attachment(pointer).await {
@@ -4040,7 +4042,7 @@ impl Actor {
         meta: &AttachmentMeta,
     ) -> anyhow::Result<()> {
         let remote = meta.remote.as_ref().context("no locator")?;
-        if meta.size > crate::MAX_RECEIVE_ATTACHMENT_BYTES {
+        if meta.size > crate::remote_config().attachment_max_receive_bytes() {
             anyhow::bail!("it's over Signal's receive limit");
         }
         let bytes = crate::history::download_attachment(manager, remote, meta.size).await?;

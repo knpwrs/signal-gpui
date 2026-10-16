@@ -642,7 +642,7 @@ async fn import_item(
     let id = db.insert_message(&message).await?;
     for (index, attachment) in message.attachments.iter().enumerate() {
         let photo = attachment.gif || attachment.voice || attachment.content_type.starts_with("image/");
-        if attachment.remote.is_some() && photo && attachment.size <= crate::actor::AUTO_DOWNLOAD_MAX {
+        if attachment.remote.is_some() && photo && crate::remote_config().auto_downloads(attachment.size) {
             imported.downloads.push((id, index));
         }
     }
@@ -677,7 +677,7 @@ async fn import_item(
             Some(PinExpiry::PinExpiresAtTimestamp(at)) => Some(at as i64),
             _ => None,
         };
-        db.pin_message(conversation, id, pin.pinnedAtTimestamp as i64, expires, crate::MAX_PINNED_MESSAGES).await?;
+        db.pin_message(conversation, id, pin.pinnedAtTimestamp as i64, expires, crate::remote_config().pinned_message_limit()).await?;
     }
     Ok(true)
 }

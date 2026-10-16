@@ -141,7 +141,8 @@ impl Actor {
     /// Desktop's "New poll" send: a message with only the poll (no body),
     /// needing a client that knows polls.
     pub(super) async fn send_poll(self: Rc<Self>, conversation: ConversationId, question: String, options: Vec<String>, allow_multiple: bool) {
-        if conversation.as_group().is_none() && !crate::POLLS_IN_DIRECT_CHATS {
+        // Desktop's `enqueuePollCreateForSend`.
+        if conversation.as_group().is_none() && !crate::remote_config().poll_send_1to1() {
             return self.error("cannot send poll", "polls can only be made in groups");
         }
         if let Some(error) = signal_store::poll_send_error(&question, &options) {
