@@ -22,6 +22,7 @@ use crate::theme::{Palette, color_for};
 use crate::views::common::{ClosedByClick, avatar, person_avatar, collapse_whitespace, find_links, conversation_avatar, day_label, message_time, same_day, status_icon, StatusPlace};
 use crate::views::composer::{Composer, ComposerEvent};
 use crate::views::emoji_picker::{EmojiPicker, PickerEvent};
+use crate::shortcuts::timeline;
 
 const PAGE: u32 = 60;
 /// Consecutive messages from one author within this window are grouped.
@@ -86,6 +87,18 @@ pub struct ConversationView {
     spoofing_dismissed: bool,
     /// For a 1:1 chat's hero: what's known about them.
     hero_details: Option<signal_backend::ContactDetails>,
+    /// Desktop's targeted message, which the timeline's keys move and the
+    /// message shortcuts act on (see the timeline's `impl` below).
+    targeted: Option<i64>,
+    /// The timeline's own focus (the composer has the chat's), and whether
+    /// it has it (the targeted message shows only then, as Desktop's focus
+    /// ring does).
+    timeline_focus: FocusHandle,
+    timeline_focused: bool,
+    /// Unread messages when the chat opened, for ⌘J.
+    unread_at_open: u32,
+    /// Target the newest message once it's loaded (End, from older ones).
+    target_newest: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -145,7 +158,17 @@ impl ConversationView {
             });
         });
 
+        let timeline_focus = cx.focus_handle();
+        let unread_at_open = state.read(cx).conversation(&id).map_or(0, |c| c.unread_count);
         let subscriptions = vec![
+            cx.on_focus(&timeline_focus, window, |this, _, cx| {
+                this.timeline_focused = true;
+                cx.notify();
+            }),
+            cx.on_blur(&timeline_focus, window, |this, _, cx| {
+                this.timeline_focused = false;
+                cx.notify();
+            }),
             cx.subscribe(&state, |this, _, event: &AppEvent, cx| match event {
                 AppEvent::MessageChanged { conversation, message_id } if *conversation == this.id => {
                     this.on_message_changed(*message_id, cx);
@@ -254,6 +277,11 @@ impl ConversationView {
             acknowledged_collisions: Default::default(),
             spoofing_dismissed: false,
             hero_details: None,
+            targeted: None,
+            timeline_focus,
+            timeline_focused: false,
+            unread_at_open,
+            target_newest: false,
             _subscriptions: subscriptions,
         };
         this.load_request_details(cx);
@@ -809,6 +837,9 @@ impl ConversationView {
                         this.list.reset(this.messages.len());
                         this.list.set_follow_mode(FollowMode::Tail);
                         this.list.scroll_to_end();
+                        if std::mem::take(&mut this.target_newest) {
+                            this.targeted = this.messages.last().map(|m| m.id);
+                        }
                     }
                     Err(e) => tracing::error!("loading messages: {e}"),
                 }
@@ -1194,8 +1225,10 @@ impl ConversationView {
         let is_group = self.state.read(cx).conversation(&self.id).is_some_and(|c| c.kind == ConversationKind::Group);
 
         let show_day = prev.is_none_or(|p| !same_day(p.sent_at, message.sent_at));
+        let targeted = self.timeline_focused && self.targeted == Some(message.id);
         if let Some(notice) = &message.notice {
             let notice = self.render_notice(notice, show_day, message.sent_at, palette, cx);
+            let notice = div().w_full().when(targeted, |d| d.bg(palette.row_hover)).child(notice).into_any_element();
             return match (ix == 0 && !self.has_more).then(|| self.render_hero(cx)).flatten() {
                 Some(hero) => div().flex().flex_col().w_full().child(hero).child(notice).into_any_element(),
                 None => notice,
@@ -1258,8 +1291,21 @@ impl ConversationView {
                         ),
                 )
             })
-            // A search result just jumped to.
-            .when(self.highlight == Some(message_id), |d| d.bg(palette.row_hover))
+            // A search result just jumped to, or the targeted message.
+            .when(self.highlight == Some(message_id) || targeted, |d| d.bg(palette.row_hover))
+            .when(targeted, |d| d.debug_selector(move || format!("targeted-{message_id}")))
+            // Desktop focuses a message clicked (outside select mode),
+            // which targets it.
+            .when(selecting.is_none(), |d| {
+                d.on_mouse_down(
+                    gpui_kit::MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        if let Some(ix) = this.messages.iter().position(|m| m.id == message_id) {
+                            this.target(ix, window, cx);
+                        }
+                    }),
+                )
+            })
             .when(first_in_group, |d| d.pt_2())
             .when(!first_in_group, |d| d.pt(px(2.)))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
@@ -3538,7 +3584,10 @@ impl Focusable for ConversationView {
 }
 
 impl Render for ConversationView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Read fresh each draw; the focus subscriptions redraw it as focus
+        // comes and goes.
+        self.timeline_focused = self.timeline_focus.is_focused(window);
         let palette = Palette::get(cx);
         let entity = cx.entity();
         let typing = self.render_typing(palette, cx);
@@ -3560,6 +3609,16 @@ impl Render for ConversationView {
                     .relative()
                     .flex_1()
                     .min_h_0()
+                    .key_context(crate::shortcuts::TIMELINE)
+                    .track_focus(&self.timeline_focus)
+                    .on_action(cx.listener(|this, _: &timeline::SelectPrevious, window, cx| this.move_target(-1, window, cx)))
+                    .on_action(cx.listener(|this, _: &timeline::SelectNext, window, cx| this.move_target(1, window, cx)))
+                    .on_action(cx.listener(|this, _: &timeline::PreviousPage, window, cx| this.page_target(true, window, cx)))
+                    .on_action(cx.listener(|this, _: &timeline::NextPage, window, cx| this.page_target(false, window, cx)))
+                    .on_action(cx.listener(|this, _: &timeline::SelectFirst, window, cx| this.target_first(window, cx)))
+                    .on_action(cx.listener(|this, _: &timeline::SelectLast, window, cx| this.target_last(window, cx)))
+                    .on_action(cx.listener(|this, _: &timeline::OpenSelected, window, cx| this.open_targeted(window, cx)))
+                    .on_action(cx.listener(|this, _: &timeline::LeaveTimeline, window, cx| this.leave_timeline(window, cx)))
                     .image_cache(self.image_cache.clone())
                     .when(self.messages.is_empty() && !self.has_more, |d| d.children(self.render_hero(cx)))
                     .child(
@@ -4169,6 +4228,252 @@ fn confirm_admin_delete(state: Entity<AppState>, message_ids: Vec<i64>, window: 
 fn capitalize(text: &str) -> String {
     let mut chars = text.chars();
     chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
+}
+
+
+/// The timeline's keyboard, as Signal Desktop's (`Timeline.dom.tsx`
+/// `#handleKeyDown`, `Message.dom.tsx` `#handleOpen`, and the message
+/// shortcuts in `addGlobalKeyboardShortcuts.preload.ts`): a targeted
+/// message that the arrow keys move and the message shortcuts act on.
+impl ConversationView {
+    /// The targeted message's place in the loaded list.
+    fn targeted_index(&self) -> Option<usize> {
+        let id = self.targeted?;
+        self.messages.iter().position(|m| m.id == id)
+    }
+
+    fn targeted_message(&self) -> Option<Message> {
+        self.targeted_index().map(|ix| self.messages[ix].clone())
+    }
+
+    /// Targets the item at `ix`, shows it, and gives the timeline the
+    /// keyboard.
+    fn target(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(message) = self.messages.get(ix) else { return };
+        self.targeted = Some(message.id);
+        self.list.scroll_to_reveal_item(ix);
+        window.focus(&self.timeline_focus, cx);
+        cx.notify();
+    }
+
+    /// ↑ and ↓: the item above or below, stopping at the ends (older
+    /// messages load as the list nears the top).
+    fn move_target(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.targeted_index() else { return };
+        let next = ix as isize + step;
+        if next >= 0 && (next as usize) < self.messages.len() {
+            self.target(next as usize, window, cx);
+        }
+    }
+
+    /// Page Up and Page Down: the item about a screen away.
+    fn page_target(&mut self, up: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mut ix) = self.targeted_index() else { return };
+        let page = self.list.viewport_bounds().size.height;
+        let mut travelled = px(0.);
+        loop {
+            let next = if up { ix.checked_sub(1) } else { Some(ix + 1).filter(|&n| n < self.messages.len()) };
+            let Some(next) = next else { break };
+            ix = next;
+            // Items not laid out yet count as a typical message.
+            travelled += self.list.bounds_for_item(ix).map_or(px(60.), |b| b.size.height);
+            if travelled >= page {
+                break;
+            }
+        }
+        self.target(ix, window, cx);
+    }
+
+    /// Home or ⌘↑: the first item loaded.
+    fn target_first(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.targeted.is_some() && !self.messages.is_empty() {
+            self.target(0, window, cx);
+        }
+    }
+
+    /// End or ⌘↓: down to the newest message (Desktop's `#scrollDown`),
+    /// targeted once it's loaded.
+    fn target_last(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_newer {
+            self.target_newest = true;
+            self.load_initial(cx);
+            self.caught_up(cx);
+            window.focus(&self.timeline_focus, cx);
+            return;
+        }
+        self.list.set_follow_mode(FollowMode::Tail);
+        if let Some(last) = self.messages.len().checked_sub(1) {
+            self.target(last, window, cx);
+        }
+        self.list.scroll_to_end();
+    }
+
+    /// Desktop's ⌘J: the oldest message that was unread when the chat
+    /// opened (where its "unread messages" line is), or the last one.
+    pub fn target_oldest_unread_or_last(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let unread = self.unread_at_open as usize;
+        let incoming: Vec<usize> = (0..self.messages.len())
+            .filter(|&ix| self.messages[ix].notice.is_none() && self.messages[ix].direction == Direction::Incoming)
+            .collect();
+        let oldest_unread = (unread > 0).then(|| incoming.len().checked_sub(unread).map_or(incoming.first(), |at| incoming.get(at))).flatten();
+        match oldest_unread.copied().or(self.messages.len().checked_sub(1)) {
+            Some(ix) => self.target(ix, window, cx),
+            None => window.focus(&self.timeline_focus, cx),
+        }
+    }
+
+    /// Esc in the timeline: back to typing.
+    fn leave_timeline(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.targeted = None;
+        let handle = self.composer.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    /// Enter or Space on the targeted message: Desktop's `#handleOpen`. A
+    /// view-once message opens (or says why it can't); a file opens in its
+    /// app; a voice message or audio plays; anything not downloaded starts
+    /// downloading; a photo or video opens full-window.
+    fn open_targeted(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(message) = self.targeted_message() else { return };
+        if message.deleted || message.notice.is_some() {
+            return;
+        }
+        let id = message.id;
+        let outgoing = message.direction == Direction::Outgoing;
+        if let Some(view_once) = message.view_once {
+            let first = message.attachments.first();
+            match (view_once, outgoing, first) {
+                (ViewOnce::Ready, false, Some(a)) if a.local_path.is_some() => {
+                    self.state.read(cx).send(Command::OpenViewOnce { message_id: id })
+                }
+                (ViewOnce::Ready, false, Some(_)) => self.state.read(cx).send(Command::FetchAttachment { message_id: id, index: 0 }),
+                _ => {
+                    if let Some(toast) = view_once_toast(view_once, outgoing) {
+                        use gpui_kit::component::WindowExt as _;
+                        window.push_notification(gpui_kit::component::notification::Notification::new().message(toast), cx);
+                    }
+                }
+            }
+            return;
+        }
+        let Some(first) = message.attachments.first() else { return };
+        if too_big(first) {
+            return;
+        }
+        let kind = &first.content_type;
+        let media = (kind.starts_with("image/") || kind.starts_with("video/")) && !first.sticker;
+        let audio = kind.starts_with("audio/");
+        match first.local_path.as_ref().map(std::path::PathBuf::from) {
+            // Desktop's generic attachment: opened.
+            Some(path) if !media && !audio && !first.sticker => cx.open_with_system(&path),
+            Some(path) if audio => {
+                let title = self.reactor_name(message.author.as_deref(), cx);
+                self.state.update(cx, |state, cx| state.toggle_audio(id, 0, path, title, cx));
+            }
+            None if !first.sticker => self.state.read(cx).send(Command::FetchAttachment { message_id: id, index: 0 }),
+            Some(path) if kind.starts_with("video/") && !first.gif => self.state.update(cx, |state, cx| {
+                let video = crate::views::video_viewer::ViewedVideo { path, file_name: first.file_name.clone(), view_once: false };
+                state.view_video(video, cx);
+            }),
+            Some(_) if kind.starts_with("image/") => {
+                if let Some(image) = viewed_image(first) {
+                    self.state.update(cx, |state, cx| state.view_image(image, cx));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Desktop's ⌘D: the targeted message's details.
+    pub fn show_targeted_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(message) = self.targeted_message().filter(|m| m.notice.is_none()) {
+            crate::views::message_info::open(self.state.clone(), message, window, cx);
+        }
+    }
+
+    /// Whether replies and reactions are offered here (Desktop's
+    /// `canReplyOrReact`): not in an ended group, a blocked chat or a
+    /// message request, nor the Signal chat.
+    fn can_reply_or_react(&self, cx: &App) -> bool {
+        !self.ended(cx)
+            && !self.id.is_signal()
+            && !self.state.read(cx).conversation(&self.id).is_some_and(|c| c.blocked || !c.accepted)
+    }
+
+    /// Desktop's ⌘⇧R: a reply being written is dropped; otherwise the
+    /// targeted message is replied to.
+    pub fn toggle_reply_to_targeted(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let message = self
+            .targeted_message()
+            .filter(|m| m.notice.is_none() && !m.deleted && self.can_reply_or_react(cx));
+        self.composer.update(cx, |composer, cx| composer.toggle_reply(message, window, cx));
+    }
+
+    /// Desktop's ⌘⇧E (`TimelineMessage`'s `onReactShortcut`): the targeted
+    /// message's reactions open or close.
+    pub fn toggle_reactions_for_targeted(&mut self, cx: &mut Context<Self>) {
+        let Some(message) = self.targeted_message() else { return };
+        if message.notice.is_some() || message.deleted || !self.can_reply_or_react(cx) {
+            return;
+        }
+        self.reaction_bar_for = if self.reaction_bar_for == Some(message.id) { None } else { Some(message.id) };
+        cx.notify();
+    }
+
+    /// Desktop's ⌘S: the targeted message's attachments, saved.
+    pub fn save_targeted(&mut self, cx: &mut Context<Self>) {
+        let Some(message) = self.targeted_message() else { return };
+        // View-once media can't be saved (Desktop's `canDownload`).
+        let downloadable: Vec<AttachmentMeta> = message
+            .attachments
+            .iter()
+            .filter(|a| a.local_path.is_some() && !a.sticker && message.view_once.is_none())
+            .cloned()
+            .collect();
+        if !downloadable.is_empty() {
+            download_attachments(downloadable, cx);
+        }
+    }
+
+    /// What ⌘⇧D and ⌘⇧S act on: the messages picked in select mode, or
+    /// the targeted one (Desktop's `getSelectedOrTargetedMessageIds`).
+    fn selected_or_targeted(&self) -> Vec<Message> {
+        match &self.selecting {
+            Some(selected) if !selected.is_empty() => self.messages.iter().filter(|m| selected.contains(&m.id)).cloned().collect(),
+            _ => self.targeted_message().filter(|m| m.notice.is_none()).into_iter().collect(),
+        }
+    }
+
+    /// Desktop's ⌘⇧D: the delete dialog for them.
+    pub fn delete_selected_or_targeted(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_kit::component::WindowExt as _;
+        let chosen = self.selected_or_targeted();
+        if chosen.is_empty() || window.has_active_dialog(cx) {
+            return;
+        }
+        let everyone = everyone_delete(&chosen, self.delete_chat(cx), now_millis());
+        let ids = chosen.iter().map(|m| m.id).collect();
+        confirm_delete(self.state.clone(), ids, self.note_to_self(cx), everyone, window, cx);
+        self.selecting = None;
+        cx.notify();
+    }
+
+    /// Desktop's ⌘⇧S: the forward dialog for them, when they can go
+    /// (not deleted, polls or view-once, and not too many).
+    pub fn forward_selected_or_targeted(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_kit::component::WindowExt as _;
+        let chosen = self.selected_or_targeted();
+        let forwardable = !chosen.is_empty()
+            && chosen.len() <= crate::views::forward::MAX_MESSAGES
+            && chosen.iter().all(|m| !m.deleted && m.poll.is_none() && m.view_once.is_none());
+        if !forwardable || window.has_active_dialog(cx) {
+            return;
+        }
+        self.selecting = None;
+        crate::views::forward::open(self.state.clone(), chosen.iter().map(|m| m.id).collect(), window, cx);
+        cx.notify();
+    }
 }
 
 #[cfg(test)]
@@ -5587,6 +5892,98 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(read, "opening the chat didn't read the vote");
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn arrow_keys_move_a_targeted_message_that_enter_opens(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        let photos = wait_for_messages(&backend, NOTE_TO_SELF, 3, |m| !m.attachments.is_empty());
+        cx.update(crate::shortcuts::bind_keys);
+        let (mut cx, view) = open_view(cx, &backend, NOTE_TO_SELF);
+        let cx = &mut cx;
+        let opened = std::rc::Rc::new(std::cell::Cell::new(0));
+        cx.update(|_, cx| {
+            let opened = opened.clone();
+            let state = view.read(cx).state.clone();
+            cx.subscribe(&state, move |_, event: &AppEvent, _| {
+                if let AppEvent::ViewImage(_) = event {
+                    opened.set(opened.get() + 1);
+                }
+            })
+            .detach();
+        });
+        let targeted = |cx: &mut VisualTestContext| view.read_with(cx, |v, _| v.targeted);
+
+        // Clicking a message targets it (beside the bubble, not on the photo).
+        let row = bounds(cx, format!("row-{}", photos[2].id));
+        cx.simulate_click(row.origin + gpui_kit::point(px(8.), px(8.)), gpui_kit::Modifiers::none());
+        assert_eq!(targeted(cx), Some(photos[2].id));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |v, _| v.timeline_focused));
+        bounds(cx, format!("targeted-{}", photos[2].id));
+        assert_eq!(opened.get(), 0, "clicking beside a photo doesn't open it");
+
+        // ↑ and ↓ move it through the timeline, one item at a time.
+        let ids: Vec<i64> = view.read_with(cx, |v, _| v.messages.iter().map(|m| m.id).collect());
+        let at = ids.iter().position(|&id| id == photos[2].id).unwrap();
+        cx.simulate_keystrokes("up");
+        assert_eq!(targeted(cx), Some(ids[at - 1]));
+        cx.simulate_keystrokes("down down");
+        assert_eq!(targeted(cx), ids.get(at + 1).copied().or(Some(ids[at])));
+        // Home: the first loaded; End: the newest.
+        cx.simulate_keystrokes("home");
+        assert_eq!(targeted(cx), Some(ids[0]));
+        cx.simulate_keystrokes("cmd-down");
+        assert_eq!(targeted(cx), ids.last().copied());
+
+        // Enter on a photo opens it full-window.
+        let row = bounds(cx, format!("row-{}", photos[0].id));
+        cx.simulate_click(row.origin + gpui_kit::point(px(8.), px(8.)), gpui_kit::Modifiers::none());
+        cx.simulate_keystrokes("enter");
+        assert_eq!(opened.get(), 1);
+
+        // ⌘⇧E's reactions and ⌘⇧R's reply, for the targeted message.
+        cx.update(|_, cx| view.update(cx, |v, cx| v.toggle_reactions_for_targeted(cx)));
+        assert_eq!(view.read_with(cx, |v, _| v.reaction_bar_for), Some(photos[0].id));
+        cx.update(|window, cx| view.update(cx, |v, cx| v.toggle_reply_to_targeted(window, cx)));
+        let replying = |cx: &mut VisualTestContext| view.read_with(cx, |v, cx| v.composer.read(cx).replying_to());
+        assert_eq!(replying(cx), Some(photos[0].id));
+        cx.update(|window, cx| view.update(cx, |v, cx| v.toggle_reply_to_targeted(window, cx)));
+        assert_eq!(replying(cx), None, "pressed again, the reply goes");
+
+        // Esc: back to typing.
+        cx.update(|window, cx| {
+            let handle = view.read(cx).timeline_focus.clone();
+            window.focus(&handle, cx);
+        });
+        cx.simulate_keystrokes("escape");
+        assert_eq!(targeted(cx), None);
+        assert!(cx.update(|window, cx| view.read(cx).composer.read(cx).focus_handle(cx).is_focused(window)));
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn command_j_targets_the_oldest_unread_message(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        let messages = wait_for_messages(&backend, NOTE_TO_SELF, 3, |m| !m.attachments.is_empty());
+        let (mut cx, view) = open_view(cx, &backend, NOTE_TO_SELF);
+        let cx = &mut cx;
+        bounds(cx, format!("row-{}", messages[0].id));
+        // Nothing unread: the last message.
+        cx.update(|window, cx| view.update(cx, |v, cx| v.target_oldest_unread_or_last(window, cx)));
+        let last = view.read_with(cx, |v, _| v.messages.last().map(|m| m.id));
+        assert_eq!(view.read_with(cx, |v, _| v.targeted), last);
+        // Two were unread when it opened: the older of the last two incoming.
+        let incoming: Vec<i64> = view.read_with(cx, |v, _| {
+            v.messages.iter().filter(|m| m.notice.is_none() && m.direction == Direction::Incoming).map(|m| m.id).collect()
+        });
+        if incoming.len() >= 2 {
+            view.update(cx, |v, _| v.unread_at_open = 2);
+            cx.update(|window, cx| view.update(cx, |v, cx| v.target_oldest_unread_or_last(window, cx)));
+            assert_eq!(view.read_with(cx, |v, _| v.targeted), Some(incoming[incoming.len() - 2]));
+        }
         backend.shutdown();
     }
 }

@@ -5,6 +5,9 @@
 //! `CallScreen`, `CallingLobby`); each is handled where it applies (see
 //! `views::root` and `views::call`).
 //!
+//! In the timeline (`views::conversation`), the arrow keys move a targeted
+//! message, as Desktop's do, and the message shortcuts act on it.
+//!
 //! Desktop's that aren't here: "Navigate by section" (⌘T), "Open chat menu"
 //! (⌘⇧L), "Open context menu for selected message" (⌘F12), "Expand
 //! composer" (⌘⇧K) and sending in it (⌘Enter), and "Toggle expanded
@@ -42,6 +45,28 @@ gpui_kit::actions!(
     ]
 );
 
+gpui_kit::actions!(
+    signal,
+    [
+        FocusOldestUnreadOrLast,
+        MessageDetails,
+        ToggleReply,
+        ToggleReactionPicker,
+        SaveAttachment,
+        DeleteMessages,
+        ForwardMessages,
+    ]
+);
+
+/// The timeline's keys, while it has the keyboard (Desktop's
+/// `Timeline.dom.tsx` `#handleKeyDown`).
+pub mod timeline {
+    gpui_kit::actions!(
+        timeline,
+        [SelectPrevious, SelectNext, PreviousPage, NextPage, SelectFirst, SelectLast, OpenSelected, LeaveTimeline]
+    );
+}
+
 /// ⌘1 to ⌘9: the chat at that place in the list (0 for the first).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, gpui_kit::Action)]
 #[action(namespace = signal, no_json)]
@@ -49,6 +74,8 @@ pub struct JumpToChat(pub usize);
 
 /// Key context of the main window's content.
 const MAIN: Option<&str> = Some("Signal");
+/// Key context of the timeline.
+pub const TIMELINE: &str = "Timeline";
 /// Key context of the full-window call screen and lobby.
 pub const CALL_SCREEN: &str = "CallScreen";
 
@@ -84,6 +111,24 @@ pub fn bind_keys(cx: &mut App) {
         // the text fields' own, so they're tried first.
         KeyBinding::new("ctrl-shift-a", AcceptAudioCall, Some("Input")),
         KeyBinding::new("ctrl-shift-e", HangUp, Some("Input")),
+        KeyBinding::new("cmd-j", FocusOldestUnreadOrLast, MAIN),
+        KeyBinding::new("cmd-d", MessageDetails, MAIN),
+        KeyBinding::new("cmd-shift-r", ToggleReply, MAIN),
+        KeyBinding::new("cmd-shift-e", ToggleReactionPicker, MAIN),
+        KeyBinding::new("cmd-s", SaveAttachment, MAIN),
+        KeyBinding::new("cmd-shift-d", DeleteMessages, MAIN),
+        KeyBinding::new("cmd-shift-s", ForwardMessages, MAIN),
+        KeyBinding::new("up", timeline::SelectPrevious, Some(TIMELINE)),
+        KeyBinding::new("down", timeline::SelectNext, Some(TIMELINE)),
+        KeyBinding::new("pageup", timeline::PreviousPage, Some(TIMELINE)),
+        KeyBinding::new("pagedown", timeline::NextPage, Some(TIMELINE)),
+        KeyBinding::new("home", timeline::SelectFirst, Some(TIMELINE)),
+        KeyBinding::new("cmd-up", timeline::SelectFirst, Some(TIMELINE)),
+        KeyBinding::new("end", timeline::SelectLast, Some(TIMELINE)),
+        KeyBinding::new("cmd-down", timeline::SelectLast, Some(TIMELINE)),
+        KeyBinding::new("enter", timeline::OpenSelected, Some(TIMELINE)),
+        KeyBinding::new("space", timeline::OpenSelected, Some(TIMELINE)),
+        KeyBinding::new("escape", timeline::LeaveTimeline, Some(TIMELINE)),
         KeyBinding::new("shift-m", ToggleCallAudio, Some(CALL_SCREEN)),
         KeyBinding::new("shift-v", ToggleCallVideo, Some(CALL_SCREEN)),
         KeyBinding::new("shift-h", ToggleRaiseHand, Some(CALL_SCREEN)),
@@ -116,6 +161,7 @@ pub const GUIDE: &[(&str, &[Shortcut])] = &[
             s("Previous unread chat", &[&["Option", "Shift", "↑"]]),
             s("Next unread chat", &[&["Option", "Shift", "↓"]]),
             s("Jump to chat", &[&["⌘", "1 to 9"]]),
+            s("Focus oldest unread or last message", &[&["⌘", "J"]]),
             s("Preferences", &[&["⌘", ","]]),
             s("Start new chat", &[&["⌘", "N"]]),
             s("Search", &[&["⌘", "F"]]),
@@ -128,7 +174,21 @@ pub const GUIDE: &[(&str, &[Shortcut])] = &[
             s("Begin recording voice note", &[&["⌘", "Shift", "Y"]]),
             s("Archive chat", &[&["⌘", "Shift", "A"]]),
             s("Unarchive chat", &[&["⌘", "Shift", "U"]]),
+            s("Scroll to top of list", &[&["⌘", "↑"]]),
+            s("Scroll to bottom of list", &[&["⌘", "↓"]]),
             s("Close current chat", &[&["⌘", "Shift", "C"]]),
+        ],
+    ),
+    (
+        "Messages",
+        &[
+            s("Default action for selected message", &[&["Enter"]]),
+            s("View selected message details", &[&["⌘", "D"]]),
+            s("Toggle reply to selected message", &[&["⌘", "Shift", "R"]]),
+            s("Toggle emoji-reaction picker for selected message", &[&["⌘", "Shift", "E"]]),
+            s("Save attachment from selected message", &[&["⌘", "S"]]),
+            s("Delete selected messages", &[&["⌘", "Shift", "D"]]),
+            s("Forward selected messages", &[&["⌘", "Shift", "S"]]),
         ],
     ),
     (

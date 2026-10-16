@@ -374,6 +374,22 @@ impl Composer {
         }
     }
 
+    /// The message being replied to.
+    #[cfg(test)]
+    pub fn replying_to(&self) -> Option<i64> {
+        self.reply_to.as_ref().map(|m| m.id)
+    }
+
+    /// Desktop's ⌘⇧R: a reply being written is dropped; otherwise
+    /// `message` (the targeted one) is replied to.
+    pub fn toggle_reply(&mut self, message: Option<Message>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.reply_to.take().is_some() {
+            cx.notify();
+        } else if let Some(message) = message {
+            self.reply_to(message, window, cx);
+        }
+    }
+
     pub fn reply_to(&mut self, message: Message, window: &mut Window, cx: &mut Context<Self>) {
         self.reply_to = Some(message);
         self.focus(window, cx);

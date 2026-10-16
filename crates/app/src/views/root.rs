@@ -270,6 +270,13 @@ impl RootView {
         self.conversation.clone().filter(|_| ready)
     }
 
+    /// Acts on the open chat.
+    fn with_chat(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut ConversationView, &mut Context<ConversationView>)) {
+        if let Some(view) = self.open_chat(cx) {
+            view.update(cx, f);
+        }
+    }
+
     /// Acts on the open chat's composer.
     fn with_composer(
         &mut self,
@@ -337,6 +344,26 @@ impl RootView {
             }))
             .on_action(cx.listener(|this, _: &RemoveDraftAttachments, window, cx| {
                 this.with_composer(window, cx, |composer, _, cx| composer.remove_attachments(cx));
+            }))
+            // The targeted message's shortcuts, wherever the keyboard is.
+            .on_action(cx.listener(|this, _: &FocusOldestUnreadOrLast, window, cx| {
+                this.with_chat(cx, |view, cx| view.target_oldest_unread_or_last(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &MessageDetails, window, cx| {
+                this.with_chat(cx, |view, cx| view.show_targeted_details(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &ToggleReply, window, cx| {
+                this.with_chat(cx, |view, cx| view.toggle_reply_to_targeted(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &ToggleReactionPicker, _, cx| {
+                this.with_chat(cx, |view, cx| view.toggle_reactions_for_targeted(cx));
+            }))
+            .on_action(cx.listener(|this, _: &SaveAttachment, _, cx| this.with_chat(cx, |view, cx| view.save_targeted(cx))))
+            .on_action(cx.listener(|this, _: &DeleteMessages, window, cx| {
+                this.with_chat(cx, |view, cx| view.delete_selected_or_targeted(window, cx));
+            }))
+            .on_action(cx.listener(|this, _: &ForwardMessages, window, cx| {
+                this.with_chat(cx, |view, cx| view.forward_selected_or_targeted(window, cx));
             }))
             // Desktop's `onArchiveConversation` and `onUnarchiveConversation`:
             // only one that isn't already.
