@@ -223,6 +223,7 @@ impl Actor {
             sticker: false,
             voice: false,
             remote: None,
+            thumbnail_path: None,
         })
     }
 

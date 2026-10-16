@@ -250,6 +250,10 @@ pub struct AttachmentMeta {
     /// attachment from transferred history).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteAttachment>,
+    /// A small preview from the backup tier, shown until the file itself
+    /// is downloaded (Desktop's `thumbnailFromBackup`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail_path: Option<String>,
 }
 
 /// How a call went.
@@ -277,19 +281,29 @@ pub enum ReadSync {
     NotFound,
 }
 
-/// An attachment on Signal's transit CDN: enough to download and check it.
+/// Where an attachment from transferred history can be downloaded: Signal's
+/// transit CDN, the backup (media) tier, or both. Enough to download and
+/// check it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RemoteAttachment {
+    /// The transit tier's CDN number.
     pub cdn: u32,
-    pub cdn_key: String,
+    /// Its key on the transit tier; `None` when it's only in the backup tier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdn_key: Option<String>,
     /// The 64-byte AES and HMAC key, hex.
     pub key: String,
     /// SHA-256 of the encrypted file, hex, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
     /// SHA-256 of the decrypted file, hex, when that's what's known instead.
+    /// With the key, it names the file in the backup tier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plaintext_hash: Option<String>,
+    /// The backup tier's CDN number, when the backup named one
+    /// (`mediaTierCdnNumber`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_tier_cdn: Option<u32>,
 }
 
 /// A message as rendered in the timeline.
@@ -2443,6 +2457,16 @@ impl AppDb {
     /// attachment that already has a path is overwritten with `Ok(true)`,
     /// never `Ok(false)`, so a second download of it keeps its file.
     pub async fn set_attachment_path(&self, message_id: i64, index: usize, path: &str) -> Result<bool> {
+        self.edit_attachment(message_id, index, |att| att.local_path = Some(path.to_owned())).await
+    }
+
+    /// Records where an attachment's backup thumbnail was saved; `Ok(false)`
+    /// as for `set_attachment_path`.
+    pub async fn set_attachment_thumbnail(&self, message_id: i64, index: usize, path: &str) -> Result<bool> {
+        self.edit_attachment(message_id, index, |att| att.thumbnail_path = Some(path.to_owned())).await
+    }
+
+    async fn edit_attachment(&self, message_id: i64, index: usize, edit: impl FnOnce(&mut AttachmentMeta)) -> Result<bool> {
         let mut tx = self.write().await?;
         let Some(json) =
             sqlx::query_scalar::<_, String>("SELECT attachments FROM messages WHERE id = ?")
@@ -2454,7 +2478,7 @@ impl AppDb {
         };
         let mut list: Vec<AttachmentMeta> = serde_json::from_str(&json)?;
         let Some(att) = list.get_mut(index) else { return Ok(false) };
-        att.local_path = Some(path.to_owned());
+        edit(att);
         sqlx::query("UPDATE messages SET attachments = ? WHERE id = ?")
             .bind(serde_json::to_string(&list)?)
             .bind(message_id)

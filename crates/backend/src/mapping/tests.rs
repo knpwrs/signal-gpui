@@ -1055,7 +1055,7 @@ fn a_long_text_is_kept_apart_from_the_attachments() {
 #[test]
 fn where_a_long_text_downloads_from() {
     let remote = remote_of(&long_text_pointer()).unwrap();
-    assert_eq!((remote.cdn, remote.cdn_key.as_str()), (3, "text-key"));
+    assert_eq!((remote.cdn, remote.cdn_key.as_deref()), (3, Some("text-key")));
     assert_eq!((remote.key, remote.digest), ("09".repeat(64), Some("08".repeat(32))));
     // Older pointers name the file by number, on CDN 0.
     let old = AttachmentPointer {
@@ -1064,7 +1064,7 @@ fn where_a_long_text_downloads_from() {
         ..long_text_pointer()
     };
     let remote = remote_of(&old).unwrap();
-    assert_eq!((remote.cdn, remote.cdn_key.as_str()), (0, "42"));
+    assert_eq!((remote.cdn, remote.cdn_key.as_deref()), (0, Some("42")));
     // Without its digest it can't be checked, so it isn't fetched.
     assert_eq!(remote_of(&AttachmentPointer { digest: None, ..long_text_pointer() }), None);
 }

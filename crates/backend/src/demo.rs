@@ -192,6 +192,7 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
             gif: false,
             voice: false,
             remote: None,
+            thumbnail_path: None,
         })
     };
     let photo = image("demo-photo.png", PHOTO_WIDTH, PHOTO_HEIGHT);
@@ -277,6 +278,7 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
             gif: false,
             voice: true,
             remote: None,
+            thumbnail_path: None,
         }];
         db.insert_message(&voice).await?;
     }
@@ -368,6 +370,7 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
             gif: true,
             voice: false,
             remote: None,
+            thumbnail_path: None,
         }];
         db.insert_message(&gif).await?;
     }
@@ -597,6 +600,7 @@ async fn seed_stories(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
             gif: false,
             voice: false,
             remote: None,
+            thumbnail_path: None,
         };
         let content = StoryContent::Media { attachment: photo, caption: "Golden hour".into(), styles: Vec::new() };
         db.insert_story(&story(Some(JORDAN), Some("Jordan Reyes"), 5 * HOUR, None, content), now).await?;
@@ -1041,6 +1045,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                             gif: false,
                             voice: false,
                             remote: None,
+                            thumbnail_path: None,
                         })
                     });
                     LinkPreview { url: draft.url, title: Some(draft.title), description: draft.description, date: draft.date, image }
@@ -1485,6 +1490,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                         gif: true,
                         voice: false,
                         remote: None,
+                        thumbnail_path: None,
                     }],
                     link_preview: None,
                     expires_in: 0,
@@ -1533,6 +1539,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                         gif: false,
                         voice: false,
                         remote: None,
+                        thumbnail_path: None,
                     }],
                     link_preview: None,
                     expires_in: 0,
@@ -1580,6 +1587,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                         gif: false,
                         voice: false,
                         remote: None,
+                        thumbnail_path: None,
                     });
                 }
                 if attachments.is_empty() {
@@ -1642,6 +1650,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                         gif: false,
                         voice: file.voice,
                         remote: None,
+                        thumbnail_path: None,
                     }],
                     link_preview: None,
                     expires_in: 0,
@@ -1757,6 +1766,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                                     gif: false,
                                     voice: false,
                                     remote: None,
+                                    thumbnail_path: None,
                                 },
                                 caption: caption.clone(),
                                 styles: styles.clone(),

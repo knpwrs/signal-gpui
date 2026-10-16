@@ -624,6 +624,7 @@ pub fn attachment_meta(p: &AttachmentPointer) -> AttachmentMeta {
         gif: p.flags.unwrap_or(0) & attachment_pointer::Flags::Gif as u32 != 0,
         voice: p.flags.unwrap_or(0) & attachment_pointer::Flags::VoiceMessage as u32 != 0,
         remote: None,
+        thumbnail_path: None,
     }
 }
 
@@ -659,10 +660,11 @@ pub fn remote_of(pointer: &AttachmentPointer) -> Option<signal_store::RemoteAtta
     let digest = pointer.digest.as_deref().filter(|d| !d.is_empty())?;
     Some(signal_store::RemoteAttachment {
         cdn: pointer.cdn_number.unwrap_or(0),
-        cdn_key,
+        cdn_key: Some(cdn_key),
         key: hex::encode(key),
         digest: Some(hex::encode(digest)),
         plaintext_hash: None,
+        media_tier_cdn: None,
     })
 }
 

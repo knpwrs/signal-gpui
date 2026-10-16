@@ -4136,10 +4136,11 @@ mod tests {
             let long_text = signal_store::LongText {
                 remote: signal_store::RemoteAttachment {
                     cdn: 3,
-                    cdn_key: "made-up".into(),
+                    cdn_key: Some("made-up".into()),
                     key: "00".repeat(64),
                     digest: Some("00".repeat(32)),
                     plaintext_hash: None,
+                    media_tier_cdn: None,
                 },
                 size: 4000,
                 mentions: vec![],
@@ -4172,6 +4173,7 @@ mod tests {
             gif: false,
             voice: false,
             remote: None,
+            thumbnail_path: None,
         };
         let limit = signal_backend::remote_config().attachment_max_receive_bytes();
         let insert = |sent_at: i64, attachments: Vec<AttachmentMeta>| {
@@ -4273,6 +4275,7 @@ mod tests {
                 gif: false,
                 voice: false,
                 remote: None,
+                thumbnail_path: None,
             }),
         };
         assert_eq!(full_size_preview_image(&preview(1200, 630)).map(|f| f.1), Some((300., 157.5)));
@@ -5122,6 +5125,7 @@ mod tests {
             gif: false,
             voice: false,
             remote: None,
+            thumbnail_path: None,
         };
         let label = |v, outgoing, a: Option<&AttachmentMeta>| {
             let (_, title, detail) = view_once_label(v, outgoing, a);

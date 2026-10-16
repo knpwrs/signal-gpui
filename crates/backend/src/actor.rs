@@ -2320,6 +2320,7 @@ impl Actor {
             gif: true,
             voice: false,
             remote: None,
+            thumbnail_path: None,
         };
         let Some((id, data, timestamp)) = self.store_outgoing(&conversation, String::new(), quote, vec![meta], None).await
         else {
@@ -2382,6 +2383,7 @@ impl Actor {
             gif: false,
             voice: false,
             remote: None,
+            thumbnail_path: None,
         };
         let Some((id, mut data, timestamp)) = self.store_outgoing(&conversation, String::new(), quote, vec![meta], None).await
         else {
@@ -3326,6 +3328,7 @@ impl Actor {
                                 gif: false,
                                 voice: false,
                                 remote: None,
+                                thumbnail_path: None,
                             })
                         }
                     }
@@ -3442,6 +3445,7 @@ impl Actor {
                 gif: false,
                 voice: false,
                 remote: None,
+                thumbnail_path: None,
             });
             files.push(Upload { path, file_name: image.file_name, file_type: None, voice: false });
         }
@@ -3521,6 +3525,7 @@ impl Actor {
             gif: false,
             voice: file.voice,
             remote: None,
+            thumbnail_path: None,
         };
         let wire_caption = caption.trim_end().to_owned();
         let wire_styles = mapping::wire_styles(&wire_caption, &styles);

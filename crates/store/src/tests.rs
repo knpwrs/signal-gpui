@@ -227,6 +227,7 @@ async fn delete_edit_attachments_and_search() {
         gif: false,
         voice: false,
         remote: None,
+        thumbnail_path: None,
     }];
     m.quote = Some(Quote { author: None, author_name: "You".into(), sent_at: 0, text: "q".into(), thumbnail: None, attachment: None, story: false });
     let id = db.insert_message(&m).await.unwrap();
@@ -234,12 +235,14 @@ async fn delete_edit_attachments_and_search() {
 
     let got = db.message(id).await.unwrap().unwrap();
     assert_eq!(got.quote.unwrap().text, "q");
+    // A backup thumbnail first, then the file; each kept.
+    assert!(db.set_attachment_thumbnail(id, 0, "/tmp/a-thumbnail.webp").await.unwrap());
+    assert!(!db.set_attachment_thumbnail(id, 5, "/tmp/nope").await.unwrap(), "no such attachment");
     assert!(db.set_attachment_path(id, 0, "/tmp/a.png").await.unwrap());
     assert!(!db.set_attachment_path(id, 5, "/tmp/nope").await.unwrap(), "no such attachment");
-    assert_eq!(
-        db.message(id).await.unwrap().unwrap().attachments[0].local_path.as_deref(),
-        Some("/tmp/a.png")
-    );
+    let attachment = db.message(id).await.unwrap().unwrap().attachments[0].clone();
+    assert_eq!(attachment.local_path.as_deref(), Some("/tmp/a.png"));
+    assert_eq!(attachment.thumbnail_path.as_deref(), Some("/tmp/a-thumbnail.webp"));
 
     let hits = db.search_messages("fox", 10).await.unwrap();
     assert_eq!(hits.iter().map(|h| h.message_id).collect::<Vec<_>>(), [id2, id]);
@@ -316,6 +319,7 @@ async fn attachment_only_preview() {
         gif: false,
         voice: false,
         remote: None,
+        thumbnail_path: None,
     }];
     db.insert_message(&m).await.unwrap();
     assert_eq!(
@@ -790,6 +794,7 @@ async fn media_messages_are_those_with_attachments_or_previews() {
         gif: false,
         voice: false,
         remote: None,
+        thumbnail_path: None,
     }];
     let photo = db.insert_message(&photo).await.unwrap();
     let media: Vec<i64> = db.media_messages(&conv("d:a"), 10).await.unwrap().iter().map(|m| m.id).collect();
@@ -1376,6 +1381,7 @@ async fn attachments_are_named_as_desktop_names_them() {
         gif: false,
         voice: false,
         remote: None,
+        thumbnail_path: None,
     };
     let gif = AttachmentMeta { gif: true, ..meta("video/mp4") };
     assert_eq!(attachment_preview(&gif), "🎡 GIF", "a GIF is an MP4 with the GIF flag");
@@ -1428,6 +1434,7 @@ async fn stories_last_a_day_and_keep_views_and_replies() {
             gif: false,
             voice: false,
             remote: None,
+            thumbnail_path: None,
         },
         caption: String::new(),
         styles: Vec::new(),
@@ -1534,10 +1541,11 @@ async fn a_long_text_replaces_the_start_of_the_body_once() {
     let long_text = |cdn_key: &str| LongText {
         remote: RemoteAttachment {
             cdn: 2,
-            cdn_key: cdn_key.into(),
+            cdn_key: Some(cdn_key.into()),
             key: "00".repeat(64),
             digest: Some("11".repeat(32)),
             plaintext_hash: None,
+            media_tier_cdn: None,
         },
         size: 3000,
         mentions: vec!["m".into()],
@@ -1794,6 +1802,7 @@ fn photo(path: Option<&str>) -> AttachmentMeta {
         gif: false,
         voice: false,
         remote: None,
+        thumbnail_path: None,
     }
 }
 
@@ -1959,4 +1968,20 @@ async fn pending_votes_and_unread_votes_are_found_by_index() {
     let sync =
         plan("UPDATE messages SET unread_poll_votes = 0 WHERE author_key = '' AND sent_at = 1 AND unread_poll_votes = 1".into()).await;
     assert!(sync.contains("messages_outgoing_sent_at"), "{sync}");
+}
+
+#[test]
+fn locators_saved_before_the_backup_tier_still_read() {
+    // As the previous version wrote them: a transit key, no media tier.
+    let old = r#"{"cdn":3,"cdn_key":"abc","key":"00","digest":"11"}"#;
+    let remote: RemoteAttachment = serde_json::from_str(old).unwrap();
+    assert_eq!((remote.cdn_key.as_deref(), remote.media_tier_cdn), (Some("abc"), None));
+    let old = r#"{"content_type":"image/png","file_name":null,"size":1,"width":null,"height":null,"local_path":null}"#;
+    let attachment: AttachmentMeta = serde_json::from_str(old).unwrap();
+    assert_eq!(attachment.thumbnail_path, None);
+    // Only in the backup tier: no transit key written.
+    let backup_only = RemoteAttachment { cdn_key: None, media_tier_cdn: Some(3), ..remote };
+    let json = serde_json::to_string(&backup_only).unwrap();
+    assert!(!json.contains("cdn_key"), "{json}");
+    assert_eq!(serde_json::from_str::<RemoteAttachment>(&json).unwrap(), backup_only);
 }

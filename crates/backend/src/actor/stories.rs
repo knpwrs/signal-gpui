@@ -978,6 +978,7 @@ impl Actor {
             gif: false,
             voice: false,
             remote: None,
+            thumbnail_path: None,
         };
         Ok((pointer, meta))
     }

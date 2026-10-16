@@ -124,7 +124,8 @@ pub(crate) async fn download_attachment(
     use sha2::Digest as _;
     let key: [u8; 64] = hex::decode(&remote.key)?.try_into().map_err(|_| anyhow!("bad attachment key"))?;
     let service = crate::storage::push_service(manager)?;
-    let path = format!("attachments/{}", remote.cdn_key);
+    let cdn_key = remote.cdn_key.as_deref().context("it isn't on the transit tier")?;
+    let path = format!("attachments/{cdn_key}");
     let response = service.request(reqwest::Method::GET, Endpoint::cdn(remote.cdn, path), HttpAuthOverride::Unidentified)?.send().await?;
     // Desktop's `AttachmentUndownloadableFromTransitTierError`
     // (`ts/util/downloadAttachment.preload.ts`): a 404, or a 403 from CDN 0.
@@ -793,6 +794,7 @@ fn attachment(pointer: &proto::FilePointer) -> AttachmentMeta {
         gif: false,
         voice: false,
         remote: locator.and_then(remote),
+        thumbnail_path: None,
     }
 }
 
@@ -810,7 +812,14 @@ fn remote(locator: &proto::file_pointer::LocatorInfo) -> Option<RemoteAttachment
         Some(IntegrityCheck::PlaintextHash(h)) => (None, Some(hex::encode(h))),
         _ => return None,
     };
-    Some(RemoteAttachment { cdn: locator.transitCdnNumber.unwrap_or(0), cdn_key, key: hex::encode(&locator.key), digest, plaintext_hash })
+    Some(RemoteAttachment {
+        cdn: locator.transitCdnNumber.unwrap_or(0),
+        cdn_key: Some(cdn_key),
+        key: hex::encode(&locator.key),
+        digest,
+        plaintext_hash,
+        media_tier_cdn: None,
+    })
 }
 
 /// A backup's text styles (as on the wire: UTF-16, over the body with its
@@ -1115,7 +1124,7 @@ mod tests {
         assert_eq!(by_edit, Some(in_group[0].id));
         // Its whole text downloads next, its mention kept for it.
         let long_text = in_group[0].long_text.as_ref().unwrap();
-        assert_eq!((long_text.size, long_text.remote.cdn_key.as_str()), (3_000, "text"));
+        assert_eq!((long_text.size, long_text.remote.cdn_key.as_deref()), (3_000, Some("text")));
         assert_eq!(long_text.mentions, vec![me.clone()]);
         assert_eq!(imported.long_texts, [in_group[0].id]);
         // The poll, with each voter's choices, ended, and its notice.
@@ -1139,7 +1148,7 @@ mod tests {
         let photo = &reply.attachments[0];
         assert_eq!(photo.size, 1234);
         let remote = photo.remote.as_ref().unwrap();
-        assert_eq!((remote.cdn, remote.cdn_key.as_str(), remote.key.len()), (3, "abc", 128));
+        assert_eq!((remote.cdn, remote.cdn_key.as_deref(), remote.key.len()), (3, Some("abc"), 128));
         assert_eq!(remote.digest.as_deref(), Some(hex::encode([2; 32]).as_str()));
         assert_eq!(imported.downloads, vec![(reply.id, 0)]);
         assert!(with_alice[1].deleted);
