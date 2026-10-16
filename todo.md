@@ -22,7 +22,7 @@ made-up config; the fetch hasn't been run against Signal's server.
 | `groupMemberLabels.edit` | Editing your own member label in a group. | Done (Group settings), following the flag: whether you may set one follows the group's label access, as Desktop's `getCanAddLabel`. |
 | `groupTerminate.send` | Admins ending a group for everyone. | Done (Group settings, "End group"), following the flag. A group ended by someone else (received, synced, or in a transferred backup) blocks sending and the rest, as Desktop. Ending a group on Signal's group server hasn't been tried. |
 | `binaryServiceId` | Service ids in the binary proto fields (`*Binary`) instead of strings. | Done for the messages and sync messages we build: only the binary fields with the flag on, only the strings without, as Desktop's `SendMessage.preload.ts`. Sent transcripts built in libsignal-service-rs and the Storage Service records we write (contacts, story lists, pins) carry both forms, which every client reads; Desktop writes one. We accept both. |
-| `retireAccessKeyGroupSend` | Group sends with group send endorsements instead of access keys. | Up to libsignal-service-rs / presage. |
+| `retireAccessKeyGroupSend` | Group sends with group send endorsements instead of access keys. | Always on: group messages go with a sender key and a `Group-Send-Token`, and one by one without endorsements. See "Sender keys" below. |
 | `sendMessageViaLibsignal` | Sending through libsignal's network stack. | Not applicable. |
 | `keyTransparency` | Key transparency checks in safety numbers. | Not done: safety numbers are shown and can be verified, without key transparency. |
 | `localBackups` | Local (on-disk) backups. | Not applicable. |
@@ -52,6 +52,37 @@ Done for the transit tier (`FilePointer.locatorInfo`: CDN number, key, and
 digest or plaintext hash), which is what the phone fills for link and sync.
 Attachments only in the backup (media) tier need backup-tier credentials
 and aren't downloaded.
+
+## Sender keys
+
+Group messages and stories go to everyone at once with a sender key
+(`sendToGroupViaSenderKey`), with Desktop's fallback to one by one. Group
+messages carry a `Group-Send-Token` from the group's send endorsements,
+which are fetched with the group (`GET /v2/groups/`) when they're missing,
+about to expire, or don't cover a member. Each member's result is kept
+(also for those it went to one by one), and a retry to the members a send
+missed (poll votes) goes with the sender key as a partial send: Desktop's
+`isPartialSend`, where those left out keep our key. The wire format, the
+tokens and every fallback path are unit tested (against libsignal's parser and
+decrypter, a made-up zkgroup server and a fake network). Not tried
+against Signal's servers. Not done:
+
+- **Retry requests:** when someone can't read a sender key message, their
+  client asks us to resend. We don't handle those requests at all (no
+  send log), so we don't send our key to them again either. Group messages
+  use `ContentHint::Default` rather than Desktop's `Resendable`, so their
+  client shows the failure instead of waiting for a resend.
+- **Old sender keys** stay in presage's store: it can't delete one, so a
+  reset starts a new distribution id instead of deleting the old key, as
+  Desktop does.
+- **Pre-key fetches** for a sender key send are made over the identified
+  connection; Desktop makes them unidentified with the access key or
+  endorsement.
+- **Endorsements** come only from the `GET /v2/groups/` made before a send.
+  Desktop also takes them from group changes and the group logs.
+- **Unregistered recipients** the server names (`uuids404`) are skipped
+  for that send, but not marked unregistered, and their sessions aren't
+  archived as Desktop does.
 
 ## View-once messages
 
@@ -185,9 +216,10 @@ hiding, story privacy (My Story, custom stories, the first post asking),
 stories off and view receipts for the whole account, who viewed and
 replied to ours, and Desktop's tabs work. Not done yet:
 
-- **Sender keys:** a story goes to each recipient in turn through the
-  outbound queue, where Desktop sends to a list at once with sender keys.
-  Posting to hundreds of connections takes a while.
+- **Sender keys:** stories (each list's share, and group stories) go to
+  everyone at once with a sender key, as Desktop's `sendStory`. Replies to
+  group stories and deletes for everyone still go one by one. See "Sender
+  keys" below.
 - **Story privacy, account settings, views and replies** are written
   against Desktop's code and checked with unit, store and demo-mode UI
   tests; none of it has been tried with a real account yet (the Storage

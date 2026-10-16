@@ -7,6 +7,7 @@ mod early;
 mod group_calls;
 mod polls;
 mod stories;
+mod sender_keys;
 mod release_notes;
 mod remote_config;
 mod view_once;
@@ -170,6 +171,10 @@ enum Outbound {
     Sync { body: SyncMessage },
     /// A story (or group story reply) to one recipient, part of `job`.
     Story { recipient: String, body: ContentBody, timestamp: u64, job: u64 },
+    /// A story to many at once with our sender key for `target` (a group's
+    /// conversation id, or `list:<id>`; `group` is the group's master key),
+    /// part of `job`. Whoever that doesn't reach gets it one by one.
+    StoryBatch { target: String, group: Option<Vec<u8>>, recipients: Vec<String>, body: ContentBody, timestamp: u64, job: u64 },
 }
 
 /// Why a long text is being downloaded.
@@ -296,6 +301,9 @@ struct Actor {
     /// Stories being sent, recipient by recipient.
     story_jobs: RefCell<HashMap<u64, stories::StoryJob>>,
     next_story_job: std::cell::Cell<u64>,
+    /// When a group's send endorsements were last fetched without getting
+    /// usable ones, so a failing fetch isn't repeated on every send.
+    endorsement_misses: RefCell<HashMap<ConversationId, std::time::Instant>>,
     /// Lets stories go after a day; notified when one arrives.
     story_expiry_task: RefCell<Option<tokio::task::JoinHandle<()>>>,
     story_expiry: tokio::sync::Notify,
@@ -400,6 +408,7 @@ pub(crate) async fn run(
         story_expiry_task: RefCell::new(None),
         story_jobs: RefCell::new(HashMap::new()),
         next_story_job: std::cell::Cell::new(0),
+        endorsement_misses: RefCell::default(),
         story_expiry: tokio::sync::Notify::new(),
         early_replaying: RefCell::default(),
         early_retried: RefCell::new(false),
@@ -3843,6 +3852,11 @@ impl Actor {
                         self.finish_send(&conversation, id, timestamp, DeliveryStatus::Failed).await;
                     }
                     Outbound::Story { recipient, job, .. } => self.story_part_done(job, recipient, Err("not connected".into())),
+                    Outbound::StoryBatch { recipients, job, .. } => {
+                        for recipient in recipients {
+                            self.story_part_done(job, recipient, Err("not connected".into()));
+                        }
+                    }
                     // Desktop's job queue waits until it can send.
                     Outbound::PollVote { message, vote_count, attempt } => {
                         self.send_poll_vote(None, message, vote_count, attempt).await;
@@ -3915,6 +3929,9 @@ impl Actor {
                 Outbound::Story { recipient, body, timestamp, job } => {
                     self.send_story_part(&mut manager, recipient, body, timestamp, job).await;
                 }
+                Outbound::StoryBatch { target, group, recipients, body, timestamp, job } => {
+                    self.send_story_batch(&mut manager, &target, group, recipients, body, timestamp, job).await;
+                }
                 Outbound::PollVote { message, vote_count, attempt } => {
                     self.send_poll_vote(Some(&mut manager), message, vote_count, attempt).await;
                 }
@@ -3986,7 +4003,7 @@ impl Actor {
             (Some(key), _) => {
                 let only: Option<Vec<ServiceId>> =
                     only.map(|list| list.iter().filter_map(|s| ServiceId::parse_from_service_id_string(s)).collect());
-                match manager.send_message_to_group_members(&key, body, timestamp, only.as_deref()).await {
+                match self.send_to_group(manager, conversation, &key, body, timestamp, only.as_deref()).await {
                     Ok(results) => {
                         for (recipient, result) in results {
                             delivery.record(recipient.service_id_string(), result.map_err(SendFailure::from));

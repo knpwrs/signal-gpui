@@ -32,6 +32,7 @@ pub mod long_text;
 pub mod release_notes;
 pub mod megaphones;
 pub mod remote_config;
+mod sender_keys;
 
 pub use remote_config::{RemoteConfig, current as remote_config};
 

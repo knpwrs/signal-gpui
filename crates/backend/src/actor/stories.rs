@@ -565,14 +565,21 @@ impl Actor {
             };
             self.keep_our_story(base, None, content.clone(), allows_replies, recipients.clone()).await;
             info!(recipients = recipients.len(), lists = resolved.len(), "posting a story");
-            let parts = recipients
-                .iter()
-                .map(|r| {
-                    let message = presage::proto::StoryMessage { allows_replies: Some(r.allows_replies), ..message.clone() };
-                    (r.service_id.clone(), ContentBody::StoryMessage(message))
+            // Desktop's `sendStory`: each list sends to its share at once,
+            // with that list's sender key and whether it allows replies.
+            let batches = crate::sender_keys::list_sends(&resolved)
+                .into_iter()
+                .map(|send| {
+                    let message = presage::proto::StoryMessage { allows_replies: Some(send.allows_replies), ..message.clone() };
+                    StoryBatch {
+                        target: crate::sender_keys::list_target(&send.list_id),
+                        group: None,
+                        recipients: send.recipients,
+                        body: ContentBody::StoryMessage(message),
+                    }
                 })
                 .collect();
-            self.start_story_job(parts, base as u64, StoryJobSync::Story { message: Box::new(message), recipients }, "story");
+            self.start_story_batches(batches, base as u64, StoryJobSync::Story { message: Box::new(message), recipients }, "story");
         }
         for group in groups {
             // Its own timestamp, so a later send never takes it.
@@ -589,10 +596,22 @@ impl Actor {
                 .into_iter()
                 .map(|service_id| signal_store::StoryRecipient { service_id, list_ids: Vec::new(), allows_replies: true })
                 .collect();
-            self.keep_our_story(timestamp, Some(group), content.clone(), true, Vec::new()).await;
+            self.keep_our_story(timestamp, Some(group.clone()), content.clone(), true, Vec::new()).await;
             info!(recipients = recipients.len(), "posting a group story");
-            let parts = recipients.iter().map(|r| (r.service_id.clone(), ContentBody::StoryMessage(message.clone()))).collect();
-            self.start_story_job(parts, timestamp as u64, StoryJobSync::Story { message: Box::new(message), recipients }, "story");
+            // With the group's sender key, as its messages (Desktop's
+            // `conversation.toSenderKeyTarget()`).
+            let batch = StoryBatch {
+                target: group.to_string(),
+                group: group.as_group(),
+                recipients: recipients.iter().map(|r| r.service_id.clone()).collect(),
+                body: ContentBody::StoryMessage(message.clone()),
+            };
+            self.start_story_batches(
+                vec![batch],
+                timestamp as u64,
+                StoryJobSync::Story { message: Box::new(message), recipients },
+                "story",
+            );
         }
         self.story_expiry.notify_one();
         self.emit(Event::StoriesChanged);
@@ -843,6 +862,33 @@ impl Actor {
         }
     }
 
+    /// Like [`Self::start_story_job`], each batch sent at once with our
+    /// sender key for its target (and one by one to whoever that misses).
+    fn start_story_batches(&self, batches: Vec<StoryBatch>, timestamp: u64, sync: StoryJobSync, what: &'static str) {
+        let job = self.next_story_job.get();
+        self.next_story_job.set(job + 1);
+        let batches: Vec<StoryBatch> = batches
+            .into_iter()
+            .map(|mut batch| {
+                batch.recipients.retain(|r| ServiceId::parse_from_service_id_string(r).is_some());
+                batch
+            })
+            .filter(|batch| !batch.recipients.is_empty())
+            .collect();
+        let remaining = batches.iter().map(|b| b.recipients.len()).sum();
+        self.story_jobs.borrow_mut().insert(
+            job,
+            StoryJob { remaining, timestamp, sync, sent: Vec::new(), failures: HashMap::new(), what },
+        );
+        if remaining == 0 {
+            self.finish_story_job(job);
+            return;
+        }
+        for StoryBatch { target, group, recipients, body } in batches {
+            self.enqueue(Outbound::StoryBatch { target, group, recipients, body, timestamp, job });
+        }
+    }
+
     pub(super) async fn send_story_part(
         &self,
         manager: &mut SignalManager,
@@ -991,6 +1037,16 @@ fn without_list(
 }
 
 /// A story (or group story reply) going out recipient by recipient.
+/// Recipients of one story send with one sender key.
+struct StoryBatch {
+    /// Whose sender key: a group's conversation id, or `list:<id>`.
+    target: String,
+    /// The group's master key, for a group story.
+    group: Option<Vec<u8>>,
+    recipients: Vec<String>,
+    body: ContentBody,
+}
+
 pub(super) struct StoryJob {
     remaining: usize,
     timestamp: u64,
@@ -1002,7 +1058,7 @@ pub(super) struct StoryJob {
 }
 
 /// A send failure, said shortly (as each reason is counted).
-fn failure_reason(error: &str) -> String {
+pub(super) fn failure_reason(error: &str) -> String {
     let error = error.trim();
     if error.contains("not registered") || error.contains("NotFound") {
         "no longer on Signal".into()
