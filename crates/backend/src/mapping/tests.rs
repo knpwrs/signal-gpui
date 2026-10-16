@@ -65,6 +65,18 @@ fn incoming_direct_text() {
 }
 
 #[test]
+fn a_message_needing_a_newer_protocol_is_unsupported() {
+    let newer = DataMessage { required_protocol_version: Some(9), ..text("from the future", 100) };
+    let actions = map_content(&content(ALICE, newer), &ctx());
+    let [Action::Notice { conversation, at, notice }] = actions.as_slice() else { panic!("{actions:?}") };
+    assert_eq!((conversation, *at), (&ConversationId::direct(ALICE), 100));
+    assert_eq!(notice, &signal_store::Notice::UnsupportedMessage { who: Some(ALICE.into()) });
+    // Our version (Desktop's CURRENT, 8) is fine.
+    let current = DataMessage { required_protocol_version: Some(8), ..text("polls", 100) };
+    assert!(matches!(map_content(&content(ALICE, current), &ctx()).as_slice(), [Action::Insert { .. }]));
+}
+
+#[test]
 fn timestamp_falls_back_to_envelope() {
     let dm = DataMessage { body: Some("x".into()), ..Default::default() };
     let actions = map_content(&content(ALICE, dm), &ctx());

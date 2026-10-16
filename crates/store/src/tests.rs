@@ -2206,6 +2206,35 @@ async fn whether_a_chat_is_accepted_is_found_by_index() {
 }
 
 #[tokio::test]
+async fn a_new_number_is_noted_only_when_it_replaces_one() {
+    let db = test_db().await;
+    let phone = |p: &str| ConversationUpdate { phone: Some(p.into()), ..Default::default() };
+    assert_eq!(db.upsert_conversation_noting_phone(&conv("d:a"), phone("+15550100")).await.unwrap(), None);
+    assert_eq!(db.upsert_conversation_noting_phone(&conv("d:a"), phone("+15550100")).await.unwrap(), None);
+    // No number given keeps the one there.
+    assert_eq!(db.upsert_conversation_noting_phone(&conv("d:a"), ConversationUpdate::default()).await.unwrap(), None);
+    assert_eq!(db.upsert_conversation_noting_phone(&conv("d:a"), phone("+15550199")).await.unwrap(), Some("+15550100".into()));
+    assert_eq!(db.conversation(&conv("d:a")).await.unwrap().unwrap().phone.as_deref(), Some("+15550199"));
+}
+
+#[tokio::test]
+async fn a_profile_name_change_is_noted_only_from_a_name_they_had() {
+    let db = test_db().await;
+    let named = |given: &str, family: &str| FetchedProfile { given_name: given.into(), family_name: family.into(), ..Default::default() };
+    // A username alone gives no name to change from.
+    db.replace_usernames(&[("a".into(), "al.01".into())]).await.unwrap();
+    assert_eq!(db.save_fetched_profile_noting_name("a", &named("Al", ""), 10).await.unwrap(), (true, None));
+    assert_eq!(
+        db.save_fetched_profile_noting_name("a", &named("Al", "Bo"), 20).await.unwrap(),
+        (true, Some(("Al".into(), "Al Bo".into())))
+    );
+    // The same combined name, split differently, isn't a change.
+    assert_eq!(db.save_fetched_profile_noting_name("a", &named("Al Bo", ""), 30).await.unwrap(), (true, None));
+    // Removing the name is.
+    assert_eq!(db.save_fetched_profile_noting_name("a", &named("", ""), 40).await.unwrap(), (true, Some(("Al Bo".into(), String::new()))));
+}
+
+#[tokio::test]
 async fn profiles_keep_fetches_and_usernames_apart() {
     let db = test_db().await;
     let fetched = FetchedProfile {

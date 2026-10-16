@@ -83,6 +83,8 @@ pub struct ConversationView {
     /// chat is open).
     names: std::collections::HashMap<String, String>,
     system_contacts: std::collections::HashSet<String>,
+    /// Who we gave a nickname: their profile name changes offer "Update".
+    nicknamed: std::collections::HashSet<String>,
     acknowledged_collisions: std::collections::BTreeMap<String, Vec<String>>,
     spoofing_dismissed: bool,
     /// For a 1:1 chat's hero: what's known about them.
@@ -191,7 +193,11 @@ impl ConversationView {
                     this.read_open_poll_votes(cx);
                     cx.notify()
                 }
-                AppEvent::AuthorNamesChanged(names) => this.rename_authors(names, cx),
+                AppEvent::AuthorNamesChanged(names) => {
+                    this.rename_authors(names, cx);
+                    // A nickname may have come or gone.
+                    this.load_request_details(cx);
+                }
                 AppEvent::ProfileChanged(sid) if this.id.as_direct() == Some(sid.as_str()) => this.load_hero(cx),
                 AppEvent::ProfileChanged(_) | AppEvent::OwnProfileChanged => cx.notify(),
                 _ => {}
@@ -274,6 +280,7 @@ impl ConversationView {
             pin_index: 0,
             names: Default::default(),
             system_contacts: Default::default(),
+            nicknamed: Default::default(),
             acknowledged_collisions: Default::default(),
             spoofing_dismissed: false,
             hero_details: None,
@@ -312,13 +319,19 @@ impl ConversationView {
         let db = backend.db().clone();
         let key = crate::views::message_request::acknowledged_key(&self.id);
         let query = backend.spawn(async move {
-            Ok::<_, signal_store::Error>((db.display_names(&people).await?, db.system_contacts().await?, db.setting(&key).await?))
+            Ok::<_, signal_store::Error>((
+                db.display_names(&people).await?,
+                db.system_contacts().await?,
+                db.setting(&key).await?,
+                db.nicknamed().await?,
+            ))
         });
         cx.spawn(async move |this, cx| {
-            let Ok((names, system, acknowledged)) = query.await else { return };
+            let Ok((names, system, acknowledged, nicknamed)) = query.await else { return };
             let _ = this.update(cx, |this, cx| {
                 this.names = names.into_iter().collect();
                 this.system_contacts = system.into_iter().collect();
+                this.nicknamed = nicknamed.into_iter().collect();
                 this.acknowledged_collisions = acknowledged.and_then(|a| serde_json::from_str(&a).ok()).unwrap_or_default();
                 cx.notify();
             });
@@ -502,7 +515,33 @@ impl ConversationView {
     fn render_notice(&self, notice: &signal_store::Notice, show_day: bool, sent_at: i64, palette: Palette, cx: &mut Context<Self>) -> AnyElement {
         use gpui_kit::component::button::{Button, ButtonVariants as _};
         use signal_store::Notice;
-        let text = crate::views::notices::notice_text(notice, |sid| self.reactor_name(Some(sid), cx));
+        let mut text = crate::views::notices::notice_text(notice, |sid| self.reactor_name(Some(sid), cx));
+        match notice {
+            // Desktop names them as we saved them when they're in our
+            // address book (`getStringForProfileChange`).
+            Notice::ProfileNameChanged { who, old_name, new_name } if self.system_contacts.contains(who) => {
+                let sender = self.reactor_name(Some(who), cx);
+                text = crate::views::notices::profile_change_text(old_name, new_name, Some(&sender));
+            }
+            // `ChangeNumberNotification` adds its time.
+            Notice::NumberChanged { .. } => text = format!("{text} \u{b7} {}", message_time(sent_at)),
+            _ => {}
+        }
+        let icon = crate::views::notices::notice_icon(notice);
+        // `ProfileChangeNotification`'s "Update": their nickname, when we gave one.
+        let update_nickname = match notice {
+            Notice::ProfileNameChanged { who, .. } if self.nicknamed.contains(who) => {
+                self.state.read(cx).conversation(&ConversationId::direct(who)).cloned()
+            }
+            _ => None,
+        };
+        // "Learn More" on a refreshed session or a delivery issue.
+        let learn_more_dialog = match notice {
+            Notice::SessionRefreshed => Some(None),
+            Notice::DeliveryIssue { who } => Some(Some(self.reactor_name(Some(who), cx))),
+            _ => None,
+        };
+        let in_group = self.id.as_group().is_some();
         let go_to = match notice {
             Notice::Pinned { author, sent_at, .. } => Some((author.clone(), *sent_at, "Go to message", "Pinned message not found")),
             // Desktop's "View poll" (`PollTerminateNotification`).
@@ -557,7 +596,53 @@ impl ConversationView {
                     .gap_1()
                     .text_sm()
                     .text_color(palette.text_secondary)
-                    .child(div().text_center().child(text))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap_1p5()
+                            .when_some(icon, |d, icon| d.child(Icon::new(icon).size_4().flex_none().text_color(palette.text_secondary)))
+                            .child(div().text_center().child(text)),
+                    )
+                    .when_some(update_nickname, |d, chat| {
+                        let state = self.state.clone();
+                        d.child(
+                            div().debug_selector(|| "notice-update-nickname".into()).child(
+                                Button::new(SharedString::from(format!("notice-nickname-{sent_at}")))
+                                    .label("Update")
+                                    .ghost()
+                                    .on_click(move |_, window, cx| {
+                                        let (state, chat) = (state.clone(), chat.clone());
+                                        let Some(sid) = chat.id.as_direct().map(str::to_owned) else { return };
+                                        let backend = state.read(cx).backend.clone();
+                                        let db = backend.db().clone();
+                                        let read = backend.spawn(async move { db.contact_nickname(&sid).await });
+                                        let window_handle = window.window_handle();
+                                        cx.spawn(async move |cx| {
+                                            let current = read.await.ok().flatten().unwrap_or_default();
+                                            let _ = cx.update_window(window_handle, |_, window, cx| {
+                                                crate::views::nickname::open_edit(state, chat, current, window, cx);
+                                            });
+                                        })
+                                        .detach();
+                                    }),
+                            ),
+                        )
+                    })
+                    .when_some(learn_more_dialog, |d, sender| {
+                        d.child(
+                            div().debug_selector(|| "notice-learn-more-issue".into()).child(
+                                Button::new(SharedString::from(format!("notice-issue-{sent_at}")))
+                                    .label("Learn More")
+                                    .ghost()
+                                    .on_click(move |_, window, cx| match &sender {
+                                        Some(sender) => crate::views::notices::open_delivery_issue(sender, in_group, window, cx),
+                                        None => crate::views::notices::open_session_refreshed(window, cx),
+                                    }),
+                            ),
+                        )
+                    })
                     .when_some(go_to, |d, (author, at, label, missing)| {
                         d.child(
                             Button::new(SharedString::from(format!("notice-go-{sent_at}")))

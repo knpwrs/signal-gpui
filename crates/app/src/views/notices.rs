@@ -25,7 +25,121 @@ pub fn notice_text(notice: &Notice, name: impl Fn(&str) -> String) -> String {
         Notice::PollEnded { by: None, question, .. } => format!("You ended the poll: {question}"),
         Notice::PollEnded { by: Some(by), question, .. } => format!("{} ended the poll: {question}", name(by)),
         Notice::MessageRequest { event, group, who } => message_request_text(*event, *group, who.as_deref(), name),
+        // Without their address book name; see `profile_change_text`.
+        Notice::ProfileNameChanged { old_name, new_name, .. } => profile_change_text(old_name, new_name, None),
+        // Desktop's `icu:ChangeNumber--notification`.
+        Notice::NumberChanged { who } => format!("{} changed their phone number", name(who)),
+        // `icu:ChatRefresh--notification`.
+        Notice::SessionRefreshed => "Chat session refreshed".into(),
+        // `icu:DeliveryIssue--notification`.
+        Notice::DeliveryIssue { who } => format!("A message from {} couldn\u{2019}t be delivered", name(who)),
+        // `icu:Message--unsupported-message` and `--from-me-unsupported-message`.
+        Notice::UnsupportedMessage { who: Some(who) } => format!(
+            "{} sent you a message that can't be processed or displayed because it uses a new Signal feature.",
+            name(who)
+        ),
+        Notice::UnsupportedMessage { who: None } => {
+            "One of your devices sent a message that can't be processed or displayed because it uses a new Signal feature.".into()
+        }
+        // `icu:youMarkedAsVerified` and the rest (`VerificationNotification`).
+        Notice::Verified { who, verified, local } => format!(
+            "You marked your Safety Number with {} as {}{}",
+            name(who),
+            if *verified { "verified" } else { "not verified" },
+            if *local { "" } else { " from another device" }
+        ),
     }
+}
+
+/// Desktop's `getStringForProfileChange`: `icu:contactChangedProfileName`
+/// with the name we know them by (`sender`, when we saved a name for them),
+/// else `icu:changedProfileName`.
+pub fn profile_change_text(old_name: &str, new_name: &str, sender: Option<&str>) -> String {
+    match sender {
+        Some(sender) => format!("{sender} changed their profile name from {old_name} to {new_name}."),
+        None => format!("{old_name} changed their profile name to {new_name}."),
+    }
+}
+
+/// The icon Desktop's `SystemMessage` shows beside a notice, for the
+/// notices that have one here.
+pub fn notice_icon(notice: &Notice) -> Option<gpui_kit::assets::IconName> {
+    use gpui_kit::assets::IconName;
+    Some(match notice {
+        // Desktop's `profile` icon.
+        Notice::ProfileNameChanged { .. } => IconName::User,
+        Notice::NumberChanged { .. } => IconName::Phone,
+        // `arrow-clockwise`.
+        Notice::SessionRefreshed => IconName::RotateCcw,
+        // `info-circle`.
+        Notice::DeliveryIssue { .. } => IconName::Info,
+        Notice::UnsupportedMessage { .. } => IconName::CircleAlert,
+        // `verified` and `verified-not`.
+        Notice::Verified { verified: true, .. } => IconName::BadgeCheck,
+        Notice::Verified { verified: false, .. } => IconName::CircleAlert,
+        _ => return None,
+    })
+}
+
+/// Desktop's `ChatSessionRefreshedDialog` and `DeliveryIssueDialog`
+/// support pages.
+const CHAT_REFRESHED_SUPPORT: &str = "https://support.signal.org/hc/requests/new?desktop&chat_refreshed";
+const DELIVERY_ISSUE_SUPPORT: &str = "https://support.signal.org/hc/articles/4404859745690";
+
+/// Desktop's "Learn More" dialog for a chat session refreshed notice
+/// (`ChatSessionRefreshedDialog`): what happened, "Contact Support" and OK.
+pub fn open_session_refreshed(window: &mut gpui_kit::Window, cx: &mut gpui_kit::App) {
+    learn_more_dialog(
+        "Chat session refreshed",
+        "Signal uses end-to-end encryption and it may need to refresh your chat session sometimes. This doesn\u{2019}t affect your chat\u{2019}s security but you may have missed a message from this contact and you can ask them to resend it.".into(),
+        ("Contact Support", CHAT_REFRESHED_SUPPORT),
+        window,
+        cx,
+    );
+}
+
+/// Desktop's `DeliveryIssueDialog`: `sender` by name, in a group or not.
+pub fn open_delivery_issue(sender: &str, group: bool, window: &mut gpui_kit::Window, cx: &mut gpui_kit::App) {
+    let summary = if group {
+        format!("A message, sticker, reaction, read receipt or media couldn\u{2019}t be delivered to you from {sender} in this chat.")
+    } else {
+        format!(
+            "A message, sticker, reaction, read receipt or media couldn\u{2019}t be delivered to you from {sender}. They may have tried sending it to you directly, or in a group."
+        )
+    };
+    learn_more_dialog("Delivery Issue", summary, ("Learn More", DELIVERY_ISSUE_SUPPORT), window, cx);
+}
+
+fn learn_more_dialog(
+    title: &'static str,
+    summary: String,
+    (link_label, url): (&'static str, &'static str),
+    window: &mut gpui_kit::Window,
+    cx: &mut gpui_kit::App,
+) {
+    use gpui_kit::component::WindowExt as _;
+    use gpui_kit::component::button::{Button, ButtonVariants as _};
+    use gpui_kit::component::dialog::DialogFooter;
+    use gpui_kit::prelude::*;
+    window.open_dialog(cx, move |dialog, _, cx| {
+        let palette = crate::theme::Palette::get(cx);
+        dialog
+            .title(title)
+            .w(gpui_kit::px(400.))
+            .child(
+                gpui_kit::div()
+                    .debug_selector(move || format!("learn-more-{title}"))
+                    .text_sm()
+                    .text_center()
+                    .text_color(palette.text_secondary)
+                    .child(summary.clone()),
+            )
+            .footer(
+                DialogFooter::new()
+                    .child(Button::new("learn-more-link").label(link_label).outline().on_click(move |_, _, cx| cx.open_url(url)))
+                    .child(Button::new("learn-more-ok").label("OK").primary().on_click(|_, window, cx| window.close_all_dialogs(cx))),
+            )
+    });
 }
 
 /// Desktop's `MessageRequestResponseNotification` wording.
@@ -289,6 +403,26 @@ mod tests {
         assert_eq!(request(E::Block, true, None), "You blocked the group");
         assert_eq!(request(E::Unblock, false, by("a")), "You unblocked this person");
         assert_eq!(request(E::Spam, false, by("a")), "Reported as spam");
+    }
+
+    #[test]
+    fn identity_and_profile_notices_read_like_desktop() {
+        let profile = Notice::ProfileNameChanged { who: "a".into(), old_name: "Al".into(), new_name: "Alice B".into() };
+        assert_eq!(text(profile), "Al changed their profile name to Alice B.");
+        assert_eq!(profile_change_text("Al", "Alice B", Some("Alice")), "Alice changed their profile name from Al to Alice B.");
+        assert_eq!(text(Notice::NumberChanged { who: "a".into() }), "Alice changed their phone number");
+        assert_eq!(text(Notice::SessionRefreshed), "Chat session refreshed");
+        assert_eq!(text(Notice::DeliveryIssue { who: "b".into() }), "A message from Bob couldn\u{2019}t be delivered");
+        assert_eq!(
+            text(Notice::UnsupportedMessage { who: Some("a".into()) }),
+            "Alice sent you a message that can't be processed or displayed because it uses a new Signal feature."
+        );
+        assert!(text(Notice::UnsupportedMessage { who: None }).starts_with("One of your devices sent a message"));
+        let verified = |verified, local| text(Notice::Verified { who: "a".into(), verified, local });
+        assert_eq!(verified(true, true), "You marked your Safety Number with Alice as verified");
+        assert_eq!(verified(false, true), "You marked your Safety Number with Alice as not verified");
+        assert_eq!(verified(true, false), "You marked your Safety Number with Alice as verified from another device");
+        assert_eq!(verified(false, false), "You marked your Safety Number with Alice as not verified from another device");
     }
 
     #[test]

@@ -316,6 +316,9 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
     // She set up a new phone.
     let changed = signal_store::Notice::SafetyNumberChanged { who: aci(MAYA).into() };
     db.insert_notice(&ConversationId(MAYA.into()), now - 30 * MINUTE, &changed).await?;
+    // And gave her profile her full name.
+    let renamed = signal_store::Notice::ProfileNameChanged { who: aci(MAYA).into(), old_name: "Maya".into(), new_name: "Maya Chen".into() };
+    db.insert_notice(&ConversationId(MAYA.into()), now - 29 * MINUTE, &renamed).await?;
     db.mark_read(&ConversationId(MAYA.into())).await?;
     db.insert_message(&incoming(MAYA, MAYA, now - 12 * MINUTE, "Let me know what you think!")).await?;
 
@@ -1969,7 +1972,16 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 }
             }
             Command::SetVerified { conversation, verified } => {
-                let _ = db.set_setting(&format!("demo.verified.{}", conversation.0), if verified { "1" } else { "" }).await;
+                let key = format!("demo.verified.{}", conversation.0);
+                let was = db.setting(&key).await.ok().flatten().is_some_and(|v| v == "1");
+                let _ = db.set_setting(&key, if verified { "1" } else { "" }).await;
+                // Desktop's `addVerifiedChange`, as the real backend adds it.
+                if was != verified && let Some(who) = conversation.as_direct() {
+                    let notice = signal_store::Notice::Verified { who: who.to_owned(), verified, local: true };
+                    if let Ok(Some(id)) = db.insert_notice(&conversation, now(), &notice).await {
+                        emit(Event::MessageChanged { conversation: conversation.clone(), message_id: id });
+                    }
+                }
                 let auto_verify = demo_auto_verify(&db, &conversation).await;
                 emit(Event::SafetyNumber { conversation: conversation.clone(), result: Ok(demo_safety_number(&conversation, verified, auto_verify)) });
             }

@@ -220,6 +220,9 @@ pub enum Action {
         sent_at: i64,
     },
     #[serde(skip)]
+    /// A timeline notice at `at`, as it is.
+    Notice { conversation: ConversationId, at: i64, notice: signal_store::Notice },
+    #[serde(skip)]
     /// Our answer to a message request on another of our devices
     /// (Desktop's `MessageRequestResponse` sync), sent `at`.
     MessageRequestResponse { thread: ThreadRef, response: signal_store::MessageRequestResponse, at: i64 },
@@ -1035,6 +1038,14 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
     };
     let author = author_of(&origin, ctx);
     let flags = dm.flags.unwrap_or(0);
+
+    // One that needs a newer protocol than ours shows Desktop's unsupported
+    // message in its place (`isUnsupportedMessage`: the version we support
+    // at receipt is below `requiredProtocolVersion`).
+    // (`CURRENT` is an alias of `POLLS`, 8, as in Desktop's proto.)
+    if dm.required_protocol_version.is_some_and(|v| v > data_message::ProtocolVersion::Polls as u32) {
+        return vec![Action::Notice { conversation, at: ts, notice: signal_store::Notice::UnsupportedMessage { who: author } }];
+    }
 
     if flags & data_message::Flags::ExpirationTimerUpdate as u32 != 0 {
         return vec![Action::ExpireTimer {

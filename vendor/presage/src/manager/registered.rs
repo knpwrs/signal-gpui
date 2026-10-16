@@ -766,7 +766,7 @@ impl<S: Store> Manager<S, Registered> {
                                             "got error decrypting a message"
                                         );
                                         return Some((
-                                            Received::DecryptionError(content.metadata.sender),
+                                            Received::RetryRequest(content.metadata.sender),
                                             state,
                                         ));
                                     }
@@ -1051,8 +1051,9 @@ impl<S: Store> Manager<S, Registered> {
                                 Err(error) => {
                                     error!(%error, "error opening envelope, message will be skipped!");
                                     if let libsignal_service::prelude::ServiceError::SealedSenderDecryptionError(libsignal_service::cipher::SealedSenderDecryptionError { sender: Some(sender), .. }) = &error {
-                                        if let Some(sender) = ServiceId::parse_from_service_id_string(sender.name()) {
-                                            return Some((Received::DecryptionError(sender), state));
+                                        if let Some(service_id) = ServiceId::parse_from_service_id_string(sender.name()) {
+                                            let device = u32::from(sender.device_id());
+                                            return Some((Received::DecryptionError(service_id, device), state));
                                         }
                                     }
                                 }

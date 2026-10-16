@@ -56,6 +56,12 @@ upstream workspace). Modified by Ken Powers for signal-gpui since
   libsignal-service's `look_up_username_link`, for opening those links
   (Desktop's `resolveUsernameByLinkBase64`). Upstream has no call for it.
 
+- `src/model/messages.rs`, `src/manager/registered.rs`:
+  `Received::DecryptionError` carries the sender's device and is only for
+  messages we couldn't decrypt; a `DecryptionErrorMessage` someone sent us
+  (they couldn't decrypt ours) is the new `Received::RetryRequest`.
+  Upstream reports both as `DecryptionError`.
+
 ## libsignal-service
 
 whisperfish/libsignal-service-rs at `fb92b13c82fde40ba4d10696cf79aa4f36ce25f1`

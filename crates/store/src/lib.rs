@@ -700,6 +700,26 @@ pub enum Notice {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         who: Option<String>,
     },
+    /// Desktop's `profile-change`: `who` changed their profile name from
+    /// `old_name` to `new_name` (each given and family name combined).
+    ProfileNameChanged { who: String, old_name: String, new_name: String },
+    /// Desktop's `change-number-notification`: `who` changed their number.
+    NumberChanged { who: String },
+    /// Desktop's `chat-session-refreshed`: a message from them couldn't be
+    /// decrypted and the session was reset.
+    SessionRefreshed,
+    /// Desktop's `delivery-issue`: something `who` sent couldn't be
+    /// decrypted and won't be sent again.
+    DeliveryIssue { who: String },
+    /// Desktop's unsupported message: `who` (`None`: one of our devices)
+    /// sent something that needs a newer protocol version.
+    UnsupportedMessage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        who: Option<String>,
+    },
+    /// Desktop's `verified-change`: we marked our safety number with `who`
+    /// verified (or not), here (`local`) or on another device.
+    Verified { who: String, verified: bool, local: bool },
 }
 
 /// One change to a group, as a notice shows it. Service ids are `None`
@@ -1372,6 +1392,14 @@ impl AppDb {
         Ok(row.map(|(given, family, note, plain_name)| ContactNickname { given, family, note, plain_name }))
     }
 
+    /// Everyone we gave a nickname (a first or last name, not only a
+    /// note), for Desktop's "Update" on their profile name changes.
+    pub async fn nicknamed(&self) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar("SELECT service_id FROM contact_nicknames WHERE given != '' OR family != ''")
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
     /// Sets (or, all empty, clears) someone's nickname and note here, and
     /// their display name to follow: the nickname, else the name they had
     /// without one. Returns the display name now saved (`None` when none
@@ -1592,8 +1620,23 @@ impl AppDb {
         id: &ConversationId,
         update: ConversationUpdate,
     ) -> Result<()> {
+        self.upsert_conversation_noting_phone(id, update).await.map(|_| ())
+    }
+
+    /// [`AppDb::upsert_conversation`], returning the phone number it had
+    /// when the update replaced it with another (Desktop's `updateE164`
+    /// notices a change from one number to another, not a first number).
+    pub async fn upsert_conversation_noting_phone(&self, id: &ConversationId, update: ConversationUpdate) -> Result<Option<String>> {
         let mut tx = self.write().await?;
         ensure_conversation(&mut tx, id).await?;
+        let old_phone: Option<String> = match &update.phone {
+            Some(_) => sqlx::query_scalar("SELECT phone FROM conversations WHERE id = ?")
+                .bind(&id.0)
+                .fetch_one(&mut *tx)
+                .await?,
+            None => None,
+        };
+        let changed_from = old_phone.filter(|old| update.phone.as_ref().is_some_and(|new| new != old));
         sqlx::query(
             "UPDATE conversations SET \
                 kind = COALESCE(?, kind), \
@@ -1633,7 +1676,7 @@ impl AppDb {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(changed_from)
     }
 
     async fn set_flag(&self, id: &ConversationId, column: &'static str, value: bool) -> Result<()> {

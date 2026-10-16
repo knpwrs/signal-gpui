@@ -197,6 +197,20 @@ impl AppDb {
     /// Saves what a profile fetch at `fetched_at` returned. Returns whether
     /// anything shown changed (not just the time).
     pub async fn save_fetched_profile(&self, service_id: &str, profile: &FetchedProfile, fetched_at: i64) -> Result<bool> {
+        Ok(self.save_fetched_profile_noting_name(service_id, profile, fetched_at).await?.0)
+    }
+
+    /// [`AppDb::save_fetched_profile`], also returning their profile name
+    /// before and after (given and family name combined) when it changed
+    /// from one they had, as Desktop's `setEncryptedProfileName` notices
+    /// (read and written in one transaction, so two fetches at once can't
+    /// both see the old name).
+    pub async fn save_fetched_profile_noting_name(
+        &self,
+        service_id: &str,
+        profile: &FetchedProfile,
+        fetched_at: i64,
+    ) -> Result<(bool, Option<(String, String)>)> {
         let badges = serde_json::to_string(&profile.badges)?;
         let mut tx = self.write().await?;
         let old: Option<(String, String, String, String, String)> = sqlx::query_as(
@@ -228,7 +242,13 @@ impl AppDb {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(old.as_ref() != Some(&new))
+        let old_name = old.as_ref().and_then(|(given, family, ..)| combine_names(given, family));
+        let new_name = combine_names(&profile.given_name, &profile.family_name);
+        let name_change = match old_name {
+            Some(old_name) if Some(&old_name) != new_name.as_ref() => Some((old_name, new_name.unwrap_or_default())),
+            _ => None,
+        };
+        Ok((old.as_ref() != Some(&new), name_change))
     }
 
     /// Sets our own profile name (from the account record, or after we

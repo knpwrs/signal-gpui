@@ -16,6 +16,7 @@ mod release_notes;
 mod remote_config;
 mod view_once;
 mod profile;
+mod session_reset;
 mod settings;
 
 pub(crate) use view_once::VIEW_ONCE_DIR;
@@ -183,6 +184,9 @@ enum Outbound {
     PollVote { message: i64, vote_count: u32, attempt: u32 },
     /// Sync message to our other devices.
     Sync { body: SyncMessage },
+    /// Something to one person that's no chat's message (a receipt, a
+    /// null message), sent as it is; `what` names it in the log.
+    To { recipient: String, body: ContentBody, what: &'static str },
     /// A group update to someone outside the group's members: an invitee,
     /// or someone just removed (Desktop's `includePendingMembers` and
     /// `extraConversationsForSend`). Sent as it is, not as a 1:1 message.
@@ -1175,8 +1179,14 @@ impl Actor {
                 let _ = self.db.set_setting(crate::SETTING_CONTACTS_SYNCED_AT, &now_millis().to_string()).await;
                 self.emit(Event::ContactsSynced);
             }
-            Received::DecryptionError(sender) => {
-                warn!(sender = %sender.service_id_string(), "failed to decrypt message");
+            Received::DecryptionError(sender, device) => {
+                warn!(sender = %sender.service_id_string(), device, "failed to decrypt message");
+                self.on_decryption_error(&sender, device).await;
+            }
+            // Desktop answers by sending the message again
+            // (`onRetryRequest`); that isn't done here yet.
+            Received::RetryRequest(sender) => {
+                warn!(sender = %sender.service_id_string(), "they couldn't decrypt one of our messages");
             }
             Received::Content(content) => {
                 let self_aci = self.self_aci();
@@ -1495,13 +1505,37 @@ impl Actor {
                     self.on_group_call_started(conversation, by, era, at).await
                 }
             }
+            Action::Notice { conversation, at, notice } => {
+                // Theirs counts as unread, as Desktop's unsupported message
+                // is an incoming message.
+                let unread = matches!(notice, signal_store::Notice::UnsupportedMessage { who: Some(_) });
+                self.ensure_title(&conversation).await;
+                let saved = if unread {
+                    self.db.insert_unread_notice(&conversation, at, &notice).await
+                } else {
+                    self.db.insert_notice(&conversation, at, &notice).await
+                };
+                match saved {
+                    Ok(Some(id)) => {
+                        self.emit(Event::MessageChanged { conversation, message_id: id });
+                        self.emit(Event::ConversationsChanged);
+                    }
+                    Ok(None) => {}
+                    Err(error) => self.error("failed to add notice", error),
+                }
+            }
             Action::Verified { aci, identity_key, verified } => {
                 let conversation = ConversationId::direct(&aci);
                 let current = self.identities(&conversation).await.ok().map(|(_, _, _, theirs)| theirs.serialize());
                 // Only for the key we have; an older key's verification is moot.
                 if current.as_deref() == Some(identity_key.as_slice()) {
                     let value = if verified { hex::encode(&identity_key) } else { String::new() };
-                    let _ = self.db.set_setting(&format!("{SETTING_VERIFIED}{aci}"), &value).await;
+                    let setting = format!("{SETTING_VERIFIED}{aci}");
+                    let was = self.db.setting(&setting).await.ok().flatten().is_some_and(|v| v == hex::encode(&identity_key));
+                    if self.db.set_setting(&setting, &value).await.is_ok() && was != verified {
+                        let notice = signal_store::Notice::Verified { who: aci.clone(), verified, local: false };
+                        self.notice_about(&aci, notice).await;
+                    }
                     self.emit_safety_number(conversation).await;
                 }
             }
@@ -3178,11 +3212,31 @@ impl Actor {
             None => None,
         };
         if let Some(update) = self.title_for(conversation).await {
-            if let Err(error) = self.db.upsert_conversation(conversation, update).await {
-                self.error("failed to update conversation", error);
+            if !self.upsert_title(conversation, update).await {
                 return;
             }
             self.titled.borrow_mut().insert(conversation.clone());
+        }
+    }
+
+    /// Saves a conversation's title and details; a person's new number
+    /// gets Desktop's "changed their phone number" notice
+    /// (`addChangeNumberNotification`, never for us). `false` if not saved.
+    async fn upsert_title(&self, conversation: &ConversationId, update: ConversationUpdate) -> bool {
+        match self.db.upsert_conversation_noting_phone(conversation, update).await {
+            Ok(changed_from) => {
+                if changed_from.is_some()
+                    && let Some(sid) = conversation.as_direct()
+                    && sid != self.self_aci()
+                {
+                    self.notice_about(sid, signal_store::Notice::NumberChanged { who: sid.to_owned() }).await;
+                }
+                true
+            }
+            Err(error) => {
+                self.error("failed to update conversation", error);
+                false
+            }
         }
     }
 
@@ -3215,8 +3269,7 @@ impl Actor {
                     || update.description.as_ref().is_some_and(|d| Some(d).filter(|d| !d.is_empty()) != conversation.description.as_ref());
                 if differs {
                     changed = true;
-                    if let Err(error) = self.db.upsert_conversation(&conversation.id, update).await {
-                        self.error("failed to update conversation", error);
+                    if !self.upsert_title(&conversation.id, update).await {
                         continue;
                     }
                 }
@@ -4416,6 +4469,12 @@ impl Actor {
                         warn!(%error, "failed to send sync message");
                     }
                 }
+                Outbound::To { recipient, body, what } => {
+                    let Some(to) = ServiceId::parse_from_service_id_string(&recipient) else { continue };
+                    if let Err(error) = manager.send_message(to, body, self.next_timestamp() as u64).await {
+                        warn!(%error, what, "failed to send");
+                    }
+                }
                 Outbound::GroupUpdateTo { recipient, body, timestamp } => {
                     let Some(to) = ServiceId::parse_from_service_id_string(&recipient) else { continue };
                     if let Err(error) = manager.send_message(to, body, timestamp).await {
@@ -4772,7 +4831,14 @@ impl Actor {
     /// The safety-number-changed notice in their 1:1 chat and the groups we
     /// share; `false` if one couldn't be saved.
     async fn add_safety_notices(&self, sid: &str) -> bool {
-        let notice = signal_store::Notice::SafetyNumberChanged { who: sid.to_owned() };
+        self.notice_about(sid, signal_store::Notice::SafetyNumberChanged { who: sid.to_owned() }).await
+    }
+
+    /// A notice about someone in their 1:1 chat (when there is one) and
+    /// every group we share with them, as Desktop's `addKeyChange`,
+    /// `addProfileChange` and `addChangeNumberNotification` fan out
+    /// (`#getSharedGroups`); `false` if one couldn't be saved.
+    pub(crate) async fn notice_about(&self, sid: &str, notice: signal_store::Notice) -> bool {
         let at = now_millis();
         let direct = ConversationId::direct(sid);
         let mut chats = Vec::new();
@@ -4831,8 +4897,15 @@ impl Actor {
         };
         let key = their_key.serialize();
         let value = if verified { hex::encode(&key) } else { String::new() };
-        if let Err(error) = self.db.set_setting(&format!("{SETTING_VERIFIED}{}", theirs.service_id_string()), &value).await {
+        let setting = format!("{SETTING_VERIFIED}{}", theirs.service_id_string());
+        let was = self.db.setting(&setting).await.ok().flatten().is_some_and(|v| v == hex::encode(&key));
+        if let Err(error) = self.db.set_setting(&setting, &value).await {
             return self.error("can't verify", error);
+        }
+        // Desktop's `addVerifiedChange` when the state changed (`_setVerified`).
+        if was != verified {
+            let sid = theirs.service_id_string();
+            self.notice_about(&sid, signal_store::Notice::Verified { who: sid.clone(), verified, local: true }).await;
         }
         let state = if verified { presage::proto::verified::State::Verified } else { presage::proto::verified::State::Default };
         // Padding, as Desktop sends, so the message's size says nothing.

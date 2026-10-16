@@ -46,7 +46,20 @@ impl Actor {
         if let Err(error) = self.db.save_badges(&remote.badges).await {
             warn!(%error, "failed to save badges");
         }
-        match self.db.save_fetched_profile(sid, &remote.profile, now_millis()).await {
+        let saved = self.db.save_fetched_profile_noting_name(sid, &remote.profile, now_millis()).await;
+        // Desktop's `setEncryptedProfileName`: a notice when the name
+        // changed from one they had, never for ours (`addProfileChange`).
+        if let Ok((_, Some((old_name, new_name)))) = &saved
+            && sid != self.self_aci()
+        {
+            let notice = signal_store::Notice::ProfileNameChanged {
+                who: sid.to_owned(),
+                old_name: old_name.clone(),
+                new_name: new_name.clone(),
+            };
+            self.notice_about(sid, notice).await;
+        }
+        match saved.map(|(changed, _)| changed) {
             Ok(true) => {
                 self.emit(Event::ProfileChanged(sid.to_owned()));
                 if sid == self.self_aci() {
