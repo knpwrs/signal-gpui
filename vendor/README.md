@@ -1,13 +1,17 @@
 # Vendored dependencies
 
-Copies of upstream crates with small changes this app needs, used through
-`[patch]` in the workspace `Cargo.toml`. Each keeps its upstream license.
+Copies of upstream crates with the changes this app needs, used through
+`[patch]` in the workspace `Cargo.toml`. Each keeps its upstream license
+(AGPL-3.0-only, `LICENSE.md` in each directory) and its upstream copyright.
+These are modified versions, as the AGPL's section 5 requires saying: the
+changes are listed below, and `git log -- vendor/<crate>` dates each one.
 
 ## presage
 
 whisperfish/presage at `32ffc659fce2f0be7fb01cffdf8c3ebc0c757d80`, the
 `presage` crate only (its dev-dependencies removed, as they point into the
-upstream workspace). Changes:
+upstream workspace). Modified by Ken Powers for signal-gpui since
+2026-10-15. Changes:
 
 - `src/manager/registered.rs`: the receiving websocket sends
   `X-Signal-Receive-Stories: true`, so the server delivers stories (upstream
@@ -51,7 +55,8 @@ upstream workspace). Changes:
 ## libsignal-service
 
 whisperfish/libsignal-service-rs at `fb92b13c82fde40ba4d10696cf79aa4f36ce25f1`
-(presage's), without its examples and dev-dependencies. Changes:
+(presage's), without its examples and dev-dependencies. Modified by Ken
+Powers for signal-gpui since 2026-10-15. Changes:
 
 - `src/sender.rs`, `src/websocket/sender.rs`: `MessageSender::send_story`
   sends sealed with the story flag (`PUT /v1/messages/{id}?story=true`),

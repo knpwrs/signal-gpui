@@ -16,9 +16,31 @@ Third-party components
 
 Linked libraries (AGPL-3.0-only):
   - libsignal              https://github.com/signalapp/libsignal
-  - libsignal-service-rs   https://github.com/whisperfish/libsignal-service-rs
-  - presage                https://github.com/whisperfish/presage
+    Copyright Signal Messenger, LLC. Some tests reproduce values from its
+    own tests (backup credential presentations, key transparency wire
+    formats) to check this app against it.
   - RingRTC (calls)        https://github.com/signalapp/ringrtc
+    Copyright Signal Messenger, LLC.
+
+Modified libraries, vendored in vendor/ (AGPL-3.0-only):
+  - presage                https://github.com/whisperfish/presage
+  - libsignal-service-rs   https://github.com/whisperfish/libsignal-service-rs
+  Both are Copyright their upstream authors (the whisperfish contributors)
+  and keep their licenses in vendor/*/LICENSE.md. They are modified
+  versions, changed by Ken Powers for signal-gpui since 2026-10-15:
+  vendor/README.md lists each change, and the git history of vendor/ dates
+  it.
+
+Signal Desktop (AGPL-3.0-only), Copyright Signal Messenger, LLC,
+https://github.com/signalapp/Signal-Desktop:
+  - Much of this app's behavior follows Signal Desktop, and parts of its
+    logic are adapted from Desktop's TypeScript source (for example name
+    formatting, the "Read more" cut, the story text color slider, poll
+    limits, and retry back-off schedules). Code comments name the Desktop
+    file each part follows.
+  - Much of the English interface text (dialogs, notices, toasts, menu
+    items) is taken from Signal Desktop's _locales/en/messages.json.
+  - Icons, the ringtone and the app icon's logo, listed below.
 
 Calls use WebRTC (BSD-3-Clause), Copyright (c) 2011, The WebRTC project
 authors, linked from Signal's prebuilt library through RingRTC. Its license
