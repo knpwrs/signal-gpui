@@ -431,7 +431,54 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
         },
     ])
     .await?;
+    seed_calls(db, now).await?;
     Ok(())
+}
+
+/// The demo's call link ("Book club"), ours: a made-up 16-byte root key.
+const DEMO_LINK_KEY: [u8; 16] = [0x3c, 0x91, 0x5e, 0x07, 0xa2, 0x6d, 0xf4, 0x18, 0x8b, 0x2e, 0x73, 0xc5, 0x19, 0xd0, 0x64, 0xb7];
+
+/// A link's room id in hex, as the store keeps it.
+fn demo_room(key: &[u8]) -> String {
+    signal_calls::room_id(key).map(hex::encode).unwrap_or_default()
+}
+
+/// Calls for the Calls tab: a missed call from Sam, a video call with
+/// Maya, and a call link of ours we called through yesterday. (Older than
+/// each chat's last message, so previews stay as they were.)
+async fn seed_calls(db: &AppDb, now: i64) -> signal_store::Result<()> {
+    use signal_store::{CallOutcome, Notice};
+    let missed = Notice::Call { incoming: true, video: false, outcome: CallOutcome::Missed, call_id: None, unseen: false };
+    db.insert_notice(&ConversationId(SAM.into()), now - 10 * DAY, &missed).await?;
+    let video = Notice::Call { incoming: false, video: true, outcome: CallOutcome::Accepted, call_id: None, unseen: false };
+    db.insert_notice(&ConversationId(MAYA.into()), now - 3 * DAY, &video).await?;
+    let room_id = demo_room(&DEMO_LINK_KEY);
+    db.add_call_link(&signal_store::CallLink {
+        room_id: room_id.clone(),
+        root_key: DEMO_LINK_KEY.to_vec(),
+        admin_key: Some(vec![0x42; 16]),
+        name: "Book club".into(),
+        restrictions: signal_store::CallLinkRestrictions::AdminApproval,
+        revoked: false,
+        expiration: Some(now + 90 * DAY),
+        deleted_at: None,
+        added_at: now - 5 * DAY,
+    })
+    .await?;
+    let call = signal_store::AdhocCall { room_id, call_id: 1, at: now - DAY, status: signal_store::AdhocCallStatus::Joined };
+    db.record_adhoc_call(&call).await?;
+    Ok(())
+}
+
+/// A new link's root key: random, but valid (no "repeated" byte pairs).
+fn new_demo_link_key() -> Vec<u8> {
+    use rand::Rng as _;
+    loop {
+        let key: [u8; 16] = rand::rng().random();
+        if signal_calls::room_id(&key).is_some() {
+            return key.to_vec();
+        }
+    }
 }
 
 const STICKER_SIZE: u32 = 256;
@@ -693,7 +740,19 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     Some(_) => db.conversation(&conversation).await.ok().flatten().map(|c| c.members).unwrap_or_default(),
                     None => Vec::new(),
                 };
-                let group = conversation.as_group().is_some();
+                // A call link's call: Leo asks to join one of ours.
+                let link = match conversation.as_call_link() {
+                    Some(room) => match db.call_link(room).await.ok().flatten() {
+                        Some(link) => Some(crate::CallLinkCall {
+                            admin: link.is_admin(),
+                            pending: if link.is_admin() { vec![aci(LEO).to_owned()] } else { Vec::new() },
+                            waiting: false,
+                        }),
+                        None => continue,
+                    },
+                    None => None,
+                };
+                let group = conversation.as_group().is_some() || link.is_some();
                 let update = crate::CallUpdate {
                     conversation,
                     status: if group { crate::CallStatus::Connecting } else { crate::CallStatus::Calling },
@@ -718,6 +777,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     ringer: None,
                     raised_hands: Vec::new(),
                     local_demux_id: group.then_some(DEMO_LOCAL_DEMUX),
+                    link,
                 };
                 let started = next_sent_at();
                 *call.borrow_mut() = Some((update.clone(), started, false));
@@ -749,6 +809,20 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
             }
             Command::HangUp | Command::DeclineCall => {
                 let Some((update, started, connected)) = call.borrow_mut().take() else { continue };
+                // A call link's call goes in the call history.
+                if let Some(room_id) = update.conversation.as_call_link() {
+                    let call = signal_store::AdhocCall {
+                        room_id: room_id.to_owned(),
+                        call_id: started,
+                        at: started,
+                        status: signal_store::AdhocCallStatus::Joined,
+                    };
+                    if db.record_adhoc_call(&call).await.is_ok() {
+                        emit(Event::CallLinksChanged);
+                    }
+                    emit(Event::Call(None));
+                    continue;
+                }
                 // A group call's notice is "You started a group call", from the start.
                 if update.group {
                     // In the call history as a real one is: ringing while
@@ -813,6 +887,83 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
             Command::PeekGroupCall { conversation } => {
                 let users = if conversation.0 == GROUP { vec![aci(MAYA).to_owned()] } else { Vec::new() };
                 emit(Event::GroupPeek { conversation, users });
+            }
+            Command::CreateCallLink => {
+                let key = new_demo_link_key();
+                let room_id = demo_room(&key);
+                let at = now();
+                let link = signal_store::CallLink {
+                    room_id: room_id.clone(),
+                    root_key: key,
+                    admin_key: Some(vec![0x42; 16]),
+                    restrictions: signal_store::CallLinkRestrictions::AdminApproval,
+                    expiration: Some(at + 90 * DAY),
+                    added_at: at,
+                    ..Default::default()
+                };
+                if db.add_call_link(&link).await.is_ok() {
+                    let placeholder =
+                        signal_store::AdhocCall { room_id: room_id.clone(), call_id: at, at, status: signal_store::AdhocCallStatus::Pending };
+                    let _ = db.record_adhoc_call(&placeholder).await;
+                    emit(Event::CallLinksChanged);
+                    emit(Event::CallLinkCreated(room_id));
+                }
+            }
+            Command::UpdateCallLink { room_id, name, restrictions } => {
+                let Ok(Some(link)) = db.call_link(&room_id).await else { continue };
+                let name = name.map(|n| crate::actor::clamp_link_name(&n)).unwrap_or(link.name);
+                let restrictions = restrictions.unwrap_or(link.restrictions);
+                if db.set_call_link_state(&room_id, &name, restrictions, false, link.expiration).await.is_ok() {
+                    emit(Event::CallLinksChanged);
+                }
+            }
+            Command::DeleteCallLink { room_id } => {
+                let Ok(Some(link)) = db.call_link(&room_id).await else { continue };
+                let done = if link.is_admin() {
+                    db.mark_call_link_deleted(&room_id, now()).await.map(|_| ())
+                } else {
+                    db.remove_call_link(&room_id).await
+                };
+                if done.is_ok() {
+                    emit(Event::CallLinksChanged);
+                }
+            }
+            Command::OpenCallLink { url } => {
+                let Some(key) = signal_calls::parse_link(&url) else {
+                    emit(Event::Error("can't open the call link: it isn't a valid call link".into()));
+                    continue;
+                };
+                let room_id = demo_room(&key);
+                let link = signal_store::CallLink {
+                    room_id: room_id.clone(),
+                    root_key: key,
+                    restrictions: signal_store::CallLinkRestrictions::None,
+                    expiration: Some(now() + 90 * DAY),
+                    added_at: now(),
+                    ..Default::default()
+                };
+                if db.add_call_link(&link).await.is_ok() {
+                    emit(Event::CallLinksChanged);
+                    emit(Event::CallLinkOpened(room_id));
+                }
+            }
+            // Leo, let in, joins with his camera off.
+            Command::ApproveCallJoin { aci: who, approve } => {
+                let mut current = call.borrow_mut();
+                let Some((update, _, _)) = current.as_mut() else { continue };
+                let Some(link) = update.link.as_mut() else { continue };
+                link.pending.retain(|p| *p != who);
+                if approve {
+                    let demux_id = update.participants.len() as u32 + 1;
+                    update.participants.push(crate::CallParticipant { aci: who, demux_id, video: false, audio: true, presenting: false });
+                }
+                emit(Event::Call(Some(update.clone())));
+            }
+            Command::RemoveFromCall { demux_id } => {
+                let mut current = call.borrow_mut();
+                let Some((update, _, _)) = current.as_mut() else { continue };
+                update.participants.retain(|p| p.demux_id != demux_id);
+                emit(Event::Call(Some(update.clone())));
             }
             Command::LoadShareSources => {
                 let source = |id: &str, name: &str, is_display| crate::ShareSource { id: id.into(), name: name.into(), is_display };
@@ -1665,6 +1816,16 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     }
                     emit(Event::ConversationsChanged);
                 }
+                // Links' calls go, links we joined go, and ours are deleted.
+                let _ = db.clear_adhoc_calls(now()).await;
+                for link in db.call_links().await.unwrap_or_default() {
+                    let _ = if link.is_admin() {
+                        db.mark_call_link_deleted(&link.room_id, now()).await.map(|_| ())
+                    } else {
+                        db.remove_call_link(&link.room_id).await
+                    };
+                }
+                emit(Event::CallLinksChanged);
             }
             Command::Link
             | Command::Typing { .. }

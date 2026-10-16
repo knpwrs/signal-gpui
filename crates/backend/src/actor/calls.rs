@@ -51,6 +51,7 @@ impl ActiveCall {
             ringer: None,
             raised_hands: Vec::new(),
             local_demux_id: None,
+            link: None,
         }
     }
 }

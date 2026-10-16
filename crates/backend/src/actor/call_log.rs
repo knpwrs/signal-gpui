@@ -24,6 +24,10 @@ impl Actor {
 
     /// A chat as a call event's peer id (Desktop's `getBytesForPeerId`).
     fn call_peer_bytes(conversation: &ConversationId) -> Option<Vec<u8>> {
+        // A call link's room id (hex here).
+        if let Some(room) = conversation.as_call_link() {
+            return hex::decode(room).ok();
+        }
         if let Some(key) = conversation.as_group().and_then(|k| <[u8; 32]>::try_from(k).ok()) {
             return Some(crate::groups::group_identifier(key));
         }
@@ -71,17 +75,22 @@ impl Actor {
     /// Clears the call history up to its latest call, and tells our other
     /// devices (Desktop's "Clear call history").
     pub(super) async fn clear_call_history(&self) {
-        let call = match self.db.latest_call(None).await {
-            Ok(Some(call)) => call,
-            Ok(None) => return,
+        let chat_call = match self.db.latest_call(None).await {
+            Ok(call) => call,
             Err(error) => return self.error("failed to read the call history", error),
         };
-        let target = CallTarget { conversation: Some(call.conversation.clone()), call_id: call.call_id, timestamp: call.sent_at };
-        match self.db.clear_call_history(&target).await {
-            Ok(removed) => self.call_history_changed(true, removed),
-            Err(error) => return self.error("failed to clear the call history", error),
+        // The latest call may be through a call link (`call_links.rs`).
+        let link_call = self.latest_link_call().await;
+        let Some(latest) = [chat_call.clone(), link_call].into_iter().flatten().max_by_key(|c| c.sent_at) else { return };
+        if let Some(call) = &chat_call {
+            let target = CallTarget { conversation: Some(call.conversation.clone()), call_id: call.call_id, timestamp: call.sent_at };
+            match self.db.clear_call_history(&target).await {
+                Ok(removed) => self.call_history_changed(true, removed),
+                Err(error) => return self.error("failed to clear the call history", error),
+            }
         }
-        self.sync_call_log(CallLogType::Clear, &call);
+        self.sync_call_log(CallLogType::Clear, &latest);
+        self.clear_call_links(latest.sent_at).await;
     }
 
     /// Desktop's `CallLogEvent` sync, naming the call it goes up to.
@@ -106,12 +115,25 @@ impl Actor {
             Some(bytes) => self.call_peer_conversation(bytes).await,
             None => None,
         };
+        // A call through a link of ours names its time (our chats' calls
+        // have no link call ids); links' calls are cleared up to it too.
+        let link_room = match (&event.conversation, &conversation) {
+            (Some(bytes), None) => {
+                let room = hex::encode(bytes);
+                self.db.call_link(&room).await.ok().flatten().map(|_| room)
+            }
+            _ => None,
+        };
         // A call we can't place names nothing (Desktop's
         // `getCallHistoryForCallLogEventTarget` finds none).
-        if event.conversation.is_some() && conversation.is_none() {
+        if event.conversation.is_some() && conversation.is_none() && link_room.is_none() {
             return;
         }
-        let target = CallTarget { conversation, call_id: event.call_id, timestamp: event.timestamp };
+        if event.kind == CallLogKind::Clear {
+            self.clear_link_calls(event.timestamp).await;
+        }
+        let call_id = if link_room.is_some() { None } else { event.call_id };
+        let target = CallTarget { conversation, call_id, timestamp: event.timestamp };
         let result = match event.kind {
             CallLogKind::Clear => self.db.clear_call_history(&target).await.map(|removed| (true, removed)),
             CallLogKind::MarkedAsRead | CallLogKind::MarkedAsReadInConversation => {

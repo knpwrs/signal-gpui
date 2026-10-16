@@ -11,9 +11,14 @@
 
 mod camera;
 mod group;
+mod link;
 mod screen;
 
-pub use group::{GroupEvent, GroupFrames, Participant, Peek, Ring, SFU_URL, call_id_from_era};
+pub use group::{GroupEnd, GroupEvent, GroupFrames, Participant, Peek, Ring, SFU_URL, call_id_from_era};
+pub use link::{
+    LINK_PREFIX, LinkClient, LinkRestrictions, LinkResult, LinkState, Responder, link_url, new_link_keys, parse_link,
+    room_id, root_key_string,
+};
 pub use ringrtc::core::group_call::{ClientId, RingCancelReason};
 pub use ringrtc::lite::http::{Method as HttpMethod, Request as HttpRequest, Response as HttpResponse};
 pub use ringrtc::lite::sfu::{DemuxId, GroupMember};
@@ -315,7 +320,9 @@ impl GroupUpdateHandler for Handler {
                 let (connected, connecting) = group::connection(&state);
                 GroupEvent::Connection { client_id, connected, connecting }
             }
-            GroupUpdate::JoinStateChanged(client_id, state) => GroupEvent::Joined { client_id, joined: group::joined(&state) },
+            GroupUpdate::JoinStateChanged(client_id, state) => {
+                GroupEvent::Joined { client_id, joined: group::joined(&state), pending: group::pending(&state) }
+            }
             GroupUpdate::RemoteDeviceStatesChanged(client_id, states) => {
                 GroupEvent::Participants { client_id, participants: states.iter().map(Participant::from).collect() }
             }
@@ -323,7 +330,7 @@ impl GroupUpdateHandler for Handler {
             GroupUpdate::PeekResult { request_id, peek_result } => {
                 GroupEvent::PeekResult { request_id, peek: peek_result.as_ref().ok().map(Peek::from) }
             }
-            GroupUpdate::Ended(client_id, _, _) => GroupEvent::Ended { client_id },
+            GroupUpdate::Ended(client_id, reason, _) => GroupEvent::Ended { client_id, reason: GroupEnd::from(&reason) },
             GroupUpdate::Ring { group_id, ring_id, sender_id, update } => {
                 GroupEvent::Ring { group_id, ring_id: ring_id.into(), sender: sender_id, ring: update.into() }
             }
@@ -676,6 +683,56 @@ impl Calls {
     /// `GroupEvent::PeekResult`.
     pub fn peek_group_call(&mut self, request_id: u32, proof: Vec<u8>, members: Vec<GroupMember>) {
         self.manager.peek_group_call(request_id, SFU_URL.to_owned(), proof, members);
+    }
+
+    /// A client for a call link's call (Desktop's `connectCallLinkCall`):
+    /// `auth` is a `CallLinkAuthCredentialPresentation` for the link,
+    /// `endorsement_key` the server's endorsement public key, and
+    /// `admin_passkey` ours if we made the link. Connect, then join.
+    pub fn create_call_link_call(
+        &mut self,
+        root_key: &[u8],
+        auth: &[u8],
+        admin_passkey: Option<Vec<u8>>,
+        endorsement_key: &[u8],
+    ) -> anyhow::Result<ClientId> {
+        let root_key = ringrtc::lite::call_links::CallLinkRootKey::try_from(root_key)?;
+        let params = ringrtc::core::call_manager::CreateCallLinkCallParams {
+            sfu_url: SFU_URL.to_owned(),
+            endorsement_public_key: endorsement_key,
+            auth_presentation: auth,
+            root_key,
+            admin_passkey,
+            hkdf_extra_info: Vec::new(),
+            audio_levels_interval: None,
+            dred_duration: 0,
+            svc_config: None,
+            peer_connection_factory: None,
+            outgoing_audio_track: self.audio.clone(),
+            outgoing_video_track: self.video.clone(),
+            incoming_video_sink: Some(Box::new(group::GroupSink(self.group_frames.clone()))),
+        };
+        self.manager.create_call_link_call_client(params).map_err(|e| anyhow!("{e}"))
+    }
+
+    /// Lets someone waiting into a call link's call (we're its admin).
+    pub fn approve_user(&mut self, client_id: ClientId, user: Vec<u8>) {
+        self.manager.approve_user(client_id, user);
+    }
+
+    /// Turns down someone waiting to join a call link's call.
+    pub fn deny_user(&mut self, client_id: ClientId, user: Vec<u8>) {
+        self.manager.deny_user(client_id, user);
+    }
+
+    /// Removes someone from a call link's call.
+    pub fn remove_client(&mut self, client_id: ClientId, demux_id: DemuxId) {
+        self.manager.remove_client(client_id, demux_id);
+    }
+
+    /// Removes someone from a call link's call and keeps them out.
+    pub fn block_client(&mut self, client_id: ClientId, demux_id: DemuxId) {
+        self.manager.block_client(client_id, demux_id);
     }
 
     pub fn received_http_response(&mut self, request_id: u32, response: Option<HttpResponse>) {

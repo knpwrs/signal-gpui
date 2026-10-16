@@ -9364,6 +9364,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "nokhwa",
+ "rand 0.10.3",
  "ringrtc",
  "screencapturekit 11.0.0",
  "tracing",

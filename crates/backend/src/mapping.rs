@@ -142,6 +142,13 @@ pub enum Action {
     /// Another of our devices cleared or read its call history.
     CallLogEvent(CallLogEventSync),
     #[serde(skip)]
+    /// Another of our devices made or learned of a call link (Desktop's
+    /// `CallLinkUpdate` sync): its root key, and admin passkey if ours.
+    CallLinkUpdate { root_key: Vec<u8>, admin_key: Option<Vec<u8>> },
+    #[serde(skip)]
+    /// Another of our devices' record of a call through a call link.
+    AdhocCallEvent(AdhocCallSync),
+    #[serde(skip)]
     /// Our other device marked a contact's identity key verified (or not).
     Verified { aci: String, identity_key: Vec<u8>, verified: bool },
     #[serde(skip)]
@@ -1262,6 +1269,16 @@ fn map_sync(sync: &SyncMessage, envelope_ts: i64, ctx: &MapContext) -> Vec<Actio
     {
         out.push(Action::CallLogEvent(sync));
     }
+    if let Some(sync_message::Content::CallEvent(event)) = &sync.content
+        && let Some(sync) = adhoc_call_event(event)
+    {
+        out.push(Action::AdhocCallEvent(sync));
+    }
+    if let Some(sync_message::Content::CallLinkUpdate(update)) = &sync.content
+        && let Some(root_key) = update.root_key.clone().filter(|k| !k.is_empty())
+    {
+        out.push(Action::CallLinkUpdate { root_key, admin_key: update.admin_passkey.clone().filter(|k| !k.is_empty()) });
+    }
     if let Some(sync_message::Content::Verified(v)) = &sync.content
         && let Some(aci) = parse_aci_with_fallback(v.destination_aci_binary.as_deref(), v.destination_aci.as_deref())
         && let Some(identity_key) = v.identity_key.clone()
@@ -1598,5 +1615,39 @@ fn call_log_event(event: &sync_message::CallLogEvent, envelope_ts: i64) -> Optio
         call_id: event.call_id.map(|id| id as i64),
         timestamp: event.timestamp? as i64,
         at: envelope_ts,
+    })
+}
+
+/// A call through a call link, from another of our devices.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdhocCallSync {
+    /// The link's room id, in hex.
+    pub room_id: String,
+    pub call_id: i64,
+    pub timestamp: i64,
+    /// `None`: deleted from the call history.
+    pub status: Option<signal_store::AdhocCallStatus>,
+}
+
+/// Desktop's `getCallEventForProto` for `AD_HOC_CALL`: ACCEPTED is a call
+/// we joined, OBSERVED one we saw, DELETE gone from the history.
+fn adhoc_call_event(event: &sync_message::CallEvent) -> Option<AdhocCallSync> {
+    use sync_message::call_event::{Event, Type};
+    use signal_store::AdhocCallStatus;
+    if event.r#type() != Type::AdHocCall {
+        return None;
+    }
+    let status = match event.event() {
+        Event::Accepted => Some(AdhocCallStatus::Joined),
+        Event::Observed => Some(AdhocCallStatus::Generic),
+        Event::Delete => None,
+        _ => return None,
+    };
+    let room = event.conversation_id.as_deref().filter(|r| !r.is_empty())?;
+    Some(AdhocCallSync {
+        room_id: hex::encode(room),
+        call_id: event.call_id? as i64,
+        timestamp: event.timestamp? as i64,
+        status,
     })
 }

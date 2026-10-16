@@ -632,6 +632,8 @@ impl AppState {
             Event::PinsChanged(conversation) => cx.emit(AppEvent::PinsChanged(conversation)),
             Event::SafetyNumber { conversation, result } => self.safety_number = Some((conversation, result)),
             Event::Call(update) => self.on_call(update, cx),
+            // (Call links show in the Calls tab, next.)
+            Event::CallLinksChanged | Event::CallLinkCreated(_) | Event::CallLinkOpened(_) | Event::CallLinkRefused { .. } => {}
             Event::CallDevices(devices) => self.call_devices = Some(devices),
             Event::CallReactions(reactions) => {
                 let now = std::time::Instant::now();

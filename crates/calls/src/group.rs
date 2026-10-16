@@ -55,6 +55,11 @@ pub struct Peek {
     /// Who started it (their ACI's bytes): Desktop's call history takes
     /// the call's direction and ringer from this.
     pub creator: Option<Vec<u8>>,
+    /// A call link's call: who's waiting for an admin to let them in (their
+    /// ACIs' bytes, in the order they asked).
+    pub pending: Vec<Vec<u8>>,
+    /// A call link's call: the link's state.
+    pub link: Option<crate::link::LinkState>,
 }
 
 impl From<&PeekInfo> for Peek {
@@ -64,6 +69,8 @@ impl From<&PeekInfo> for Peek {
             era_id: info.era_id.clone(),
             max_devices: info.max_devices,
             creator: info.creator.clone(),
+            pending: info.unique_pending_users().into_iter().cloned().collect(),
+            link: info.call_link_state.as_ref().map(crate::link::LinkState::from),
         }
     }
 }
@@ -105,13 +112,14 @@ pub enum GroupEvent {
     /// Hand over the group's members.
     NeedsMembers(group_call::ClientId),
     Connection { client_id: group_call::ClientId, connected: bool, connecting: bool },
-    /// We're in (with our demux id), or not.
-    Joined { client_id: group_call::ClientId, joined: Option<DemuxId> },
+    /// We're in (with our demux id), or not. `pending`: a call link's
+    /// admin hasn't let us in yet.
+    Joined { client_id: group_call::ClientId, joined: Option<DemuxId>, pending: bool },
     Participants { client_id: group_call::ClientId, participants: Vec<Participant> },
     Peek { client_id: group_call::ClientId, peek: Peek },
     /// Answer to [`crate::Calls::peek_group_call`].
     PeekResult { request_id: u32, peek: Option<Peek> },
-    Ended { client_id: group_call::ClientId },
+    Ended { client_id: group_call::ClientId, reason: GroupEnd },
     /// A ring for a group call: `group_id` is the group's identifier.
     Ring { group_id: Vec<u8>, ring_id: i64, sender: Vec<u8>, ring: Ring },
     /// Reactions sent in the call since the last, oldest first: who sent
@@ -123,6 +131,35 @@ pub enum GroupEvent {
     MutedBy { client_id: group_call::ClientId, source: DemuxId },
     /// Someone muted someone else (or us on another device).
     ObservedMute { client_id: group_call::ClientId, source: DemuxId, target: DemuxId },
+}
+
+/// Why a group call ended for us (the reasons the app tells apart).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupEnd {
+    /// We left, or it ended some other way.
+    Other,
+    /// A call link's admin turned down our request to join.
+    Denied,
+    /// A call link's admin removed us.
+    Removed,
+    /// The call was full.
+    Full,
+}
+
+impl From<&ringrtc::common::CallEndReason> for GroupEnd {
+    fn from(reason: &ringrtc::common::CallEndReason) -> Self {
+        use ringrtc::common::CallEndReason;
+        match reason {
+            CallEndReason::DeniedRequestToJoinCall => Self::Denied,
+            CallEndReason::RemovedFromCall => Self::Removed,
+            CallEndReason::HasMaxDevices => Self::Full,
+            _ => Self::Other,
+        }
+    }
+}
+
+pub(crate) fn pending(state: &JoinState) -> bool {
+    matches!(state, JoinState::Pending(_))
 }
 
 pub(crate) fn connection(state: &ConnectionState) -> (bool, bool) {

@@ -82,6 +82,30 @@ pub(crate) struct StorageSnapshot {
     pub story_view_receipts: Option<bool>,
     /// The account's `hasSetMyStoriesPrivacy`.
     pub my_story_privacy_set: Option<bool>,
+    /// Call links we made (on any of our devices), deleted ones too.
+    pub call_links: Vec<StorageCallLink>,
+}
+
+/// A call link record (Desktop's `mergeCallLinkRecord`): only links we're
+/// admin of are kept there; a deleted one keeps its root key and when.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StorageCallLink {
+    pub root_key: Vec<u8>,
+    pub admin_key: Option<Vec<u8>>,
+    /// Unix millis; a record with both this and an admin key is deleted
+    /// (Desktop: "Assuming deleted").
+    pub deleted_at: Option<i64>,
+}
+
+fn call_link(record: &presage::proto::CallLinkRecord) -> Option<StorageCallLink> {
+    if record.root_key.is_empty() {
+        return None;
+    }
+    Some(StorageCallLink {
+        root_key: record.root_key.clone(),
+        admin_key: (!record.admin_passkey.is_empty()).then(|| record.admin_passkey.clone()),
+        deleted_at: (record.deleted_at_timestamp_ms != 0).then(|| clamp_millis(record.deleted_at_timestamp_ms)),
+    })
 }
 
 /// Reads the account record and every contact record from the Storage Service.
@@ -107,6 +131,7 @@ pub(crate) async fn fetch(manager: &SignalManager) -> anyhow::Result<StorageSnap
                     | IdentifierType::Groupv2
                     | IdentifierType::Account
                     | IdentifierType::StoryDistributionList
+                    | IdentifierType::CallLink
             )
         })
         .map(|id| id.raw.clone())
@@ -144,6 +169,7 @@ pub(crate) async fn fetch(manager: &SignalManager) -> anyhow::Result<StorageSnap
                     };
                 }
                 Some(Record::StoryDistributionList(list)) => snapshot.story_lists.extend(story_list(&list)),
+                Some(Record::CallLink(link)) => snapshot.call_links.extend(call_link(&link)),
                 _ => {}
             }
         }
@@ -526,6 +552,84 @@ pub(crate) async fn write_story_list(manager: &SignalManager, list: &crate::Stor
             None => (None, new_story_list_record(&id)),
         };
         let Some(record) = edit_story_list(&record, list, deleted_at)? else { return Ok(()) };
+        if session.commit(manager, &manifest, old_key.as_deref(), kind, &record).await? {
+            return Ok(());
+        }
+    }
+    bail!("storage kept changing on another device; try again")
+}
+
+const RECORD_CALL_LINK: u32 = 7; // StorageRecord.callLink
+const LINK_ADMIN_KEY: u32 = 2;
+const LINK_DELETED_AT: u32 = 3;
+
+/// Sets a call link record's admin key, or marks it deleted at
+/// `deleted_at` (unix millis) with no admin key, as Desktop's
+/// `toCallLinkRecord` writes it, keeping its root key and any fields this
+/// client doesn't know. `Ok(None)` when nothing changes.
+pub(crate) fn edit_call_link(record: &[u8], admin_key: Option<&[u8]>, deleted_at: u64) -> anyhow::Result<Option<Vec<u8>>> {
+    edit_inner(record, RECORD_CALL_LINK, |inner| {
+        let fields = wire::fields(inner).context("malformed call link record")?;
+        let mut out = Vec::with_capacity(inner.len() + 32);
+        for field in fields.iter().filter(|f| !matches!(f.number, LINK_ADMIN_KEY | LINK_DELETED_AT)) {
+            out.extend_from_slice(field.raw);
+        }
+        match (deleted_at, admin_key) {
+            (0, Some(key)) if !key.is_empty() => wire::put_len(&mut out, LINK_ADMIN_KEY, key),
+            (0, _) => {}
+            (at, _) => wire::put_varint_field(&mut out, LINK_DELETED_AT, at),
+        }
+        let decode = |bytes: &[u8]| presage::proto::CallLinkRecord::decode(bytes).ok();
+        let same = decode(inner).zip(decode(&out)).is_some_and(|(old, new)| {
+            (old.admin_passkey, old.deleted_at_timestamp_ms) == (new.admin_passkey, new.deleted_at_timestamp_ms)
+        });
+        Ok((!same).then_some(out))
+    })
+}
+
+fn new_call_link_record(root_key: &[u8]) -> Vec<u8> {
+    let link = presage::proto::CallLinkRecord { root_key: root_key.to_vec(), ..Default::default() };
+    StorageRecord { record: Some(Record::CallLink(link)) }.encode_to_vec()
+}
+
+fn is_call_link(record: &StorageRecord, room_id: &[u8]) -> bool {
+    matches!(&record.record, Some(Record::CallLink(link))
+        if signal_calls::room_id(&link.root_key).is_some_and(|room| room == room_id))
+}
+
+/// Saves a call link we're admin of for the whole account (Desktop's
+/// `CallLinkRecord`), adding it if Storage Service doesn't have it; with
+/// `deleted_at`, marks it deleted.
+pub(crate) async fn write_call_link(
+    manager: &SignalManager,
+    root_key: &[u8],
+    admin_key: Option<&[u8]>,
+    deleted_at: u64,
+) -> anyhow::Result<()> {
+    let room_id = signal_calls::room_id(root_key).context("not a call link's key")?;
+    let session = Session::new(manager).await?;
+    let kind = IdentifierType::CallLink;
+    for _ in 0..3 {
+        let manifest = session.manifest().await?;
+        let ikm = manifest_ikm(&manifest);
+        let keys: Vec<Vec<u8>> =
+            manifest.identifiers.iter().filter(|key| key.r#type() == kind).map(|key| key.raw.clone()).collect();
+        let mut existing = None;
+        for batch in keys.chunks(READ_BATCH) {
+            existing = session
+                .read_many(batch, ikm)
+                .await?
+                .into_iter()
+                .find(|(_, raw)| StorageRecord::decode(raw.as_slice()).is_ok_and(|record| is_call_link(&record, &room_id)));
+            if existing.is_some() {
+                break;
+            }
+        }
+        let (old_key, record) = match existing {
+            Some((key, raw)) => (Some(key), raw),
+            None => (None, new_call_link_record(root_key)),
+        };
+        let Some(record) = edit_call_link(&record, admin_key, deleted_at)? else { return Ok(()) };
         if session.commit(manager, &manifest, old_key.as_deref(), kind, &record).await? {
             return Ok(());
         }
@@ -1272,6 +1376,39 @@ mod tests {
         assert_eq!(decoded.given_name, "Ken");
         assert!(edited.windows(20).any(|w| w == b"future account field"));
         assert_eq!(edit_account(&edited, &edits).unwrap(), None, "already so");
+    }
+
+    #[test]
+    fn call_link_records_read_and_write_as_desktops() {
+        use presage::proto::CallLinkRecord;
+        let decode = |record: &[u8]| match StorageRecord::decode(record).unwrap().record {
+            Some(Record::CallLink(link)) => link,
+            other => panic!("{other:?}"),
+        };
+        // A V0 root key (16 bytes, no repeated pairs).
+        let root_key: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(37).wrapping_add(11)).collect();
+        let fresh = new_call_link_record(&root_key);
+        let room = signal_calls::room_id(&root_key).unwrap();
+        assert!(is_call_link(&StorageRecord::decode(fresh.as_slice()).unwrap(), &room));
+        assert!(!is_call_link(&StorageRecord::decode(fresh.as_slice()).unwrap(), &[0; 32]));
+
+        let saved = edit_call_link(&fresh, Some(&[7; 16]), 0).unwrap().unwrap();
+        let link = decode(&saved);
+        assert_eq!((link.root_key.as_slice(), link.admin_passkey.as_slice(), link.deleted_at_timestamp_ms), (&root_key[..], &[7u8; 16][..], 0));
+        assert_eq!(edit_call_link(&saved, Some(&[7; 16]), 0).unwrap(), None, "already so");
+        assert_eq!(call_link(&link), Some(StorageCallLink { root_key: root_key.clone(), admin_key: Some(vec![7; 16]), deleted_at: None }));
+
+        // Unknown fields stay; deleting drops the admin key (Desktop's `toCallLinkRecord`).
+        let mut inner = CallLinkRecord { root_key: root_key.clone(), admin_passkey: vec![7; 16], ..Default::default() }.encode_to_vec();
+        wire::put_len(&mut inner, 99, b"future link field");
+        let mut record = Vec::new();
+        wire::put_len(&mut record, RECORD_CALL_LINK, &inner);
+        let deleted = edit_call_link(&record, None, 1234).unwrap().unwrap();
+        assert!(deleted.windows(17).any(|w| w == b"future link field"));
+        let link = decode(&deleted);
+        assert!(link.admin_passkey.is_empty());
+        assert_eq!(call_link(&link).unwrap().deleted_at, Some(1234));
+        assert_eq!(call_link(&CallLinkRecord::default()), None, "no root key");
     }
 
     #[test]

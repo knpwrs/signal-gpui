@@ -2,6 +2,7 @@
 //! the app database. Runs on a `LocalSet` because presage's futures are `!Send`.
 
 mod call_log;
+mod call_links;
 mod calls;
 mod early;
 mod group_calls;
@@ -59,6 +60,8 @@ use crate::{
     storage,
 };
 use anyhow::Context as _;
+
+pub(crate) use call_links::clamp_name as clamp_link_name;
 
 pub(crate) type SignalManager = Manager<SqliteStore, Registered>;
 
@@ -322,6 +325,14 @@ struct Actor {
     group_call: RefCell<Option<group_calls::GroupCall>>,
     /// Lobby peeks awaiting their answer, by request id.
     peeks: RefCell<HashMap<u32, ConversationId>>,
+    /// Today's call link credential (`call_links.rs`).
+    link_auth: RefCell<Option<crate::call_links::AuthCredential>>,
+    /// The calling server's call link API.
+    link_client: std::cell::OnceCell<signal_calls::LinkClient>,
+    /// Call links to read from the calling server, and whether a read is
+    /// running (`call_links.rs`).
+    link_refresh_queue: RefCell<Vec<String>>,
+    link_refresh_running: std::cell::Cell<bool>,
     next_peek: std::cell::Cell<u32>,
     /// The microphone, speaker and camera chosen in Settings.
     call_choices: RefCell<crate::CallDevices>,
@@ -419,6 +430,10 @@ pub(crate) async fn run(
         call: RefCell::new(None),
         group_call: RefCell::new(None),
         peeks: RefCell::default(),
+        link_auth: RefCell::new(None),
+        link_client: std::cell::OnceCell::new(),
+        link_refresh_queue: RefCell::default(),
+        link_refresh_running: std::cell::Cell::new(false),
         next_peek: std::cell::Cell::new(0),
         call_choices: RefCell::default(),
         call_events,
@@ -778,6 +793,9 @@ impl Actor {
                 Command::SetStoriesDisabled(disabled) => self.set_stories_disabled(disabled).await,
                 Command::SetStoryViewReceipts(on) => self.set_story_view_receipts(on).await,
                 Command::SetAccountSetting { setting, on } => self.set_account_setting(setting, on).await,
+                Command::StartCall { conversation, video } if conversation.as_call_link().is_some() => {
+                    self.start_link_call(conversation, video).await
+                }
                 Command::StartCall { conversation, video } => self.start_call(conversation, video),
                 Command::AcceptCall { video } => self.accept_call(video),
                 Command::DeclineCall | Command::HangUp => self.hang_up().await,
@@ -788,6 +806,9 @@ impl Actor {
                 Command::StartSharing { source } => self.start_sharing(source),
                 Command::StopSharing => self.stop_sharing(),
                 Command::SetCallDevice { kind, id } => self.set_call_device(kind, id).await,
+                Command::PeekGroupCall { conversation } if conversation.as_call_link().is_some() => {
+                    self.peek_call_link(conversation).await
+                }
                 Command::PeekGroupCall { conversation } => self.peek_group_call(conversation).await,
                 Command::MarkCallsRead { conversation } => self.mark_calls_read(conversation).await,
                 Command::CallReact { emoji } => self.call_react(emoji),
@@ -795,6 +816,12 @@ impl Actor {
                 Command::RemoteMute { demux_id } => self.remote_mute(demux_id),
                 Command::ShowGroupVideo { visible, main } => self.show_group_video(visible, main),
                 Command::ClearCallHistory => self.clear_call_history().await,
+                Command::CreateCallLink => self.create_call_link().await,
+                Command::UpdateCallLink { room_id, name, restrictions } => self.update_call_link(room_id, name, restrictions).await,
+                Command::DeleteCallLink { room_id } => self.delete_call_link(room_id).await,
+                Command::OpenCallLink { url } => self.open_call_link(url).await,
+                Command::ApproveCallJoin { aci, approve } => self.approve_call_join(aci, approve),
+                Command::RemoveFromCall { demux_id } => self.remove_from_call(demux_id),
                 Command::Unlink => self.unlink().await,
                 Command::SkipHistory => self.skip_history().await,
                 Command::AddGroupMembers { conversation, members } => self.add_group_members(conversation, members).await,
@@ -1232,6 +1259,8 @@ impl Actor {
             Action::CallEvent(event) => self.on_call_event(event).await,
             Action::GroupCallEvent(event) => self.on_group_call_event(event).await,
             Action::CallLogEvent(event) => self.on_call_log_event(event).await,
+            Action::CallLinkUpdate { root_key, admin_key } => self.on_call_link_update(root_key, admin_key).await,
+            Action::AdhocCallEvent(event) => self.on_adhoc_call_event(event).await,
             Action::GroupCallStarted { conversation, by, era, at } => {
                 // (Not from a blocked group.)
                 if by.is_none() || !self.is_blocked(&conversation).await {
@@ -2092,6 +2121,7 @@ impl Actor {
             stories_disabled,
             story_view_receipts,
             my_story_privacy_set,
+            call_links,
         } = match storage::fetch(manager).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -2122,6 +2152,7 @@ impl Actor {
             )
             .await;
         }
+        self.apply_storage_call_links(call_links).await;
         match self.db.apply_chat_states(&chats).await {
             Ok(true) => self.emit(Event::ConversationsChanged),
             Ok(false) => {}

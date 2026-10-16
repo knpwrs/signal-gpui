@@ -721,6 +721,47 @@ fn sync_call_log_events() {
 }
 
 #[test]
+fn sync_adhoc_call_events_and_call_link_updates() {
+    use presage::proto::sync_message::call_event::{Direction, Event, Type};
+    let event = |event: Event| SyncMessage {
+        content: Some(sync_message::Content::CallEvent(sync_message::CallEvent {
+            conversation_id: Some(vec![0xab, 0xcd]),
+            call_id: Some(7),
+            timestamp: Some(500),
+            r#type: Some(Type::AdHocCall.into()),
+            direction: Some(Direction::Incoming.into()),
+            event: Some(event.into()),
+        })),
+        ..Default::default()
+    };
+    let joined = AdhocCallSync { room_id: "abcd".into(), call_id: 7, timestamp: 500, status: Some(signal_store::AdhocCallStatus::Joined) };
+    assert_eq!(map_content(&content(ME, event(Event::Accepted)), &ctx()), vec![Action::AdhocCallEvent(joined.clone())]);
+    let observed = map_content(&content(ME, event(Event::Observed)), &ctx());
+    assert!(matches!(&observed[..], [Action::AdhocCallEvent(e)] if e.status == Some(signal_store::AdhocCallStatus::Generic)));
+    let deleted = map_content(&content(ME, event(Event::Delete)), &ctx());
+    assert!(matches!(&deleted[..], [Action::AdhocCallEvent(e)] if e.status.is_none()));
+    assert!(map_content(&content(ME, event(Event::NotAccepted)), &ctx()).is_empty());
+
+    let update = |admin: Option<Vec<u8>>| SyncMessage {
+        content: Some(sync_message::Content::CallLinkUpdate(sync_message::CallLinkUpdate {
+            root_key: Some(vec![1; 16]),
+            admin_passkey: admin,
+            r#type: None,
+        })),
+        ..Default::default()
+    };
+    assert_eq!(
+        map_content(&content(ME, update(Some(vec![2; 16]))), &ctx()),
+        vec![Action::CallLinkUpdate { root_key: vec![1; 16], admin_key: Some(vec![2; 16]) }]
+    );
+    // An empty passkey is none.
+    assert_eq!(
+        map_content(&content(ME, update(Some(Vec::new()))), &ctx()),
+        vec![Action::CallLinkUpdate { root_key: vec![1; 16], admin_key: None }]
+    );
+}
+
+#[test]
 fn group_call_updates_become_notices() {
     let mut dm = DataMessage { timestamp: Some(900), ..Default::default() };
     dm.group_v2 = Some(GroupContextV2 { master_key: Some(group_key()), ..Default::default() });

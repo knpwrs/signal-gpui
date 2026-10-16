@@ -19,6 +19,7 @@ mod groups;
 mod history;
 mod safety;
 mod calling;
+mod call_links;
 mod profiles;
 pub mod media;
 pub mod link_preview;
@@ -330,7 +331,24 @@ pub enum Command {
     /// Turns our camera on or off: in a call, or for the lobby's preview.
     SetCallVideo(bool),
     /// Who's in a group's call, for the lobby; answered with `Event::GroupPeek`.
+    /// For a call link's call (`ConversationId::call_link`) too, which
+    /// also refreshes the link's name and settings.
     PeekGroupCall { conversation: ConversationId },
+    /// Makes a call link (Desktop's "Create a call link"): answered with
+    /// `Event::CallLinkCreated`, once the calling server has it.
+    CreateCallLink,
+    /// Renames a link of ours, or changes whether an admin approves who
+    /// joins (Desktop's call link details).
+    UpdateCallLink { room_id: String, name: Option<String>, restrictions: Option<signal_store::CallLinkRestrictions> },
+    /// Deletes a link of ours for everyone, or forgets one we only joined.
+    DeleteCallLink { room_id: String },
+    /// A `https://signal.link/call/#key=…` URL: keeps the link and reads
+    /// its name; answered with `Event::CallLinkOpened` (or an error).
+    OpenCallLink { url: String },
+    /// Lets someone waiting into our call link's call (their ACI), or not.
+    ApproveCallJoin { aci: String, approve: bool },
+    /// Takes someone out of our call link's call.
+    RemoveFromCall { demux_id: u32 },
     /// Lists screens and windows to present; answered with `Event::ShareSources`.
     LoadShareSources,
     /// Presents a screen or window (an id from `Event::ShareSources`).
@@ -572,6 +590,8 @@ pub struct CallUpdate {
     pub raised_hands: Vec<u32>,
     /// Our demux id in a group call, once we're in.
     pub local_demux_id: Option<u32>,
+    /// A call link's call: what's particular to one.
+    pub link: Option<CallLinkCall>,
 }
 
 /// A reaction someone sent in a group call (Desktop's call reactions).
@@ -581,6 +601,17 @@ pub struct CallReaction {
     pub aci: String,
     pub demux_id: u32,
     pub emoji: String,
+}
+
+/// A call link's call, beyond what every group call has.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CallLinkCall {
+    /// The link is ours: we let people in.
+    pub admin: bool,
+    /// Who's asking to join (their ACIs), in the order they asked.
+    pub pending: Vec<String>,
+    /// We're waiting for an admin to let us in.
+    pub waiting: bool,
 }
 
 /// Someone in a group call (one of their devices).
@@ -636,6 +667,8 @@ pub struct CallDevices {
 }
 
 pub use signal_calls::{Device, Devices, ShareSource};
+/// A call link's URL from its root key (`https://signal.link/call/#key=…`).
+pub use signal_calls::link_url as call_link_url;
 
 /// The call's video: their latest frame, and our camera's (mirrored).
 #[derive(Clone, Default)]
@@ -747,6 +780,16 @@ pub enum Event {
     /// In the group call, `by` (an ACI) muted `target` (`None`: us; then
     /// our microphone is off).
     CallMuted { by: String, target: Option<String> },
+    /// Call links (or their calls in the history) changed: reload them.
+    CallLinksChanged,
+    /// A link we made is ready (its room id).
+    CallLinkCreated(String),
+    /// A link's URL was opened and the link is kept (its room id): its
+    /// lobby can open.
+    CallLinkOpened(String),
+    /// A call link's call ended without us: an admin turned down our
+    /// request, or removed us (Desktop's notices for both).
+    CallLinkRefused { removed: bool },
     /// A 1:1 chat's safety number, or why there isn't one.
     SafetyNumber { conversation: ConversationId, result: Result<SafetyNumber, String> },
     /// A group we created is ready to open.

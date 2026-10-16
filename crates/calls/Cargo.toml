@@ -13,6 +13,8 @@ description = "1:1 Signal calls through RingRTC"
 ringrtc = { git = "https://github.com/signalapp/ringrtc", tag = "v2.72.1", features = ["prebuilt_webrtc"] }
 # Camera capture (AVFoundation on macOS).
 nokhwa = { version = "0.10.11", features = ["input-native", "output-threaded"] }
+# Call link keys (the version RingRTC takes).
+rand = { version = "0.10", features = ["sys_rng"] }
 anyhow.workspace = true
 tracing.workspace = true
 

@@ -67,6 +67,8 @@ pub(super) struct GroupCall {
     joined: bool,
     sharing: bool,
     camera_before_sharing: bool,
+    /// A call link's call (`call_links.rs`); `key` is unused then.
+    link: Option<super::call_links::LinkCallState>,
 }
 
 impl GroupCall {
@@ -92,6 +94,7 @@ impl GroupCall {
             joined: false,
             sharing: false,
             camera_before_sharing: false,
+            link: None,
         }
     }
 
@@ -138,6 +141,7 @@ impl GroupCall {
             ringer: self.ring.as_ref().map(|(_, _, ringer)| ringer.clone()),
             raised_hands: self.raised_hands.clone(),
             local_demux_id: self.our_demux,
+            link: self.link.as_ref().map(super::call_links::LinkCallState::view),
         }
     }
 }
@@ -151,7 +155,7 @@ fn aci_of(bytes: &[u8]) -> Option<String> {
 /// For the calling server, which (as Signal's other servers) has a
 /// certificate from Signal's own root CA: trusting only that, as Desktop
 /// does. (reqwest here has no TLS of its own.)
-fn http() -> Option<&'static reqwest::Client> {
+pub(super) fn http() -> Option<&'static reqwest::Client> {
     static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
@@ -282,6 +286,10 @@ impl Actor {
     /// accepted) and starts its disappearing countdown; and, as Desktop
     /// sends on joining and on leaving, a `groupCallUpdate` to the group.
     async fn left_group_call(&self, call: &GroupCall) {
+        // A call link's call is recorded by `call_links.rs`; it has no group.
+        if call.link.is_some() {
+            return;
+        }
         if call.recorded.is_some()
             && let Some(record) = call.record(&self.self_aci())
         {
@@ -368,11 +376,15 @@ impl Actor {
                 }
                 self.emit_call();
             }
-            GroupEvent::Joined { client_id, joined } => {
+            GroupEvent::Joined { client_id, joined, pending } => {
                 let ring = {
                     let mut call = self.group_call.borrow_mut();
                     let Some(call) = call.as_mut().filter(|g| g.client_id == Some(client_id)) else { return };
-                    call.joined = joined.is_some();
+                    // Waiting for a call link's admin isn't being in it.
+                    if let Some(link) = call.link.as_mut() {
+                        link.waiting = pending;
+                    }
+                    call.joined = joined.is_some() && !pending;
                     call.our_demux = joined;
                     if call.joined && !matches!(call.status, CallStatus::Connected { .. }) {
                         call.status = CallStatus::Connected { since: now_millis() };
@@ -431,11 +443,21 @@ impl Actor {
                 }
             }
             GroupEvent::Peek { client_id, peek } => {
-                if let Some(call) = self.group_call.borrow_mut().as_mut().filter(|g| g.client_id == Some(client_id)) {
-                    call.era = peek.era_id;
+                let link = {
+                    let mut call = self.group_call.borrow_mut();
+                    let Some(call) = call.as_mut().filter(|g| g.client_id == Some(client_id)) else { return };
+                    call.era = peek.era_id.clone();
                     if let Some(creator) = peek.creator.as_deref().and_then(aci_of) {
                         call.creator = Some(creator);
                     }
+                    call.link.as_mut().map(|link| {
+                        link.pending = peek.pending.iter().filter_map(|u| aci_of(u)).collect();
+                        link.room_id.clone()
+                    })
+                };
+                if let Some(room_id) = link {
+                    self.on_link_call_peek(&room_id, &peek).await;
+                    self.emit_call();
                 }
                 self.announce_group_call(client_id).await;
                 self.record_join_state(client_id).await;
@@ -445,11 +467,19 @@ impl Actor {
                 let users = peek.map(|p| p.users.iter().filter_map(|u| aci_of(u)).collect()).unwrap_or_default();
                 self.emit(Event::GroupPeek { conversation, users });
             }
-            GroupEvent::Ended { client_id } => {
+            GroupEvent::Ended { client_id, reason } => {
                 let ended = {
                     let mut call = self.group_call.borrow_mut();
                     if call.as_ref().is_some_and(|g| g.client_id == Some(client_id)) { call.take() } else { None }
                 };
+                // Desktop tells you when a call link's admin turned you away.
+                if ended.as_ref().is_some_and(|g| g.link.is_some()) {
+                    match reason {
+                        signal_calls::GroupEnd::Denied => self.emit(Event::CallLinkRefused { removed: false }),
+                        signal_calls::GroupEnd::Removed => self.emit(Event::CallLinkRefused { removed: true }),
+                        signal_calls::GroupEnd::Other | signal_calls::GroupEnd::Full => {}
+                    }
+                }
                 if let Some(call) = ended {
                     self.with_calls(|calls| {
                         calls.group_end(client_id);
@@ -517,7 +547,9 @@ impl Actor {
         let me = self.self_aci();
         let (conversation, record, event) = {
             let mut call = self.group_call.borrow_mut();
-            let Some(call) = call.as_mut().filter(|g| g.client_id == Some(client_id) && g.joined) else { return };
+            let Some(call) = call.as_mut().filter(|g| g.client_id == Some(client_id) && g.joined && g.link.is_none()) else {
+                return;
+            };
             let Some(record) = call.record(&me) else { return };
             let event = if record.incoming { CallHistoryEvent::Accepted } else { CallHistoryEvent::Ringing };
             if call.recorded == Some(event) {
@@ -586,15 +618,20 @@ impl Actor {
     /// call's era), so the group sees "… started a group call" (once per
     /// era) and looks for the call.
     async fn announce_group_call(&self, client_id: ClientId) {
-        let (conversation, era) = {
+        let (conversation, era, link) = {
             let mut call = self.group_call.borrow_mut();
             let Some(call) = call.as_mut().filter(|g| g.client_id == Some(client_id) && g.joined && !g.announced) else {
                 return;
             };
             let Some(era) = call.era.clone() else { return };
             call.announced = true;
-            (call.conversation.clone(), era)
+            (call.conversation.clone(), era, call.link.as_ref().map(|l| l.room_id.clone()))
         };
+        // A call link's call has no group to tell: it goes in the call
+        // history instead (Desktop's `updateCallHistoryForAdhocCall`).
+        if let Some(room_id) = link {
+            return self.record_link_call(&room_id, &era, true).await;
+        }
         self.send_group_call_update(&conversation, era).await;
     }
 
@@ -692,42 +729,52 @@ impl Actor {
     }
 
     fn group_key(&self, client_id: ClientId) -> Option<[u8; 32]> {
-        self.group_call.borrow().as_ref().filter(|g| g.client_id == Some(client_id)).map(|g| g.key)
+        self.group_call.borrow().as_ref().filter(|g| g.client_id == Some(client_id) && g.link.is_none()).map(|g| g.key)
+    }
+
+    /// A call link's call, connecting through `client_id` (made by
+    /// `call_links.rs`), as Desktop's `startCallLinkLobby` and join.
+    pub(super) fn begin_link_call(&self, conversation: ConversationId, video: bool, link: super::call_links::LinkCallState) {
+        *self.group_call.borrow_mut() =
+            Some(GroupCall { video, link: Some(link), ..GroupCall::new(conversation, [0; 32], CallStatus::Connecting) });
+    }
+
+    /// Hands the link call begun for `conversation` its client. `false`:
+    /// it was hung up meanwhile.
+    pub(super) fn attach_link_client(&self, conversation: &ConversationId, client_id: ClientId) -> bool {
+        let mut call = self.group_call.borrow_mut();
+        match call.as_mut().filter(|g| g.conversation == *conversation && g.client_id.is_none() && g.link.is_some()) {
+            Some(call) => {
+                call.client_id = Some(client_id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The link call's client, for an admin's approvals.
+    pub(super) fn link_client_id(&self) -> Option<ClientId> {
+        self.group_call.borrow().as_ref().filter(|g| g.link.as_ref().is_some_and(|l| l.admin)).and_then(|g| g.client_id)
+    }
+
+    /// Drops a link call begun for `conversation` that never got its client.
+    pub(super) fn abandon_link_call(&self, conversation: &ConversationId) {
+        let mut call = self.group_call.borrow_mut();
+        if call.as_ref().is_some_and(|g| g.conversation == *conversation && g.client_id.is_none() && g.link.is_some()) {
+            call.take();
+        }
+    }
+
+    /// The room of the link call we're in or joining, if it's that.
+    pub(super) fn link_call_room(&self) -> Option<String> {
+        self.group_call.borrow().as_ref().and_then(|g| g.link.as_ref()).map(|l| l.room_id.clone())
     }
 
     /// One of RingRTC's HTTP requests (to the calling server).
     pub(super) fn group_http(self: &Rc<Self>, request_id: u32, request: signal_calls::HttpRequest) {
         let this = self.clone();
         tokio::task::spawn_local(async move {
-            let method = match request.method {
-                signal_calls::HttpMethod::Get => reqwest::Method::GET,
-                signal_calls::HttpMethod::Put => reqwest::Method::PUT,
-                signal_calls::HttpMethod::Post => reqwest::Method::POST,
-                signal_calls::HttpMethod::Delete => reqwest::Method::DELETE,
-            };
-            let Some(client) = http() else {
-                return this.with_calls(|calls| calls.received_http_response(request_id, None));
-            };
-            let mut builder = client.request(method, &request.url);
-            for (name, value) in &request.headers {
-                builder = builder.header(name, value);
-            }
-            if let Some(body) = request.body {
-                builder = builder.body(body);
-            }
-            let response = match builder.send().await {
-                Ok(response) => {
-                    let status = response.status().as_u16();
-                    match response.bytes().await {
-                        Ok(body) => Some(signal_calls::HttpResponse { status: status.into(), body: body.to_vec() }),
-                        Err(_) => None,
-                    }
-                }
-                Err(error) => {
-                    warn!(error = %format!("{:#}", anyhow::Error::from(error)), "calling server request failed");
-                    None
-                }
-            };
+            let response = calling_server_request(method_of(request.method), request).await;
             this.with_calls(|calls| calls.received_http_response(request_id, response));
         });
     }
@@ -774,6 +821,45 @@ impl Actor {
                 call.camera_before_sharing = camera;
             }
         }
+    }
+}
+
+/// Makes one of RingRTC's requests to the calling server. `None`: it
+/// failed before an answer.
+pub(super) async fn calling_server_request(
+    method: reqwest::Method,
+    request: signal_calls::HttpRequest,
+) -> Option<signal_calls::HttpResponse> {
+    let client = http()?;
+    let mut builder = client.request(method, &request.url);
+    for (name, value) in &request.headers {
+        builder = builder.header(name, value);
+    }
+    if let Some(body) = request.body {
+        builder = builder.body(body);
+    }
+    match builder.send().await {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            match response.bytes().await {
+                Ok(body) => Some(signal_calls::HttpResponse { status: status.into(), body: body.to_vec() }),
+                Err(_) => None,
+            }
+        }
+        Err(error) => {
+            warn!(error = %format!("{:#}", anyhow::Error::from(error)), "calling server request failed");
+            None
+        }
+    }
+}
+
+/// RingRTC's HTTP method, for reqwest.
+pub(super) fn method_of(method: signal_calls::HttpMethod) -> reqwest::Method {
+    match method {
+        signal_calls::HttpMethod::Get => reqwest::Method::GET,
+        signal_calls::HttpMethod::Put => reqwest::Method::PUT,
+        signal_calls::HttpMethod::Post => reqwest::Method::POST,
+        signal_calls::HttpMethod::Delete => reqwest::Method::DELETE,
     }
 }
 
