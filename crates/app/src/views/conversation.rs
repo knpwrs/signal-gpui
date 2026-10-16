@@ -101,7 +101,32 @@ pub struct ConversationView {
     unread_at_open: u32,
     /// Target the newest message once it's loaded (End, from older ones).
     target_newest: bool,
+    /// How loaded messages show in their collapse set (`collapse.rs`), by
+    /// id; one missing is shown as it is.
+    slots: std::collections::HashMap<i64, Slot>,
+    /// Collapse sets opened, by their first message.
+    expanded: std::collections::HashSet<i64>,
+    /// The oldest message unread when the chat was loaded (Desktop's unread
+    /// marker): collapse sets break there, and what follows was unseen.
+    unseen_from: Option<i64>,
+    /// Messages that arrived while the chat was open: unseen when first
+    /// shown, so they stay out of a collapse set's fold (Desktop's
+    /// `messageCache` of each item's first `isUnseen`).
+    fresh: std::collections::HashSet<i64>,
+    /// `unseen_from` was placed from the first page loaded.
+    marker_placed: bool,
     _subscriptions: Vec<Subscription>,
+}
+
+/// How a message shows in its collapse set.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Slot {
+    /// As it is.
+    Shown,
+    /// The first message folded behind a set's button, which it carries.
+    Head { set: i64, kind: crate::views::collapse::Kind, count: usize, timer: Option<u32> },
+    /// Folded behind set `set`'s button (shown when it's open).
+    Folded { set: i64 },
 }
 
 /// How long a jumped-to message stays highlighted.
@@ -289,6 +314,11 @@ impl ConversationView {
             timeline_focused: false,
             unread_at_open,
             target_newest: false,
+            slots: Default::default(),
+            expanded: Default::default(),
+            unseen_from: None,
+            fresh: Default::default(),
+            marker_placed: false,
             _subscriptions: subscriptions,
         };
         this.load_request_details(cx);
@@ -711,6 +741,58 @@ impl ConversationView {
             .into_any_element()
     }
 
+    /// A collapse set's button (Desktop's `CollapseSetButton`): its icon,
+    /// "N group updates" and the like, and an arrow; it opens or closes
+    /// the set.
+    #[allow(clippy::too_many_arguments)]
+    fn render_collapse_button(
+        &self,
+        set: i64,
+        kind: crate::views::collapse::Kind,
+        count: usize,
+        timer: Option<u32>,
+        open: bool,
+        palette: Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::views::collapse::{Kind, button_text};
+        let group = self.id.as_group().is_some();
+        // Desktop's `group`, `message-thread`, `timer` and `phone` symbols.
+        let icon = match kind {
+            Kind::Updates if group => IconName::Users,
+            Kind::Updates => IconName::MessageCircle,
+            Kind::Timer(_) => IconName::Timer,
+            _ => IconName::Phone,
+        };
+        let text = button_text(kind, count, group, timer);
+        div()
+            .w_full()
+            .my(px(10.))
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .id(("collapse-set", set as u64))
+                    .debug_selector(move || format!("collapse-{set}"))
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .px_3()
+                    .py_1p5()
+                    .rounded_full()
+                    .bg(palette.input_bg)
+                    .hover(|d| d.bg(palette.row_hover))
+                    .cursor_pointer()
+                    .text_sm()
+                    .text_color(palette.text)
+                    .child(Icon::new(icon).size_4().text_color(palette.text_secondary))
+                    .child(text)
+                    .child(Icon::new(if open { IconName::ChevronUp } else { IconName::ChevronDown }).size_4().text_color(palette.text_secondary))
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_set(set, cx))),
+            )
+            .into_any_element()
+    }
+
     /// Desktop's mini player (`MiniPlayer`), under the header while audio
     /// is loaded, whichever chat it's from: play or pause, who sent it, the
     /// time, the rate while it plays, and close, which stops it.
@@ -919,7 +1001,9 @@ impl ConversationView {
                         this.has_more = messages.len() as u32 == PAGE;
                         this.has_newer = false;
                         this.messages = messages;
+                        this.start_seen();
                         this.list.reset(this.messages.len());
+                        this.relayout(cx);
                         this.list.set_follow_mode(FollowMode::Tail);
                         this.list.scroll_to_end();
                         if std::mem::take(&mut this.target_newest) {
@@ -957,7 +1041,14 @@ impl ConversationView {
                 this.has_more = ix as u32 == half;
                 this.has_newer = (messages.len() - ix - 1) as u32 == half;
                 this.messages = messages;
+                this.start_seen();
+                // The message jumped to is never folded away.
                 this.list.reset(this.messages.len());
+                this.relayout(cx);
+                if let Slot::Head { set, .. } | Slot::Folded { set } = this.slot(message_id) {
+                    this.expanded.insert(set);
+                    this.relayout(cx);
+                }
                 this.list.set_follow_mode(FollowMode::Normal);
                 // A little context above it.
                 this.list.scroll_to(ListOffset { item_ix: ix.saturating_sub(2), offset_in_item: px(0.) });
@@ -1008,6 +1099,7 @@ impl ConversationView {
                 this.list.splice(start..start, count);
                 // The old last row may lose its time / corner.
                 this.list.remeasure_items(start.saturating_sub(1)..start);
+                this.relayout(cx);
                 cx.notify();
             });
         })
@@ -1048,6 +1140,7 @@ impl ConversationView {
                 });
                 // The old first row may lose its day separator / group header.
                 this.list.remeasure_items(count..count + 1);
+                this.relayout(cx);
                 cx.notify();
             });
         })
@@ -1080,6 +1173,7 @@ impl ConversationView {
                     let incoming = message.direction == Direction::Incoming;
                     // Before the splice, which forgets the scroll position.
                     let was_at_end = this.at_end();
+                    this.fresh.insert(message.id);
                     this.messages.insert(ix, message);
                     this.list.splice(ix..ix, 1);
                     if ix > 0 {
@@ -1096,10 +1190,84 @@ impl ConversationView {
                         }
                     }
                 }
+                this.relayout(cx);
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// What was unseen as the chat loaded: from its oldest unread message.
+    /// Opening the chat marks it read, which may be done before the page
+    /// is read: then the count of unread messages at opening places it.
+    fn start_seen(&mut self) {
+        self.fresh.clear();
+        let unread_at_open = if std::mem::replace(&mut self.marker_placed, true) { 0 } else { self.unread_at_open };
+        self.unseen_from = self.messages.iter().find(|m| !m.is_read).map(|m| m.id).or_else(|| {
+            let incoming = self.messages.iter().filter(|m| m.direction == Direction::Incoming && m.notice.is_none());
+            (unread_at_open > 0).then(|| incoming.rev().nth(unread_at_open as usize - 1).map(|m| m.id)).flatten()
+        });
+    }
+
+    /// Works out the collapse sets again (Desktop's
+    /// `mapItemsIntoCollapseSets` and `CollapseSetViewer`), and has the
+    /// rows whose part in one changed measured again.
+    fn relayout(&mut self, cx: &App) {
+        use crate::views::collapse::{self, Kind};
+        // The call going on here stays out of sets: in a 1:1 chat its calls,
+        // in a group its newest group call.
+        let in_call = self.state.read(cx).call.as_ref().is_some_and(|c| c.conversation == self.id);
+        let live_group_call = self
+            .messages
+            .iter()
+            .rposition(|m| matches!(m.notice, Some(signal_store::Notice::GroupCall { .. })))
+            .filter(|_| in_call && self.id.as_group().is_some());
+        let kinds: Vec<Kind> = self
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(ix, m)| collapse::kind_of(m, in_call && (self.id.as_group().is_none() || Some(ix) == live_group_call)))
+            .collect();
+        let days: Vec<i64> = self.messages.iter().map(|m| day_number(m.sent_at)).collect();
+        let marker = self.unseen_from.and_then(|id| self.messages.iter().position(|m| m.id == id));
+        let unseen = |ix: usize| marker.is_some_and(|m| ix >= m) || self.fresh.contains(&self.messages[ix].id);
+        let mut slots = std::collections::HashMap::new();
+        for set in collapse::collapse_sets(&kinds, &days, marker) {
+            let folded = collapse::folded(&set, unseen);
+            if folded == 0 {
+                continue;
+            }
+            let id = self.messages[set.start].id;
+            slots.insert(id, Slot::Head { set: id, kind: set.kind, count: folded, timer: set.ending_timer(&kinds) });
+            for message in &self.messages[set.start + 1..set.start + folded] {
+                slots.insert(message.id, Slot::Folded { set: id });
+            }
+        }
+        let slot_of = |slots: &std::collections::HashMap<i64, Slot>, id: i64| slots.get(&id).copied().unwrap_or(Slot::Shown);
+        for (ix, message) in self.messages.iter().enumerate() {
+            if slot_of(&self.slots, message.id) != slot_of(&slots, message.id) {
+                self.list.remeasure_items(ix..ix + 1);
+            }
+        }
+        self.slots = slots;
+    }
+
+    /// How a message shows in its collapse set.
+    fn slot(&self, id: i64) -> Slot {
+        self.slots.get(&id).copied().unwrap_or(Slot::Shown)
+    }
+
+    /// Opens or closes a collapse set.
+    fn toggle_set(&mut self, set: i64, cx: &mut Context<Self>) {
+        if !self.expanded.remove(&set) {
+            self.expanded.insert(set);
+        }
+        for (ix, message) in self.messages.iter().enumerate() {
+            if matches!(self.slot(message.id), Slot::Head { set: s, .. } | Slot::Folded { set: s } if s == set) {
+                self.list.remeasure_items(ix..ix + 1);
+            }
+        }
+        cx.notify();
     }
 
     fn on_message_removed(&mut self, message_id: i64, cx: &mut Context<Self>) {
@@ -1110,6 +1278,7 @@ impl ConversationView {
             // Grouping of the neighbours may have changed.
             self.list.remeasure_items(ix - 1..(ix + 1).min(self.messages.len()));
         }
+        self.relayout(cx);
         if self.hovered == Some(message_id) {
             self.hovered = None;
         }
@@ -1311,6 +1480,39 @@ impl ConversationView {
 
         let show_day = prev.is_none_or(|p| !same_day(p.sent_at, message.sent_at));
         let targeted = self.timeline_focused && self.targeted == Some(message.id);
+        // In a collapse set: folded away, or its button and (open) itself.
+        match self.slot(message.id) {
+            Slot::Folded { set } if !self.expanded.contains(&set) => return div().into_any_element(),
+            Slot::Head { set, kind, count, timer } => {
+                let open = self.expanded.contains(&set);
+                let button = self.render_collapse_button(set, kind, count, timer, open, palette, cx);
+                return div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .when(ix == 0 && !self.has_more, |d| d.children(self.render_hero(cx)))
+                    .when(show_day, |d| {
+                        d.child(
+                            div()
+                                .pt_4()
+                                .pb_2()
+                                .flex()
+                                .justify_center()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(palette.text_secondary)
+                                .child(day_label(message.sent_at)),
+                        )
+                    })
+                    .child(button)
+                    .when(open, |d| {
+                        let notice = message.notice.as_ref().map(|n| self.render_notice(n, false, message.sent_at, palette, cx));
+                        d.children(notice)
+                    })
+                    .into_any_element();
+            }
+            _ => {}
+        }
         if let Some(notice) = &message.notice {
             let notice = self.render_notice(notice, show_day, message.sent_at, palette, cx);
             let notice = div().w_full().when(targeted, |d| d.bg(palette.row_hover)).child(notice).into_any_element();
@@ -3933,6 +4135,12 @@ fn signal_hero(palette: Palette, cx: &App) -> impl IntoElement {
 /// Where a release note's "Donate" goes.
 const DONATE_URL: &str = "https://signal.org/donate/";
 
+/// The local day a time falls on, as a number (Desktop's `getMidnight`).
+fn day_number(millis: i64) -> i64 {
+    use chrono::{Datelike as _, TimeZone as _};
+    chrono::Local.timestamp_millis_opt(millis).single().map_or(0, |t| i64::from(t.date_naive().num_days_from_ce()))
+}
+
 fn now_millis() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
@@ -4592,6 +4800,7 @@ mod tests {
             poll: None,
             view_once: None,
             sealed_sender: Vec::new(),
+            is_read: true,
         }
     }
 
@@ -5435,6 +5644,35 @@ mod tests {
         let edited = wait_for_messages(&backend, NOTE_TO_SELF, 1, |m| m.id == last.id && m.body == "Edited text").remove(0);
         assert!(edited.edited);
         assert_eq!(edited.edit_count, 1);
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn consecutive_group_updates_fold_into_one_row(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        let updates = wait_for_messages(&backend, GROUP, 3, |m| matches!(m.notice, Some(signal_store::Notice::Group { .. })));
+        let (first, rest) = (updates[0].id, [updates[1].id, updates[2].id]);
+        // Once the demo has read the chat (unread messages before them would
+        // leave the updates unseen, shown as they are).
+        wait_for_messages(&backend, GROUP, 1, |m| m.id < first && m.is_read);
+        let (mut cx, view) = open_view(cx, &backend, GROUP);
+        for _ in 0..300 {
+            cx.run_until_parked();
+            if view.read_with(&cx, |v, _| v.messages.iter().any(|m| m.id == first)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let ix = view.read_with(&cx, |v, _| v.messages.iter().position(|m| m.id == first)).unwrap();
+        view.update(&mut cx, |v, _| v.list.scroll_to(ListOffset { item_ix: ix, offset_in_item: px(0.) }));
+        let button = bounds(&mut cx, format!("collapse-{first}"));
+        assert!(button.size.height > px(0.));
+        assert!(view.read_with(&cx, |v, _| matches!(v.slot(first), Slot::Head { count: 3, .. })));
+        assert!(rest.iter().all(|id| view.read_with(&cx, |v, _| v.slot(*id) == Slot::Folded { set: first })));
+        view.update(&mut cx, |v, cx| v.toggle_set(first, cx));
+        assert!(view.read_with(&cx, |v, _| v.expanded.contains(&first)));
+        view.update(&mut cx, |v, cx| v.toggle_set(first, cx));
+        assert!(!view.read_with(&cx, |v, _| v.expanded.contains(&first)));
         backend.shutdown();
     }
 

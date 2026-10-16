@@ -481,6 +481,7 @@ fn sealed_sender_shows_in_message_details_when_on(cx: &mut TestAppContext) {
         poll: None,
         view_once: None,
         sealed_sender: sealed.iter().map(|s| (*s).to_owned()).collect(),
+        is_read: true,
     };
     let incoming = message(signal_store::Direction::Incoming, &["made-up"]);
     let shown = |cx: &mut TestAppContext, m: &signal_store::Message| cx.read(|cx| crate::views::message_info::sealed_sender(h.state.read(cx), m));

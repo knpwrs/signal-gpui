@@ -224,6 +224,14 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
         change: signal_store::GroupNotice::Added { member: Some(aci(SAM).into()) },
     };
     db.insert_notice(&ConversationId(GROUP.into()), y + 12 * MINUTE, &added).await?;
+    // In the same change, a millisecond apart: folded into "3 group updates".
+    let admin = signal_store::Notice::Group {
+        by: Some(aci(MAYA).into()),
+        change: signal_store::GroupNotice::Admin { member: Some(aci(JORDAN).into()), admin: true },
+    };
+    db.insert_notice(&ConversationId(GROUP.into()), y + 12 * MINUTE + 1, &admin).await?;
+    let link = signal_store::Notice::Group { by: Some(aci(MAYA).into()), change: signal_store::GroupNotice::LinkOn { approval: true } };
+    db.insert_notice(&ConversationId(GROUP.into()), y + 12 * MINUTE + 2, &link).await?;
     db.insert_message(&incoming(GROUP, SAM, y + 15 * MINUTE, "Thanks for the add! Which trail are we thinking?")).await?;
     let mut trail = incoming(GROUP, MAYA, y + 17 * MINUTE, "The ridge loop, about 7 miles. Conditions: https://www.nps.gov/subjects/trails/");
     trail.link_preview = Some(LinkPreview {

@@ -54,6 +54,7 @@ mod tests {
             poll: None,
             view_once: None,
             sealed_sender: Vec::new(),
+            is_read: true,
         }
     }
 

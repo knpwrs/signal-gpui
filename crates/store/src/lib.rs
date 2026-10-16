@@ -382,6 +382,8 @@ pub struct Message {
     pub view_once: Option<ViewOnce>,
     /// Who it came from, or went to, by sealed sender (service ids).
     pub sealed_sender: Vec<String>,
+    /// Read here (ours and most notices always are).
+    pub is_read: bool,
 }
 
 /// The group admin who deleted a message for everyone (Desktop's
@@ -1063,7 +1065,7 @@ const CONVERSATION_COLUMNS: &str = "id, kind, title, phone, color, members, last
                OR EXISTS (SELECT 1 FROM profile_sharing p WHERE p.id = 'd:' || conversations.added_by)))) AS accepted";
 
 const MESSAGE_COLUMNS: &str = "id, conversation_id, sent_at, received_at, direction, author, \
-     author_name, body, status, reactions, quote, attachments, link_preview, deleted, edited, expires_in, expire_start, edit_count, notice, mentions, styles, cta, deleted_by_admin, long_text, poll, view_once, sealed_sender";
+     author_name, body, status, reactions, quote, attachments, link_preview, deleted, edited, expires_in, expire_start, edit_count, notice, mentions, styles, cta, deleted_by_admin, long_text, poll, view_once, sealed_sender, is_read";
 
 /// SQL matching a message whose own timestamp, or one of its edits', is
 /// the bound parameter `{param}`.
@@ -1290,6 +1292,7 @@ fn message_from_row(row: &SqliteRow) -> Result<Message> {
             .map(|s| serde_json::from_str(&s))
             .transpose()?
             .unwrap_or_default(),
+        is_read: row.try_get("is_read")?,
     })
 }
 
