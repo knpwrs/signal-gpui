@@ -6,7 +6,7 @@ An unofficial native Signal client for macOS, built with Rust and [GPUI](https:/
 
 ## A fraction of the memory
 
-Signal Desktop is an Electron app: a main process, a renderer and four helpers. Signal GPUI is one native process. In an Activity Monitor spot check (Memory column, same account, both apps open), Signal GPUI used 121 MB and Signal Desktop's six processes used 1,038 MB, so about 12%. Counting the 11 MB AutoFill process macOS starts for our text fields, it's 132 MB, about 13%.
+Signal Desktop is an Electron app: a main process, a renderer and four helpers. Signal GPUI is one native process. In an Activity Monitor spot check (Memory column, same account, both apps open), Signal GPUI used 121 MB and Signal Desktop's six processes used 1,038 MB or about 12%.
 
 It stays small as you use it:
 
