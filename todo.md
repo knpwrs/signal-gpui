@@ -224,6 +224,51 @@ account or checked on a phone. Not done:
 - **Delete menu:** Desktop puts "Delete" in a menu beside the Nickname row,
   always shown; here it's a button shown once there's a nickname or note.
 
+## App chrome, keyboard and links
+
+The menus, closing to the Dock, the window's saved size and place, the
+shortcut guide and Desktop's shortcuts, the timeline's keyboard, and
+Signal's links (`sgnl://`, `signal.me`, `signal.group`, call links)
+follow Desktop 8.34 (`app/menu.std.ts`, `app/main.main.ts`,
+`ShortcutGuide.dom.tsx`, `addGlobalKeyboardShortcuts.preload.ts`,
+`Timeline.dom.tsx`, `ts/util/signalRoutes.std.ts`). Tested in demo mode
+with headless windows. Not done, or not checked:
+
+- **Untried on macOS itself:** hiding the window with the close button,
+  bringing it back from the Dock, the menus as drawn, and `sgnl://` links
+  opening the app (the bundle registers the scheme; nothing ran it). The
+  test platform has none of these.
+- **The Dock's Quit during a call** doesn't ask "Close Signal and end the
+  call?" as ⌘Q does: GPUI can't cancel a quit macOS started. The call is
+  hung up as the app quits, which may be too soon for the other side to
+  hear it.
+- **Username links** (`signal.me/#eu/`) are read with a new presage call
+  (`Manager::lookup_username_link`) that hasn't run against the server.
+- **Sticker pack links** (`signal.art/addstickers`, `sgnl://addstickers`)
+  say installing from links isn't supported: Desktop opens the pack's
+  preview to install it, and this app has no sticker pack manager.
+- **Links Desktop handles that this app can't:** captchas
+  (`signalcaptcha://`, part of the rate-limit challenge, which isn't
+  built), and its notification tokens (`show-conversation`,
+  `start-call-lobby`), linking a device and donations, which show
+  Desktop's "didn't make sense" error.
+- **Shortcuts left out**, as their features don't exist here: navigate by
+  section (⌘T, Desktop's focus cycling), the chat menu (⌘⇧L; GPUI's
+  dropdowns can't be opened from code), a message's context menu (⌘F12),
+  the expanded composer (⌘⇧K, ⌘Enter), and a call's expanded preview
+  (⇧P). ⌘N focuses the search box, where new chats start here, rather
+  than Desktop's compose pane.
+- **Menus left out:** Desktop's Speech submenu, Go to Release Notes and
+  Join the Beta (Desktop's, not this app's), and its developer items.
+  Contact Us opens this project's issues, not Signal's support form.
+- **Zoom** from the View menu steps by Chromium's levels like Desktop's
+  but, as Settings' zoom, scales text rather than the whole window.
+- **The timeline** targets notices too, as Desktop does, but Enter does
+  nothing on one. ⌘J finds the oldest unread message by counting back
+  from the newest incoming ones (this app has no unread line yet), so a
+  chat with more unread than are loaded targets the oldest loaded one.
+  Page Up and Page Down weren't tested.
+
 ## Group administration
 
 Removing members, admins, permissions (including announcement-only, which
@@ -245,9 +290,6 @@ Signal's group server: the join info, avatar upload form and CDN post,
 `?inviteLinkPassword=` changes, and whether pending members can fetch the
 group (we assume they can, as Desktop does). Not done:
 
-- **OS link handling:** `AppState::open_group_link` opens a link (as a
-  message link click and the paste dialog in New group do); the app doesn't
-  register for `signal.group` or `sgnl://` URLs yet.
 - **Retries:** Desktop retries a change on 409 (the group changed) for a
   minute, fetching it again; here one conflict fails with an error.
   Changes are queued one at a time per group, so ours don't conflict with
