@@ -5792,6 +5792,50 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn a_changed_safety_number_is_confirmed_before_sending(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        wait_for_messages(&backend, MAYA, 1, |_| true);
+        let (mut cx, view) = open_view(cx, &backend, MAYA);
+        let state = view.read_with(&cx, |v, _| v.state.clone());
+        let maya = MAYA.trim_start_matches("d:").to_owned();
+        // We verified her, and her key changed since.
+        let db = backend.db().clone();
+        let who = maya.clone();
+        futures::executor::block_on(backend.spawn(async move {
+            db.set_setting(&format!("verified.{who}"), "aa").await.unwrap();
+            db.set_setting(&format!("identity.{who}"), "bb").await.unwrap();
+        }));
+        for _ in 0..300 {
+            state.update(&mut cx, |s, cx| s.reload_conversations(cx));
+            cx.run_until_parked();
+            let ready = state.read_with(&cx, |s, _| s.conversation(&ConversationId(MAYA.into())).is_some() && s.unverified.contains(&maya));
+            if ready {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        cx.update(|window, cx| {
+            let composer = view.read(cx).composer.clone();
+            composer.update(cx, |c, cx| c.focus(window, cx));
+        });
+        cx.simulate_input("still there?");
+        cx.simulate_keystrokes("enter");
+        bounds(&mut cx, "safety-number-changes".into());
+        let sent = |backend: &Backend| {
+            let db = backend.db().clone();
+            futures::executor::block_on(backend.spawn(async move { db.messages(&ConversationId(MAYA.into()), None, 50).await }))
+                .unwrap()
+                .iter()
+                .any(|m| m.body == "still there?")
+        };
+        assert!(!sent(&backend), "nothing goes until it's confirmed");
+        crate::views::test_support::click_at(&mut cx, "safety-changes-send");
+        wait_for_messages(&backend, MAYA, 1, |m| m.body == "still there?" && m.direction == Direction::Outgoing);
+        assert!(state.read_with(&cx, |s, _| !s.unverified.contains(&maya)));
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
     fn formatting_markers_are_sent_as_styles_beside_a_mention(cx: &mut TestAppContext) {
         let (backend, _dir) = demo_backend(cx);
         wait_for_messages(&backend, GROUP, 1, |_| true);

@@ -1983,6 +1983,10 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 let key = format!("demo.verified.{}", conversation.0);
                 let was = db.setting(&key).await.ok().flatten().is_some_and(|v| v == "1");
                 let _ = db.set_setting(&key, if verified { "1" } else { "" }).await;
+                // Not verified any more: no send asks about them (`unverified_people`).
+                if let (false, Some(who)) = (verified, conversation.as_direct()) {
+                    let _ = db.set_setting(&format!("verified.{who}"), "").await;
+                }
                 // Desktop's `addVerifiedChange`, as the real backend adds it.
                 if was != verified && let Some(who) = conversation.as_direct() {
                     let notice = signal_store::Notice::Verified { who: who.to_owned(), verified, local: true };

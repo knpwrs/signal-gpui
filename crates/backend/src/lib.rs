@@ -1192,6 +1192,31 @@ pub async fn contact_details(db: &AppDb, service_id: &str) -> ContactDetails {
     }
 }
 
+/// Who we marked verified and whose identity key has changed since
+/// (Desktop's `isUnverified`, the `UNVERIFIED` state): sends to them wait
+/// for Desktop's "Safety Number Changes" confirmation
+/// (`blockSendUntilConversationsAreVerified`).
+pub async fn unverified_people(db: &AppDb) -> std::collections::HashSet<String> {
+    let verified = db.settings_with_prefix(actor::SETTING_VERIFIED).await.unwrap_or_default();
+    let current: std::collections::HashMap<String, String> =
+        db.settings_with_prefix(actor::SETTING_IDENTITY).await.unwrap_or_default().into_iter().collect();
+    verified
+        .into_iter()
+        .filter(|(sid, key)| !key.is_empty() && current.get(sid).is_some_and(|now| now != key))
+        .map(|(sid, _)| sid)
+        .collect()
+}
+
+/// Of the people a send to `conversation` goes to, those waiting for the
+/// "Safety Number Changes" confirmation (see [`unverified_people`]).
+pub fn stopping_send(conversation: &signal_store::Conversation, unverified: &std::collections::HashSet<String>) -> Vec<String> {
+    match conversation.kind {
+        signal_store::ConversationKind::Direct => conversation.id.as_direct().filter(|sid| unverified.contains(*sid)).map(str::to_owned).into_iter().collect(),
+        signal_store::ConversationKind::Group => conversation.members.iter().filter(|m| unverified.contains(*m)).cloned().collect(),
+        signal_store::ConversationKind::NoteToSelf => Vec::new(),
+    }
+}
+
 /// The backend thread's stack (see `Backend::start`).
 const BACKEND_STACK: usize = 16 * 1024 * 1024;
 

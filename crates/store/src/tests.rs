@@ -2206,6 +2206,18 @@ async fn whether_a_chat_is_accepted_is_found_by_index() {
 }
 
 #[tokio::test]
+async fn settings_are_read_by_prefix() {
+    let db = test_db().await;
+    db.set_setting("verified.a", "k1").await.unwrap();
+    db.set_setting("verified.b", "").await.unwrap();
+    db.set_setting("verifiedz", "x").await.unwrap();
+    db.set_setting("identity.a", "k2").await.unwrap();
+    let mut verified = db.settings_with_prefix("verified.").await.unwrap();
+    verified.sort();
+    assert_eq!(verified, [("a".to_owned(), "k1".to_owned()), ("b".to_owned(), String::new())]);
+}
+
+#[tokio::test]
 async fn a_new_number_is_noted_only_when_it_replaces_one() {
     let db = test_db().await;
     let phone = |p: &str| ConversationUpdate { phone: Some(p.into()), ..Default::default() };

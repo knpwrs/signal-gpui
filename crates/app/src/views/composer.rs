@@ -816,6 +816,28 @@ impl Composer {
             window.push_notification(Notification::new().message("Message body is too long."), cx);
             return;
         }
+        // Desktop's `withPreSendChecks`: someone whose safety number changed
+        // since we verified it is confirmed first (the draft stays until then).
+        let sending = !text.is_empty() || !self.images.is_empty() || !self.files.is_empty();
+        if self.editing.is_none() && sending {
+            let state = self.state.read(cx);
+            let stopping = state.conversation(&self.conversation).map(|c| signal_backend::stopping_send(c, &state.unverified)).unwrap_or_default();
+            if !stopping.is_empty() {
+                let people = stopping
+                    .into_iter()
+                    .map(|sid| {
+                        let name = state
+                            .conversation(&ConversationId::direct(&sid))
+                            .map(|c| c.title.clone())
+                            .or_else(|| self.members.iter().find(|(m, _)| *m == sid).map(|(_, n)| n.clone()))
+                            .unwrap_or_else(|| sid.get(..8).unwrap_or(&sid).to_owned());
+                        (sid, name)
+                    })
+                    .collect();
+                confirm_safety_changes(self.state.clone(), cx.entity().downgrade(), people, window, cx);
+                return;
+            }
+        }
         let (plain, styles) = crate::formatting::parse(&text);
         let (body, mentions, styles) = encode_mentions(&plain, &std::mem::take(&mut self.mentions), &styles);
         if let Some(original) = self.editing.take() {
@@ -1492,6 +1514,72 @@ fn mention_query(text: &str, cursor: usize) -> Option<(Range<usize>, String)> {
 /// Turns the picked "@Name"s still in `text` into Signal's placeholders,
 /// with who each one mentions, in order, and moves `styles` (spans over
 /// `text`) to match. A mention you've since edited stays as plain text.
+/// Desktop's `SafetyNumberChangeDialog` before a send: the people whose
+/// safety number changed since we verified it, each with "View" (their
+/// safety number), and "Send anyway", which marks them not verified, as
+/// Desktop's `verifyConversationsStoppingSend` does (`setVerifiedDefault`),
+/// and sends. (Desktop asks for a review step past five people; here they
+/// are listed.)
+fn confirm_safety_changes(
+    state: Entity<AppState>,
+    composer: gpui_kit::WeakEntity<Composer>,
+    people: Vec<(String, String)>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    use gpui_kit::component::WindowExt as _;
+    use gpui_kit::component::button::{Button, ButtonVariants as _};
+    use gpui_kit::component::dialog::DialogFooter;
+    window.open_dialog(cx, move |dialog, _, cx| {
+        let palette = Palette::get(cx);
+        let (send_state, send_people, send_composer) = (state.clone(), people.clone(), composer.clone());
+        dialog
+            .title("Safety Number Changes")
+            .w(px(440.))
+            .child(
+                div()
+                    .debug_selector(|| "safety-number-changes".into())
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(div().text_sm().text_color(palette.text_secondary).child(
+                        "The following people may have reinstalled Signal or changed devices. Click a recipient to confirm their new safety number. This is optional.",
+                    ))
+                    .children(people.iter().map(|(sid, name)| {
+                        let (state, chat, name_for) = (state.clone(), ConversationId::direct(sid), name.clone());
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(div().flex_1().min_w_0().truncate().text_sm().child(name.clone()))
+                            .child(
+                                Button::new(SharedString::from(format!("view-safety-{sid}"))).label("View").ghost().on_click(
+                                    move |_, window, cx| {
+                                        crate::views::safety_number::open(state.clone(), chat.clone(), name_for.clone(), window, cx)
+                                    },
+                                ),
+                            )
+                    })),
+            )
+            .footer(
+                DialogFooter::new()
+                    .child(Button::new("safety-changes-cancel").label("Cancel").outline().on_click(|_, window, cx| window.close_all_dialogs(cx)))
+                    .child(div().debug_selector(|| "safety-changes-send".into()).child(
+                        Button::new("safety-changes-send").label("Send anyway").primary().on_click(move |_, window, cx| {
+                            send_state.update(cx, |state, _| {
+                                for (sid, _) in &send_people {
+                                    state.unverified.remove(sid);
+                                    state.send(Command::SetVerified { conversation: ConversationId::direct(sid), verified: false });
+                                }
+                            });
+                            window.close_all_dialogs(cx);
+                            let _ = send_composer.update(cx, |composer, cx| composer.submit(window, cx));
+                        }),
+                    )),
+            )
+    });
+}
+
 fn encode_mentions(
     text: &str,
     picked: &[(String, String)],

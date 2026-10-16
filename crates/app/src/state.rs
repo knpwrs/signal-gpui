@@ -251,6 +251,9 @@ pub struct AppState {
     jump: Option<(ConversationId, i64)>,
     /// Downloaded profile photos by service id.
     person_avatars: HashMap<String, std::path::PathBuf>,
+    /// People whose safety number changed after we verified it: sends to
+    /// them ask first (`signal_backend::unverified_people`).
+    pub unverified: std::collections::HashSet<String>,
     /// Our profile, username and link (`None` until read).
     pub own_profile: Option<signal_backend::OwnProfile>,
     pub badges: Badges,
@@ -463,6 +466,7 @@ impl AppState {
             conversations: Vec::new(),
             archived: Vec::new(),
             person_avatars: HashMap::new(),
+            unverified: Default::default(),
             own_profile: None,
             badges: Badges::default(),
             contact_avatars: HashMap::new(),
@@ -1050,7 +1054,11 @@ impl AppState {
                 self.reload_conversations(cx);
             }
             Event::PinsChanged(conversation) => cx.emit(AppEvent::PinsChanged(conversation)),
-            Event::SafetyNumber { conversation, result } => self.safety_number = Some((conversation, result)),
+            Event::SafetyNumber { conversation, result } => {
+                self.safety_number = Some((conversation, result));
+                // Verification may have changed who a send asks about.
+                self.reload_conversations(cx);
+            }
             Event::KeyTransparency { conversation, verified } => {
                 // Only the check this screen is waiting for.
                 if self.kt_status == Some((conversation.clone(), KtStatus::Running)) {
@@ -1308,14 +1316,16 @@ impl AppState {
                     db.archived_conversations().await?,
                     db.person_avatars().await?,
                     db.setting(signal_backend::SETTING_CONTACT_AVATARS).await?,
+                    signal_backend::unverified_people(&db).await,
                 ))
             });
         self.reload_task = Some(cx.spawn(async move |this, cx| {
             let result = query.await;
             let _ = this.update(cx, |this, cx| {
                 match result {
-                    Ok((conversations, archived, avatars, contact_avatars)) => {
+                    Ok((conversations, archived, avatars, contact_avatars, unverified)) => {
                         this.conversations = conversations;
+                        this.unverified = unverified;
                         this.archived = archived;
                         this.person_avatars = avatars.into_iter().map(|(sid, path)| (sid, path.into())).collect();
                         this.contact_avatars = contact_avatars

@@ -2965,6 +2965,19 @@ impl AppDb {
         Ok(())
     }
 
+    /// Every setting whose key starts with `prefix` (which must end in an
+    /// ASCII character other than DEL), with the prefix taken off its key.
+    pub async fn settings_with_prefix(&self, prefix: &'static str) -> Result<Vec<(String, String)>> {
+        let last = prefix.bytes().last().filter(|b| *b < 0x7f).expect("a prefix ending in ASCII");
+        let upper = format!("{}{}", &prefix[..prefix.len() - 1], char::from(last + 1));
+        let rows: Vec<(String, String)> = sqlx::query_as("SELECT key, value FROM settings WHERE key >= ? AND key < ?")
+            .bind(prefix)
+            .bind(upper)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|(key, value)| (key[prefix.len()..].to_owned(), value)).collect())
+    }
+
     /// Deletes every setting whose key starts with `prefix` (which must end
     /// in an ASCII character other than DEL), by a range over the primary key.
     pub async fn remove_settings_with_prefix(&self, prefix: &'static str) -> Result<u64> {
