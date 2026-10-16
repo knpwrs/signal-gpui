@@ -37,6 +37,7 @@ pub mod long_text;
 pub mod release_notes;
 pub mod megaphones;
 pub mod remote_config;
+pub mod message_requests;
 mod sender_keys;
 
 pub use remote_config::{RemoteConfig, current as remote_config};
@@ -272,6 +273,12 @@ pub enum Command {
     Forward { message_ids: Vec<i64>, conversations: Vec<ConversationId> },
     /// Deletes a whole chat on this device and your other devices.
     DeleteConversation { conversation: ConversationId },
+    /// Answers a message request as Desktop's message request bar does:
+    /// `Accept` (also what Unblock does there), `Delete`, `Block`,
+    /// `Spam` (Report spam) or `BlockAndSpam` (Report and block). Here
+    /// and on our other devices; a spam report goes to Signal. Answered
+    /// with `Event::MessageRequestAnswered`.
+    AnswerMessageRequest { conversation: ConversationId, answer: signal_store::MessageRequestResponse },
     /// Deletes our own message for everyone.
     DeleteForEveryone { message_id: i64 },
     /// Downloads attachment `index` of `message_id`.
@@ -322,12 +329,6 @@ pub enum Command {
     AnswerJoinRequest { conversation: ConversationId, member: String, approve: bool },
     /// Revokes invitations (service ids).
     RevokeGroupInvites { conversation: ConversationId, invitees: Vec<String> },
-    /// Accepts our invitation to a group.
-    AcceptGroupInvite { conversation: ConversationId },
-    /// Declines our invitation to a group and deletes the chat (Desktop's
-    /// "Delete and Leave"), or (`block`) declines it and blocks the group
-    /// ("Block and Leave").
-    DeclineGroupInvite { conversation: ConversationId, block: bool },
     /// Takes back our request to join a group.
     CancelJoinRequest { conversation: ConversationId },
     /// A `signal.group` link was opened: answered with
@@ -910,6 +911,8 @@ pub enum Event {
     GroupOpened { conversation: ConversationId, toast: Option<String> },
     /// A group link couldn't be read or joined: Desktop's title and words.
     GroupLinkFailed { title: String, description: String },
+    /// Our answer to a message request took (for Desktop's toasts).
+    MessageRequestAnswered { conversation: ConversationId, answer: signal_store::MessageRequestResponse },
     /// Progress of the message history transfer after linking.
     /// Draining the server queue after starting: the server timestamps
     /// (unix millis) of the first queued message and the latest one

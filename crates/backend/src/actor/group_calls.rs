@@ -504,6 +504,10 @@ impl Actor {
         if self.is_blocked(&conversation).await {
             return;
         }
+        // Desktop: "conversation has not been accepted".
+        if !self.is_accepted(&conversation).await {
+            return info!("a group call ring in a message request");
+        }
         let ringer = aci_of(&sender);
         let record = GroupCallRecord {
             call_id: ring_id,

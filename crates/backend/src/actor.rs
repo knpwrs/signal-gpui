@@ -11,6 +11,7 @@ mod polls;
 mod stories;
 mod sender_keys;
 mod key_transparency;
+mod message_requests;
 mod release_notes;
 mod remote_config;
 mod view_once;
@@ -296,14 +297,30 @@ impl Outbound {
     /// typing indicator or sync), with which Desktop shares our profile
     /// from then on (`enqueueMessageForSend`'s "mandatoryProfileSharing").
     fn message_to(&self) -> Option<&ConversationId> {
-        let conversation = match self {
+        self.message_to_any().filter(|c| c.as_direct().is_some())
+    }
+
+    /// The chat (1:1 or group) a message of ours goes to.
+    fn message_to_any(&self) -> Option<&ConversationId> {
+        match self {
             Outbound::Send { conversation, message: Some(_), .. }
             | Outbound::SendImages { conversation, .. }
             | Outbound::SendGif { conversation, .. }
-            | Outbound::SendSticker { conversation, .. } => conversation,
-            _ => return None,
-        };
-        conversation.as_direct().is_some().then_some(conversation)
+            | Outbound::SendSticker { conversation, .. } => Some(conversation),
+            _ => None,
+        }
+    }
+
+    /// The message row whose status this send tracks, with its chat and
+    /// timestamp.
+    fn tracked(&self) -> Option<(ConversationId, i64, u64)> {
+        match self {
+            Outbound::Send { conversation, message: Some(id), timestamp, .. }
+            | Outbound::SendImages { conversation, message: id, timestamp, .. }
+            | Outbound::SendSticker { conversation, message: id, timestamp, .. }
+            | Outbound::SendGif { conversation, message: id, timestamp, .. } => Some((conversation.clone(), *id, *timestamp)),
+            _ => None,
+        }
     }
 }
 
@@ -820,6 +837,9 @@ impl Actor {
                 Command::UnpinMessage { message_id } => self.set_pin(message_id, false, None).await,
                 Command::Forward { message_ids, conversations } => self.forward(message_ids, conversations).await,
                 Command::DeleteConversation { conversation } => self.delete_conversation(conversation).await,
+                Command::AnswerMessageRequest { conversation, answer } => {
+                    self.answer_message_request(conversation, answer).await
+                }
                 Command::DeleteForEveryone { message_id } => self.delete_for_everyone(message_id).await,
                 Command::FetchAttachment { message_id, index } => {
                     self.fetch_attachment(message_id, index).await
@@ -853,8 +873,6 @@ impl Actor {
                     self.answer_join_request(conversation, member, approve).await
                 }
                 Command::RevokeGroupInvites { conversation, invitees } => self.revoke_group_invites(conversation, invitees).await,
-                Command::AcceptGroupInvite { conversation } => self.accept_group_invite(conversation).await,
-                Command::DeclineGroupInvite { conversation, block } => self.decline_group_invite(conversation, block).await,
                 Command::CancelJoinRequest { conversation } => self.cancel_join_request(conversation).await,
                 Command::OpenGroupLink { url } => self.open_group_link(url).await,
                 Command::JoinGroupLink { url } => self.join_group_link(url).await,
@@ -1134,6 +1152,7 @@ impl Actor {
                 let sender = content.metadata.sender.service_id_string();
                 if sender != self_aci {
                     self.check_identity(&sender).await;
+                    self.keep_reporting_token(&sender, content.metadata.server_guid).await;
                 }
                 // The phone's keys (Desktop's `onKeysSync`): presage keeps
                 // the account entropy pool; the media root key is ours.
@@ -1188,7 +1207,13 @@ impl Actor {
                     return;
                 }
                 let ctx = MapContext { self_aci: &self_aci, now: now_millis() };
-                for action in mapping::map_content(&content, &ctx) {
+                for mut action in mapping::map_content(&content, &ctx) {
+                    // Theirs keep the server's GUID, for a spam report.
+                    if let Action::Insert { message, server_guid, .. } = &mut action
+                        && message.direction == Direction::Incoming
+                    {
+                        *server_guid = content.metadata.server_guid.map(|g| g.to_string());
+                    }
                     // Nor from a blocked group (our own sync messages still apply).
                     if let Action::Insert { message, .. } = &action
                         && message.direction == Direction::Incoming
@@ -1214,7 +1239,18 @@ impl Actor {
 
     async fn apply(self: &Rc<Self>, manager: &SignalManager, action: Action) {
         match action {
-            Action::Insert { mut message, mentions, styles, pointers, long_text, preview_image, timer_version, poll, view_once } => {
+            Action::Insert {
+                mut message,
+                mentions,
+                styles,
+                pointers,
+                long_text,
+                preview_image,
+                timer_version,
+                poll,
+                view_once,
+                server_guid,
+            } => {
                 let mut spans = Vec::new();
                 let mut style_spans = Vec::new();
                 // Every 1:1 message carries the sender's timer (groups take
@@ -1289,8 +1325,11 @@ impl Actor {
                     .ok()
                     .flatten()
                     .is_some();
-                match self.db.insert_message_view_once(&message, view_once).await {
+                match self.db.insert_received(&message, view_once, server_guid.as_deref()).await {
                     Ok(id) => {
+                        // A message request's media waits until it's
+                        // accepted (Desktop's `queueAttachmentDownloads`).
+                        let held = message.direction == Direction::Incoming && !self.is_accepted(&conversation).await;
                         if view_once == Some(signal_store::ViewOnce::Ready) {
                             self.view_once_expiry.notify_one();
                         }
@@ -1314,7 +1353,7 @@ impl Actor {
                         // Only its start came in the body; the rest follows
                         // (a re-delivery is already on its way).
                         if !repeat && let Some(pointer) = &long_text {
-                            self.expect_long_text(manager, id, pointer, mentions.clone(), styles.clone()).await;
+                            self.expect_long_text(manager, id, pointer, mentions.clone(), styles.clone(), held).await;
                         }
                         if let Some(poll) = &poll
                             && let Err(error) = self.db.set_poll(id, poll).await
@@ -1346,7 +1385,8 @@ impl Actor {
                             });
                         }
                         if let Some(pointer) = preview_image.filter(|p| {
-                            p.content_type.as_deref().is_some_and(|c| c.starts_with("image/"))
+                            !held
+                                && p.content_type.as_deref().is_some_and(|c| c.starts_with("image/"))
                                 && p.size.is_some_and(|size| crate::remote_config().auto_downloads(u64::from(size)))
                         }) {
                             let this = self.clone();
@@ -1356,7 +1396,7 @@ impl Actor {
                                 this.download_preview_image(&manager, conversation, id, &pointer).await
                             });
                         }
-                        for (index, pointer) in downloadable {
+                        for (index, pointer) in downloadable.into_iter().filter(|_| !held) {
                             let this = self.clone();
                             let manager = manager.clone();
                             let conversation = conversation.clone();
@@ -1483,6 +1523,9 @@ impl Actor {
             }
             Action::PollVote { .. } | Action::PollEnd { .. } => {
                 self.modify(manager, action).await;
+            }
+            Action::MessageRequestResponse { thread, response, at } => {
+                self.apply_message_request_sync(manager, thread, response, at).await;
             }
         }
     }
@@ -1689,6 +1732,10 @@ impl Actor {
         if let Some(manager) = self.manager() {
             self.refresh_group_avatar(&manager, key, false).await;
         }
+        // We made it: never a message request (Desktop sets `addedBy` to us).
+        if let Err(error) = self.db.set_message_request(&conversation, signal_store::MessageRequestResponse::Accept).await {
+            warn!(%error, "failed to mark our new group accepted");
+        }
         self.emit(Event::ConversationsChanged);
         self.emit(Event::GroupCreated(conversation.clone()));
         // Members' apps learn of the group from its first message.
@@ -1812,6 +1859,7 @@ impl Actor {
     }
 
     /// Leaves a group. Like Desktop, the last admin must name another first.
+    /// An invitation we haven't taken is declined.
     async fn leave_group(self: Rc<Self>, conversation: ConversationId) {
         // Desktop's `leaveGroupV2`: an invitation is declined.
         if matches!(self.stored_group_state(&conversation).await.membership, signal_store::Membership::Invited { .. }) {
@@ -1993,6 +2041,12 @@ impl Actor {
             };
             if let Err(error) = self.db.upsert_conversation(&conversation, update).await {
                 warn!(%error, "failed to record that a group ended");
+            }
+        }
+        if summary.added_by.is_some() {
+            let update = ConversationUpdate { added_by: summary.added_by.clone(), ..Default::default() };
+            if let Err(error) = self.db.upsert_conversation(&conversation, update).await {
+                warn!(%error, "failed to record who added us");
             }
         }
         if summary.left {
@@ -2614,14 +2668,27 @@ impl Actor {
                 phone,
             });
         };
+        // Who's in our address book (Desktop's `isInSystemContacts`): a
+        // system name on their contact record, or a name from the phone's
+        // contact sync.
+        let mut system: Vec<String> =
+            storage_contacts.iter().filter(|c| c.system_name).map(|c| Aci::from(c.aci).service_id_string()).collect();
         for contact in storage_contacts.iter().filter(|c| !c.hidden) {
             add(Aci::from(contact.aci).service_id_string(), contact.name.clone(), contact.e164.clone());
         }
         if let Ok(contacts) = self.store.contacts().await {
             for contact in contacts.flatten() {
                 let name = Some(contact.name.trim().to_owned()).filter(|n| !n.is_empty());
+                if name.is_some() {
+                    system.push(contact.uuid.to_string());
+                }
                 add(contact.uuid.to_string(), name, contact.phone_number.map(|p| p.to_string()));
             }
+        }
+        match self.db.replace_system_contacts(&system).await {
+            Ok(true) => self.emit(Event::ConversationsChanged),
+            Ok(false) => {}
+            Err(error) => warn!(%error, "failed to save who's in the address book"),
         }
         let mut entries: Vec<_> = entries.into_values().collect();
         if let Ok(groups) = self.store.groups().await {
@@ -3044,6 +3111,7 @@ impl Actor {
                     || update.can_edit_info.is_some_and(|v| v != conversation.can_edit_info)
                     || update.can_label.is_some_and(|v| v != conversation.can_label)
                     || update.can_add_members.is_some_and(|v| v != conversation.can_add_members)
+                    || (update.added_by.is_some() && update.added_by != conversation.added_by)
                     || update.admins.as_ref().is_some_and(|a| *a != conversation.admins)
                     || update.member_labels.as_ref().is_some_and(|l| *l != conversation.member_labels)
                     || update.group_state.as_ref().is_some_and(|g| *g != conversation.group_state)
@@ -4017,13 +4085,18 @@ impl Actor {
             return;
         }
 
-        let send_receipts = self.setting_on(AccountSetting::ReadReceipts).await;
+        // Not to a message request: they don't learn we've seen it until we
+        // accept (Desktop's `markConversationRead` and `sendReceipts`).
+        let send_receipts = self.setting_on(AccountSetting::ReadReceipts).await && self.is_accepted(&conversation).await;
         let mut by_author: HashMap<String, Vec<u64>> = HashMap::new();
         for (author, sent_at) in &unread {
             by_author.entry(author.clone()).or_default().push(*sent_at as u64);
         }
         if send_receipts {
             for (author, timestamps) in by_author {
+                if !self.is_accepted(&ConversationId::direct(&author)).await {
+                    continue;
+                }
                 let receipt = ReceiptMessage {
                     r#type: Some(receipt_message::Type::Read.into()),
                     timestamp: timestamps,
@@ -4059,6 +4132,8 @@ impl Actor {
     async fn typing(self: Rc<Self>, conversation: ConversationId, started: bool) {
         if !self.setting_on(AccountSetting::TypingIndicators).await
             || conversation.as_direct() == Some(self.self_aci().as_str())
+            // Not to a message request (Desktop's `shouldSendToConversation`).
+            || !self.is_accepted(&conversation).await
         {
             return;
         }
@@ -4155,6 +4230,17 @@ impl Actor {
                 }
                 continue;
             };
+            // Nothing of ours goes to a message request until it's
+            // accepted (Desktop's `shouldSendToConversation`).
+            if let Some(chat) = job.message_to_any()
+                && !self.is_accepted(chat).await
+            {
+                warn!("not sending to a message request");
+                if let Some((conversation, id, timestamp)) = job.tracked() {
+                    self.finish_send(&conversation, id, timestamp, DeliveryStatus::Failed).await;
+                }
+                continue;
+            }
             if let Some(chat) = job.message_to() {
                 self.share_profile_with(chat).await;
             }
@@ -4719,21 +4805,28 @@ impl Actor {
         pointer: &AttachmentPointer,
         mentions: Vec<String>,
         styles: Vec<mapping::WireStyle>,
+        held: bool,
     ) {
         let Some(remote) = mapping::remote_of(pointer) else {
             return warn!("a long text came without where to download it");
         };
+        // Held for a message request: left as one not downloaded yet (it
+        // can be asked for), and fetched once the request is accepted.
+        let state = if held { signal_store::LongTextState::Failed } else { signal_store::LongTextState::Downloading };
         let long_text = signal_store::LongText {
             remote,
             size: pointer.size.map_or(0, u64::from),
             mentions,
             styles,
-            state: signal_store::LongTextState::Downloading,
+            state,
             attempts: 0,
             retry_at: None,
         };
         if let Err(error) = self.db.set_long_text(message_id, Some(&long_text)).await {
             return self.error("failed to store message", error);
+        }
+        if held {
+            return;
         }
         let this = self.clone();
         let manager = manager.clone();

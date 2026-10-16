@@ -792,6 +792,19 @@ impl AppState {
                 tracing::warn!("backend error: {error}");
                 self.report_error(error, cx);
             }
+            // Desktop's toasts for a spam report (`ToastType.ReportedSpam`
+            // and `ReportedSpamAndBlocked`).
+            Event::MessageRequestAnswered { answer, .. } => {
+                let toast = match answer {
+                    signal_store::MessageRequestResponse::Spam => Some("Reported as spam."),
+                    signal_store::MessageRequestResponse::BlockAndSpam => Some("Reported as spam and blocked."),
+                    _ => None,
+                };
+                if let Some(toast) = toast {
+                    cx.emit(AppEvent::Info(toast.into()));
+                }
+                self.reload_conversations(cx);
+            }
             Event::Unlinked => {
                 // The old account's notifications and badge go too.
                 if let Some(notifier) = self.notifier.clone() {

@@ -185,37 +185,6 @@ pub(crate) async fn handle(db: &AppDb, data_dir: &Path, command: &Command, emit:
             };
             notice(conversation, change).await;
         }
-        Command::AcceptGroupInvite { conversation } => {
-            let Some(group) = chat(conversation.clone()).await else { return true };
-            let mut state = group.group_state.clone();
-            let inviter = match &state.membership {
-                Membership::Invited { by: Some(by) } => Inviter::Person { id: by.clone() },
-                _ => Inviter::Unknown,
-            };
-            state.membership = Membership::Member;
-            let mut members = group.members.clone();
-            members.push(ME.into());
-            let update = ConversationUpdate {
-                members: Some(members),
-                group_state: Some(state),
-                can_label: Some(true),
-                can_add_members: Some(true),
-                ..Default::default()
-            };
-            save(conversation.clone(), update).await;
-            notice(conversation, GroupNotice::AcceptedInvite { member: None, inviter }).await;
-        }
-        Command::DeclineGroupInvite { conversation, block } => {
-            if block {
-                let _ = db.set_blocked(&conversation, true).await;
-                let _ = db.set_left(&conversation, true).await;
-                let state = GroupState::default();
-                save(conversation.clone(), ConversationUpdate { group_state: Some(state), ..Default::default() }).await;
-                notice(conversation, GroupNotice::InviteRemoved { member: None, inviter: Inviter::Unknown }).await;
-            } else if db.remove_conversation(&conversation).await.is_ok() {
-                emit(Event::ConversationRemoved(conversation));
-            }
-        }
         Command::CancelJoinRequest { conversation } => {
             let Some(group) = chat(conversation.clone()).await else { return true };
             let mut state = group.group_state.clone();
@@ -304,4 +273,35 @@ pub(crate) async fn handle(db: &AppDb, data_dir: &Path, command: &Command, emit:
     }
     emit(Event::ConversationsChanged);
     true
+}
+
+/// Takes our invitation (as `actor/group_admin.rs` would): a member now,
+/// with Desktop's notice. Returns the notice to add.
+pub(crate) async fn accept_invite(db: &AppDb, conversation: &ConversationId) -> Option<Notice> {
+    let group = db.conversation(conversation).await.ok().flatten()?;
+    let mut state = group.group_state.clone();
+    let inviter = match &state.membership {
+        Membership::Invited { by: Some(by) } => Inviter::Person { id: by.clone() },
+        _ => Inviter::Unknown,
+    };
+    state.membership = Membership::Member;
+    let mut members = group.members.clone();
+    members.push(ME.into());
+    let update = ConversationUpdate {
+        members: Some(members),
+        group_state: Some(state),
+        can_label: Some(true),
+        can_add_members: Some(true),
+        ..Default::default()
+    };
+    let _ = db.upsert_conversation(conversation, update).await;
+    Some(Notice::Group { by: None, change: GroupNotice::AcceptedInvite { member: None, inviter } })
+}
+
+/// Declines our invitation: out of the group, with Desktop's notice.
+pub(crate) async fn decline_invite(db: &AppDb, conversation: &ConversationId) -> Notice {
+    let _ = db.set_left(conversation, true).await;
+    let update = ConversationUpdate { group_state: Some(GroupState::default()), ..Default::default() };
+    let _ = db.upsert_conversation(conversation, update).await;
+    Notice::Group { by: None, change: GroupNotice::InviteRemoved { member: None, inviter: Inviter::Unknown } }
 }

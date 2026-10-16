@@ -1485,3 +1485,83 @@ fn view_once_open_syncs_name_the_message() {
     assert_eq!(map_content(&content(ME, open(None, Some(binary))), &ctx()), expected);
     assert!(map_content(&content(ME, open(None, None)), &ctx()).is_empty());
 }
+
+#[test]
+fn message_request_answers_from_our_other_devices() {
+    use signal_store::MessageRequestResponse;
+    let alice = presage::libsignal_service::protocol::Aci::parse_from_service_id_string(ALICE).unwrap();
+    let sync = |answer: sync_message::MessageRequestResponse| SyncMessage {
+        content: Some(sync_message::Content::MessageRequestResponse(answer)),
+        ..Default::default()
+    };
+    // A person by raw UUID (binaryServiceId) or by string.
+    let binary = sync_message::MessageRequestResponse {
+        thread_aci_binary: Some(uuid::Uuid::from(alice).into_bytes().to_vec()),
+        r#type: Some(sync_message::message_request_response::Type::Accept as i32),
+        ..Default::default()
+    };
+    assert_eq!(
+        map_content(&content(ME, sync(binary)), &ctx()),
+        vec![Action::MessageRequestResponse {
+            thread: ThreadRef::Direct(ALICE.into()),
+            response: MessageRequestResponse::Accept,
+            at: 500
+        }]
+    );
+    let string = sync_message::MessageRequestResponse {
+        thread_aci: Some(ALICE.into()),
+        r#type: Some(sync_message::message_request_response::Type::BlockAndSpam as i32),
+        ..Default::default()
+    };
+    let actions = map_content(&content(ME, sync(string)), &ctx());
+    assert!(matches!(&actions[..], [Action::MessageRequestResponse { response: MessageRequestResponse::BlockAndSpam, .. }]));
+    // A group by its 32-byte id; another length names nothing.
+    let group = sync_message::MessageRequestResponse {
+        group_id: Some(vec![4; 32]),
+        thread_aci: Some(ALICE.into()),
+        r#type: Some(sync_message::message_request_response::Type::Delete as i32),
+        ..Default::default()
+    };
+    let actions = map_content(&content(ME, sync(group)), &ctx());
+    assert!(matches!(&actions[..], [Action::MessageRequestResponse { thread: ThreadRef::GroupId(id), .. }] if id == &vec![4; 32]));
+    let bad = sync_message::MessageRequestResponse { group_id: Some(vec![4; 16]), thread_aci: Some(ALICE.into()), ..Default::default() };
+    assert!(map_content(&content(ME, sync(bad)), &ctx()).is_empty());
+}
+
+#[test]
+fn message_request_syncs_we_send_name_the_chat_as_desktop() {
+    use signal_store::MessageRequestResponse;
+    let alice = presage::libsignal_service::protocol::Aci::parse_from_service_id_string(ALICE).unwrap();
+    let binary = message_request_sync(Some(ALICE), None, MessageRequestResponse::Accept, true);
+    assert_eq!(binary.thread_aci_binary, Some(uuid::Uuid::from(alice).into_bytes().to_vec()));
+    assert_eq!((binary.thread_aci.as_deref(), binary.r#type), (None, Some(1)));
+    let string = message_request_sync(Some(ALICE), None, MessageRequestResponse::Spam, false);
+    assert_eq!((string.thread_aci.as_deref(), string.thread_aci_binary.as_deref(), string.r#type), (Some(ALICE), None, Some(5)));
+    let group = message_request_sync(None, Some(vec![7; 32]), MessageRequestResponse::Block, true);
+    assert_eq!((group.group_id, group.thread_aci, group.thread_aci_binary), (Some(vec![7; 32]), None, None));
+    // What we send reads back as the same chat and answer.
+    assert_eq!(message_request_thread(&binary), Some(ThreadRef::Direct(ALICE.into())));
+    assert_eq!(message_request_thread(&string), Some(ThreadRef::Direct(ALICE.into())));
+}
+
+#[test]
+fn who_added_us_outright_is_kept_for_message_requests() {
+    use presage::libsignal_service::groups_v2::{GroupChange, GroupChanges, Member, Role};
+    use presage::libsignal_service::protocol::Aci;
+    let alice = Aci::parse_from_service_id_string(ALICE).unwrap();
+    let me = Aci::parse_from_service_id_string(ME).unwrap();
+    let key = presage::libsignal_service::zkgroup::profiles::ProfileKey::create([1; 32]);
+    let added = |editor, aci| GroupChanges {
+        group_id: [0; 32],
+        editor,
+        version: 4,
+        changes: vec![GroupChange::NewMember(Member { aci, role: Role::Default, profile_key: key, joined_at_version: 4, label: None, label_emoji: None })],
+        change_epoch: 0,
+    };
+    // Desktop's `addedBy`: whoever added us.
+    assert_eq!(summarize_group_change(&added(alice, me), ME, None, &Default::default()).added_by.as_deref(), Some(ALICE));
+    // Not when we added ourselves (by the link), nor for someone else.
+    assert_eq!(summarize_group_change(&added(me, me), ME, None, &Default::default()).added_by, None);
+    let bob = Aci::parse_from_service_id_string(BOB).unwrap();
+    assert_eq!(summarize_group_change(&added(alice, bob), ME, None, &Default::default()).added_by, None);
+}

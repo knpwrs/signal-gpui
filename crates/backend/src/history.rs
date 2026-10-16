@@ -328,6 +328,32 @@ fn story_state(recipient: &proto::Recipient) -> Option<(ConversationId, bool, Op
     }
 }
 
+/// A contact with a name from the phone's address book (Desktop's import
+/// keeps `systemGivenName`, `systemFamilyName` and `systemNickname`, which
+/// `isInSystemContacts` reads): their service id.
+fn system_contact(recipient: &proto::Recipient) -> Option<String> {
+    use proto::recipient::Destination;
+    let Some(Destination::Contact(contact)) = &recipient.destination else { return None };
+    let named = [&contact.systemGivenName, &contact.systemFamilyName, &contact.systemNickname].iter().any(|n| !n.trim().is_empty());
+    named.then(|| contact.aci.as_deref().and_then(uuid_sid)).flatten()
+}
+
+/// A message request answer in transferred history (Desktop's import of
+/// `REPORTED_SPAM`, `BLOCKED`, `UNBLOCKED` and `MESSAGE_REQUEST_ACCEPTED`
+/// simple updates as `message-request-response-event`s).
+fn message_request_event(update: &proto::ChatUpdateMessage) -> Option<signal_store::MessageRequestEvent> {
+    use proto::simple_chat_update::Type;
+    use signal_store::MessageRequestEvent;
+    let Some(proto::chat_update_message::Update::SimpleUpdate(simple)) = &update.update else { return None };
+    match simple.type_.enum_value().ok()? {
+        Type::REPORTED_SPAM => Some(MessageRequestEvent::Spam),
+        Type::BLOCKED => Some(MessageRequestEvent::Block),
+        Type::UNBLOCKED => Some(MessageRequestEvent::Unblock),
+        Type::MESSAGE_REQUEST_ACCEPTED => Some(MessageRequestEvent::Accept),
+        _ => None,
+    }
+}
+
 /// Imports a decrypted backup's chats and messages for account `me`.
 /// `progress` gets the bytes of `plain` imported so far.
 pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: impl FnMut(u64)) -> anyhow::Result<Imported> {
@@ -338,6 +364,8 @@ pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: imp
     // Whom we share our profile with, and groups' story send modes.
     let mut sharing: Vec<(ConversationId, bool)> = Vec::new();
     let mut modes: Vec<(ConversationId, signal_store::StorySendMode)> = Vec::new();
+    // Who's in our address book (Desktop's `isInSystemContacts`).
+    let mut system: Vec<String> = Vec::new();
     let mut imported = Imported::default();
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64;
     let mut frames = delimited(plain);
@@ -355,6 +383,7 @@ pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: imp
                     sharing.push((chat.clone(), on));
                     modes.extend(mode.map(|mode| (chat, mode)));
                 }
+                system.extend(system_contact(&recipient));
                 import_key_transparency(db, &recipient).await;
                 people.insert(recipient.id, who(&recipient));
             }
@@ -429,6 +458,7 @@ pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: imp
     }
     db.apply_chat_states(&states).await?;
     db.apply_profile_sharing(&sharing).await?;
+    db.add_system_contacts(&system).await?;
     db.set_story_send_modes(&modes).await?;
     if !pinned.is_empty() {
         pinned.sort_by_key(|(order, _)| *order);
@@ -473,6 +503,14 @@ async fn import_item(
             _ => return Ok(false),
         };
         let notice = signal_store::Notice::PollEnded { by, question: end.question.clone(), sent_at: end.targetSentTimestamp as i64 };
+        return Ok(db.insert_notice(conversation, item.dateSent as i64, &notice).await?.is_some());
+    }
+    if let Some(Item::UpdateMessage(update)) = &item.item
+        && let Some(event) = message_request_event(update)
+    {
+        let group = conversation.as_group().is_some();
+        let who = conversation.as_direct().map(str::to_owned);
+        let notice = signal_store::Notice::MessageRequest { event, group, who };
         return Ok(db.insert_notice(conversation, item.dateSent as i64, &notice).await?.is_some());
     }
     let (author, author_name) = person(item.authorId);
@@ -1222,5 +1260,35 @@ mod tests {
         assert_eq!(signal.title, "Signal");
         let notes = db.messages(&signal.id, None, 10).await.unwrap();
         assert_eq!((notes[0].body.as_str(), notes[0].author.as_deref()), ("Something new", Some(signal_store::SIGNAL_ACI)));
+    }
+
+    #[test]
+    fn message_request_answers_and_address_book_names_are_read() {
+        use proto::simple_chat_update::Type;
+        use signal_store::MessageRequestEvent;
+        let update = |kind: Type| {
+            let mut simple = proto::SimpleChatUpdate::new();
+            simple.type_ = kind.into();
+            let mut update = proto::ChatUpdateMessage::new();
+            update.update = Some(proto::chat_update_message::Update::SimpleUpdate(simple));
+            update
+        };
+        assert_eq!(message_request_event(&update(Type::MESSAGE_REQUEST_ACCEPTED)), Some(MessageRequestEvent::Accept));
+        assert_eq!(message_request_event(&update(Type::REPORTED_SPAM)), Some(MessageRequestEvent::Spam));
+        assert_eq!(message_request_event(&update(Type::BLOCKED)), Some(MessageRequestEvent::Block));
+        assert_eq!(message_request_event(&update(Type::UNBLOCKED)), Some(MessageRequestEvent::Unblock));
+        assert_eq!(message_request_event(&update(Type::JOINED_SIGNAL)), None);
+
+        let mut contact = proto::Contact::new();
+        contact.aci = Some(vec![0xa1; 16]);
+        contact.profileGivenName = Some("Alice".into());
+        let recipient = |contact: proto::Contact| {
+            let mut r = proto::Recipient::new();
+            r.destination = Some(proto::recipient::Destination::Contact(contact));
+            r
+        };
+        assert_eq!(system_contact(&recipient(contact.clone())), None, "a profile name isn't the address book's");
+        contact.systemGivenName = "Alice".into();
+        assert_eq!(system_contact(&recipient(contact)), Some(Aci::from_uuid_bytes([0xa1; 16]).service_id_string()));
     }
 }

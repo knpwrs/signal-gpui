@@ -95,6 +95,14 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
         .await?;
     }
 
+    // Everyone here is in the made-up phone's address book, and both
+    // groups share our profile: none of them is a message request (set
+    // before any message, so no chat shows as one while this runs).
+    db.replace_system_contacts(&[MAYA, JORDAN, PRIYA, SAM, ANA, LEO].map(|p| aci(p).to_owned())).await?;
+    for group in [GROUP, HOUSE] {
+        db.set_profile_sharing(&ConversationId(group.into()), true).await?;
+    }
+
     // Group members, for Desktop's per-member name colors.
     db.upsert_conversation(
         &ConversationId(GROUP.into()),
@@ -438,7 +446,44 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
         },
     ])
     .await?;
+    seed_message_requests(db, now).await?;
     seed_calls(db, now).await?;
+    Ok(())
+}
+
+/// A made-up stranger, using Maya's name: their message request.
+pub(crate) const STRANGER: &str = "d:00000000-0000-4000-8000-0000000000a5";
+/// A message request from someone we don't know, with a contact's name,
+/// so the name collision warning shows too. (The group we're invited to,
+/// the other kind, is `demo_groups`'.)
+async fn seed_message_requests(db: &AppDb, now: i64) -> signal_store::Result<()> {
+    let stranger = ConversationId(STRANGER.into());
+    db.upsert_conversation(
+        &stranger,
+        ConversationUpdate { kind: Some(ConversationKind::Direct), title: Some("Maya Chen".into()), ..Default::default() },
+    )
+    .await?;
+    for (at, body) in [
+        (now - 40 * MINUTE, "Hi! It's Maya, I got a new phone 📱"),
+        (now - 39 * MINUTE, "Can you send me the 6-digit code you just got? I need it to get back into my account"),
+    ] {
+        db.insert_message(&NewMessage {
+            conversation_id: stranger.clone(),
+            sent_at: at,
+            received_at: at,
+            direction: Direction::Incoming,
+            author: Some(aci(STRANGER).into()),
+            author_name: Some("Maya Chen".into()),
+            body: body.into(),
+            status: DeliveryStatus::Delivered,
+            quote: None,
+            attachments: vec![],
+            link_preview: None,
+            expires_in: 0,
+        })
+        .await?;
+    }
+
     Ok(())
 }
 
@@ -1328,6 +1373,11 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     let _ = events.unbounded_send(Event::ConversationsChanged);
                 }
             }
+            Command::AnswerMessageRequest { conversation, answer } => {
+                for event in demo_answer_message_request(&db, &conversation, answer).await {
+                    emit(event);
+                }
+            }
             Command::SetExpireTimer { conversation, seconds } => {
                 let _ = db.set_expire_timer(&conversation, seconds, 1).await;
                 let notice = signal_store::Notice::Timer { by: None, seconds };
@@ -1937,8 +1987,6 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
             | Command::ChangeGroupLink { .. }
             | Command::AnswerJoinRequest { .. }
             | Command::RevokeGroupInvites { .. }
-            | Command::AcceptGroupInvite { .. }
-            | Command::DeclineGroupInvite { .. }
             | Command::CancelJoinRequest { .. }
             | Command::OpenGroupLink { .. }
             | Command::JoinGroupLink { .. }
@@ -1972,6 +2020,70 @@ async fn demo_auto_verify(db: &AppDb, conversation: &ConversationId) -> crate::A
         Some(_) => crate::AutoVerify::Available,
         None => crate::AutoVerify::Unavailable,
     }
+}
+
+/// The real backend's answer to a message request, without a network:
+/// the answer, its notices, the block, profile sharing, the report flag,
+/// deleting, and joining, declining or leaving a group.
+async fn demo_answer_message_request(
+    db: &AppDb,
+    conversation: &ConversationId,
+    answer: signal_store::MessageRequestResponse,
+) -> Vec<Event> {
+    use signal_store::{GroupNotice, MessageRequestResponse as Answer, Notice};
+    let Ok(Some(before)) = db.conversation(conversation).await else { return Vec::new() };
+    let group = before.kind == ConversationKind::Group;
+    let mut events = Vec::new();
+    let mut notices = Vec::new();
+    let at = next_sent_at();
+    if answer == Answer::Accept && before.invited() {
+        notices.extend(crate::demo_groups::accept_invite(db, conversation).await);
+    }
+    let _ = db.set_message_request(conversation, answer).await;
+    let who = conversation.as_direct().map(str::to_owned);
+    for event in crate::message_requests::answer_events(before.message_request, before.blocked, answer) {
+        notices.push(Notice::MessageRequest { event, group, who: who.clone() });
+    }
+    if answer == Answer::Accept {
+        let _ = db.set_blocked(conversation, false).await;
+        let _ = db.set_profile_sharing(conversation, true).await;
+    } else {
+        if answer.blocks() {
+            let _ = db.set_blocked(conversation, true).await;
+        }
+        if answer.blocks() || answer.deletes() {
+            let _ = db.set_profile_sharing(conversation, false).await;
+            if group && !before.left {
+                if before.invited() {
+                    notices.push(crate::demo_groups::decline_invite(db, conversation).await);
+                } else {
+                    let _ = db.set_left(conversation, true).await;
+                    notices.push(Notice::Group { by: None, change: GroupNotice::Removed { member: None } });
+                }
+            }
+        }
+        if answer.spam() {
+            let _ = db.set_reported(conversation).await;
+        }
+    }
+    if answer.deletes() {
+        if answer.blocks() || before.blocked {
+            let _ = db.clear_messages(conversation).await;
+            events.push(Event::ConversationCleared(conversation.clone()));
+        } else {
+            let _ = db.remove_conversation(conversation).await;
+            events.push(Event::ConversationRemoved(conversation.clone()));
+            notices.clear();
+        }
+    }
+    for (ix, notice) in notices.into_iter().enumerate() {
+        if let Ok(Some(id)) = db.insert_notice(conversation, at + ix as i64, &notice).await {
+            events.push(Event::MessageChanged { conversation: conversation.clone(), message_id: id });
+        }
+    }
+    events.push(Event::ConversationsChanged);
+    events.push(Event::MessageRequestAnswered { conversation: conversation.clone(), answer });
+    events
 }
 
 /// "@Name" for each mention placeholder, names from the demo's chats.

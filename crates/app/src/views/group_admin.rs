@@ -627,7 +627,7 @@ pub fn composer_replacement(state: &Entity<AppState>, chat: &Conversation, palet
                                     true,
                                     window,
                                     cx,
-                                    move |_, cx| state.read(cx).send(Command::DeclineGroupInvite { conversation: id.clone(), block: true }),
+                                    move |_, cx| state.read(cx).send(Command::AnswerMessageRequest { conversation: id.clone(), answer: signal_store::MessageRequestResponse::Block }),
                                 );
                             }))
                             .child(Button::new("invite-delete").label("Delete").outline().on_click(move |_, window, cx| {
@@ -639,11 +639,11 @@ pub fn composer_replacement(state: &Entity<AppState>, chat: &Conversation, palet
                                     true,
                                     window,
                                     cx,
-                                    move |_, cx| state.read(cx).send(Command::DeclineGroupInvite { conversation: id.clone(), block: false }),
+                                    move |_, cx| state.read(cx).send(Command::AnswerMessageRequest { conversation: id.clone(), answer: signal_store::MessageRequestResponse::Delete }),
                                 );
                             }))
                             .child(Button::new("invite-accept").label("Accept").primary().on_click(move |_, _, cx| {
-                                accept_state.read(cx).send(Command::AcceptGroupInvite { conversation: accept_id.clone() });
+                                accept_state.read(cx).send(Command::AnswerMessageRequest { conversation: accept_id.clone(), answer: signal_store::MessageRequestResponse::Accept });
                             })),
                     )
                     .into_any_element(),

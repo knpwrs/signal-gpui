@@ -355,6 +355,42 @@ impl Actor {
         }
     }
 
+    /// Whether a call from them may ring (Desktop's `handleCallingMessage`:
+    /// the chat accepted, and not just because it's empty, its
+    /// `ignoreEmptyConvo`).
+    async fn takes_calls_from(&self, peer: &str) -> bool {
+        let chat = ConversationId::direct(peer);
+        let sharing = self.db.profile_sharing(&chat).await.unwrap_or(false);
+        match self.db.conversation(&chat).await.ok().flatten() {
+            Some(c) => {
+                c.accepted
+                    && (sharing
+                        || c.system_contact
+                        || c.message_request == signal_store::MessageRequestResponse::Accept
+                        || c.last_message_at > 0)
+            }
+            None => sharing || self.db.system_contacts().await.unwrap_or_default().iter().any(|s| s == peer),
+        }
+    }
+
+    /// Turns down a call from a message request, as Desktop does: a hangup
+    /// saying we need to accept first (`HangupType.NeedPermission`, naming
+    /// their device), and a missed call in the chat.
+    async fn refuse_call(self: &Rc<Self>, peer: &str, device: u32, call_id: CallId, video: bool, at: i64) {
+        use presage::proto::call_message::{Hangup, hangup::Type};
+        info!("a call from a message request: telling them we need to accept first");
+        let hangup = Hangup { id: Some(call_id.as_u64()), r#type: Some(Type::HangupNeedPermission as i32), device_id: Some(device) };
+        self.send_call_message(peer, CallMessage { hangup: Some(hangup), ..Default::default() });
+        let conversation = ConversationId::direct(peer);
+        let notice = Notice::Call { incoming: true, video, outcome: CallOutcome::Missed, call_id: Some(call_id.as_u64() as i64), unseen: false };
+        match self.db.record_call(&conversation, at, &notice).await {
+            Ok(Some(id)) => self.emit(Event::MessageChanged { conversation, message_id: id }),
+            Ok(None) => {}
+            Err(error) => self.error("failed to record the call", error),
+        }
+        self.emit(Event::ConversationsChanged);
+    }
+
     fn send_call_message(self: &Rc<Self>, recipient: &str, message: CallMessage) {
         let Some(aci) = Aci::parse_from_service_id_string(recipient) else { return };
         let _ = self.call_sends.unbounded_send((aci, message));
@@ -600,6 +636,10 @@ impl Actor {
         for message in incoming {
             match message {
                 Incoming::Offer { call_id, video, opaque } => {
+                    if !self.takes_calls_from(&peer).await {
+                        self.refuse_call(&peer, sender_device, call_id, video, server_timestamp).await;
+                        continue;
+                    }
                     let Some((theirs, ours)) = keys.clone() else { continue };
                     let media = if video { CallMediaType::Video } else { CallMediaType::Audio };
                     let Ok(offer) = Offer::new(media, opaque) else { continue };

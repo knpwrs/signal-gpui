@@ -58,6 +58,9 @@ pub(crate) struct StorageContact {
     /// The nickname and note we gave them, and the name without the
     /// nickname.
     pub nickname: signal_store::ContactNickname,
+    /// The record has a name from the phone's address book (Desktop's
+    /// `isInSystemContacts`: `systemGivenName` and the rest).
+    pub system_name: bool,
 }
 
 /// What we read from the Storage Service.
@@ -737,6 +740,26 @@ pub(crate) async fn write_chat(manager: &SignalManager, conversation: &Conversat
     write_chat_record(manager, conversation, |record| edit_chat_record(record, edit)).await
 }
 
+/// Edits several of a record's flags at once: `Ok(None)` when none changes.
+pub(crate) fn edit_chat_record_all(record: &[u8], edits: &[ChatEdit]) -> anyhow::Result<Option<Vec<u8>>> {
+    let mut current: Option<Vec<u8>> = None;
+    for edit in edits {
+        if let Some(edited) = edit_chat_record(current.as_deref().unwrap_or(record), *edit)? {
+            current = Some(edited);
+        }
+    }
+    Ok(current)
+}
+
+/// Changes several flags on a chat for the whole account in one write
+/// (accepting a message request unblocks and shares our profile at once).
+pub(crate) async fn write_chat_all(manager: &SignalManager, conversation: &ConversationId, edits: &[ChatEdit]) -> anyhow::Result<()> {
+    if conversation.is_signal() || edits.is_empty() {
+        return Ok(());
+    }
+    write_chat_record(manager, conversation, |record| edit_chat_record_all(record, edits)).await
+}
+
 const CONTACT_NICKNAME: u32 = 22; // ContactRecord.nickname
 const CONTACT_NOTE: u32 = 23; // ContactRecord.note
 const NAME_GIVEN: u32 = 1; // ContactRecord.Name.given
@@ -1094,6 +1117,9 @@ pub(crate) fn from_record(record: &ContactRecord) -> Option<StorageContact> {
         profile_key: record.profile_key.as_slice().try_into().ok(),
         e164: Some(record.e164.clone()).filter(|e| !e.is_empty()),
         hidden: record.hidden || record.blocked,
+        system_name: [&record.system_given_name, &record.system_family_name, &record.system_nickname]
+            .iter()
+            .any(|n| !n.trim().is_empty()),
         nickname,
     })
 }
@@ -1353,6 +1379,27 @@ mod tests {
         let shared = edit_chat_record(&removed, ChatEdit::ProfileSharing(true)).unwrap().unwrap();
         let Some(Record::GroupV2(g)) = StorageRecord::decode(shared.as_slice()).unwrap().record else { panic!() };
         assert!(g.whitelisted && g.story_send_mode() == presage::proto::group_v2_record::StorySendMode::Disabled);
+    }
+
+    #[test]
+    fn accepting_a_blocked_request_unblocks_and_shares_in_one_edit() {
+        let record = StorageRecord {
+            record: Some(Record::Contact(ContactRecord { aci: ACI.into(), blocked: true, archived: true, ..Default::default() })),
+        };
+        let edits = [ChatEdit::Blocked(false), ChatEdit::ProfileSharing(true)];
+        let edited = edit_chat_record_all(&record.encode_to_vec(), &edits).unwrap().unwrap();
+        let Some(Record::Contact(c)) = StorageRecord::decode(edited.as_slice()).unwrap().record else { panic!() };
+        assert!(!c.blocked && c.whitelisted && c.archived, "other fields kept");
+        // Nothing to change: no write.
+        assert_eq!(edit_chat_record_all(&edited, &edits).unwrap(), None);
+        // One of two changing is still a change.
+        let edits = [ChatEdit::Blocked(false), ChatEdit::ProfileSharing(false)];
+        let Some(Record::Contact(c)) =
+            StorageRecord::decode(edit_chat_record_all(&edited, &edits).unwrap().unwrap().as_slice()).unwrap().record
+        else {
+            panic!()
+        };
+        assert!(!c.whitelisted && !c.blocked);
     }
 
     #[test]

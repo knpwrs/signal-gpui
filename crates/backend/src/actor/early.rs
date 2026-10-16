@@ -317,7 +317,9 @@ impl Actor {
                 let _ = self.db.set_mentions(target, &spans).await;
                 let _ = self.db.set_styles(target, &style_spans).await;
                 if let Some(pointer) = long_text {
-                    self.expect_long_text(manager, target, pointer, mentions.clone(), styles.clone()).await;
+                    // Held in a message request, as the message's own was.
+                    let held = target_author.is_some() && !self.is_accepted(conversation).await;
+                    self.expect_long_text(manager, target, pointer, mentions.clone(), styles.clone(), held).await;
                 }
                 // What names the edit can come before it: a read sync, a
                 // reaction, a delete.

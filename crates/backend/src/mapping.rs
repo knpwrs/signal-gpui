@@ -45,6 +45,9 @@ pub enum Action {
         /// A view-once message: ready to view once, or (ours, or not one
         /// that can be viewed) already erased, with nothing kept.
         view_once: Option<signal_store::ViewOnce>,
+        /// The server's GUID for an incoming message (a spam report names
+        /// it); set by the receive loop, not here.
+        server_guid: Option<String>,
     },
     React {
         conversation: ConversationId,
@@ -209,6 +212,50 @@ pub enum Action {
         target_sent_at: i64,
         sent_at: i64,
     },
+    #[serde(skip)]
+    /// Our answer to a message request on another of our devices
+    /// (Desktop's `MessageRequestResponse` sync), sent `at`.
+    MessageRequestResponse { thread: ThreadRef, response: signal_store::MessageRequestResponse, at: i64 },
+}
+
+/// The chat a `MessageRequestResponse` sync names, as Desktop's
+/// `handleMessageRequestResponse` reads it: a group by its 32-byte id (any
+/// other length is refused), else the person by `threadAciBinary` (a raw
+/// UUID) or `threadAci`.
+pub fn message_request_thread(sync: &sync_message::MessageRequestResponse) -> Option<ThreadRef> {
+    use presage::libsignal_service::protocol::Aci;
+    match sync.group_id.as_deref() {
+        Some(id) if id.len() == 32 => return Some(ThreadRef::GroupId(id.to_vec())),
+        Some(id) if !id.is_empty() => return None,
+        _ => {}
+    }
+    let aci = sync
+        .thread_aci_binary
+        .as_deref()
+        .and_then(|b| uuid::Uuid::from_slice(b).ok())
+        .map(Aci::from)
+        .or_else(|| Aci::parse_from_service_id_string(sync.thread_aci.as_deref()?))?;
+    Some(ThreadRef::Direct(aci.service_id_string()))
+}
+
+/// The `MessageRequestResponse` sync for our answer (Desktop's
+/// `getMessageRequestResponseSync`): a group by its id, a person by ACI,
+/// as a raw UUID with `binary` (the remote config's `binaryServiceId`),
+/// else as a string.
+pub fn message_request_sync(
+    aci: Option<&str>,
+    group_id: Option<Vec<u8>>,
+    response: signal_store::MessageRequestResponse,
+    binary: bool,
+) -> sync_message::MessageRequestResponse {
+    use presage::libsignal_service::protocol::Aci;
+    let aci = aci.and_then(Aci::parse_from_service_id_string);
+    sync_message::MessageRequestResponse {
+        thread_aci: aci.filter(|_| !binary).map(|a| a.service_id_string()),
+        thread_aci_binary: aci.filter(|_| binary).map(|a| uuid::Uuid::from(a).into_bytes().to_vec()),
+        group_id,
+        r#type: Some(response.to_wire() as i32),
+    }
 }
 
 /// An attachment pointer as its protobuf bytes, to keep an early edit.
@@ -248,6 +295,8 @@ pub struct GroupChangeSummary {
     pub unbanned: Vec<String>,
     /// Where we stand now, when this change moved us.
     pub membership: Option<MembershipChange>,
+    /// Someone else added us outright (Desktop's `addedBy`): who.
+    pub added_by: Option<String>,
 }
 
 /// How a group change moved us.
@@ -306,6 +355,9 @@ pub fn summarize_group_change(
                 let sid = member.aci.service_id_string();
                 if ours(&sid) {
                     summary.membership = Some(MembershipChange::Joined);
+                    // Desktop's `addedBy`, for whether the group is a
+                    // message request.
+                    summary.added_by = Some(editor.clone()).filter(|e| !ours(e));
                 }
                 // Only the link lets someone add themselves.
                 if sid == editor {
@@ -1200,6 +1252,7 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
         timer_version: dm.expire_timer_version,
         poll,
         view_once,
+        server_guid: None,
     }]
 }
 
@@ -1416,6 +1469,7 @@ fn map_story_reply(
         timer_version: dm.expire_timer_version,
         poll: None,
         view_once: None,
+        server_guid: None,
     });
     out
 }
@@ -1615,6 +1669,16 @@ fn map_sync(sync: &SyncMessage, envelope_ts: i64, ctx: &MapContext) -> Vec<Actio
     }
     if let Some(sync_message::Content::Configuration(configuration)) = &sync.content {
         out.push(Action::AccountSettings(account_settings(configuration)));
+    }
+    if let Some(sync_message::Content::MessageRequestResponse(answer)) = &sync.content {
+        match message_request_thread(answer) {
+            Some(thread) => out.push(Action::MessageRequestResponse {
+                thread,
+                response: signal_store::MessageRequestResponse::from_wire(i64::from(answer.r#type.unwrap_or(0))),
+                at: envelope_ts,
+            }),
+            None => tracing::warn!("message request answer for no chat we can name"),
+        }
     }
     if let Some(sync_message::Content::FetchLatest(fetch)) = &sync.content
         && fetch.r#type() == sync_message::fetch_latest::Type::StorageManifest

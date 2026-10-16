@@ -190,9 +190,11 @@ impl Actor {
     }
 
     /// Desktop's "Accept" on an invitation (`promotePendingMember`): our
-    /// profile key proof, for the ACI or PNI we were invited by.
-    pub(super) async fn accept_group_invite(self: Rc<Self>, conversation: ConversationId) {
-        let Some(manager) = self.manager() else { return };
+    /// profile key proof, for the ACI or PNI we were invited by. The message
+    /// request bar's Accept calls this for an invitation.
+    /// Whether it went (the message request bar accepts through this).
+    pub(super) async fn accept_group_invite(self: Rc<Self>, conversation: ConversationId) -> bool {
+        let Some(manager) = self.manager() else { return false };
         let profile_key = manager.registration_data().profile_key();
         let pni = self.self_pni();
         self.admin_change(&conversation, "couldn't accept the invitation", Vec::new(), async |session, group, me, actions| {
@@ -201,7 +203,7 @@ impl Actor {
             admin::accept_invite(&session.secret, &session.params, &credential, matches!(invited, ServiceId::Pni(_)), actions);
             Ok(())
         })
-        .await;
+        .await
     }
 
     /// Declines our invitation (Desktop's `leaveGroupV2` for a pending
@@ -214,17 +216,6 @@ impl Actor {
             Ok(())
         })
         .await
-    }
-
-    /// Desktop's "Delete and Leave" on an invitation (declined, then the
-    /// chat deleted once that worked) or "Block and Leave" (blocking a group
-    /// leaves it, which for an invitation declines it).
-    pub(super) async fn decline_group_invite(self: Rc<Self>, conversation: ConversationId, block: bool) {
-        if block {
-            self.set_chat(conversation, crate::ChatChange::Blocked(true)).await;
-        } else if self.decline_invite(&conversation).await {
-            self.delete_conversation(conversation).await;
-        }
     }
 
     /// Desktop's "Cancel Request" (`cancelJoinRequest`): we can't read the
