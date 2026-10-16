@@ -436,7 +436,7 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
             id: ConversationId("d:00000000-0000-4000-8000-0000000000d5".into()),
             kind: ConversationKind::Direct,
             title: "Dana Brooks".into(),
-            phone: Some("+15550177".into()),
+            phone: Some("+14155550177".into()),
         },
         signal_store::DirectoryEntry {
             id: ConversationId("g:0000000000000000000000000000000000000000000000000000000000000002".into()),
@@ -1617,9 +1617,23 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     emit(Event::MessageChanged { conversation, message_id: id });
                 }
             }
-            // No servers to ask: say so.
+            // No servers to ask: a `signal.me/#p/` link finds someone in the
+            // demo's directory by number; anything else says so.
             Command::FindRecipient { query } => {
-                emit(Event::RecipientFound { query, result: Err("Looking people up isn't available in the demo".into()) });
+                let number = match crate::routes::parse(&query) {
+                    Some(crate::routes::Route::ContactByPhoneNumber(number)) => Some(number),
+                    _ => None,
+                };
+                let found = match &number {
+                    Some(number) => db
+                        .search_directory(number, 20)
+                        .await
+                        .ok()
+                        .and_then(|entries| entries.into_iter().find(|e| e.phone.as_deref() == Some(number.as_str()))),
+                    None => None,
+                };
+                let result = found.ok_or_else(|| "Looking people up isn't available in the demo".to_owned());
+                emit(Event::RecipientFound { query, result });
             }
             Command::SendImages { conversation, images, caption, quote, mentions, styles } => {
                 let mut attachments = Vec::new();

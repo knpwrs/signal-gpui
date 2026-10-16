@@ -158,6 +158,14 @@ fn bind_keys(cx: &mut App) {
     }]);
 }
 
+/// Brings the app and its main window to the front.
+fn show_main_window(cx: &mut App) {
+    cx.activate(true);
+    if let Some(window) = cx.windows().into_iter().find(|w| w.downcast::<RootView>().is_some()) {
+        let _ = window.update(cx, |_, window, _| window.activate_window());
+    }
+}
+
 fn main() -> Result<()> {
     let (data_dir, key_store) = data_dir()?;
     std::fs::create_dir_all(&data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
@@ -169,7 +177,16 @@ fn main() -> Result<()> {
 
     let (backend, mut events) = start_backend(data_dir, key_store)?;
 
-    gpui_kit::application().with_assets(assets::Assets).run(move |cx| {
+    // Links macOS opens us with (`sgnl://`, registered in the bundle's
+    // Info.plist by scripts/bundle.sh), handed to the app once it runs.
+    let (link_tx, mut links) = futures::channel::mpsc::unbounded::<String>();
+    let app = gpui_kit::application().with_assets(assets::Assets);
+    app.on_open_urls(move |urls| {
+        for url in urls {
+            let _ = link_tx.unbounded_send(url);
+        }
+    });
+    app.run(move |cx| {
         gpui_kit::init(cx);
         fonts::register(cx);
         Theme::sync_system_appearance(None, cx);
@@ -206,6 +223,19 @@ fn main() -> Result<()> {
         cx.spawn(async move |cx| {
             while let Some(event) = events.next().await {
                 pump_state.update(cx, |state, cx| state.handle(event, cx));
+            }
+        })
+        .detach();
+
+        // Desktop's `open-url` (app/main.main.ts): the window comes forward
+        // and the link opens.
+        let link_state = state.clone();
+        cx.spawn(async move |cx| {
+            while let Some(url) = links.next().await {
+                cx.update(|cx| {
+                    show_main_window(cx);
+                    link_state.update(cx, |state, cx| state.open_link_from_system(url, cx));
+                });
             }
         })
         .detach();

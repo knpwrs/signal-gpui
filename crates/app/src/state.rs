@@ -378,6 +378,12 @@ pub struct AppState {
     reaction_notifications: HashMap<ConversationId, Vec<String>>,
     /// Checks for unread reminders hourly while an account is linked.
     reminder_task: Option<Task<()>>,
+    /// The `signal.me` link being looked up (`open_signal_link`); its
+    /// answer opens the chat.
+    link_lookup: Option<String>,
+    /// Links macOS handed us while the account was still loading (Desktop's
+    /// `macInitialOpenUrlRoute`), opened once it's known.
+    pending_links: Vec<String>,
 }
 
 impl EventEmitter<AppEvent> for AppState {}
@@ -499,6 +505,8 @@ impl AppState {
             held_notification: None,
             reaction_notifications: HashMap::new(),
             reminder_task: None,
+            link_lookup: None,
+            pending_links: Vec::new(),
         };
         this.load_emoji_usage(cx);
         this.start_notifications(cx);
@@ -957,6 +965,8 @@ impl AppState {
     pub fn handle(&mut self, event: Event, cx: &mut Context<Self>) {
         match event {
             Event::NeedsLinking => {
+                // Desktop ignores Signal links until it's linked.
+                self.pending_links.clear();
                 self.screen = Screen::Link { url: None, error: None };
                 self.backend.send(Command::Link);
             }
@@ -978,6 +988,9 @@ impl AppState {
                 self.reload_badges(cx);
                 self.start_catch_up(cx);
                 self.start_unread_reminders(cx);
+                for url in std::mem::take(&mut self.pending_links) {
+                    self.open_signal_link(&url, cx);
+                }
             }
             Event::Connection(state) => {
                 // Desktop shows the app once the queue is drained, or when it
@@ -1128,6 +1141,20 @@ impl AppState {
                 self.sticker_packs = packs.into_iter().map(std::sync::Arc::new).collect();
             }
             Event::StickerUpload(upload) => cx.emit(AppEvent::StickerUpload(upload)),
+            Event::RecipientFound { query, result } if self.link_lookup.as_ref() == Some(&query) => {
+                self.link_lookup = None;
+                match result {
+                    Ok(entry) => self.start_conversation(entry, cx),
+                    Err(description) => {
+                        let title = if description == signal_backend::routes::UNKNOWN_LINK {
+                            signal_backend::routes::UNKNOWN_LINK_TITLE
+                        } else {
+                            ""
+                        };
+                        cx.emit(AppEvent::Alert { title: title.into(), description: description.into() });
+                    }
+                }
+            }
             Event::RecipientFound { query, result } => cx.emit(AppEvent::RecipientFound { query, result }),
             Event::LinkPreview { url, preview } => {
                 cx.emit(AppEvent::LinkPreview { url, preview: preview.map(std::rc::Rc::new) })
@@ -1490,6 +1517,57 @@ impl AppState {
     /// join dialog shows the group, or its chat opens if we're in it.
     pub fn open_group_link(&self, url: String) {
         self.send(Command::OpenGroupLink { url });
+    }
+
+    /// Opens one of Signal's links (from a message, or from macOS for
+    /// `sgnl://`), as Desktop's `handleSignalRoute` does (app/main.main.ts):
+    /// a chat by number or username link, a group's join dialog, a call
+    /// link's lobby. Returns `false` for a link that isn't Signal's, which
+    /// opens in the browser. Before linking, Desktop ignores them.
+    pub fn open_signal_link(&mut self, url: &str, cx: &mut Context<Self>) -> bool {
+        use signal_backend::routes::{self, Route};
+        let Some(route) = routes::parse(url) else { return false };
+        if self.account.is_none() {
+            tracing::info!("ignoring a Signal link before linking");
+            return true;
+        }
+        match route {
+            Route::ContactByPhoneNumber(_) | Route::ContactByEncryptedUsername(_) => {
+                self.link_lookup = Some(url.to_owned());
+                self.send(Command::FindRecipient { query: url.to_owned() });
+            }
+            Route::GroupInvite(code) => self.open_group_link(Route::group_link(&code)),
+            Route::LinkCall(key) => self.open_call_link(Route::call_link(&key)),
+            // Desktop shows the pack's preview (`showStickerPackPreview`);
+            // this app has no sticker pack manager yet.
+            Route::AddStickers { .. } => {
+                cx.emit(AppEvent::Info("Installing sticker packs from links isn't supported yet".into()))
+            }
+            // The window is shown by whoever handed us the link.
+            Route::ShowWindow => {}
+            Route::Unsupported(name) => {
+                tracing::info!(route = name, "unsupported Signal link");
+                cx.emit(AppEvent::Alert { title: routes::UNKNOWN_LINK_TITLE.into(), description: routes::UNKNOWN_LINK.into() });
+            }
+        }
+        true
+    }
+
+    /// A link macOS opened us with (`sgnl://…`, or one of Signal's https
+    /// links handed over): opened now, or once the account has loaded. A
+    /// link that isn't one of Signal's routes is ignored, as Desktop's
+    /// `open-url` handler ignores it.
+    pub fn open_link_from_system(&mut self, url: String, cx: &mut Context<Self>) {
+        if signal_backend::routes::parse(&url).is_none() {
+            tracing::info!("ignoring a link that isn't Signal's");
+            return;
+        }
+        match self.screen {
+            Screen::Loading => self.pending_links.push(url),
+            _ => {
+                self.open_signal_link(&url, cx);
+            }
+        }
     }
 
     /// A `https://signal.link/call/#key=…` URL (from a message, say): the
@@ -2630,5 +2708,78 @@ mod sticker_tests {
         let recents = vec![(vec![0xde, 0x70], 3), (vec![0x01], 12)];
         assert_eq!(parse_recent_stickers(&format_recent_stickers(&recents)), recents);
         assert_eq!(parse_recent_stickers("junk,zz:1,ab:x"), vec![]);
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use gpui_kit::TestAppContext;
+
+    use super::*;
+    use crate::views::test_support::{demo, wait};
+
+    /// Dana Brooks, in the demo's directory with a made-up number.
+    const DANA: &str = "d:00000000-0000-4000-8000-0000000000d5";
+
+    #[gpui_kit::test]
+    fn signal_links_open_here_and_others_dont(cx: &mut TestAppContext) {
+        let (backend, state, mut cx, _dir) = demo(cx);
+        let cx = &mut cx;
+        wait(cx, "the account", &mut |cx| state.read_with(cx, |s, _| s.account.is_some()));
+        let events = Rc::new(RefCell::new(Vec::new()));
+        cx.update(|_, cx| {
+            let events = events.clone();
+            cx.subscribe(&state, move |_, event: &AppEvent, _| events.borrow_mut().push(format!("{event:?}"))).detach();
+        });
+        let open = |cx: &mut gpui_kit::VisualTestContext, url: &str| state.update(cx, |s, cx| s.open_signal_link(url, cx));
+
+        // Not Signal's: the caller opens them in the browser.
+        assert!(!open(cx, "https://example.com/"));
+        assert!(!open(cx, "https://signal.tube/#proxy.example.com"));
+
+        // signal.me by number: the chat opens.
+        assert!(open(cx, "https://signal.me/#p/+14155550177"));
+        wait(cx, "Dana's chat", &mut |cx| state.read_with(cx, |s, _| s.selected.as_ref().map(|c| c.0.as_str()) == Some(DANA)));
+
+        // A call link's lobby.
+        let key: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(37).wrapping_add(11)).collect();
+        let url = signal_backend::call_link_url(&key).unwrap().replace("https://", "sgnl://");
+        assert!(open(cx, &url));
+        wait(cx, "the lobby", &mut |cx| {
+            state.read_with(cx, |s, _| s.lobby.as_ref().is_some_and(|l| l.conversation.as_call_link().is_some()))
+        });
+        state.update(cx, |s, cx| s.close_call_lobby(cx));
+
+        // Links Desktop knows but this app can't use say so.
+        assert!(open(cx, "sgnl://addstickers/?pack_id=0123&pack_key=ffee"));
+        assert!(open(cx, "sgnl://linkdevice?uuid=a&pub_key=b"));
+        cx.run_until_parked();
+        let seen = events.borrow().join("\n");
+        assert!(seen.contains("Installing sticker packs from links isn't supported yet"), "{seen}");
+        assert!(seen.contains("didn't make sense"), "{seen}");
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn links_from_the_system_wait_for_the_account(cx: &mut TestAppContext) {
+        let (backend, state, mut cx, _dir) = demo(cx);
+        let cx = &mut cx;
+        wait(cx, "the account", &mut |cx| state.read_with(cx, |s, _| s.account.is_some()));
+        // As if macOS opened the app with the link: it's queued until the
+        // account loads, then opened.
+        state.update(cx, |s, cx| {
+            let aci = s.account.take().unwrap().aci;
+            s.screen = Screen::Loading;
+            s.open_link_from_system("sgnl://signal.me/#p/+14155550177".into(), cx);
+            s.open_link_from_system("https://example.com/".into(), cx);
+            assert_eq!(s.pending_links, ["sgnl://signal.me/#p/+14155550177"]);
+            s.handle(signal_backend::Event::Ready { phone: None, aci }, cx);
+            assert!(s.pending_links.is_empty());
+        });
+        wait(cx, "Dana's chat", &mut |cx| state.read_with(cx, |s, _| s.selected.as_ref().map(|c| c.0.as_str()) == Some(DANA)));
+        backend.shutdown();
     }
 }

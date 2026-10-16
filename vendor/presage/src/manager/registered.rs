@@ -1142,6 +1142,16 @@ impl<S: Store> Manager<S, Registered> {
         Ok(resolved_username)
     }
 
+    /// signal-gpui: reads the username a `https://signal.me/#eu/…` link
+    /// holds (`GET /v1/accounts/username_link/{handle}`, decrypted with the
+    /// link's entropy), as Signal Desktop's `resolveUsernameByLinkBase64`
+    /// does. `None` when the link no longer exists.
+    pub async fn lookup_username_link(&mut self, link: &Url) -> Result<Option<String>, Error<S::Error>> {
+        let mut ws = self.unidentified_websocket().await?;
+        let username = ws.look_up_username_link(link).await?;
+        Ok(username.map(|u| u.to_string()))
+    }
+
     /// signal-gpui: sends a story (a `StoryMessage`), or a reply to a group
     /// story (a `DataMessage` with its `story_context`), to one recipient's
     /// devices: sealed, flagged as a story, without an access key. Our

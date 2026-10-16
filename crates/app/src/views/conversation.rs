@@ -1618,7 +1618,7 @@ impl ConversationView {
                             .when_some(message.quote.clone(), |d, quote| d.child(self.render_quote(message.id, quote, fg, palette, cx))),
                     )
                 })
-                .child(render_preview_card(message.id, preview, full, (!header).then_some(corners), meta_color))
+                .child(render_preview_card(self.state.clone(), message.id, preview, full, (!header).then_some(corners), meta_color))
                 .child(
                     div()
                         .relative()
@@ -2465,6 +2465,7 @@ const PREVIEW_THUMBNAIL: f32 = 72.;
 /// title, description and "domain · date". Opens the link when clicked.
 /// `top_corners` rounds a full-width image that starts the bubble.
 fn render_preview_card(
+    state: Entity<AppState>,
     message_id: i64,
     preview: &signal_store::LinkPreview,
     full: Option<(String, (f32, f32))>,
@@ -2491,7 +2492,7 @@ fn render_preview_card(
         .flex_col()
         .bg(Hsla { h: 0., s: 0., l: 0., a: 0.14 })
         .cursor_pointer()
-        .on_click(move |_, _, cx| cx.open_url(&url))
+        .on_click(move |_, _, cx| open_link(&state, &url, cx))
         .when_some(full, |d, (path, (_, height))| {
             d.child(
                 img(std::path::PathBuf::from(path))
@@ -3029,19 +3030,11 @@ fn message_text(
     text.child(gpui_kit::InteractiveText::new(("message-text", message_id as u64), styled).on_click(
         ranges,
         move |ix, _, cx| match &actions[ix] {
-            // A group link shows Desktop's join dialog.
-            TextClick::Open(url) if signal_backend::group_admin::is_group_link(url) => {
+            TextClick::Open(url) => {
                 if let Some(state) = view.upgrade().map(|v| v.read(cx).state.clone()) {
-                    state.read(cx).open_group_link(url.clone());
+                    open_link(&state, url, cx);
                 }
             }
-            // A call link opens its lobby here, as Desktop does.
-            TextClick::Open(url) if url.starts_with("https://signal.link/call/") => {
-                if let Some(state) = view.upgrade().map(|v| v.read(cx).state.clone()) {
-                    state.update(cx, |s, _| s.open_call_link(url.clone()));
-                }
-            }
-            TextClick::Open(url) => cx.open_url(url),
             TextClick::Reveal => {
                 let _ = view.update(cx, |this, cx| {
                     this.revealed_spoilers.insert(message_id);
@@ -3060,6 +3053,15 @@ fn message_text(
         },
     ))
     .into_any_element()
+}
+
+/// A link clicked in a message or its preview: Signal's own links open
+/// here (a group's join dialog, a call's lobby, a chat), as Desktop's
+/// `handleUrl` routes them (app/main.main.ts); the rest go to the browser.
+fn open_link(state: &Entity<AppState>, url: &str, cx: &mut App) {
+    if !state.update(cx, |state, cx| state.open_signal_link(url, cx)) {
+        cx.open_url(url);
+    }
 }
 
 /// Display size of a photo, following Signal Desktop's single-image limits:

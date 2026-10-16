@@ -2679,6 +2679,25 @@ impl Actor {
     /// A username or phone number, looked up on Signal's servers.
     async fn find_recipient(&self, query: &str) -> Result<signal_store::DirectoryEntry, String> {
         let mut manager = self.manager().ok_or("not connected")?;
+        // A `signal.me/#eu/…` link: the username it holds (Desktop's
+        // `showConversationViaSignalDotMe`, which shows its "didn't make
+        // sense" error when the link is gone or can't be read).
+        let linked = match crate::routes::parse(query) {
+            Some(crate::routes::Route::ContactByEncryptedUsername(encrypted)) => {
+                let link = url::Url::parse(&crate::routes::Route::username_link(&encrypted)).map_err(|_| crate::routes::UNKNOWN_LINK)?;
+                match manager.lookup_username_link(&link).await {
+                    Ok(Some(username)) => Some(username),
+                    Ok(None) => return Err(crate::routes::UNKNOWN_LINK.into()),
+                    Err(error) => {
+                        warn!(error = %error, "couldn't read a username link");
+                        return Err(crate::routes::UNKNOWN_LINK.into());
+                    }
+                }
+            }
+            Some(crate::routes::Route::ContactByPhoneNumber(number)) => Some(number),
+            _ => None,
+        };
+        let query = linked.as_deref().unwrap_or(query);
         if let Some(username) = crate::recipients::username_in(query) {
             return match manager.lookup_username(&username).await {
                 Ok(Some(aci)) => Ok(signal_store::DirectoryEntry {

@@ -40,6 +40,7 @@ pub mod megaphones;
 pub mod remote_config;
 pub mod message_requests;
 pub mod auto_download;
+pub mod routes;
 mod sender_keys;
 
 pub use remote_config::{RemoteConfig, current as remote_config};

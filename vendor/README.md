@@ -51,6 +51,10 @@ upstream workspace). Modified by Ken Powers for signal-gpui since
   out the unauthenticated chat websocket, so key transparency's
   `/v1/key-transparency/*` requests (which libsignal sends on libsignal-net's
   own unauthenticated connection) can go over it.
+- `src/manager/registered.rs`: `Manager::lookup_username_link` reads the
+  username a `https://signal.me/#eu/…` link holds through
+  libsignal-service's `look_up_username_link`, for opening those links
+  (Desktop's `resolveUsernameByLinkBase64`). Upstream has no call for it.
 
 ## libsignal-service
 

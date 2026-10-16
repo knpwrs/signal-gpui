@@ -48,6 +48,15 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>NSHighResolutionCapable</key><true/>
     <key>NSCameraUsageDescription</key><string>Signal GPUI uses your camera for video calls.</string>
     <key>NSMicrophoneUsageDescription</key><string>Signal GPUI uses your microphone for calls and voice messages.</string>
+    <!-- sgnl:// links (Signal Desktop registers the scheme the same way:
+         app.setAsDefaultProtocolClient('sgnl') in app/main.main.ts). -->
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key><string>org.signal-gpui.sgnl</string>
+            <key>CFBundleURLSchemes</key><array><string>sgnl</string></array>
+        </dict>
+    </array>
 </dict>
 </plist>
 PLIST
