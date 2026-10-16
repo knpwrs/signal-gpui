@@ -2570,12 +2570,7 @@ impl ConversationView {
         let ended = self.ended(cx) || self.state.read(cx).conversation(&self.id).is_some_and(|c| c.blocked || !c.accepted);
         let for_reply = message.clone();
         // View-once media can't be saved (Desktop's `canDownload`).
-        let downloadable: Vec<AttachmentMeta> = message
-            .attachments
-            .iter()
-            .filter(|a| a.local_path.is_some() && !a.sticker && message.view_once.is_none())
-            .cloned()
-            .collect();
+        let downloadable = downloadable(message);
         let button = |name: &'static str, icon: IconName| {
             div()
                 .id(SharedString::from(format!("{name}-{id}")))
@@ -4649,6 +4644,16 @@ fn message_menu(
         }
     };
     let mut menu = menu;
+    // Desktop's "Download", first: a save dialog for one attachment, a
+    // folder for several (as the hover button's).
+    let downloadable = downloadable(message);
+    if !downloadable.is_empty() && !message.deleted {
+        menu = menu.item(
+            PopupMenuItem::new("Download")
+                .icon(IconName::Download)
+                .on_click(move |_, _, cx| download_attachments(downloadable.clone(), cx)),
+        );
+    }
     // Desktop doesn't forward polls or view-once messages (`canForward`).
     if !message.deleted && message.poll.is_none() && message.view_once.is_none() {
         let state = state.clone();
@@ -4842,6 +4847,17 @@ fn too_big_label(message: &Message) -> Option<AnyElement> {
     let label = too_big_text(message)?;
     let id = message.id;
     Some(div().debug_selector(move || format!("too-big-{id}")).italic().child(label).into_any_element())
+}
+
+/// A message's attachments that can be saved: downloaded, not a sticker,
+/// not view-once.
+fn downloadable(message: &Message) -> Vec<AttachmentMeta> {
+    message
+        .attachments
+        .iter()
+        .filter(|a| a.local_path.is_some() && !a.sticker && message.view_once.is_none())
+        .cloned()
+        .collect()
 }
 
 /// Saves downloaded attachments: one through a save dialog, several into a
@@ -5210,17 +5226,13 @@ impl ConversationView {
         cx.notify();
     }
 
-    /// Desktop's ⌘S: the targeted message's attachments, saved.
+    /// Desktop's ⌘S: the targeted message's attachments, saved, as its
+    /// menu's "Download" does.
     pub fn save_targeted(&mut self, cx: &mut Context<Self>) {
         let Some(message) = self.targeted_message() else { return };
         // View-once media can't be saved (Desktop's `canDownload`).
-        let downloadable: Vec<AttachmentMeta> = message
-            .attachments
-            .iter()
-            .filter(|a| a.local_path.is_some() && !a.sticker && message.view_once.is_none())
-            .cloned()
-            .collect();
-        if !downloadable.is_empty() {
+        let downloadable = downloadable(&message);
+        if !downloadable.is_empty() && !message.deleted {
             download_attachments(downloadable, cx);
         }
     }

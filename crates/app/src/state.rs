@@ -2362,6 +2362,15 @@ impl AppState {
         self.start_audio_as(message_id, index, path, fraction, title, true, 1., cx);
     }
 
+    /// Plays audio from All media: on its own, nothing following it
+    /// (Desktop has no consecutive playback there).
+    pub fn play_audio_alone(&mut self, message_id: i64, index: usize, path: std::path::PathBuf, title: String, cx: &mut Context<Self>) {
+        if self.audio.as_ref().is_some_and(|a| a.message_id == message_id && a.index == index) {
+            return self.toggle_current_audio(cx);
+        }
+        self.start_audio_as(message_id, index, &path, 0., title, false, 1., cx);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn start_audio_as(
         &mut self,
