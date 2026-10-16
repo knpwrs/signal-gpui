@@ -36,6 +36,14 @@ const DRAFT_DEBOUNCE: Duration = Duration::from_millis(400);
 gpui_kit::actions!(composer, [FormatBold, FormatItalic, FormatStrikethrough, FormatMonospace, FormatSpoiler]);
 // Desktop's shortcut for recording a voice message (cmd-shift-y).
 gpui_kit::actions!(composer, [RecordVoice]);
+// Desktop's large composer (`CompositionArea`'s `large`, ⌘⇧K; bound in
+// `shortcuts.rs`).
+gpui_kit::actions!(composer, [ToggleLargeComposer]);
+
+/// The large composer's rows: Desktop's 212px input at 20px lines.
+const LARGE_ROWS: usize = 10;
+/// The usual composer grows from one row to this many.
+const MAX_ROWS: usize = 10;
 
 /// A stopped recording to play back: its waveform (once decoded), and its
 /// player while it plays.
@@ -178,6 +186,10 @@ pub struct Composer {
     voice_draft: Option<VoiceDraft>,
     recording_focus: FocusHandle,
     _recording_poll: Option<Task<()>>,
+    /// Desktop's large composer: a tall input, its buttons in a row below.
+    large: bool,
+    /// The pointer is over the composer (Desktop shows its expand tab then).
+    hovered: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -194,7 +206,7 @@ impl Composer {
     ) -> Self {
         let input = cx.new(|cx| {
             let mut input = TextareaState::new(window, cx)
-                .auto_grow(1, 10)
+                .auto_grow(1, MAX_ROWS)
                 .submit_on_enter(true)
                 .placeholder("Message");
             if let Some(draft) = draft.filter(|d| !d.is_empty()) {
@@ -233,7 +245,8 @@ impl Composer {
             }),
             cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| match event {
                 InputEvent::Change => this.on_typed(window, cx),
-                InputEvent::PressEnter { shift: false, .. } => this.submit(window, cx),
+                // In the large composer Enter adds a line; ⌘Enter sends.
+                InputEvent::PressEnter { shift: false, secondary } if !this.large || *secondary => this.submit(window, cx),
                 InputEvent::Blur => this.stop_typing(cx),
                 _ => {}
             }),
@@ -299,11 +312,31 @@ impl Composer {
             recording: None,
             voice_draft: None,
             recording_focus: cx.focus_handle(),
+            large: false,
+            hovered: false,
             _recording_poll: None,
             _subscriptions: subscriptions,
         };
         this.load_members(cx);
         this
+    }
+
+    /// Desktop's expand and collapse (`handleToggleLarge`).
+    fn set_large(&mut self, large: bool, cx: &mut Context<Self>) {
+        if self.large == large {
+            return;
+        }
+        self.large = large;
+        self.input.update(cx, |input, cx| {
+            // Enter adds a line in the large composer.
+            input.set_submit_on_enter(!large, cx);
+            if large {
+                input.set_auto_grow(LARGE_ROWS, LARGE_ROWS, cx)
+            } else {
+                input.set_auto_grow(1, MAX_ROWS, cx)
+            }
+        });
+        cx.notify();
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
@@ -852,6 +885,7 @@ impl Composer {
             }
             self.input.update(cx, |input, cx| input.set_value("", window, cx));
             self.save_draft_later(String::new(), cx);
+            self.set_large(false, cx);
             cx.notify();
             return;
         }
@@ -915,6 +949,8 @@ impl Composer {
         self.input.update(cx, |input, cx| input.set_value("", window, cx));
         self.typing_sent_at = None; // sending a message implicitly stops typing
         self.save_draft_later(String::new(), cx);
+        // Desktop collapses the large composer once sent.
+        self.set_large(false, cx);
         cx.emit(ComposerEvent::Sent);
         cx.notify();
     }
@@ -1658,6 +1694,12 @@ impl Render for Composer {
             .on_action(cx.listener(|this, _: &FormatMonospace, window, cx| this.format(TextStyle::Monospace, window, cx)))
             .on_action(cx.listener(|this, _: &FormatSpoiler, window, cx| this.format(TextStyle::Spoiler, window, cx)))
             .on_action(cx.listener(|this, _: &RecordVoice, window, cx| this.start_recording(window, cx)))
+            .on_action(cx.listener(|this, _: &ToggleLargeComposer, _, cx| this.set_large(!this.large, cx)))
+            .id("composer")
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                this.hovered = *hovered;
+                cx.notify();
+            }))
             .relative()
             .flex()
             .flex_col()
@@ -1672,7 +1714,9 @@ impl Render for Composer {
             .capture_action(cx.listener(|this, enter: &Enter, window, cx| {
                 // Only the message input's (the emoji picker's search, say,
                 // keeps its own).
-                if enter.shift || !this.input.read(cx).focus_handle(cx).is_focused(window) {
+                // The large composer: Enter adds a line, ⌘Enter sends
+                // (Desktop's `CompositionInput` with `large`).
+                if enter.shift || (this.large && !enter.secondary) || !this.input.read(cx).focus_handle(cx).is_focused(window) {
                     return;
                 }
                 // Handled before the input sees it: it would first replace a
@@ -1762,91 +1806,137 @@ impl Render for Composer {
                 d.child(self.render_recording(recording, palette, cx))
             })
             .when(self.voice_draft.is_some(), |d| d.child(self.render_draft(palette, cx)))
-            .when(self.recording.is_none(), |d| d.child(
-                div()
+            .when(self.recording.is_none() && (self.hovered || self.large) && !self.view_once_active(), |d| {
+                d.child(self.render_large_toggle(palette, cx))
+            })
+            .when(self.recording.is_none(), |d| {
+                let large = self.large;
+                let emoji = div()
+                    .id("emoji-button")
+                    .debug_selector(|| "emoji-button".into())
+                    .flex_none()
+                    .size(px(32.))
                     .flex()
-                    .items_end()
-                    .gap_2()
-                    .px_3()
-                    .py_2()
-                    .child(
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(palette.row_hover))
+                    .on_click(cx.listener(|this, click, window, cx| {
+                        if !this.picker_closed_by.take(click) {
+                            this.toggle_picker(window, cx);
+                        }
+                    }))
+                    .child(Icon::new(IconName::FaceSlightlySmiling).size_5().text_color(palette.text_secondary));
+                // One line tall when empty, like Signal Desktop: the pill
+                // supplies the padding, the textarea none.
+                let input = div()
+                    .debug_selector(|| "composer-input".into())
+                    .flex_1()
+                    .min_w_0()
+                    .px(px(12.))
+                    .py(px(6.))
+                    .rounded(px(16.))
+                    .bg(palette.input_bg)
+                    .child(Textarea::new(&self.input).appearance(false).xsmall().text_size(px(14.5)).line_height(px(20.)));
+                let send = div()
+                    .id("send-button")
+                    .flex_none()
+                    .size(px(32.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .bg(palette.accent)
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
+                    .child(Icon::new(IconName::Send).size_4().text_color(palette.on_accent));
+                // Desktop's microphone, where Send goes once there's
+                // something to send (never in the large composer).
+                let mic = (!can_send && self.editing.is_none() && !large).then(|| {
+                    div()
+                        .id("mic-button")
+                        .debug_selector(|| "mic-button".into())
+                        .flex_none()
+                        .size(px(32.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .cursor_pointer()
+                        .hover(|d| d.bg(palette.row_hover))
+                        .on_click(cx.listener(|this, _, window, cx| this.start_recording(window, cx)))
+                        .child(Icon::new(IconName::Mic).size_5().text_color(palette.text_secondary))
+                });
+                if large {
+                    // Desktop's large composer: the input across, then its
+                    // buttons and Send in a row of their own.
+                    d.child(div().flex().px_3().pt_2().child(input)).child(
                         div()
-                            .id("emoji-button")
-                            .debug_selector(|| "emoji-button".into())
-                            .flex_none()
-                            .size(px(32.))
                             .flex()
                             .items_center()
-                            .justify_center()
-                            .rounded_full()
-                            .cursor_pointer()
-                            .hover(|d| d.bg(palette.row_hover))
-                            .on_click(cx.listener(|this, click, window, cx| {
-                                if !this.picker_closed_by.take(click) {
-                                    this.toggle_picker(window, cx);
-                                }
-                            }))
-                            .child(Icon::new(IconName::FaceSlightlySmiling).size_5().text_color(palette.text_secondary)),
+                            .gap_2()
+                            .px_3()
+                            .py_2()
+                            .child(emoji)
+                            .child(self.render_attach_button(palette, cx))
+                            .child(div().flex_1())
+                            .child(send),
                     )
-                    .child(self.render_attach_button(palette, cx))
-                    .child(
-                        // One line tall when empty, like Signal Desktop: the
-                        // pill supplies the padding, the textarea none.
+                } else {
+                    d.child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .px(px(12.))
-                            .py(px(6.))
-                            .rounded(px(16.))
-                            .bg(palette.input_bg)
-                            .child(
-                                Textarea::new(&self.input)
-                                    .appearance(false)
-                                    .xsmall()
-                                    .text_size(px(14.5))
-                                    .line_height(px(20.)),
-                            ),
+                            .flex()
+                            .items_end()
+                            .gap_2()
+                            .px_3()
+                            .py_2()
+                            .child(emoji)
+                            .child(self.render_attach_button(palette, cx))
+                            .child(input)
+                            .when(can_send, |d| d.child(send))
+                            .children(mic),
                     )
-                    .when(can_send, |d| {
-                        d.child(
-                            div()
-                                .id("send-button")
-                                .flex_none()
-                                .size(px(32.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_full()
-                                .bg(palette.accent)
-                                .cursor_pointer()
-                                .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
-                                .child(Icon::new(IconName::Send).size_4().text_color(palette.on_accent)),
-                        )
-                    })
-                    // Desktop's microphone, where Send goes once there's
-                    // something to send.
-                    .when(!can_send && self.editing.is_none(), |d| {
-                        d.child(
-                            div()
-                                .id("mic-button")
-                                .debug_selector(|| "mic-button".into())
-                                .flex_none()
-                                .size(px(32.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_full()
-                                .cursor_pointer()
-                                .hover(|d| d.bg(palette.row_hover))
-                                .on_click(cx.listener(|this, _, window, cx| this.start_recording(window, cx)))
-                                .child(Icon::new(IconName::Mic).size_5().text_color(palette.text_secondary)),
-                        )
-                    }),
-            ))
+                }
+            })
     }
 }
 
 impl Composer {
+    /// Desktop hides the expand tab while view-once is on.
+    fn view_once_active(&self) -> bool {
+        self.view_once && self.view_once_eligible()
+    }
+
+    /// Desktop's tab at the top of the composer (`CompositionArea__toggle-large`):
+    /// a chevron up to expand, down to collapse.
+    fn render_large_toggle(&self, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        div().absolute().top(px(-18.)).left_0().right_0().flex().justify_center().child(
+            div()
+                .id("composer-toggle-large")
+                .debug_selector(|| "composer-toggle-large".into())
+                .w(px(48.))
+                .h(px(24.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_t(px(12.))
+                .bg(palette.background)
+                .cursor_pointer()
+                .tooltip({
+                    // Desktop labels it "Expand" either way; this says what a click does.
+                    let label = if self.large { "Collapse" } else { "Expand" };
+                    move |window, cx| gpui_kit::component::tooltip::Tooltip::new(label).build(window, cx)
+                })
+                .on_click(cx.listener(|this, _, _, cx| this.set_large(!this.large, cx)))
+                .child(
+                    Icon::new(if self.large { IconName::ChevronDown } else { IconName::ChevronUp })
+                        .size_4()
+                        .text_color(palette.text_secondary),
+                ),
+        )
+    }
+
     /// Desktop's `CompositionRecordingDraft`: play or pause, the waveform
     /// (click to play from there), the time, then Cancel and Send.
     fn render_draft(&self, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2609,6 +2699,37 @@ mod tests {
         .unwrap();
         cx.run_until_parked();
         assert_eq!(sent.get(), 1);
+        assert_eq!(text(&f, cx), "");
+    }
+
+    #[gpui_kit::test]
+    fn the_large_composer_expands_and_collapses_once_sent(cx: &mut TestAppContext) {
+        let f = mount(cx);
+        let target = input_id(&f, cx);
+        let mut vcx = gpui_kit::VisualTestContext::from_window(f.window, cx);
+        let height = |cx: &mut gpui_kit::VisualTestContext| {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            cx.debug_bounds("composer-input").expect("input drawn").size.height
+        };
+        let small = height(&mut vcx);
+        vcx.update(|window, cx| {
+            window.click(target.clone(), cx);
+            window.input("a long thought", cx);
+            window.dispatch_action(Box::new(ToggleLargeComposer), cx);
+        });
+        let large = height(&mut vcx);
+        // Desktop's 212px: ten 20px lines and the pill's padding.
+        assert!(large >= px(200.) && small < px(40.), "{small:?} → {large:?}");
+        assert!(vcx.debug_bounds("composer-toggle-large").is_some(), "the tab stays while large");
+        assert!(vcx.debug_bounds("mic-button").is_none());
+        // Enter adds a line there; ⌘Enter sends, which collapses it.
+        vcx.update(|window, cx| window.press("enter", cx));
+        vcx.run_until_parked();
+        assert_eq!(text(&f, cx), "a long thought\n");
+        let mut vcx = gpui_kit::VisualTestContext::from_window(f.window, cx);
+        vcx.update(|window, cx| window.press("cmd-enter", cx));
+        assert_eq!(height(&mut vcx), small, "sending collapses it");
         assert_eq!(text(&f, cx), "");
     }
 

@@ -9,9 +9,8 @@
 //! message, as Desktop's do, and the message shortcuts act on it.
 //!
 //! Desktop's that aren't here: "Navigate by section" (⌘T), "Open chat menu"
-//! (⌘⇧L), "Open context menu for selected message" (⌘F12), "Expand
-//! composer" (⌘⇧K) and sending in it (⌘Enter), and "Toggle expanded
-//! preview" in a call (⇧P). See todo.md.
+//! (⌘⇧L), "Open context menu for selected message" (⌘F12), and "Toggle
+//! expanded preview" in a call (⇧P). See todo.md.
 
 use gpui_kit::{App, KeyBinding};
 
@@ -117,6 +116,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-e", ToggleReactionPicker, MAIN),
         KeyBinding::new("cmd-s", SaveAttachment, MAIN),
         KeyBinding::new("cmd-shift-d", DeleteMessages, MAIN),
+        KeyBinding::new("cmd-shift-k", crate::views::composer::ToggleLargeComposer, Some("Composer")),
         KeyBinding::new("cmd-shift-s", ForwardMessages, MAIN),
         KeyBinding::new("up", timeline::SelectPrevious, Some(TIMELINE)),
         KeyBinding::new("down", timeline::SelectNext, Some(TIMELINE)),
@@ -195,6 +195,8 @@ pub const GUIDE: &[(&str, &[Shortcut])] = &[
         "Composer",
         &[
             s("Add newline to message", &[&["Shift", "Enter"]]),
+            s("Expand composer", &[&["⌘", "Shift", "K"]]),
+            s("Send (in expanded composer)", &[&["⌘", "Enter"]]),
             s("Attach file", &[&["⌘", "U"]]),
             s("Remove draft link preview", &[&["⌘", "P"]]),
             s("Remove all draft attachments", &[&["⌘", "Shift", "P"]]),
