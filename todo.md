@@ -99,34 +99,21 @@ account or checked on a phone. Not done:
 
 ## Sticker pack creator
 
-Make a sticker pack and upload it to Signal from here. Signal Desktop
-used to build this in and now sends people to Signal's web sticker creator;
-check that (and Desktop's old `sticker-creator/` code in git history) for the
-current rules before building.
+Built (File → Create/upload sticker pack), following Desktop's
+`sticker-creator/`: images processed to Desktop's rules, emoji, title,
+author and cover, confirmation, upload with progress, the share link.
+Tested with unit and headless UI tests against the demo backend; the
+upload hasn't been tried against Signal's servers. Left:
 
-- **Pack contents:** a title, an author, a cover and the stickers, each with
-  an emoji. Signal's published guidelines: stickers are PNG, APNG or WebP,
-  512×512, at most 300 KB each, and at most 200 per pack (check these
-  against the creator; they may have changed).
-- **Picking images:** drop or choose files, crop or pad to square, and
-  convert to WebP or PNG. The emoji search we already have can pick each
-  sticker's emoji.
-- **Upload:**
-  - Generate a random 32-byte pack key.
-  - Encrypt the manifest (the `Pack` proto: title, author, cover, stickers
-    with id and emoji) and each image with keys derived from the pack key,
-    as installed packs are decrypted now.
-  - Ask the service for upload forms
-    (`GET /v1/sticker/pack/form/{count}`, which also returns the pack id)
-    and upload each file to the CDN.
-  - libsignal-service-rs has no helper for this, so it's new code against
-    the service API.
-- **After upload:**
-  - Install the pack (a sticker pack operation sync so your phone gets it
-    too).
-  - Show the share link: `https://signal.art/addstickers/#pack_id=…&pack_key=…`.
-- **Privacy:** anyone with the link can install the pack, so confirm before
-  uploading.
+- **Hover preview:** Desktop shows a larger preview of a sticker after
+  hovering it for half a second (`ArtFrame.tsx`).
+- **Drop zone text:** Desktop's empty drop zone says "Drop images here"
+  while files are dragged over it; here only its border changes, since
+  GPUI's drag-over hook only restyles.
+- **Share buttons:** Desktop's are round brand icons; here they're
+  outlined text buttons with the same links.
+- **Cancel during upload:** Desktop has one, but it only goes back a
+  step while the upload carries on, so it's left out.
 
 ## Calls
 

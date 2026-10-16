@@ -160,7 +160,13 @@ pub(crate) async fn upload(
 
     // Desktop downloads the pack back to install it, and tells the other
     // devices (ts/types/Stickers `installStickerPack`, actionSource 'ui').
-    manager.install_sticker_pack(&pack_id, &pack_key).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    // It doesn't wait for that (sticker-creator/src/util/api.ts), so a
+    // failed install doesn't fail the upload: the pack is on the CDN and
+    // its link works, and saying it failed would only invite uploading it
+    // twice.
+    if let Err(error) = manager.install_sticker_pack(&pack_id, &pack_key).await {
+        tracing::warn!(%error, "uploaded a sticker pack but couldn't install it");
+    }
     Ok((pack_id, pack_key.to_vec()))
 }
 

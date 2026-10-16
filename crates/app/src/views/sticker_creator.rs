@@ -30,6 +30,7 @@ use crate::views::emoji_picker::{EmojiPicker, PickerEvent};
 /// Desktop's "Sticker Pack Creator Guidelines" link.
 const GUIDELINES: &str = "https://support.signal.org/hc/articles/360031836512-Stickers#sticker_creator";
 const TILE: f32 = 160.;
+const NOTICE_DISMISS: std::time::Duration = std::time::Duration::from_secs(10);
 /// Desktop's recommended margin: 16px of 512.
 const MARGIN: f32 = TILE * 16. / 512.;
 
@@ -128,7 +129,10 @@ pub struct StickerCreator {
     confirming: bool,
     /// Desktop's toasts: what was added, or why something wasn't.
     notice: Option<SharedString>,
-    /// Images added in the last drop, for "N images added".
+    /// Counts notices, so an old one's timer doesn't clear a newer one.
+    notice_count: u64,
+    /// Images added while "N images added" shows; Desktop counts on in
+    /// the toast that's up.
     added: usize,
     progress: (usize, usize),
     url: Option<String>,
@@ -173,6 +177,7 @@ impl StickerCreator {
             cover: None,
             confirming: false,
             notice: None,
+            notice_count: 0,
             added: 0,
             progress: (0, 0),
             url: None,
@@ -180,11 +185,44 @@ impl StickerCreator {
         }
     }
 
+    /// Shows a toast, which goes after Desktop's 10 seconds
+    /// (`DEFAULT_DISMISS` in `sticker-creator/src/components/Toaster.tsx`)
+    /// or on a click.
+    fn show_notice(&mut self, notice: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.added = 0;
+        self.notice = Some(notice.into());
+        self.notice_count += 1;
+        let count = self.notice_count;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(NOTICE_DISMISS).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.notice_count == count {
+                    this.clear_notice();
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn clear_notice(&mut self) {
+        self.notice = None;
+        self.added = 0;
+    }
+
+    /// One more image added: "N images added", counting on while it shows.
+    fn image_added(&mut self, cx: &mut Context<Self>) {
+        let added = self.added + 1;
+        let plural = if added == 1 { "" } else { "s" };
+        self.show_notice(format!("{added} image{plural} added"), cx);
+        self.added = added;
+    }
+
     fn reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.stage = Stage::Drop;
         self.stickers.clear();
         self.cover = None;
-        self.notice = None;
+        self.clear_notice();
         self.url = None;
         self.title.update(cx, |input, cx| input.set_value("", window, cx));
         self.author.update(cx, |input, cx| input.set_value("", window, cx));
@@ -215,7 +253,6 @@ impl StickerCreator {
     /// Adds images in order, skipping files already in the pack, up to
     /// Desktop's 200.
     fn add(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        self.added = 0;
         for path in paths {
             if self.stickers.len() >= MAX_STICKERS {
                 break;
@@ -224,7 +261,7 @@ impl StickerCreator {
                 continue;
             }
             if !sticker_image::accepts(&path) {
-                self.notice = Some(sticker_image::Rejected::Unsupported.message().into());
+                self.show_notice(sticker_image::Rejected::Unsupported.message(), cx);
                 continue;
             }
             let key = self.next_key;
@@ -238,14 +275,15 @@ impl StickerCreator {
                         Ok(sticker) => {
                             if let Some(s) = this.stickers.iter_mut().find(|s| s.key == key) {
                                 s.art = Art::ready(sticker);
-                                this.added += 1;
-                                let plural = if this.added == 1 { "" } else { "s" };
-                                this.notice = Some(format!("{} image{plural} added", this.added).into());
+                                // Desktop's `adjustCover`: the first
+                                // sticker is the cover again.
+                                this.cover = None;
+                                this.image_added(cx);
                             }
                         }
                         Err(rejected) => {
                             this.stickers.retain(|s| s.key != key);
-                            this.notice = Some(rejected.message().into());
+                            this.show_notice(rejected.message(), cx);
                         }
                     }
                     cx.notify();
@@ -258,6 +296,11 @@ impl StickerCreator {
 
     fn set_cover(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
         let Some(path) = path else { return };
+        // A file of the wrong type, as Desktop's cover drop zone refuses it
+        // (`onDropRejected` in `MetaStage.tsx`).
+        if !sticker_image::accepts(&path) {
+            return self.show_notice("Error processing image", cx);
+        }
         self.cover = Some(Art::Processing);
         let task = cx.background_spawn(process(path));
         cx.spawn(async move |this, cx| {
@@ -267,7 +310,7 @@ impl StickerCreator {
                     Ok(sticker) => this.cover = Some(Art::ready(sticker)),
                     Err(rejected) => {
                         this.cover = None;
-                        this.notice = Some(rejected.message().into());
+                        this.show_notice(rejected.message(), cx);
                     }
                 }
                 cx.notify();
@@ -314,7 +357,7 @@ impl StickerCreator {
         if !self.can_continue(cx) {
             return;
         }
-        self.notice = None;
+        self.clear_notice();
         match self.stage {
             Stage::Drop => self.stage = Stage::Emoji,
             Stage::Emoji => self.stage = Stage::Meta,
@@ -325,7 +368,7 @@ impl StickerCreator {
     }
 
     fn back(&mut self, cx: &mut Context<Self>) {
-        self.notice = None;
+        self.clear_notice();
         self.picking_for = None;
         self.stage = match self.stage {
             Stage::Emoji => Stage::Drop,
@@ -376,7 +419,7 @@ impl StickerCreator {
             }
             StickerUpload::Failed(error) => {
                 self.stage = Stage::Meta;
-                self.notice = Some(format!("Error uploading images: {error}").into());
+                self.show_notice(format!("Error uploading images: {error}"), cx);
             }
         }
         cx.notify();
@@ -437,6 +480,8 @@ impl StickerCreator {
                             .tooltip(|window, cx| gpui_kit::component::tooltip::Tooltip::new("Remove image").build(window, cx))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.stickers.retain(|s| s.key != key);
+                                // Desktop's `adjustCover`.
+                                this.cover = None;
                                 cx.notify();
                             }))
                             .child("✕"),
@@ -671,7 +716,7 @@ impl StickerCreator {
                     )
                     .child(Button::new("copy-url").label("Copy").outline().on_click(cx.listener(move |this, _, _, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
-                        this.notice = Some("Link copied".into());
+                        this.show_notice("Link copied", cx);
                         cx.notify();
                     }))),
             )
@@ -789,7 +834,7 @@ impl Render for StickerCreator {
                         .text_sm()
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.notice = None;
+                            this.clear_notice();
                             cx.notify();
                         }))
                         .child(notice),
@@ -1045,6 +1090,35 @@ mod tests {
             cx.notify();
         });
         assert_eq!(order(&mut f), [c, b]);
+    }
+
+    #[gpui_kit::test]
+    fn the_cover_follows_desktops_rules_and_toasts_go_after_10_seconds(cx: &mut TestAppContext) {
+        let mut f = Fixture::new(cx);
+        let (a, b, cover) = (f.png("a.png", 32, 32), f.png("b.png", 32, 32), f.png("cover.png", 40, 40));
+        f.update(|this, _, cx| this.add(vec![a], cx));
+        f.until("processed", |this, _| this.all_ready());
+        f.update(|this, _, cx| this.set_cover(Some(cover), cx));
+        f.until("cover processed", |this, _| matches!(this.cover, Some(Art::Ready { .. })));
+
+        // A file of the wrong type is refused as Desktop's cover drop zone
+        // refuses it, and the cover stays.
+        let jpeg = f.dir.path().join("photo.jpg");
+        std::fs::write(&jpeg, b"not really").unwrap();
+        f.update(|this, _, cx| this.set_cover(Some(jpeg), cx));
+        assert_eq!(f.update(|this, _, _| this.notice.clone()), Some("Error processing image".into()));
+        assert!(f.update(|this, _, _| matches!(this.cover, Some(Art::Ready { .. }))));
+
+        // Adding a sticker makes the first sticker the cover again.
+        f.update(|this, _, cx| this.add(vec![b], cx));
+        f.until("second processed", |this, _| this.all_ready() && this.stickers.len() == 2);
+        assert!(f.update(|this, _, _| this.cover.is_none()));
+        assert_eq!(f.update(|this, _, _| this.notice.clone()), Some("1 image added".into()));
+
+        // The toast goes by itself after 10 seconds.
+        f.cx.executor().advance_clock(NOTICE_DISMISS);
+        f.cx.run_until_parked();
+        assert_eq!(f.update(|this, _, _| this.notice.clone()), None);
     }
 
     #[gpui_kit::test]

@@ -181,6 +181,16 @@ fn main() -> Result<()> {
         cx.on_action(move |_: &CreateStickerPack, cx| {
             if creator_state.read(cx).account.is_some() {
                 views::sticker_creator::open(creator_state.clone(), cx);
+            } else if let Some(window) = cx.windows().first() {
+                // Desktop's warning (`openArtCreator`, app/main.main.ts).
+                use gpui_kit::component::WindowExt as _;
+                use gpui_kit::component::notification::Notification;
+                let _ = window.update(cx, |_, window, cx| {
+                    window.push_notification(
+                        Notification::warning("Please set up Signal on your phone and desktop to use the Sticker Pack Creator"),
+                        cx,
+                    )
+                });
             }
         });
 
