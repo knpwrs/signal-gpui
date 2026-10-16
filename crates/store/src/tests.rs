@@ -866,6 +866,8 @@ async fn drop_later_migrations(db: &AppDb) {
     sqlx::query("ALTER TABLE messages DROP COLUMN view_once").execute(&db.writer).await.unwrap();
     sqlx::query("DROP INDEX messages_unread_poll_votes").execute(&db.writer).await.unwrap();
     sqlx::query("ALTER TABLE messages DROP COLUMN unread_poll_votes").execute(&db.writer).await.unwrap();
+    sqlx::query("DROP TABLE profile_sharing").execute(&db.writer).await.unwrap();
+    sqlx::query("DROP TABLE story_send_modes").execute(&db.writer).await.unwrap();
 }
 
 /// Rewrites the migration history to look like a pre-squash database that
@@ -1492,6 +1494,30 @@ async fn our_stories_keep_who_they_went_to() {
     assert_eq!(db.remove_story(id).await.unwrap(), None, "a text story has no file");
     assert_eq!(db.story(id).await.unwrap(), None);
     assert_eq!(db.remove_story(id).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn profile_sharing_and_story_send_modes_are_kept_per_chat() {
+    let db = test_db().await;
+    let (alice, bob, group) = (ConversationId::direct("a"), ConversationId::direct("b"), conv("g"));
+    assert!(!db.profile_sharing(&alice).await.unwrap());
+    assert!(db.set_profile_sharing(&alice, true).await.unwrap());
+    assert!(!db.set_profile_sharing(&alice, true).await.unwrap(), "once");
+    assert!(db.profile_sharing(&alice).await.unwrap());
+    // Storage Service's word, for the records it has.
+    db.apply_profile_sharing(&[(alice.clone(), false), (bob.clone(), true)]).await.unwrap();
+    assert!(!db.profile_sharing(&alice).await.unwrap());
+    assert!(db.profile_sharing(&bob).await.unwrap());
+
+    assert_eq!(db.story_send_mode(&group).await.unwrap(), StorySendMode::IfActive);
+    assert!(db.set_story_send_modes(&[(group.clone(), StorySendMode::Always)]).await.unwrap());
+    assert!(!db.set_story_send_modes(&[(group.clone(), StorySendMode::Always)]).await.unwrap(), "unchanged");
+    assert_eq!(db.story_send_modes().await.unwrap(), [(group.clone(), StorySendMode::Always)]);
+    assert!(db.set_story_send_modes(&[(group.clone(), StorySendMode::Never)]).await.unwrap());
+    assert_eq!(db.story_send_mode(&group).await.unwrap(), StorySendMode::Never);
+    // Back to the default: not listed.
+    assert!(db.set_story_send_modes(&[(group.clone(), StorySendMode::IfActive)]).await.unwrap());
+    assert!(db.story_send_modes().await.unwrap().is_empty());
 }
 
 #[tokio::test]

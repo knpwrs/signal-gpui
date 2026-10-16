@@ -375,4 +375,121 @@ impl AppDb {
     pub async fn next_story_expiry(&self) -> Result<Option<i64>> {
         Ok(sqlx::query_scalar("SELECT MIN(expires_at) FROM stories").fetch_one(&self.pool).await?)
     }
+
+    /// Whether we share our profile with this person or group (Desktop's
+    /// `profileSharing`).
+    pub async fn profile_sharing(&self, chat: &ConversationId) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>("SELECT 1 FROM profile_sharing WHERE id = ?")
+            .bind(&chat.0)
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some())
+    }
+
+    /// Shares our profile with them (or stops). Returns whether it changed.
+    pub async fn set_profile_sharing(&self, chat: &ConversationId, on: bool) -> Result<bool> {
+        let done = if on {
+            sqlx::query("INSERT OR IGNORE INTO profile_sharing (id) VALUES (?)")
+        } else {
+            sqlx::query("DELETE FROM profile_sharing WHERE id = ?")
+        }
+        .bind(&chat.0)
+        .execute(&self.writer)
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// Profile sharing as Storage Service has it (`whitelisted`), for the
+    /// chats it has records for; others are left as they are. A
+    /// transaction per hundred, so other writes don't wait on thousands.
+    pub async fn apply_profile_sharing(&self, chats: &[(ConversationId, bool)]) -> Result<()> {
+        for batch in chats.chunks(100) {
+            let mut tx = self.write().await?;
+            for (chat, on) in batch {
+                if *on {
+                    sqlx::query("INSERT OR IGNORE INTO profile_sharing (id) VALUES (?)")
+                } else {
+                    sqlx::query("DELETE FROM profile_sharing WHERE id = ?")
+                }
+                .bind(&chat.0)
+                .execute(&mut *tx)
+                .await?;
+            }
+            tx.commit().await?;
+        }
+        Ok(())
+    }
+
+    /// Every group's story send mode that isn't the default.
+    pub async fn story_send_modes(&self) -> Result<Vec<(ConversationId, StorySendMode)>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as("SELECT id, mode FROM story_send_modes").fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|(id, mode)| (ConversationId(id), StorySendMode::from_wire(mode))).collect())
+    }
+
+    pub async fn story_send_mode(&self, group: &ConversationId) -> Result<StorySendMode> {
+        let mode: Option<i64> = sqlx::query_scalar("SELECT mode FROM story_send_modes WHERE id = ?")
+            .bind(&group.0)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(mode.map_or(StorySendMode::IfActive, StorySendMode::from_wire))
+    }
+
+    /// Sets groups' story send modes. Returns whether any changed.
+    pub async fn set_story_send_modes(&self, modes: &[(ConversationId, StorySendMode)]) -> Result<bool> {
+        let mut changed = false;
+        for batch in modes.chunks(100) {
+            let mut tx = self.write().await?;
+            for (group, mode) in batch {
+                let done = match mode {
+                    StorySendMode::IfActive => {
+                        sqlx::query("DELETE FROM story_send_modes WHERE id = ?").bind(&group.0).execute(&mut *tx).await?
+                    }
+                    mode => sqlx::query(
+                        "INSERT INTO story_send_modes (id, mode) VALUES (?1, ?2) \
+                         ON CONFLICT (id) DO UPDATE SET mode = ?2 WHERE mode != ?2",
+                    )
+                    .bind(&group.0)
+                    .bind(mode.to_wire())
+                    .execute(&mut *tx)
+                    .await?,
+                };
+                changed |= done.rows_affected() > 0;
+            }
+            tx.commit().await?;
+        }
+        Ok(changed)
+    }
+}
+
+/// A group's story send mode (Desktop's `StorySendMode`, Storage Service's
+/// `GroupV2Record.StorySendMode`): whether its story is offered when
+/// posting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StorySendMode {
+    /// Offered while the group has stories up (`DEFAULT`).
+    #[default]
+    IfActive,
+    /// Removed from the list (`DISABLED`).
+    Never,
+    /// Always offered (`ENABLED`): we posted to it, or added it.
+    Always,
+}
+
+impl StorySendMode {
+    /// From the protobuf's number (unknown ones are the default).
+    pub fn from_wire(value: i64) -> Self {
+        match value {
+            1 => Self::Never,
+            2 => Self::Always,
+            _ => Self::IfActive,
+        }
+    }
+
+    pub fn to_wire(self) -> i64 {
+        match self {
+            Self::IfActive => 0,
+            Self::Never => 1,
+            Self::Always => 2,
+        }
+    }
 }

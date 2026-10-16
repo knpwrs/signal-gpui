@@ -2678,6 +2678,8 @@ impl AppDb {
         sqlx::query("DELETE FROM early_events").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM adhoc_calls").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM call_links").execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM profile_sharing").execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM story_send_modes").execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
     }
