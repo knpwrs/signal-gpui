@@ -2421,6 +2421,16 @@ impl AppState {
         cx.notify();
     }
 
+    /// Desktop's media auto-download choices (Data usage).
+    pub fn set_auto_download(&mut self, choices: signal_backend::auto_download::AutoDownload, cx: &mut Context<Self>) {
+        self.prefs.auto_download = choices;
+        if let Ok(json) = serde_json::to_string(&choices) {
+            self.pending_prefs.insert(signal_backend::auto_download::SETTING_AUTO_DOWNLOAD, json);
+        }
+        self.send(Command::SetAutoDownload(choices));
+        cx.notify();
+    }
+
     /// Blocked people and groups (Desktop's Blocked page), people first.
     pub fn blocked(&self) -> Vec<&signal_store::Conversation> {
         let mut blocked: Vec<_> = self.conversations.iter().chain(&self.archived).filter(|c| c.blocked).collect();

@@ -142,6 +142,7 @@ pub const KEYS: &[&str] = &[
     signal_backend::SETTING_UNIVERSAL_EXPIRE_TIMER,
     signal_backend::SETTING_PHONE_NUMBER_SHARING,
     signal_backend::SETTING_PHONE_NUMBER_DISCOVERABLE,
+    signal_backend::auto_download::SETTING_AUTO_DOWNLOAD,
 ];
 
 /// The settings as stored.
@@ -163,6 +164,8 @@ pub struct Prefs {
     pub number_shared: bool,
     /// People can find us by our number.
     pub number_discoverable: bool,
+    /// Which media download as it arrives.
+    pub auto_download: signal_backend::auto_download::AutoDownload,
 }
 
 impl Default for Prefs {
@@ -171,6 +174,7 @@ impl Default for Prefs {
             universal_timer: 0,
             number_shared: false,
             number_discoverable: false,
+            auto_download: Default::default(),
         }
     }
 }
@@ -200,6 +204,9 @@ impl Prefs {
             universal_timer: get(signal_backend::SETTING_UNIVERSAL_EXPIRE_TIMER).and_then(|t| t.parse().ok()).unwrap_or(0),
             number_shared: get(signal_backend::SETTING_PHONE_NUMBER_SHARING) == Some("true"),
             number_discoverable: get(signal_backend::SETTING_PHONE_NUMBER_DISCOVERABLE) == Some("true"),
+            auto_download: signal_backend::auto_download::AutoDownload::from_setting(get(
+                signal_backend::auto_download::SETTING_AUTO_DOWNLOAD,
+            )),
         }
     }
 

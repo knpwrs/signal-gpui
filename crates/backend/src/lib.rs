@@ -39,6 +39,7 @@ pub mod release_notes;
 pub mod megaphones;
 pub mod remote_config;
 pub mod message_requests;
+pub mod auto_download;
 mod sender_keys;
 
 pub use remote_config::{RemoteConfig, current as remote_config};
@@ -500,6 +501,9 @@ pub enum Command {
     /// configuration and blocked list (`sendSyncRequests`). The contacts'
     /// arrival is `Event::ContactsSynced`.
     SyncContacts,
+    /// Desktop's media auto-download choices (Data usage), kept on this
+    /// device.
+    SetAutoDownload(auto_download::AutoDownload),
     /// Adds groups' stories to the list we post to (`Always`, Desktop's
     /// "New group story") or removes them (`Never`, "Remove group story"),
     /// for the whole account (`GroupV2Record.storySendMode`).

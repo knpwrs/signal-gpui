@@ -115,11 +115,10 @@ pub(crate) const SETTING_VERIFIED: &str = "verified.";
 /// change.
 pub(crate) const SETTING_IDENTITY: &str = "identity.";
 
-/// Whether an attachment is fetched whole as soon as it arrives: photos,
-/// GIFs and voice messages under the auto-download limit.
+/// Whether an attachment is fetched whole as soon as it arrives: as the
+/// media auto-download choices say (Data usage), under the limit.
 pub(crate) fn downloads_whole(attachment: &AttachmentMeta) -> bool {
-    let photo = attachment.gif || attachment.voice || attachment.content_type.starts_with("image/");
-    photo && crate::remote_config().auto_downloads(attachment.size)
+    crate::auto_download::current().downloads(attachment)
 }
 
 fn now_millis() -> i64 {
@@ -545,6 +544,7 @@ pub(crate) async fn run(
     tokio::task::spawn_local(actor.clone().call_send_loop(call_sends_rx));
     actor.load_call_choices().await;
     actor.load_remote_config().await;
+    crate::auto_download::load(&actor.db).await;
 
     if actor.store.is_registered().await {
         match Manager::load_registered(actor.store.clone()).await {
@@ -929,6 +929,7 @@ impl Actor {
                 Command::SetPhoneNumberSharing(everybody) => self.set_phone_number_sharing(everybody).await,
                 Command::SetPhoneNumberDiscoverable(on) => self.set_phone_number_discoverable(on).await,
                 Command::SyncContacts => self.request_syncs(),
+                Command::SetAutoDownload(choices) => self.set_auto_download(choices).await,
                 Command::StartCall { conversation, video } if conversation.as_call_link().is_some() => {
                     self.start_link_call(conversation, video).await
                 }
@@ -1085,6 +1086,7 @@ impl Actor {
         self.self_aci.borrow_mut().clear();
         self.storage_synced.replace(false);
         crate::remote_config::set_current(Default::default());
+        crate::auto_download::set_current(Default::default());
         self.remote_config_at.set(None);
     }
 
@@ -1342,18 +1344,12 @@ impl Actor {
                     }
                 }
                 let conversation = message.conversation_id.clone();
+                // What downloads on its own: Desktop's media auto-download
+                // choices (Data usage).
                 let downloadable: Vec<(usize, AttachmentPointer)> = pointers
                     .into_iter()
                     .enumerate()
-                    .filter(|(_, p)| {
-                        // Photos, GIFs (looping videos) and voice messages
-                        // download on their own (as in Desktop).
-                        let flags = p.flags.unwrap_or(0);
-                        let gif = flags & attachment_pointer::Flags::Gif as u32 != 0;
-                        let voice = flags & attachment_pointer::Flags::VoiceMessage as u32 != 0;
-                        (gif || voice || p.content_type.as_deref().is_some_and(|c| c.starts_with("image/")))
-                            && p.size.is_some_and(|size| crate::remote_config().auto_downloads(u64::from(size)))
-                    })
+                    .filter(|(ix, _)| message.attachments.get(*ix).is_some_and(downloads_whole))
                     .collect();
                 // Re-deliveries are de-duplicated by the store; only notify once.
                 let repeat = self
@@ -1428,9 +1424,11 @@ impl Actor {
                                 started: false,
                             });
                         }
+                        // A link preview's image is a photo (Desktop's `queuePreviews`).
                         if let Some(pointer) = preview_image.filter(|p| {
                             !held
                                 && p.content_type.as_deref().is_some_and(|c| c.starts_with("image/"))
+                                && crate::auto_download::current().photos
                                 && p.size.is_some_and(|size| crate::remote_config().auto_downloads(u64::from(size)))
                         }) {
                             let this = self.clone();

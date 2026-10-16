@@ -233,6 +233,25 @@ fn data_usage_shows_image_optimization(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn media_auto_download_is_chosen_by_kind(cx: &mut TestAppContext) {
+    use signal_backend::auto_download::AutoDownload;
+    let h = Harness::open(cx, Page::DataUsage);
+    // Desktop's default: everything.
+    for id in ["auto-download-photos", "auto-download-videos", "auto-download-audio", "auto-download-documents"] {
+        assert_eq!(h.value(cx, id).as_deref(), Some("on"), "{id}");
+    }
+    h.click(cx, "auto-download-videos");
+    h.click(cx, "auto-download-documents");
+    let expected = AutoDownload { videos: false, documents: false, ..Default::default() };
+    assert_eq!(cx.read(|cx| h.state.read(cx).prefs.auto_download), expected);
+    let stored = |_: &mut TestAppContext| {
+        AutoDownload::from_setting(h.stored(signal_backend::auto_download::SETTING_AUTO_DOWNLOAD).as_deref())
+    };
+    assert!(wait(cx, |cx| stored(cx) == expected));
+    assert_eq!(h.value(cx, "auto-download-videos").as_deref(), Some("off"));
+}
+
+#[gpui_kit::test]
 fn chats_toggles_save_and_contacts_import(cx: &mut TestAppContext) {
     use crate::state::ContactSync;
     use signal_backend::AccountSetting;

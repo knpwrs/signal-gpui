@@ -1912,6 +1912,9 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 }
                 emit(Event::AccountSettingsChanged);
             }
+            Command::SetAutoDownload(choices) => {
+                let _ = db.set_setting(crate::auto_download::SETTING_AUTO_DOWNLOAD, &serde_json::to_string(&choices).unwrap_or_default()).await;
+            }
             // The made-up phone answers at once.
             Command::SyncContacts => {
                 let _ = db.set_setting(crate::SETTING_CONTACTS_SYNCED_AT, &now().to_string()).await;

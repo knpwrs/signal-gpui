@@ -75,6 +75,19 @@ impl Actor {
         self.write_account(&[storage::AccountEdit::UnlistedPhoneNumber(!discoverable)]).await;
     }
 
+    /// Desktop's media auto-download choices: in effect at once, and saved.
+    pub(super) async fn set_auto_download(&self, choices: crate::auto_download::AutoDownload) {
+        crate::auto_download::set_current(choices);
+        match serde_json::to_string(&choices) {
+            Ok(json) => {
+                if let Err(error) = self.db.set_setting(crate::auto_download::SETTING_AUTO_DOWNLOAD, &json).await {
+                    self.error("failed to save media auto-download", error);
+                }
+            }
+            Err(error) => warn!(%error, "failed to save media auto-download"),
+        }
+    }
+
     /// Desktop's "Import now" (`sendSyncRequests`): asks the phone for its
     /// contacts, configuration and blocked list.
     pub(super) fn request_syncs(&self) {

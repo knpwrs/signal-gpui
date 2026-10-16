@@ -309,12 +309,8 @@ impl Actor {
     }
 }
 
-/// Whether an attachment downloads on its own (photos, GIFs and voice
-/// messages under the auto-download size), as `apply` decides for one
-/// arriving.
+/// Whether an attachment downloads on its own (the media auto-download
+/// choices, under the limit), as `apply` decides for one arriving.
 pub(super) fn auto_downloads(attachment: &AttachmentMeta) -> bool {
-    let kind = attachment.content_type.as_str();
-    (attachment.gif || attachment.voice || kind.starts_with("image/"))
-        && attachment.size > 0
-        && crate::remote_config().auto_downloads(attachment.size)
+    attachment.size > 0 && super::downloads_whole(attachment)
 }
