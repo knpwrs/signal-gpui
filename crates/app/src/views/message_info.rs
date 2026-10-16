@@ -151,13 +151,24 @@ fn show(state: Entity<AppState>, message: Message, states: Vec<SendState>, windo
         }
         let retry_state = state.clone();
         let id = message.id;
+        // A deleted message's recipients are its delete's: Desktop's
+        // "Retry Delete for Everyone" sends it to those it missed.
+        let deleted = message.deleted;
         dialog.title("Message details").w(px(460.)).child(body).when(any_failed, |dialog| {
             use gpui_kit::component::button::{Button, ButtonVariants as _};
             dialog.footer(gpui_kit::component::dialog::DialogFooter::new().child(
-                Button::new("details-retry").label("Retry Send").primary().on_click(move |_, window, cx| {
-                    retry_state.read(cx).send(signal_backend::Command::RetrySend { message_id: id });
-                    window.close_all_dialogs(cx);
-                }),
+                Button::new("details-retry")
+                    .label(if deleted { "Retry Delete for Everyone" } else { "Retry Send" })
+                    .primary()
+                    .on_click(move |_, window, cx| {
+                        let command = if deleted {
+                            signal_backend::Command::RetryDeleteForEveryone { message_id: id }
+                        } else {
+                            signal_backend::Command::RetrySend { message_id: id }
+                        };
+                        retry_state.read(cx).send(command);
+                        window.close_all_dialogs(cx);
+                    }),
             ))
         })
     });

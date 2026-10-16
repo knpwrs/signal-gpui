@@ -395,6 +395,9 @@ pub enum Command {
     AnswerMessageRequest { conversation: ConversationId, answer: signal_store::MessageRequestResponse },
     /// Deletes our own message for everyone.
     DeleteForEveryone { message_id: i64 },
+    /// Sends a delete for everyone that failed again (Desktop's "Retry
+    /// Delete for Everyone").
+    RetryDeleteForEveryone { message_id: i64 },
     /// Downloads attachment `index` of `message_id`.
     FetchAttachment { message_id: i64, index: usize },
     /// Opens their view-once message, its one time: answered with

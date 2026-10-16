@@ -339,6 +339,11 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
     let mut reply = outgoing(MAYA, now - 45 * MINUTE, "Reading it now", DeliveryStatus::Read);
     reply.quote = Some(quote_of(&article, article_image.and_then(|i| i.local_path)));
     db.insert_message(&reply).await?;
+    // A message we deleted for everyone whose delete didn't go (Desktop's
+    // "Delete failed"), to retry.
+    let unsent = db.insert_message(&outgoing(MAYA, now - 40 * MINUTE, "Sending you the trail map now", DeliveryStatus::Read)).await?;
+    db.mark_deleted(unsent).await?;
+    db.set_delete_status(unsent, DeliveryStatus::Failed).await?;
     // She set up a new phone.
     let changed = signal_store::Notice::SafetyNumberChanged { who: aci(MAYA).into() };
     db.insert_notice(&ConversationId(MAYA.into()), now - 30 * MINUTE, &changed).await?;
@@ -1462,6 +1467,13 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
             }
             // Nothing fails offline.
             Command::RetrySend { .. } => {}
+            // The demo has no network: a retried delete goes at once.
+            Command::RetryDeleteForEveryone { message_id } => {
+                let Ok(Some(m)) = db.message(message_id).await else { continue };
+                if m.deleted && m.status == DeliveryStatus::Failed && db.set_delete_status(message_id, DeliveryStatus::Sent).await.is_ok() {
+                    emit(Event::MessageChanged { conversation: m.conversation_id, message_id });
+                }
+            }
             Command::Forward { message_ids, conversations } => {
                 for conversation in conversations {
                     for message_id in &message_ids {

@@ -354,6 +354,35 @@ async fn edits_keep_the_versions_they_replace() {
 }
 
 #[tokio::test]
+async fn a_deletes_progress_is_kept_on_the_deleted_message() {
+    let db = test_db().await;
+    let id = db.insert_message(&incoming("g:x", "a", 10, "oops")).await.unwrap();
+    assert!(!db.set_delete_status(id, DeliveryStatus::Failed).await.unwrap(), "not deleted yet");
+    db.mark_deleted(id).await.unwrap();
+    assert!(db.set_delete_status(id, DeliveryStatus::Failed).await.unwrap());
+    assert_eq!(db.message(id).await.unwrap().unwrap().status, DeliveryStatus::Failed);
+    // A retry starts it again.
+    db.set_delete_status(id, DeliveryStatus::Sending).await.unwrap();
+    assert_eq!(db.message(id).await.unwrap().unwrap().status, DeliveryStatus::Sending);
+
+    // Ours: the message's recipients become the delete's, and receipts for
+    // the message don't move them.
+    let ours = db.insert_message(&outgoing("g:x", 20, "oops")).await.unwrap();
+    db.record_send_states(ours, &[("b".into(), SendStatus::Sent, None)], 21).await.unwrap();
+    db.mark_deleted(ours).await.unwrap();
+    assert!(db.start_delete_send(ours).await.unwrap());
+    assert!(db.send_states(ours).await.unwrap().is_empty());
+    let summary = db
+        .record_send_states(ours, &[("b".into(), SendStatus::Sent, None), ("c".into(), SendStatus::Failed, Some("x".into()))], 22)
+        .await
+        .unwrap();
+    assert_eq!(summary, Some(DeliveryStatus::PartialSent));
+    assert_eq!(db.failed_recipients(ours).await.unwrap(), ["c"]);
+    assert!(db.apply_receipt_from("c", 20, SendStatus::Delivered, 23).await.unwrap().is_empty());
+    assert_eq!(db.failed_recipients(ours).await.unwrap(), ["c"]);
+}
+
+#[tokio::test]
 async fn admin_deletes_note_the_admin_once() {
     let db = test_db().await;
     let id = db.insert_message(&incoming("g:x", "a", 10, "off topic")).await.unwrap();

@@ -185,7 +185,10 @@ impl AppDb {
     pub async fn apply_receipt_from(&self, sender: &str, sent_at: i64, status: SendStatus, at: i64) -> Result<Vec<(ConversationId, i64)>> {
         let mut tx = self.write().await?;
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT id, conversation_id, status FROM messages WHERE author_key = '' AND direction = 1 AND {}",
+            // A deleted message's states are its delete's, which receipts
+            // for the message don't move (Desktop keeps
+            // `deletedForEveryoneSendStatus` apart).
+            "SELECT id, conversation_id, status FROM messages WHERE author_key = '' AND direction = 1 AND deleted = 0 AND {}",
             sent_at_matches("?1")
         )))
         .bind(sent_at)
@@ -241,6 +244,23 @@ impl AppDb {
         }
         tx.commit().await?;
         Ok(changed)
+    }
+
+    /// A delete for everyone of message `id` (already deleted) is going
+    /// out: the message's recipients' states become the delete's, none yet
+    /// (Desktop's `deletedForEveryoneSendStatus`), and it shows as sending.
+    pub async fn start_delete_send(&self, id: i64) -> Result<bool> {
+        let mut tx = self.write().await?;
+        let done = sqlx::query("UPDATE messages SET status = ? WHERE id = ? AND deleted = 1")
+            .bind(status_to_i64(DeliveryStatus::Sending))
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        if done.rows_affected() > 0 {
+            sqlx::query("DELETE FROM message_send_states WHERE message_id = ?").bind(id).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(done.rows_affected() > 0)
     }
 
     /// Recipients of message `id` whose send failed (who Desktop's

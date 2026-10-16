@@ -76,6 +76,22 @@ pub fn send_kind(message: &Message, chat: Chat, now: i64) -> Option<Kind> {
     can_send_as_admin(message, chat, now).ok().map(|()| Kind::Admin)
 }
 
+/// Which delete for everyone to send again for `message`, whose delete
+/// failed for some or all (Desktop's `canRetrySendDeleteForEveryone` on
+/// `deletedForEveryoneFailed`): the same kind as before, while it's still
+/// allowed. How it went is kept in its status.
+pub fn retry_kind(message: &Message, chat: Chat, now: i64) -> Option<Kind> {
+    let failed = matches!(message.status, DeliveryStatus::Failed | DeliveryStatus::PartialSent);
+    if !message.deleted || !failed || chat.ended || chat.note_to_self || message.notice.is_some() {
+        return None;
+    }
+    let age = now - message.sent_at;
+    if message.deleted_by_admin.is_some() {
+        return admin(chat.group, chat.we_are_admin, age, 0).ok().map(|()| Kind::Admin);
+    }
+    (message.direction == Direction::Outgoing && age.abs() <= max_age_ms()).then_some(Kind::Normal)
+}
+
 /// Whether we can delete `message` for everyone as a group admin at `now`,
 /// or why not. Our own message must have gone out to someone.
 pub fn can_send_as_admin(message: &Message, chat: Chat, now: i64) -> Result<(), &'static str> {
@@ -232,6 +248,30 @@ mod tests {
         // Never sent: no normal delete, and no admin delete either.
         let failed = message(Direction::Outgoing, DeliveryStatus::Failed, now - 1000);
         assert_eq!(send_kind(&failed, GROUP, now), None);
+    }
+
+    #[test]
+    fn failed_deletes_are_retried_as_they_were_sent_while_allowed() {
+        let now = 10 * DAY_MS;
+        let failed = |direction, by_admin: bool, sent_at| Message {
+            deleted: true,
+            deleted_by_admin: by_admin.then_some(signal_store::DeletedByAdmin { by: None }),
+            ..message(direction, DeliveryStatus::Failed, sent_at)
+        };
+        let ours = failed(Direction::Outgoing, false, now - 1000);
+        assert_eq!(retry_kind(&ours, Chat::default(), now), Some(Kind::Normal));
+        assert_eq!(retry_kind(&Message { status: DeliveryStatus::Sent, ..ours.clone() }, Chat::default(), now), None, "it went");
+        let partly = Message { status: DeliveryStatus::PartialSent, ..ours.clone() };
+        assert_eq!(retry_kind(&partly, Chat::default(), now), Some(Kind::Normal), "some missed it");
+        assert_eq!(retry_kind(&Message { deleted: false, ..ours.clone() }, Chat::default(), now), None, "not deleted");
+        assert_eq!(retry_kind(&failed(Direction::Outgoing, false, now - DAY_MS - 1), Chat::default(), now), None, "too old");
+        assert_eq!(retry_kind(&ours, Chat { note_to_self: true, ..Chat::default() }, now), None);
+        assert_eq!(retry_kind(&ours, Chat { ended: true, ..GROUP }, now), None);
+        // An admin's delete is retried as one, while we're still an admin.
+        let theirs = failed(Direction::Incoming, true, now - 1000);
+        assert_eq!(retry_kind(&theirs, GROUP, now), Some(Kind::Admin));
+        assert_eq!(retry_kind(&theirs, Chat { we_are_admin: false, ..GROUP }, now), None);
+        assert_eq!(retry_kind(&failed(Direction::Incoming, false, now - 1000), GROUP, now), None, "theirs, not by us");
     }
 
     #[test]

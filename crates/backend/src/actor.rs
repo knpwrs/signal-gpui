@@ -155,6 +155,16 @@ enum Outbound {
         /// Our message row whose status tracks this send.
         message: Option<i64>,
     },
+    /// A delete for everyone of `target` (already deleted here), whose
+    /// outcome the deleted message keeps.
+    Delete {
+        conversation: ConversationId,
+        body: ContentBody,
+        timestamp: u64,
+        target: i64,
+        /// A retry: only these recipients, whom it missed.
+        only: Option<Vec<String>>,
+    },
     /// A message whose images still need optimizing and uploading; their
     /// pointers are added to `body` before it is sent.
     SendImages {
@@ -944,6 +954,7 @@ impl Actor {
                     self.answer_message_request(conversation, answer).await
                 }
                 Command::DeleteForEveryone { message_id } => self.delete_for_everyone(message_id).await,
+                Command::RetryDeleteForEveryone { message_id } => self.retry_delete_for_everyone(message_id).await,
                 Command::FetchAttachment { message_id, index } => {
                     self.fetch_attachment(message_id, index).await
                 }
@@ -4300,22 +4311,11 @@ impl Actor {
                 "only your own sent messages, or anyone's in a group you're an admin of, from the last 24 hours",
             );
         };
-        let target_sent_timestamp = Some(target.sent_at as u64);
-        let (marked, delete, admin_delete) = match kind {
-            crate::deletes::Kind::Normal => (
-                self.db.mark_deleted(message_id).await.map(|()| true),
-                Some(data_message::Delete { target_sent_timestamp }),
-                None,
-            ),
+        let Some((delete, admin_delete)) = self.delete_messages(&target, kind) else { return };
+        let marked = match kind {
+            crate::deletes::Kind::Normal => self.db.mark_deleted(message_id).await.map(|()| true),
             crate::deletes::Kind::Admin => {
-                let author = target.author.clone().unwrap_or_else(|| self.self_aci());
-                let Some(author) = Aci::parse_from_service_id_string(&author).map(|a| a.service_id_binary()) else {
-                    return self.error("cannot delete for everyone", "the message's author has no ACI");
-                };
-                let by = signal_store::DeletedByAdmin { by: None };
-                let admin_delete =
-                    data_message::AdminDelete { target_author_aci_binary: Some(author), target_sent_timestamp };
-                (self.db.mark_deleted_by_admin(message_id, &by).await, None, Some(admin_delete))
+                self.db.mark_deleted_by_admin(message_id, &signal_store::DeletedByAdmin { by: None }).await
             }
         };
         match marked {
@@ -4323,9 +4323,73 @@ impl Actor {
             Ok(false) => return,
             Err(error) => return self.error("failed to delete message", error),
         }
-        self.emit(Event::MessageChanged { conversation: target.conversation_id.clone(), message_id });
         self.emit(Event::ConversationsChanged);
+        self.send_delete(target, delete, admin_delete, None).await;
+    }
 
+    /// Sends a delete for everyone that failed again (Desktop's
+    /// `retryDeleteForEveryone`), as the same kind of delete, while it's
+    /// still allowed, to the recipients it missed (all of them when none
+    /// are known).
+    async fn retry_delete_for_everyone(self: Rc<Self>, message_id: i64) {
+        let Some(target) = self.db.message(message_id).await.ok().flatten() else { return };
+        let conversation = &target.conversation_id;
+        let stored = self.db.conversation(conversation).await.ok().flatten();
+        let left = stored.as_ref().is_some_and(|c| c.left);
+        let chat = crate::deletes::Chat::new(
+            self.is_note_to_self(conversation),
+            conversation.as_group().is_some(),
+            !left && self.is_group_admin(conversation, &self.self_aci()).await,
+            stored.as_ref().is_some_and(|c| c.ended),
+        );
+        let Some(kind) = crate::deletes::retry_kind(&target, chat, now_millis()) else {
+            return self.error("cannot retry the delete", "it was sent, or it's too late to delete for everyone");
+        };
+        let Some((delete, admin_delete)) = self.delete_messages(&target, kind) else { return };
+        let missed = self.db.failed_recipients(message_id).await.unwrap_or_default();
+        self.send_delete(target, delete, admin_delete, (!missed.is_empty()).then_some(missed)).await;
+    }
+
+    /// The `delete` or `adminDelete` naming `target`.
+    fn delete_messages(
+        &self,
+        target: &Message,
+        kind: crate::deletes::Kind,
+    ) -> Option<(Option<data_message::Delete>, Option<data_message::AdminDelete>)> {
+        let target_sent_timestamp = Some(target.sent_at as u64);
+        match kind {
+            crate::deletes::Kind::Normal => Some((Some(data_message::Delete { target_sent_timestamp }), None)),
+            crate::deletes::Kind::Admin => {
+                let author = target.author.clone().unwrap_or_else(|| self.self_aci());
+                let Some(author) = Aci::parse_from_service_id_string(&author).map(|a| a.service_id_binary()) else {
+                    self.error("cannot delete for everyone", "the message's author has no ACI");
+                    return None;
+                };
+                Some((None, Some(data_message::AdminDelete { target_author_aci_binary: Some(author), target_sent_timestamp })))
+            }
+        }
+    }
+
+    /// Sends a delete for everyone of `target` (already deleted here), to
+    /// `only` these recipients when retrying. Its progress shows on the
+    /// deleted message: the message's send states become the delete's, as
+    /// Desktop's `deletedForEveryoneSendStatus`.
+    async fn send_delete(
+        &self,
+        target: Message,
+        delete: Option<data_message::Delete>,
+        admin_delete: Option<data_message::AdminDelete>,
+        only: Option<Vec<String>>,
+    ) {
+        let started = match &only {
+            // A retry keeps who already has it.
+            Some(_) => self.db.set_delete_status(target.id, DeliveryStatus::Sending).await,
+            None => self.db.start_delete_send(target.id).await,
+        };
+        if let Err(error) = started {
+            warn!(%error, "couldn't note a delete as sending");
+        }
+        self.emit(Event::MessageChanged { conversation: target.conversation_id.clone(), message_id: target.id });
         let timestamp = self.next_timestamp() as u64;
         let data = DataMessage {
             timestamp: Some(timestamp),
@@ -4334,12 +4398,31 @@ impl Actor {
             group_v2: self.group_context(&target.conversation_id).await,
             ..Default::default()
         };
-        self.enqueue(Outbound::Send {
-            conversation: target.conversation_id,
-            body: data.into(),
-            timestamp,
-            message: None,
-        });
+        self.enqueue(Outbound::Delete { conversation: target.conversation_id, body: data.into(), timestamp, target: target.id, only });
+    }
+
+    /// How a delete for everyone went, by recipient when known: failed, or
+    /// partly sent when some missed it (Desktop's `updateMessageWithFailure`
+    /// and `deletedForEveryoneSendStatus`), for "Retry Delete for Everyone".
+    /// Without recipients (not sent at all), the summary of those it has
+    /// reached before, else `status`.
+    async fn finish_delete(&self, conversation: &ConversationId, target: i64, delivery: Option<&Delivery>, status: DeliveryStatus) {
+        let states = delivery.map(|d| d.send_states(conversation.as_group().is_some())).unwrap_or_default();
+        let result = if states.is_empty() {
+            let known = self.db.send_states(target).await.unwrap_or_default();
+            let status = if status == DeliveryStatus::Failed {
+                signal_store::summarize(&known).filter(|s| *s == DeliveryStatus::PartialSent).unwrap_or(status)
+            } else {
+                status
+            };
+            self.db.set_delete_status(target, status).await.map(|_| ())
+        } else {
+            self.db.record_send_states(target, &states, now_millis()).await.map(|_| ())
+        };
+        if let Err(error) = result {
+            self.error("failed to update a delete's status", error);
+        }
+        self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id: target });
     }
 
     /// An admin ended this group (Desktop's `terminated`).
@@ -4518,6 +4601,9 @@ impl Actor {
                     | Outbound::SendGif { conversation, message: id, timestamp, .. } => {
                         self.finish_send(&conversation, id, timestamp, DeliveryStatus::Failed).await;
                     }
+                    Outbound::Delete { conversation, target, .. } => {
+                        self.finish_delete(&conversation, target, None, DeliveryStatus::Failed).await;
+                    }
                     Outbound::Story { recipient, job, .. } => self.story_part_done(job, recipient, Err("not connected".into())),
                     Outbound::StoryBatch { recipients, job, .. } => {
                         for recipient in recipients {
@@ -4561,6 +4647,11 @@ impl Actor {
                             self.report(&conversation, &delivery);
                         }
                     }
+                }
+                Outbound::Delete { conversation, body, timestamp, target, only } => {
+                    let delivery = self.deliver_to(&mut manager, &conversation, body, timestamp, only.as_deref()).await;
+                    let status = self.report(&conversation, &delivery);
+                    self.finish_delete(&conversation, target, Some(&delivery), status).await;
                 }
                 Outbound::SendImages { conversation, mut body, timestamp, message, images, preview_image } => {
                     let uploaded = match self.upload_images(&manager, images).await {

@@ -1765,7 +1765,18 @@ impl ConversationView {
                 crate::views::edit_history::open(view.clone(), current.clone(), window, cx)
             }) as crate::views::chat_menu::MenuAction
         });
-        MetaClicks { edited }
+        let retry_delete = self.can_retry_delete(message, cx).then(|| {
+            let (state, id) = (self.state.clone(), message.id);
+            std::rc::Rc::new(move |window: &mut Window, cx: &mut App| confirm_retry_delete(state.clone(), id, window, cx))
+                as crate::views::chat_menu::MenuAction
+        });
+        MetaClicks { edited, retry_delete }
+    }
+
+    /// Our delete for everyone of it failed and may be sent again (Desktop's
+    /// `canRetryDeleteForEveryone`).
+    fn can_retry_delete(&self, message: &Message, cx: &App) -> bool {
+        signal_backend::deletes::retry_kind(message, self.delete_chat(cx), now_millis()).is_some()
     }
 
     /// A message as the edit history shows it (Desktop's
@@ -2903,6 +2914,10 @@ impl ConversationView {
 /// (`MessageMetadata`); the message's menu has its details.
 const PARTIALLY_SENT: &str = "Partially sent, click for details";
 
+/// Desktop's `icu:partiallyDeleted--clickForDetails`: a delete for
+/// everyone that reached only some (the message's menu has its details).
+const PARTIALLY_DELETED: &str = "Partially deleted, click for details";
+
 /// What shows in place of the time: Desktop's `icu:partiallySent`, and
 /// `icu:sendPaused` for a send held for a captcha.
 fn status_words(status: DeliveryStatus) -> Option<&'static str> {
@@ -2919,11 +2934,31 @@ fn status_words(status: DeliveryStatus) -> Option<&'static str> {
 struct MetaClicks {
     /// "Edited": Desktop's edit history (`showEditHistoryModal`).
     edited: Option<crate::views::chat_menu::MenuAction>,
+    /// "Delete failed, click for details": Desktop's retry dialog.
+    retry_delete: Option<crate::views::chat_menu::MenuAction>,
+}
+
+/// Desktop's dialog for a delete for everyone that failed
+/// (`MessageMetadata`'s `ConfirmationType.DeleteError`).
+fn confirm_retry_delete(state: Entity<AppState>, message_id: i64, window: &mut Window, cx: &mut App) {
+    use gpui_kit::component::WindowExt as _;
+    window.open_alert_dialog(cx, move |alert, _, _| {
+        let state = state.clone();
+        alert
+            .description("Message failed to delete. Check your connection and try again.")
+            .confirm()
+            .ok_text("Try again")
+            .on_ok(move |_, window, cx| {
+                state.read(cx).send(Command::RetryDeleteForEveryone { message_id });
+                window.close_all_dialogs(cx);
+                true
+            })
+    });
 }
 
 fn render_meta(message: &Message, color: Hsla, palette: Palette, clicks: &MetaClicks) -> AnyElement {
     let outgoing = message.direction == Direction::Outgoing;
-    if let Some(words) = outgoing.then(|| status_words(message.status)).flatten() {
+    if let Some(words) = (outgoing && !message.deleted).then(|| status_words(message.status)).flatten() {
         return div()
             .debug_selector(move || format!("status-{words}"))
             .text_size(px(META_SIZE))
@@ -2958,10 +2993,33 @@ fn render_meta(message: &Message, color: Hsla, palette: Palette, clicks: &MetaCl
             None => d.child("Edited ·"),
         })
         .when(message.expires_in > 0, |d| d.child(Icon::new(IconName::Timer).size_3().text_color(color)))
-        .when(message.status == DeliveryStatus::Failed && outgoing, |d| {
+        .when(message.status == DeliveryStatus::Failed && outgoing && !message.deleted, |d| {
             d.child(div().text_color(palette.danger).child("Not sent"))
         })
-        .child(message_time(message.sent_at))
+        // Deleted, the status is our delete's (Desktop's
+        // `getMessagePropStatus`); a failed one says so in place of the time,
+        // and one that reached only some says Desktop's "Partially deleted"
+        // (its details show who it missed, with a retry).
+        .map(|d| match (message.deleted && message.status == DeliveryStatus::Failed, clicks.retry_delete.clone()) {
+            _ if message.deleted && message.status == DeliveryStatus::PartialSent => d.child(
+                div().debug_selector(move || format!("delete-partial-{id}")).text_color(palette.danger).child(PARTIALLY_DELETED),
+            ),
+            (true, Some(retry)) => d.child(
+                div()
+                    .id(SharedString::from(format!("delete-failed-{id}")))
+                    .debug_selector(move || format!("delete-failed-{id}"))
+                    .text_color(palette.danger)
+                    .cursor_pointer()
+                    .hover(|d| d.underline())
+                    .on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        retry(window, cx)
+                    })
+                    .child("Delete failed, click for details"),
+            ),
+            (true, None) => d.child(div().text_color(palette.danger).child("Delete failed")),
+            (false, _) => d.child(message_time(message.sent_at)),
+        })
         // Desktop leaves 6pt before the status icon.
         .when_some(status, |d, s| d.child(div().ml(px(STATUS_GAP)).child(s)))
         .into_any_element()
@@ -3303,7 +3361,7 @@ fn text_width(cx: &App, text: &str, size: f32) -> f32 {
 /// Width of what [`render_meta`] draws.
 fn meta_width(message: &Message, cx: &App) -> f32 {
     let outgoing = message.direction == Direction::Outgoing;
-    if let Some(words) = outgoing.then(|| status_words(message.status)).flatten() {
+    if let Some(words) = (outgoing && !message.deleted).then(|| status_words(message.status)).flatten() {
         return text_width(cx, words, META_SIZE);
     }
     let mut parts = vec![text_width(cx, &message_time(message.sent_at), META_SIZE)];
@@ -4344,7 +4402,9 @@ fn message_menu(
         this.read_with(cx, |this, cx| (this.state.clone(), this.note_to_self(cx), this.delete_chat(cx), this.ended(cx)));
     let everyone = everyone_delete(std::slice::from_ref(message), chat, now_millis());
     let failed = message.direction == Direction::Outgoing
-        && matches!(message.status, DeliveryStatus::Failed | DeliveryStatus::PartialSent);
+        && matches!(message.status, DeliveryStatus::Failed | DeliveryStatus::PartialSent)
+        && !message.deleted;
+    let retry_delete = this.read_with(cx, |this, cx| this.can_retry_delete(message, cx));
     let with_view = |f: fn(&mut ConversationView, i64, &mut Window, &mut Context<ConversationView>)| {
         let view = view.clone();
         move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| {
@@ -4423,10 +4483,19 @@ fn message_menu(
         confirm_delete(delete_state.clone(), vec![id], note_to_self, everyone, window, cx)
     }));
     if failed {
+        let state = state.clone();
         menu = menu.item(
             PopupMenuItem::new("Retry Send")
                 .icon(IconName::RotateCcw)
                 .on_click(move |_, _, cx| state.read(cx).send(Command::RetrySend { message_id: id })),
+        );
+    }
+    // Desktop's `MessageContextMenu`: after "Retry Send".
+    if retry_delete {
+        menu = menu.item(
+            PopupMenuItem::new("Retry Delete for Everyone")
+                .icon(IconName::Trash)
+                .on_click(move |_, _, cx| state.read(cx).send(Command::RetryDeleteForEveryone { message_id: id })),
         );
     }
     menu
@@ -6292,6 +6361,22 @@ mod tests {
         let oldest = bounds(&mut cx, "edit-version-2".into());
         assert!(oldest.top() > current.top(), "newest first");
         assert!(cx.debug_bounds("edit-version-3").is_none());
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn a_failed_delete_for_everyone_is_retried(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        // The demo's message to Maya whose delete didn't go.
+        let failed = wait_for_messages(&backend, MAYA, 1, |m| m.deleted && m.status == DeliveryStatus::Failed).remove(0);
+        let (mut cx, view) = open_view(cx, &backend, MAYA);
+        let can_retry = cx.update(|_, cx| view.read(cx).can_retry_delete(&failed, cx));
+        assert!(can_retry);
+        let label = bounds(&mut cx, format!("delete-failed-{}", failed.id));
+        cx.simulate_click(label.center(), gpui_kit::Modifiers::none());
+        crate::views::test_support::press(&mut cx, "ok");
+        let retried = wait_for_messages(&backend, MAYA, 1, |m| m.id == failed.id && m.status == DeliveryStatus::Sent);
+        assert!(retried[0].deleted);
         backend.shutdown();
     }
 

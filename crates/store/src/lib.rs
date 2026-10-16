@@ -2221,6 +2221,19 @@ impl AppDb {
         Ok(done.rows_affected() > 0)
     }
 
+    /// How our delete for everyone of a message is going, kept in the
+    /// deleted message's status as Desktop's message status reflects its
+    /// delete once deleted (`getMessagePropStatus`): sending, sent, or
+    /// failed (to be retried). Only a deleted message takes it.
+    pub async fn set_delete_status(&self, message_id: i64, status: DeliveryStatus) -> Result<bool> {
+        let done = sqlx::query("UPDATE messages SET status = ? WHERE id = ? AND deleted = 1")
+            .bind(status_to_i64(status))
+            .bind(message_id)
+            .execute(&self.writer)
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
     pub async fn update_status(
         &self,
         conversation: &ConversationId,
