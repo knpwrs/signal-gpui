@@ -354,6 +354,176 @@ fn message_request_event(update: &proto::ChatUpdateMessage) -> Option<signal_sto
     }
 }
 
+/// The notices for a chat update in transferred history, as Desktop's
+/// import reads them (`#fromChatItemUpdateMessage`,
+/// `#fromSimpleUpdateMessage`, `#fromGroupUpdateMessage` in
+/// `ts/services/backups/import.preload.ts`). `author` is the item's author
+/// (`Some(None)`: us; `None`: unknown), `recipient` reads a recipient id
+/// the same way. Kinds this app has no notice for (group creation, GV1
+/// migration, member label access, payments, "joined Signal", ...) give
+/// none, nor do updates missing who made them.
+fn update_notices(
+    update: &proto::ChatUpdateMessage,
+    author: Option<Option<String>>,
+    conversation: &ConversationId,
+    me: &str,
+    recipient: impl Fn(u64) -> Option<Option<String>>,
+) -> Vec<signal_store::Notice> {
+    use proto::chat_update_message::Update;
+    use proto::simple_chat_update::Type;
+    use signal_store::Notice;
+    // The person a 1:1 update is about, else the author (Desktop's
+    // `key_changed` and `changedId`).
+    let subject = || conversation.as_direct().map(str::to_owned).or_else(|| author.clone().flatten());
+    match &update.update {
+        Some(Update::SimpleUpdate(simple)) => {
+            let notice = match simple.type_.enum_value() {
+                Ok(Type::IDENTITY_UPDATE) => subject().map(|who| Notice::SafetyNumberChanged { who }),
+                // Imported without `local`, which Desktop shows as from
+                // another device.
+                Ok(Type::IDENTITY_VERIFIED) => author.clone().flatten().map(|who| Notice::Verified { who, verified: true, local: false }),
+                Ok(Type::IDENTITY_DEFAULT) => author.clone().flatten().map(|who| Notice::Verified { who, verified: false, local: false }),
+                Ok(Type::CHANGE_NUMBER) => subject().map(|who| Notice::NumberChanged { who }),
+                Ok(Type::CHAT_SESSION_REFRESH) => Some(Notice::SessionRefreshed),
+                Ok(Type::BAD_DECRYPT) => subject().map(|who| Notice::DeliveryIssue { who }),
+                Ok(Type::UNSUPPORTED_PROTOCOL_MESSAGE) => author.clone().map(|who| Notice::UnsupportedMessage { who }),
+                _ => None,
+            };
+            notice.into_iter().collect()
+        }
+        Some(Update::ProfileChange(change)) => subject()
+            .map(|who| Notice::ProfileNameChanged { who, old_name: change.previousName.clone(), new_name: change.newName.clone() })
+            .into_iter()
+            .collect(),
+        Some(Update::ExpirationTimerChange(change)) => author
+            .map(|by| Notice::Timer { by, seconds: (change.expiresInMs / 1000) as u32 })
+            .into_iter()
+            .collect(),
+        Some(Update::PinMessage(pin)) => match (author, recipient(pin.authorId)) {
+            (Some(by), Some(target)) => vec![Notice::Pinned { by, author: target, sent_at: pin.targetSentTimestamp as i64 }],
+            _ => Vec::new(),
+        },
+        Some(Update::GroupChange(change)) => change.updates.iter().filter_map(|u| group_update_notice(u, me)).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// One detail of a group change in transferred history as a notice:
+/// Desktop's `#fromGroupUpdateMessage`, in this app's notices.
+fn group_update_notice(update: &proto::group_change_chat_update::Update, me: &str) -> Option<signal_store::Notice> {
+    use proto::group_change_chat_update::update::Update as U;
+    use signal_store::{GroupNotice, Inviter, Notice};
+    // A service id, `None` for us; the outer `None` when it's missing.
+    let person = |bytes: &Option<Vec<u8>>| -> Option<Option<String>> {
+        let sid = uuid_sid(bytes.as_deref()?)?;
+        Some((sid != me).then_some(sid))
+    };
+    let required = |bytes: &Vec<u8>| -> Option<Option<String>> { person(&Some(bytes.clone())) };
+    let inviter = |bytes: &Option<Vec<u8>>| match person(bytes) {
+        Some(None) => Inviter::Us,
+        Some(Some(id)) => Inviter::Person { id },
+        None => Inviter::Unknown,
+    };
+    let admins_only = |level: proto::GroupV2AccessLevel| level == proto::GroupV2AccessLevel::ADMINISTRATOR;
+    let group = |by: Option<String>, change: GroupNotice| Some(Notice::Group { by, change });
+    match update.update.as_ref()? {
+        U::GroupNameUpdate(u) => group(person(&u.updaterAci)?, GroupNotice::Title { title: u.newGroupName.clone().unwrap_or_default() }),
+        U::GroupAvatarUpdate(u) => group(person(&u.updaterAci)?, GroupNotice::Avatar),
+        U::GroupDescriptionUpdate(u) => group(person(&u.updaterAci)?, GroupNotice::Description),
+        U::GroupMembershipAccessLevelChangeUpdate(u) => group(
+            person(&u.updaterAci)?,
+            GroupNotice::MemberAccess { admins_only: admins_only(u.accessLevel.enum_value_or_default()) },
+        ),
+        U::GroupAttributesAccessLevelChangeUpdate(u) => group(
+            person(&u.updaterAci)?,
+            GroupNotice::InfoAccess { admins_only: admins_only(u.accessLevel.enum_value_or_default()) },
+        ),
+        U::GroupAnnouncementOnlyChangeUpdate(u) => {
+            group(person(&u.updaterAci)?, GroupNotice::AnnouncementsOnly { on: u.isAnnouncementOnly })
+        }
+        U::GroupAdminStatusUpdate(u) => group(
+            person(&u.updaterAci)?,
+            GroupNotice::Admin { member: required(&u.memberAci)?, admin: u.wasAdminStatusGranted },
+        ),
+        U::GroupMemberLeftUpdate(u) => {
+            let member = required(&u.aci)?;
+            group(member.clone(), GroupNotice::Removed { member })
+        }
+        U::GroupMemberRemovedUpdate(u) => group(person(&u.removerAci)?, GroupNotice::Removed { member: required(&u.removedAci)? }),
+        U::SelfInvitedToGroupUpdate(u) => group(person(&u.inviterAci)?, GroupNotice::Invited { member: None }),
+        U::SelfInvitedOtherUserToGroupUpdate(u) => group(None, GroupNotice::Invited { member: required(&u.inviteeServiceId)? }),
+        U::GroupUnknownInviteeUpdate(u) => group(person(&u.inviterAci)?, GroupNotice::InvitedMany { count: u.inviteeCount }),
+        U::GroupInvitationAcceptedUpdate(u) => {
+            let member = required(&u.newMemberAci)?;
+            group(member.clone(), GroupNotice::AcceptedInvite { member, inviter: inviter(&u.inviterAci) })
+        }
+        U::GroupInvitationDeclinedUpdate(u) => {
+            let member = person(&u.inviteeAci).flatten();
+            group(member.clone(), GroupNotice::InviteRemoved { member, inviter: inviter(&u.inviterAci) })
+        }
+        U::GroupMemberJoinedUpdate(u) => {
+            let member = required(&u.newMemberAci)?;
+            group(member.clone(), GroupNotice::Added { member })
+        }
+        U::GroupMemberAddedUpdate(u) => group(person(&u.updaterAci)?, GroupNotice::Added { member: required(&u.newMemberAci)? }),
+        U::GroupSelfInvitationRevokedUpdate(u) => {
+            group(person(&u.revokerAci)?, GroupNotice::InviteRemoved { member: None, inviter: Inviter::Unknown })
+        }
+        U::GroupInvitationRevokedUpdate(u) => {
+            let by = person(&u.updaterAci)?;
+            match u.invitees.as_slice() {
+                [one] => {
+                    let member = person(&one.inviteeAci).flatten();
+                    group(by, GroupNotice::InviteRemoved { member, inviter: inviter(&one.inviterAci) })
+                }
+                many => {
+                    // One inviter for them all, else unknown.
+                    let first = many.first().map(|i| inviter(&i.inviterAci)).unwrap_or(Inviter::Unknown);
+                    let same = many.iter().all(|i| inviter(&i.inviterAci) == first);
+                    let inviter = if same { first } else { Inviter::Unknown };
+                    group(by, GroupNotice::InvitesRemoved { count: many.len() as u32, inviter })
+                }
+            }
+        }
+        U::GroupJoinRequestUpdate(u) => {
+            let member = required(&u.requestorAci)?;
+            group(member.clone(), GroupNotice::Requested { member })
+        }
+        U::GroupJoinRequestApprovalUpdate(u) => {
+            let member = required(&u.requestorAci)?;
+            let by = person(&u.updaterAci)?;
+            if u.wasApproved {
+                group(by, GroupNotice::Approved { member })
+            } else {
+                group(by, GroupNotice::RequestRemoved { member })
+            }
+        }
+        U::GroupJoinRequestCanceledUpdate(u) => {
+            let member = required(&u.requestorAci)?;
+            group(member.clone(), GroupNotice::RequestRemoved { member })
+        }
+        U::GroupSequenceOfRequestsAndCancelsUpdate(u) => {
+            let member = required(&u.requestorAci)?;
+            group(member.clone(), GroupNotice::RequestRemoved { member })
+        }
+        U::GroupInviteLinkResetUpdate(u) => group(person(&u.updaterAci)?, GroupNotice::LinkReset),
+        U::GroupInviteLinkEnabledUpdate(u) => {
+            group(person(&u.updaterAci)?, GroupNotice::LinkOn { approval: u.linkRequiresAdminApproval })
+        }
+        U::GroupInviteLinkAdminApprovalUpdate(u) => {
+            group(person(&u.updaterAci)?, GroupNotice::LinkApproval { on: u.linkRequiresAdminApproval })
+        }
+        U::GroupInviteLinkDisabledUpdate(u) => group(person(&u.updaterAci)?, GroupNotice::LinkOff),
+        U::GroupMemberJoinedByLinkUpdate(u) => {
+            let member = required(&u.newMemberAci)?;
+            group(member.clone(), GroupNotice::JoinedByLink { member })
+        }
+        U::GroupExpirationTimerUpdate(u) => Some(Notice::Timer { by: person(&u.updaterAci)?, seconds: (u.expiresInMs / 1000) as u32 }),
+        U::GroupTerminateChangeUpdate(u) => group(person(&u.updaterAci)?, GroupNotice::Ended),
+        _ => None,
+    }
+}
+
 /// Imports a decrypted backup's chats and messages for account `me`.
 /// `progress` gets the bytes of `plain` imported so far.
 pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: impl FnMut(u64)) -> anyhow::Result<Imported> {
@@ -476,8 +646,9 @@ pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: imp
     Ok(imported)
 }
 
-/// One chat item; `Ok(false)` for kinds that aren't imported (group
-/// updates, calls, payments, …) or that have already disappeared.
+/// One chat item; `Ok(false)` for kinds that aren't imported (updates
+/// `update_notices` has no notice for, calls, payments, …) or that have
+/// already disappeared.
 async fn import_item(
     db: &AppDb,
     item: &proto::ChatItem,
@@ -521,6 +692,25 @@ async fn import_item(
         let who = conversation.as_direct().map(str::to_owned);
         let notice = signal_store::Notice::MessageRequest { event, group, who };
         return Ok(db.insert_notice(conversation, item.dateSent as i64, &notice).await?.is_some());
+    }
+    // The other updates this app shows, a millisecond apart as live group
+    // changes are (each of a group change's details is a notice here).
+    if let Some(Item::UpdateMessage(update)) = &item.item {
+        let author = match people.get(&item.authorId) {
+            Some(Who::Me) => Some(None),
+            Some(Who::Contact { sid, .. }) => Some(Some(sid.clone())),
+            _ => None,
+        };
+        let mut inserted = false;
+        let recipient = |id: u64| match people.get(&id) {
+            Some(Who::Me) => Some(None),
+            Some(Who::Contact { sid, .. }) => Some(Some(sid.clone())),
+            _ => None,
+        };
+        for (ix, notice) in update_notices(update, author, conversation, me, recipient).into_iter().enumerate() {
+            inserted |= db.insert_notice(conversation, item.dateSent as i64 + ix as i64, &notice).await?.is_some();
+        }
+        return Ok(inserted);
     }
     let (author, author_name) = person(item.authorId);
     let (direction, received_at, status, read) = match &item.directionalDetails {
@@ -1299,6 +1489,98 @@ mod tests {
         assert_eq!(signal.title, "Signal");
         let notes = db.messages(&signal.id, None, 10).await.unwrap();
         assert_eq!((notes[0].body.as_str(), notes[0].author.as_deref()), ("Something new", Some(signal_store::SIGNAL_ACI)));
+    }
+
+    #[test]
+    fn chat_updates_become_notices_as_desktop_imports_them() {
+        use proto::chat_update_message::Update;
+        use proto::simple_chat_update::Type;
+        use signal_store::{GroupNotice, Inviter, Notice};
+        let me = Aci::from_uuid_bytes([0x11; 16]).service_id_string();
+        let alice = Aci::from_uuid_bytes([0xa1; 16]).service_id_string();
+        let bob = Aci::from_uuid_bytes([0xb0; 16]).service_id_string();
+        let direct = ConversationId::direct(&alice);
+        let group = ConversationId::group(&[1; 32]);
+        let wrap = |update: Update| {
+            let mut message = proto::ChatUpdateMessage::new();
+            message.update = Some(update);
+            message
+        };
+        let simple = |kind: Type| {
+            let mut simple = proto::SimpleChatUpdate::new();
+            simple.type_ = kind.into();
+            wrap(Update::SimpleUpdate(simple))
+        };
+        let nobody = |_: u64| None;
+        let notices = |update: &proto::ChatUpdateMessage, author: Option<Option<String>>, chat: &ConversationId| {
+            update_notices(update, author, chat, &me, nobody)
+        };
+        let theirs = Some(Some(alice.clone()));
+        assert_eq!(notices(&simple(Type::IDENTITY_UPDATE), None, &direct), [Notice::SafetyNumberChanged { who: alice.clone() }]);
+        assert_eq!(notices(&simple(Type::IDENTITY_UPDATE), theirs.clone(), &group), [Notice::SafetyNumberChanged { who: alice.clone() }]);
+        assert_eq!(
+            notices(&simple(Type::IDENTITY_VERIFIED), theirs.clone(), &direct),
+            [Notice::Verified { who: alice.clone(), verified: true, local: false }]
+        );
+        assert_eq!(
+            notices(&simple(Type::IDENTITY_DEFAULT), theirs.clone(), &direct),
+            [Notice::Verified { who: alice.clone(), verified: false, local: false }]
+        );
+        assert_eq!(notices(&simple(Type::CHANGE_NUMBER), theirs.clone(), &group), [Notice::NumberChanged { who: alice.clone() }]);
+        assert_eq!(notices(&simple(Type::CHAT_SESSION_REFRESH), theirs.clone(), &direct), [Notice::SessionRefreshed]);
+        assert_eq!(notices(&simple(Type::BAD_DECRYPT), theirs.clone(), &group), [Notice::DeliveryIssue { who: alice.clone() }]);
+        assert_eq!(
+            notices(&simple(Type::UNSUPPORTED_PROTOCOL_MESSAGE), Some(None), &direct),
+            [Notice::UnsupportedMessage { who: None }]
+        );
+        assert_eq!(notices(&simple(Type::JOINED_SIGNAL), theirs.clone(), &direct), []);
+
+        let mut profile = proto::ProfileChangeChatUpdate::new();
+        profile.previousName = "Al".into();
+        profile.newName = "Alice".into();
+        assert_eq!(
+            notices(&wrap(Update::ProfileChange(profile)), theirs.clone(), &direct),
+            [Notice::ProfileNameChanged { who: alice.clone(), old_name: "Al".into(), new_name: "Alice".into() }]
+        );
+        let mut timer = proto::ExpirationTimerChatUpdate::new();
+        timer.expiresInMs = 86_400_000;
+        assert_eq!(notices(&wrap(Update::ExpirationTimerChange(timer)), Some(None), &direct), [Notice::Timer { by: None, seconds: 86_400 }]);
+
+        // A group change's details, in order; ones naming nobody are left out.
+        let mut change = proto::GroupChangeChatUpdate::new();
+        let detail = |u: proto::group_change_chat_update::update::Update| {
+            let mut detail = proto::group_change_chat_update::Update::new();
+            detail.update = Some(u);
+            detail
+        };
+        use proto::group_change_chat_update::update::Update as U;
+        let mut name = proto::GroupNameUpdate::new();
+        name.updaterAci = Some(vec![0xa1; 16]);
+        name.newGroupName = Some("Hikers".into());
+        let mut left = proto::GroupMemberLeftUpdate::new();
+        left.aci = vec![0xb0; 16];
+        let mut accepted = proto::GroupInvitationAcceptedUpdate::new();
+        accepted.newMemberAci = vec![0xb0; 16];
+        accepted.inviterAci = Some(vec![0x11; 16]);
+        let anonymous = proto::GroupAvatarUpdate::new();
+        let mut ended = proto::GroupTerminateChangeUpdate::new();
+        ended.updaterAci = Some(vec![0x11; 16]);
+        change.updates = vec![
+            detail(U::GroupNameUpdate(name)),
+            detail(U::GroupMemberLeftUpdate(left)),
+            detail(U::GroupInvitationAcceptedUpdate(accepted)),
+            detail(U::GroupAvatarUpdate(anonymous)),
+            detail(U::GroupTerminateChangeUpdate(ended)),
+        ];
+        assert_eq!(
+            notices(&wrap(Update::GroupChange(change)), None, &group),
+            [
+                Notice::Group { by: Some(alice.clone()), change: GroupNotice::Title { title: "Hikers".into() } },
+                Notice::Group { by: Some(bob.clone()), change: GroupNotice::Removed { member: Some(bob.clone()) } },
+                Notice::Group { by: Some(bob.clone()), change: GroupNotice::AcceptedInvite { member: Some(bob.clone()), inviter: Inviter::Us } },
+                Notice::Group { by: None, change: GroupNotice::Ended },
+            ]
+        );
     }
 
     #[test]
