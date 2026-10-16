@@ -53,6 +53,7 @@ mod tests {
             long_text: None,
             poll: None,
             view_once: None,
+            content: None,
             sealed_sender: Vec::new(),
             is_read: true,
         }

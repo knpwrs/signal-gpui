@@ -55,6 +55,10 @@ pub enum Action {
         /// sent to each (Desktop's `createSentMessage` keeps them as
         /// `sendStateByConversationId`).
         sent_to: Vec<String>,
+        /// A shared contact, payment or gift badge (`message.body` is empty).
+        content: Option<signal_store::MessageContent>,
+        /// A shared contact's photo, for downloading.
+        content_image: Option<AttachmentPointer>,
     },
     React {
         conversation: ConversationId,
@@ -1017,8 +1021,8 @@ pub fn remote_of(pointer: &AttachmentPointer) -> Option<signal_store::RemoteAtta
     })
 }
 
-/// Body text for a data message, including fallbacks for content types the
-/// UI doesn't render natively.
+/// Body text for a data message: its text, or a sticker's emoji or a
+/// poll's question.
 fn body_text(dm: &DataMessage) -> String {
     if let Some(body) = dm.body.as_deref().filter(|b| !b.is_empty()) {
         return body.to_owned();
@@ -1029,15 +1033,9 @@ fn body_text(dm: &DataMessage) -> String {
     if let Some(poll) = &dm.poll_create {
         return poll.question.clone().unwrap_or_default();
     }
-    if dm.payment.is_some() {
-        return "💸 Payment".into();
-    }
-    if dm.gift_badge.is_some() {
-        return "🎁 Gift badge".into();
-    }
-    if !dm.contact.is_empty() {
-        return "👤 Contact".into();
-    }
+    // A contact, payment or gift badge is `message_content`, not text; one
+    // that can't be read leaves the message empty, and Desktop drops an
+    // empty message (`isMessageEmpty`).
     String::new()
 }
 
@@ -1197,8 +1195,14 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
         _ => signal_store::ViewOnce::Invalid,
     });
     let erased = view_once.is_some_and(|v| v != signal_store::ViewOnce::Ready);
+    // A contact, payment or gift badge shows in place of any text
+    // (Desktop's `Message` renders them instead of the body).
+    let (content, content_image) = match message_content(dm).filter(|_| view_once.is_none() && poll.is_none()) {
+        Some((content, image)) => (Some(content), image),
+        None => (None, None),
+    };
     let body = match &poll {
-        _ if view_once.is_some() => String::new(),
+        _ if view_once.is_some() || content.is_some() => String::new(),
         Some(poll) => poll.question.clone(),
         None => body_text(dm),
     };
@@ -1209,7 +1213,7 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
     // A poll's body is its question, never a long text.
     let long_text = if poll.is_some() || view_once.is_some() { None } else { long_text_of(dm) };
     // (A view-once message stays, even with nothing left of it.)
-    if body.is_empty() && pointers.is_empty() && long_text.is_none() && view_once.is_none() {
+    if body.is_empty() && pointers.is_empty() && long_text.is_none() && view_once.is_none() && content.is_none() {
         // Profile key updates, group changes, call updates, etc.
         return Vec::new();
     }
@@ -1282,7 +1286,90 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
         server_guid: None,
         sealed_sender: Vec::new(),
         sent_to: Vec::new(),
+        content,
+        content_image,
     }]
+}
+
+/// What a message holds in place of text, as Desktop's `processDataMessage`
+/// reads it (`processContact`, `processPayment`, `processGiftBadge`), with
+/// a shared contact's photo to download. A payment or activation event
+/// Desktop doesn't know, or a gift badge without a valid receipt, is none.
+pub fn message_content(dm: &DataMessage) -> Option<(signal_store::MessageContent, Option<AttachmentPointer>)> {
+    use signal_store::{ContactMethod, ContactMethodKind, MessageContent, PaymentEvent};
+    if let Some(contact) = dm.contact.first() {
+        let text = |value: &Option<String>| value.clone().filter(|v| !v.is_empty());
+        let name = contact.name.clone().unwrap_or_default();
+        let methods = |items: Vec<(Option<String>, Option<i32>, Option<String>)>| {
+            items
+                .into_iter()
+                .filter_map(|(value, kind, label)| {
+                    Some(ContactMethod { value: text(&value)?, kind: ContactMethodKind::from_wire(kind), label: text(&label) })
+                })
+                .collect()
+        };
+        let image = contact.avatar.as_ref().and_then(|a| a.avatar.clone());
+        let shared = signal_store::SharedContact {
+            given_name: name.given_name.unwrap_or_default(),
+            family_name: name.family_name.unwrap_or_default(),
+            prefix: name.prefix.unwrap_or_default(),
+            suffix: name.suffix.unwrap_or_default(),
+            middle_name: name.middle_name.unwrap_or_default(),
+            nickname: name.nickname.unwrap_or_default(),
+            aci: contact
+                .aci_binary
+                .as_deref()
+                .and_then(Aci::parse_from_service_id_binary)
+                .map(|aci| aci.service_id_string()),
+            signal_nickname_given: contact.nickname.as_ref().and_then(|n| n.given.clone()).unwrap_or_default(),
+            signal_nickname_family: contact.nickname.as_ref().and_then(|n| n.family.clone()).unwrap_or_default(),
+            note: text(&contact.note),
+            numbers: methods(contact.number.iter().map(|p| (p.value.clone(), p.r#type, p.label.clone())).collect()),
+            emails: methods(contact.email.iter().map(|e| (e.value.clone(), e.r#type, e.label.clone())).collect()),
+            addresses: contact
+                .address
+                .iter()
+                .map(|a| signal_store::PostalAddress {
+                    kind: signal_store::AddressKind::from_wire(a.r#type),
+                    label: text(&a.label),
+                    street: text(&a.street),
+                    pobox: text(&a.pobox),
+                    neighborhood: text(&a.neighborhood),
+                    city: text(&a.city),
+                    region: text(&a.region),
+                    postcode: text(&a.postcode),
+                    country: text(&a.country),
+                })
+                .collect(),
+            organization: text(&contact.organization),
+            avatar: image.as_ref().map(attachment_meta),
+        };
+        return Some((MessageContent::Contact(Box::new(shared)), image));
+    }
+    if let Some(payment) = &dm.payment {
+        use data_message::payment::{Item, activation::Type};
+        let event = match &payment.item {
+            Some(Item::Notification(notification)) => PaymentEvent::Notification { note: notification.note.clone() },
+            Some(Item::Activation(activation)) => match activation.r#type.map(Type::try_from) {
+                Some(Ok(Type::Request)) => PaymentEvent::ActivationRequest,
+                Some(Ok(Type::Activated)) => PaymentEvent::Activated,
+                _ => return None,
+            },
+            None => return None,
+        };
+        return Some((MessageContent::Payment(event), None));
+    }
+    let receipt = dm.gift_badge.as_ref()?.receipt_credential_presentation.as_deref().filter(|r| !r.is_empty())?;
+    let presentation: presage::libsignal_service::zkgroup::receipts::ReceiptCredentialPresentation =
+        presage::libsignal_service::zkgroup::deserialize(receipt).ok()?;
+    let gift = signal_store::GiftBadge {
+        level: presentation.get_receipt_level(),
+        expiration: (presentation.get_receipt_expiration_time().epoch_seconds() as i64).saturating_mul(1000),
+        // Desktop's state for a new one, ours or theirs.
+        state: signal_store::GiftBadgeState::Unopened,
+        badge_id: None,
+    };
+    Some((MessageContent::GiftBadge(gift), None))
 }
 
 /// Desktop's `isValidTapToView` (`ts/util/isValidTapToView.std.ts`): no
@@ -1501,6 +1588,8 @@ fn map_story_reply(
         server_guid: None,
         sealed_sender: Vec::new(),
         sent_to: Vec::new(),
+        content: None,
+        content_image: None,
     });
     out
 }

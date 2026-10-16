@@ -174,6 +174,32 @@ fn parse_badge(item: &serde_json::Value) -> Option<Badge> {
     })
 }
 
+/// The badge each donation level stands for, from the subscription
+/// configuration (Desktop's `parseBoostBadgeListFromServer`,
+/// `ts/badges/parseBadgesFromServer.std.ts`): a level without a badge it
+/// can read is left out.
+pub(crate) fn level_badges(config: &serde_json::Value) -> std::collections::HashMap<u64, Badge> {
+    let Some(levels) = config["levels"].as_object() else { return Default::default() };
+    levels
+        .iter()
+        .filter_map(|(level, item)| Some((level.parse().ok()?, parse_badge(&item["badge"])?)))
+        .collect()
+}
+
+/// Fetches the subscription configuration (`GET /v1/subscription/configuration`,
+/// unauthenticated, as Desktop's `getSubscriptionConfiguration`) and reads
+/// its donation levels' badges.
+pub(crate) async fn fetch_level_badges(manager: &SignalManager) -> anyhow::Result<std::collections::HashMap<u64, Badge>> {
+    let service = crate::storage::push_service(manager)?;
+    let response = service
+        .request(reqwest::Method::GET, Endpoint::service("/v1/subscription/configuration"), HttpAuthOverride::Unidentified)?
+        .send()
+        .await?
+        .error_for_status()?;
+    let config: serde_json::Value = serde_json::from_slice(&response.bytes().await?)?;
+    Ok(level_badges(&config))
+}
+
 /// Whether their profile has donor badges (what Desktop checks of ours for
 /// a donation megaphone).
 pub(crate) async fn has_badges(manager: &SignalManager, aci: Aci, key: ProfileKey) -> anyhow::Result<bool> {
@@ -509,5 +535,23 @@ mod tests {
         );
         // Undecryptable or missing fields stay empty.
         assert_eq!(profile.profile.given_name, "");
+    }
+
+    #[test]
+    fn donation_levels_name_their_badges() {
+        let config = serde_json::json!({
+            "levels": {
+                "100": { "name": "Gift", "badge": {
+                    "id": "BOOST", "category": "donor", "name": "Signal Boost", "description": "{short_name} donated",
+                    "svg": "boost.svg", "svgs": [{"light": "b1"}, {"light": "b2"}, {"light": "b3"}]
+                } },
+                "200": { "name": "Broken", "badge": { "id": "X" } },
+                "many": { "badge": {} }
+            }
+        });
+        let badges = level_badges(&config);
+        assert_eq!(badges.keys().collect::<Vec<_>>(), [&100]);
+        assert_eq!(badges[&100].id, "BOOST");
+        assert!(level_badges(&serde_json::json!({})).is_empty());
     }
 }

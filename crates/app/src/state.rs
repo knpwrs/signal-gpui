@@ -2730,6 +2730,11 @@ fn notification_preview(message: &signal_store::Message) -> String {
     if let Some(view_once) = message.view_once {
         return signal_store::view_once_preview(view_once, message.attachments.first()).into();
     }
+    if let Some(content) = &message.content {
+        let sender = (message.direction == signal_store::Direction::Incoming)
+            .then(|| message.author_name.clone().unwrap_or_else(|| "Unknown contact".into()));
+        return signal_store::content_preview(content, sender.as_deref(), None);
+    }
     if !message.body.is_empty() {
         // Spoilers stay hidden (Desktop shows "■■■■").
         let body = signal_store::hide_spoilers(&message.body, &message.styles);

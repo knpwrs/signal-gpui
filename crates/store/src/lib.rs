@@ -14,6 +14,7 @@ use sqlx::{
 
 mod call_history;
 mod call_links;
+mod content;
 mod early;
 mod message_requests;
 mod nickname;
@@ -25,6 +26,7 @@ mod stories;
 mod view_once;
 pub use call_history::*;
 pub use call_links::*;
+pub use content::*;
 pub use early::*;
 pub use message_requests::*;
 pub use nickname::*;
@@ -389,6 +391,8 @@ pub struct Message {
     pub poll: Option<Poll>,
     /// A view-once message, and where it is in its one viewing.
     pub view_once: Option<ViewOnce>,
+    /// A shared contact, payment or gift badge, shown in place of the text.
+    pub content: Option<MessageContent>,
     /// Who it came from, or went to, by sealed sender (service ids).
     pub sealed_sender: Vec<String>,
     /// Read here (ours and most notices always are).
@@ -1082,7 +1086,7 @@ const CONVERSATION_COLUMNS: &str = "id, kind, title, phone, color, members, last
                OR EXISTS (SELECT 1 FROM profile_sharing p WHERE p.id = 'd:' || conversations.added_by)))) AS accepted";
 
 const MESSAGE_COLUMNS: &str = "id, conversation_id, sent_at, received_at, direction, author, \
-     author_name, body, status, reactions, quote, attachments, link_preview, deleted, edited, expires_in, expire_start, edit_count, notice, mentions, styles, cta, deleted_by_admin, long_text, poll, view_once, sealed_sender, is_read";
+     author_name, body, status, reactions, quote, attachments, link_preview, deleted, edited, expires_in, expire_start, edit_count, notice, mentions, styles, cta, deleted_by_admin, long_text, poll, view_once, sealed_sender, is_read, content";
 
 /// SQL matching a message whose own timestamp, or one of its edits', is
 /// the bound parameter `{param}`.
@@ -1304,6 +1308,7 @@ fn message_from_row(row: &SqliteRow) -> Result<Message> {
         long_text: row.try_get::<Option<String>, _>("long_text")?.map(|l| serde_json::from_str(&l)).transpose()?,
         poll: row.try_get::<Option<String>, _>("poll")?.map(|p| serde_json::from_str(&p)).transpose()?,
         view_once: row.try_get::<Option<i64>, _>("view_once")?.map(ViewOnce::from_i64),
+        content: row.try_get::<Option<String>, _>("content")?.map(|c| serde_json::from_str(&c)).transpose()?,
         sealed_sender: row
             .try_get::<Option<String>, _>("sealed_sender")?
             .map(|s| serde_json::from_str(&s))
@@ -3096,7 +3101,7 @@ async fn current_long_text(conn: &mut sqlx::SqliteConnection, message_id: i64) -
 
 async fn refresh_preview(conn: &mut sqlx::SqliteConnection, id: &ConversationId) -> Result<()> {
     let row = sqlx::query(
-        "SELECT m.sent_at, m.body, m.styles, m.deleted, m.attachments, m.direction, m.author_name, m.poll, m.view_once, m.notice, c.kind, \
+        "SELECT m.sent_at, m.body, m.styles, m.deleted, m.attachments, m.direction, m.author_name, m.poll, m.view_once, m.notice, m.content, c.kind, c.title, \
             COALESCE((SELECT name FROM contact_names n WHERE n.service_id = json_extract(m.notice, '$.by')), \
                 (SELECT title FROM conversations p WHERE p.id = 'd:' || json_extract(m.notice, '$.by'))) AS notice_by_name \
          FROM messages m JOIN conversations c ON c.id = m.conversation_id \
@@ -3140,6 +3145,12 @@ async fn refresh_preview(conn: &mut sqlx::SqliteConnection, id: &ConversationId)
                 view_once_preview(view_once, atts.first()).to_owned()
             } else if let Some(poll) = poll {
                 poll_preview(&poll.question)
+            } else if let Some(content) = row.try_get::<Option<String>, _>("content")?.and_then(|c| serde_json::from_str::<MessageContent>(&c).ok()) {
+                let incoming = row.try_get::<i64, _>("direction")? == 0;
+                let sender: Option<String> = row.try_get("author_name")?;
+                let sender = incoming.then(|| sender.filter(|n| !n.is_empty()).unwrap_or_else(|| "Unknown contact".into()));
+                let chat: Option<String> = row.try_get("title")?;
+                content_preview(&content, sender.as_deref(), chat.as_deref())
             } else if !body.is_empty() {
                 // Line breaks collapse to spaces; the list clamps to two lines.
                 body.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(300).collect()

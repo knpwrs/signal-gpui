@@ -348,8 +348,7 @@ and the server's API and haven't been tried. Not done:
 - **Hero:** an accepted group doesn't get Desktop's "Name not verified"
   (Desktop's `isGroupNameVerified` needs who added us to be trusted); a
   request does.
-- **Badges:** our own badges' visibility can't be changed, and gift
-  badges aren't shown.
+- **Badges:** our own badges' visibility can't be changed.
 - **Phone number sharing:** read from the account record for profile
   writes; there's no setting to change it here.
 
@@ -566,3 +565,26 @@ server or a phone. Left:
   ignored.
 - **Unsupported messages:** Desktop shows "Update Signal"; nothing here
   updates the app, so there's no button.
+
+## Shared contacts, payments and gift badges
+
+Shown as Desktop shows them (`EmbeddedContact` and `ContactDetail`,
+`renderPayment` and `PaymentEventNotification`, `renderGiftBadge` and
+`OutgoingGiftBadgeModal`), read only. Tested with mapping tests (a gift
+badge's receipt is made with zkgroup's own issuance, made-up keys), store
+tests and a demo-mode UI test; nothing here has met a real message. Left:
+
+- **Transferred history:** contacts, payments and gift badges in the
+  link-time backup aren't imported (`ContactMessage`, `PaymentNotification`,
+  `GiftBadge` chat items are skipped as before).
+- **Matching a contact's number:** only numbers written as E.164 (`+` and
+  digits) find a chat; Desktop normalizes others with our region first.
+  "Add to a group" from the details isn't there.
+- **Early view syncs:** a gift badge viewed on the phone before its message
+  arrives here stays unopened (view syncs aren't kept early).
+- **The gift box:** drawn as an emoji on a red card, not Desktop's ribbon
+  and bow images.
+- **Badge lookup:** the subscription configuration's fetch
+  (`GET /v1/subscription/configuration`) hasn't been tried against the
+  server.
+

@@ -436,9 +436,42 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
     // Priya, Sam and Leo: older 1:1s; Priya's is archived.
     db.insert_message(&incoming(PRIYA, PRIYA, now - 20 * DAY, "Thanks for the help with the move!")).await?;
     db.insert_message(&outgoing(PRIYA, now - 20 * DAY + 30 * MINUTE, "Of course! The new place looks great", DeliveryStatus::Read)).await?;
-    db.set_archived(&ConversationId(PRIYA.into()), true).await?;
     db.insert_message(&outgoing(SAM, now - 9 * DAY, "Great meeting you at Maya's!", DeliveryStatus::Read)).await?;
     db.insert_message(&incoming(SAM, SAM, now - 9 * DAY + HOUR, "You too! Let me know next time you all go hiking")).await?;
+    // What Desktop shows in place of text: a shared contact (made up), a
+    // payment Sam started, and a donation we made for Priya, opened on our
+    // phone.
+    let shared = db.insert_message(&incoming(LEO, LEO, now - 13 * DAY, "")).await?;
+    let plumber = signal_store::SharedContact {
+        given_name: "Rosa".into(),
+        family_name: "Delgado".into(),
+        organization: Some("Delgado Plumbing".into()),
+        numbers: vec![signal_store::ContactMethod {
+            value: "+15550100142".into(),
+            kind: signal_store::ContactMethodKind::Work,
+            label: None,
+        }],
+        emails: vec![signal_store::ContactMethod {
+            value: "rosa@example.com".into(),
+            kind: signal_store::ContactMethodKind::Work,
+            label: None,
+        }],
+        ..Default::default()
+    };
+    db.set_content(shared, &signal_store::MessageContent::Contact(Box::new(plumber))).await?;
+    let paid = db.insert_message(&incoming(SAM, SAM, now - 10 * DAY, "")).await?;
+    let payment = signal_store::PaymentEvent::Notification { note: Some("Gas money for the trip".into()) };
+    db.set_content(paid, &signal_store::MessageContent::Payment(payment)).await?;
+    let gift = db.insert_message(&outgoing(PRIYA, now - 21 * DAY, "", DeliveryStatus::Read)).await?;
+    let badge = signal_store::GiftBadge {
+        level: 100,
+        expiration: now + 30 * DAY,
+        state: signal_store::GiftBadgeState::Opened,
+        badge_id: None,
+    };
+    db.set_content(gift, &signal_store::MessageContent::GiftBadge(badge)).await?;
+    // (Archived after our message, which would bring it back.)
+    db.set_archived(&ConversationId(PRIYA.into()), true).await?;
     db.insert_message(&incoming(LEO, LEO, now - 12 * DAY, "Did you take the recycling out?")).await?;
     db.insert_message(&outgoing(LEO, now - 12 * DAY + 4 * MINUTE, "Yep, this morning", DeliveryStatus::Read)).await?;
     for read in [PRIYA, SAM, LEO, SELF] {

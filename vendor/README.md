@@ -126,3 +126,7 @@ Powers for signal-gpui since 2026-10-15. Changes:
   `showUnreadReminders`), from Signal Desktop's `protos/SignalStorage.proto`,
   so the notification settings can be read. Writes edit the record's wire
   bytes, so fields neither proto knows are kept.
+- `protobuf/SignalService.proto`: `DataMessage.Contact` fields 8 to 10
+  (`aciBinary`, `nickname` as a `SignalNickname`, `note`), from Signal
+  Desktop's `protos/SignalService.proto`, so a shared contact's Signal
+  account, nickname and note can be shown.

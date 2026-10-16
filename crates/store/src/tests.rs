@@ -941,6 +941,7 @@ async fn drop_later_migrations(db: &AppDb) {
     sqlx::query("ALTER TABLE messages DROP COLUMN sealed_sender").execute(&db.writer).await.unwrap();
     sqlx::query("DROP TABLE message_send_states").execute(&db.writer).await.unwrap();
     sqlx::query("ALTER TABLE messages DROP COLUMN viewed").execute(&db.writer).await.unwrap();
+    sqlx::query("ALTER TABLE messages DROP COLUMN content").execute(&db.writer).await.unwrap();
 }
 
 /// Rewrites the migration history to look like a pre-squash database that
@@ -2408,4 +2409,65 @@ async fn sealed_sender_is_kept_per_message() {
     assert!(db.message(id).await.unwrap().unwrap().sealed_sender.is_empty());
     db.set_sealed_sender(id, &["alice".to_owned()]).await.unwrap();
     assert_eq!(db.message(id).await.unwrap().unwrap().sealed_sender, ["alice"]);
+}
+
+#[tokio::test]
+async fn message_content_previews_and_gift_badge_states() {
+    let db = test_db().await;
+    let gift = |state| MessageContent::GiftBadge(GiftBadge { level: 100, expiration: 9_000, state, badge_id: None });
+    let preview = |db: AppDb| async move {
+        db.conversations().await.unwrap().into_iter().find(|c| c.id == conv("d:a")).and_then(|c| c.last_message_preview)
+    };
+
+    let theirs = db.insert_message(&incoming("d:a", "a", 1_000, "")).await.unwrap();
+    db.set_content(theirs, &gift(GiftBadgeState::Unopened)).await.unwrap();
+    assert_eq!(preview(db.clone()).await.as_deref(), Some("✨ a Name donated for you"));
+    // A re-delivery doesn't take it back to unopened.
+    assert!(db.gift_badge_viewed(theirs, true).await.unwrap());
+    db.set_content(theirs, &gift(GiftBadgeState::Unopened)).await.unwrap();
+    let message = db.message(theirs).await.unwrap().unwrap();
+    assert_eq!(message.content, Some(gift(GiftBadgeState::Redeemed)));
+    assert_eq!(preview(db.clone()).await.as_deref(), Some("✨ You redeemed a donation"));
+    assert!(!db.gift_badge_viewed(theirs, true).await.unwrap(), "already redeemed");
+    assert!(db.set_gift_badge_id(theirs, "BOOST").await.unwrap());
+
+    // Not a gift badge: nothing to view.
+    let contact = db.insert_message(&incoming("d:a", "a", 2_000, "")).await.unwrap();
+    let shared = SharedContact {
+        given_name: "Rosa".into(),
+        avatar: Some(AttachmentMeta {
+            content_type: "image/jpeg".into(),
+            file_name: None,
+            size: 10,
+            width: None,
+            height: None,
+            local_path: None,
+            sticker: false,
+            gif: false,
+            voice: false,
+            remote: None,
+            thumbnail_path: None,
+        }),
+        ..Default::default()
+    };
+    db.set_content(contact, &MessageContent::Contact(Box::new(shared))).await.unwrap();
+    assert!(!db.gift_badge_viewed(contact, true).await.unwrap());
+    assert_eq!(preview(db.clone()).await.as_deref(), Some("👤 Rosa"));
+    assert!(db.set_contact_avatar_path(contact, "/tmp/rosa.jpg").await.unwrap());
+    let Some(MessageContent::Contact(saved)) = db.message(contact).await.unwrap().unwrap().content else { panic!() };
+    assert_eq!(saved.avatar.unwrap().local_path.as_deref(), Some("/tmp/rosa.jpg"));
+
+    let paid = db.insert_message(&outgoing("d:a", 3_000, "")).await.unwrap();
+    db.set_content(paid, &MessageContent::Payment(PaymentEvent::Activated)).await.unwrap();
+    assert_eq!(preview(db.clone()).await.as_deref(), Some("💳 You activated Payments."));
+}
+
+#[test]
+fn payment_descriptions_are_desktops() {
+    let note = PaymentEvent::Notification { note: None };
+    assert_eq!(note.description(Some("Sam"), Some("Sam")), "Sam started a payment to you");
+    assert_eq!(note.description(None, Some("Sam")), "You started a payment to Sam");
+    assert_eq!(PaymentEvent::ActivationRequest.description(None, None), "You sent a request to activate Payments.");
+    assert_eq!(PaymentEvent::Activated.description(Some("Sam"), None), "Sam can now accept Payments.");
+    assert_eq!(content_preview(&MessageContent::Payment(note), Some("Sam"), None), "💳 Payment");
 }

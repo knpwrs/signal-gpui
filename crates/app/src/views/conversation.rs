@@ -1521,6 +1521,33 @@ impl ConversationView {
                 None => notice,
             };
         }
+        // Desktop's `PaymentEventNotification`: a payment activation event
+        // shows as a notice.
+        if let Some(signal_store::MessageContent::Payment(event)) = message.content.as_ref().filter(|_| !message.deleted)
+            && !event.is_notification()
+        {
+            let sender = message.author.as_ref().map(|a| self.reactor_name(Some(a), cx));
+            let chat = self.state.read(cx).conversation(&self.id).map(|c| c.title.clone());
+            let text = event.description(sender.as_deref(), chat.as_deref());
+            return div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .when(show_day, |d| {
+                    d.child(div().pt_4().pb_2().flex().justify_center().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(palette.text_secondary).child(day_label(message.sent_at)))
+                })
+                .child(
+                    div()
+                        .debug_selector(|| format!("payment-event-{}", message.id))
+                        .py_2()
+                        .px_6()
+                        .text_center()
+                        .text_sm()
+                        .text_color(palette.text_secondary)
+                        .child(format!("💳 {text}")),
+                )
+                .into_any_element();
+        }
         let first_in_group = show_day || prev.is_none_or(|p| !same_group(p, &message));
         let last_in_group = next.is_none_or(|n| !same_group(&message, n));
         let outgoing = message.direction == Direction::Outgoing;
@@ -1771,6 +1798,10 @@ impl ConversationView {
 
         if let Some(view_once) = message.view_once.filter(|_| !message.deleted) {
             return self.render_view_once(message, view_once, show_author, corners, (bg, fg, meta_color), meta.map(IntoElement::into_any_element), palette, cx);
+        }
+
+        if let Some(content) = message.content.as_ref().filter(|_| !message.deleted) {
+            return self.render_content(message, content, show_author, corners, (bg, fg, meta_color), meta, palette, cx);
         }
 
         // Stickers stand alone, without a bubble, at Desktop's size.
@@ -2028,6 +2059,66 @@ impl ConversationView {
                 }
             })
             .when_some(meta, |d, m| d.child(place_meta(m, inline_meta)))
+            .into_any_element()
+    }
+
+    /// A shared contact, payment or gift badge in its bubble, with the
+    /// author and quote above as for text.
+    #[allow(clippy::too_many_arguments)]
+    fn render_content(
+        &self,
+        message: &Message,
+        content: &signal_store::MessageContent,
+        show_author: bool,
+        corners: Corners,
+        (bg, fg, meta_color): (Hsla, Hsla, Hsla),
+        meta: Option<impl IntoElement>,
+        palette: Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::views::message_content as mc;
+        use signal_store::MessageContent;
+        let outgoing = message.direction == Direction::Outgoing;
+        let secondary = if outgoing { meta_color } else { palette.text_secondary };
+        let chat = self.state.read(cx).conversation(&self.id).map(|c| c.title.clone());
+        let body = match content {
+            MessageContent::Contact(contact) => mc::render_contact(message.id, contact, outgoing, fg, secondary, &self.state, cx),
+            MessageContent::Payment(event) => {
+                let sender = message.author.as_ref().map(|a| self.reactor_name(Some(a), cx));
+                let note = match event {
+                    signal_store::PaymentEvent::Notification { note } => note.clone(),
+                    _ => None,
+                };
+                mc::render_payment(event.description(sender.as_deref(), chat.as_deref()), note, fg, secondary)
+            }
+            MessageContent::GiftBadge(gift) => {
+                mc::render_gift_badge(message.id, gift, outgoing, chat.unwrap_or_default(), fg, secondary, &self.state, cx)
+            }
+        };
+        let author_name = message.author_name.clone().unwrap_or_else(|| "Unknown".into());
+        let author_open = message.author.clone().map(|a| (self.state.clone(), a, self.id.clone()));
+        let author_color = {
+            let members = self.state.read(cx).conversation(&self.id).map(|c| c.members.clone()).unwrap_or_default();
+            crate::theme::name_color(&members, message.author.as_deref().unwrap_or(""), gpui_kit::component::ActiveTheme::theme(&**cx).is_dark())
+        };
+        let author_label = message
+            .author
+            .as_deref()
+            .and_then(|author| self.state.read(cx).conversation(&self.id)?.member_labels.get(author).cloned());
+        corners
+            .apply(div())
+            .debug_selector(|| format!("bubble-{}", message.id))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .bg(bg)
+            .text_color(fg)
+            .when(show_author && !outgoing, |d| d.child(author_line(author_name, author_color, author_label, author_open)))
+            .when_some(message.quote.clone(), |d, quote| d.child(self.render_quote(message.id, quote, fg, palette, cx)))
+            .child(body)
+            .when_some(meta, |d, m| d.child(place_meta(m, false)))
             .into_any_element()
     }
 
@@ -4826,6 +4917,7 @@ mod tests {
             long_text: None,
             poll: None,
             view_once: None,
+            content: None,
             sealed_sender: Vec::new(),
             is_read: true,
         }
@@ -5051,6 +5143,41 @@ mod tests {
         });
         let full = bounds(&mut cx, format!("bubble-{id}"));
         assert!(full.size.height > short.size.height * 1.5, "{short:?} then {full:?}");
+    }
+
+    #[gpui_kit::test]
+    fn shared_contacts_payments_and_gift_badges_show_as_desktops_do(cx: &mut TestAppContext) {
+        const LEO: &str = "d:00000000-0000-4000-8000-0000000000f1";
+        const SAM: &str = "d:00000000-0000-4000-8000-0000000000e0";
+        const PRIYA: &str = "d:00000000-0000-4000-8000-0000000000c0";
+        let (backend, _dir) = demo_backend(cx);
+        let contact = wait_for_messages(&backend, LEO, 1, |m| m.content.is_some()).remove(0);
+        let payment = wait_for_messages(&backend, SAM, 1, |m| m.content.is_some()).remove(0);
+        let gift = wait_for_messages(&backend, PRIYA, 1, |m| m.content.is_some()).remove(0);
+
+        // The payment notification: who, the phone has its status, the note.
+        let (mut sam, _view) = open_view(cx, &backend, SAM);
+        bounds(&mut sam, format!("bubble-{}", payment.id));
+        // Our gift for Priya, opened on the phone: "View" opens Desktop's
+        // thank-you dialog.
+        let (mut priya, _view) = open_view(cx, &backend, PRIYA);
+        bounds(&mut priya, format!("bubble-{}", gift.id));
+        let view: &'static str = Box::leak(format!("gift-badge-{}", gift.id).into_boxed_str());
+        crate::views::test_support::press(&mut priya, view);
+        assert!(crate::views::test_support::shows(&mut priya, "outgoing-gift-badge"));
+
+        // The contact: its card opens Desktop's details. Rosa has no chat
+        // here, so there's no "Message".
+        let (mut leo, _view) = open_view(cx, &backend, LEO);
+        bounds(&mut leo, format!("bubble-{}", contact.id));
+        let card: &'static str = Box::leak(format!("shared-contact-{}", contact.id).into_boxed_str());
+        leo.update(|window, cx| {
+            use gpui_kit::test::TestWindowExt as _;
+            window.render_frame(cx);
+            assert!(window.try_find(format!("shared-contact-message-{}", contact.id)).is_none());
+        });
+        crate::views::test_support::press(&mut leo, card);
+        assert!(crate::views::test_support::shows(&mut leo, "shared-contact-detail"));
     }
 
     #[test]

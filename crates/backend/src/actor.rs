@@ -2,6 +2,7 @@
 //! the app database. Runs on a `LocalSet` because presage's futures are `!Send`.
 
 mod call_log;
+mod content;
 mod call_links;
 mod calls;
 mod early;
@@ -1398,6 +1399,8 @@ impl Actor {
                 server_guid,
                 sealed_sender,
                 sent_to,
+                content,
+                content_image,
             } => {
                 let mut spans = Vec::new();
                 let mut style_spans = Vec::new();
@@ -1512,6 +1515,13 @@ impl Actor {
                             && let Err(error) = self.db.set_poll(id, poll).await
                         {
                             self.error("failed to store poll", error);
+                        }
+                        // (A re-delivery keeps what the first had.)
+                        if let Some(content) = content.as_ref().filter(|_| !repeat) {
+                            match self.db.set_content(id, content).await {
+                                Ok(()) => self.content_stored(manager, &conversation, id, content, content_image.clone(), held),
+                                Err(error) => self.error("failed to store message content", error),
+                            }
                         }
                         // Deletes, edits, reactions, votes, receipts and
                         // syncs that came before it. One read on another
@@ -1652,7 +1662,10 @@ impl Actor {
             }
             Action::StoryViewed { viewer, sent_at, at } => self.apply_story_viewed(viewer, sent_at, at).await,
             Action::StoryRecipientUpdate { sent_at, recipients } => self.apply_story_recipient_update(sent_at, recipients).await,
-            Action::ViewedSync(viewed) => self.apply_viewed_sync(viewed).await,
+            Action::ViewedSync(viewed) => {
+                self.gift_badges_viewed(&viewed).await;
+                self.apply_viewed_sync(viewed).await
+            }
             Action::ViewOnceOpen { .. } => {
                 self.modify(manager, action).await;
             }

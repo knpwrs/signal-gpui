@@ -480,6 +480,7 @@ fn sealed_sender_shows_in_message_details_when_on(cx: &mut TestAppContext) {
         long_text: None,
         poll: None,
         view_once: None,
+        content: None,
         sealed_sender: sealed.iter().map(|s| (*s).to_owned()).collect(),
         is_read: true,
     };

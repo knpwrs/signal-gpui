@@ -16,6 +16,7 @@ pub mod forward;
 pub mod group_admin;
 pub mod image_viewer;
 pub mod link;
+pub mod message_content;
 pub mod message_info;
 pub mod message_request;
 pub mod nav;

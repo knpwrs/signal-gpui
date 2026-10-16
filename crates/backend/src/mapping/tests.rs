@@ -1624,3 +1624,89 @@ fn sent_transcripts_say_who_got_them_by_sealed_sender() {
     let [Action::Insert { sealed_sender, .. }] = actions.as_slice() else { panic!() };
     assert!(sealed_sender.is_empty());
 }
+
+#[test]
+fn shared_contacts_keep_the_first_as_desktop_reads_it() {
+    use data_message::contact::{Name, Phone, PostalAddress, SignalNickname};
+    let rosa = data_message::Contact {
+        name: Some(Name { given_name: Some("Rosa".into()), family_name: Some("Delgado".into()), ..Default::default() }),
+        number: vec![
+            Phone { value: Some("+15550100142".into()), r#type: Some(3), label: None },
+            // Desktop skips a number without a value.
+            Phone { value: None, r#type: Some(2), label: None },
+            Phone { value: Some("+15550100143".into()), r#type: None, label: Some("Boat".into()) },
+        ],
+        address: vec![PostalAddress { r#type: Some(3), label: Some("Shop".into()), city: Some("Springfield".into()), ..Default::default() }],
+        aci_binary: Some(Aci::parse_from_service_id_string(BOB).unwrap().service_id_binary()),
+        nickname: Some(SignalNickname { given: Some("Ro".into()), family: None }),
+        note: Some("Fixed the sink".into()),
+        ..Default::default()
+    };
+    let other = data_message::Contact { organization: Some("Second".into()), ..Default::default() };
+    let dm = DataMessage { contact: vec![rosa, other], timestamp: Some(100), ..Default::default() };
+    let actions = map_content(&content(ALICE, dm), &ctx());
+    let [Action::Insert { message, content: Some(signal_store::MessageContent::Contact(contact)), .. }] = actions.as_slice() else {
+        panic!("{actions:?}")
+    };
+    assert_eq!(message.body, "");
+    assert_eq!(contact.display_name().as_deref(), Some("Rosa Delgado"));
+    assert_eq!(contact.display_nickname().as_deref(), Some("Ro"));
+    assert_eq!(contact.aci.as_deref(), Some(BOB));
+    assert_eq!(contact.note.as_deref(), Some("Fixed the sink"));
+    let kinds: Vec<_> = contact.numbers.iter().map(|n| (n.value.as_str(), n.kind)).collect();
+    assert_eq!(kinds, [("+15550100142", signal_store::ContactMethodKind::Work), ("+15550100143", signal_store::ContactMethodKind::Home)]);
+    assert_eq!(contact.addresses[0].kind, signal_store::AddressKind::Custom);
+    assert_eq!(contact.addresses[0].label.as_deref(), Some("Shop"));
+}
+
+#[test]
+fn payments_map_as_desktops_process_payment() {
+    use data_message::payment::{Activation, Item, Notification, activation};
+    let payment = |item| DataMessage { payment: Some(data_message::Payment { item }), timestamp: Some(100), ..Default::default() };
+    let content_of = |dm: DataMessage| match map_content(&content(ALICE, dm), &ctx()).as_slice() {
+        [Action::Insert { content, .. }] => content.clone(),
+        _ => None,
+    };
+    let note = Item::Notification(Notification { note: Some("Gas".into()), transaction: None });
+    assert_eq!(
+        content_of(payment(Some(note))),
+        Some(signal_store::MessageContent::Payment(signal_store::PaymentEvent::Notification { note: Some("Gas".into()) }))
+    );
+    let request = Item::Activation(Activation { r#type: Some(activation::Type::Request as i32) });
+    assert_eq!(content_of(payment(Some(request))), Some(signal_store::MessageContent::Payment(signal_store::PaymentEvent::ActivationRequest)));
+    // No type, or nothing at all: Desktop has no event, and the message
+    // has nothing to show.
+    assert_eq!(content_of(payment(Some(Item::Activation(Activation { r#type: None })))), None);
+    assert_eq!(content_of(payment(None)), None);
+}
+
+#[test]
+fn gift_badges_read_their_receipt() {
+    use presage::libsignal_service::zkgroup::{ServerSecretParams, Timestamp};
+    let server = ServerSecretParams::generate([1; 32]);
+    let public = server.get_public_params();
+    let context = public.create_receipt_credential_request_context([2; 32], [3; 16]);
+    let expiration = Timestamp::from_epoch_seconds(20 * 86_400);
+    let response = server.issue_receipt_credential([4; 32], &context.get_request(), expiration, 100);
+    let credential = public.receive_receipt_credential(&context, &response).unwrap();
+    let presentation = public.create_receipt_credential_presentation([5; 32], &credential);
+    let receipt = presage::libsignal_service::zkgroup::serialize(&presentation);
+    let dm = DataMessage {
+        gift_badge: Some(data_message::GiftBadge { receipt_credential_presentation: Some(receipt) }),
+        timestamp: Some(100),
+        ..Default::default()
+    };
+    let actions = map_content(&content(ALICE, dm), &ctx());
+    let [Action::Insert { content: Some(signal_store::MessageContent::GiftBadge(gift)), .. }] = actions.as_slice() else {
+        panic!("{actions:?}")
+    };
+    assert_eq!((gift.level, gift.expiration, gift.state), (100, 20 * 86_400_000, signal_store::GiftBadgeState::Unopened));
+
+    // A receipt that isn't one: nothing.
+    let junk = DataMessage {
+        gift_badge: Some(data_message::GiftBadge { receipt_credential_presentation: Some(vec![9; 12]) }),
+        timestamp: Some(100),
+        ..Default::default()
+    };
+    assert!(map_content(&content(ALICE, junk), &ctx()).is_empty());
+}
