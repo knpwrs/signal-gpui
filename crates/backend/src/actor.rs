@@ -16,6 +16,7 @@ mod release_notes;
 mod remote_config;
 mod view_once;
 mod profile;
+mod receipts;
 mod session_reset;
 mod settings;
 
@@ -228,14 +229,20 @@ struct Delivery {
     retry_after: Option<Duration>,
     /// The server refused it (HTTP 508 or 400): Desktop stops retrying.
     rejected: bool,
+    /// Of `failed`, those whose identity key changed (Desktop's
+    /// `OutgoingIdentityKeyError`).
+    identity: Vec<String>,
 }
 
 /// Why a send to someone failed.
+#[derive(Default)]
 struct SendFailure {
     message: String,
     unregistered: bool,
     retry_after: Option<Duration>,
     rejected: bool,
+    /// Their identity key changed (Desktop's `OutgoingIdentityKeyError`).
+    identity: bool,
 }
 
 impl SendFailure {
@@ -248,7 +255,7 @@ impl SendFailure {
             }
             _ => None,
         };
-        Self { message, unregistered: false, retry_after, rejected }
+        Self { message, retry_after, rejected, ..Default::default() }
     }
 }
 
@@ -257,9 +264,10 @@ impl From<presage::libsignal_service::prelude::MessageSenderError> for SendFailu
         use presage::libsignal_service::prelude::MessageSenderError as E;
         let message = error.to_string();
         match &error {
-            E::NotFound { .. } => Self { message, unregistered: true, retry_after: None, rejected: false },
+            E::NotFound { .. } => Self { message, unregistered: true, ..Default::default() },
             E::ServiceError(service) => Self::service(service, message),
-            _ => Self { message, unregistered: false, retry_after: None, rejected: false },
+            E::UntrustedIdentity { .. } => Self { message, identity: true, ..Default::default() },
+            _ => Self { message, ..Default::default() },
         }
     }
 }
@@ -272,7 +280,7 @@ impl<S: std::error::Error> From<presage::Error<S>> for SendFailure {
                 let message = service.to_string();
                 Self::service(&service, message)
             }
-            other => Self { message: other.to_string(), unregistered: false, retry_after: None, rejected: false },
+            other => Self { message: other.to_string(), ..Default::default() },
         }
     }
 }
@@ -291,9 +299,30 @@ impl Delivery {
             Err(failure) if failure.unregistered => self.unregistered.push(recipient),
             Err(failure) => {
                 self.note(&failure);
+                if failure.identity {
+                    self.identity.push(recipient.clone());
+                }
                 self.failed.push((recipient, failure.message));
             }
         }
+    }
+
+    /// Each recipient's send state from this send, as Desktop's
+    /// `handleMessageSend` sets them (`Sent` for whoever it reached,
+    /// `Failed` with why for the rest). Someone no longer registered fails
+    /// in a 1:1 chat; in a group, Desktop leaves them out of later sends
+    /// without an error, so they're left as they were.
+    fn send_states(&self, group: bool) -> Vec<(String, signal_store::SendStatus, Option<String>)> {
+        use signal_store::SendStatus;
+        let mut states: Vec<_> = self.reached.iter().map(|r| (r.clone(), SendStatus::Sent, None)).collect();
+        states.extend(self.failed.iter().map(|(r, why)| {
+            let error = if self.identity.contains(r) { signal_store::SEND_ERROR_IDENTITY.to_owned() } else { why.clone() };
+            (r.clone(), SendStatus::Failed, Some(error))
+        }));
+        if !group {
+            states.extend(self.unregistered.iter().map(|r| (r.clone(), SendStatus::Failed, Some("not registered".to_owned()))));
+        }
+        states
     }
 }
 
@@ -449,6 +478,15 @@ struct Actor {
     username_reservation: RefCell<Option<tokio::task::JoinHandle<()>>>,
     /// Held across a profile or username write, so two don't interleave.
     profile_edit: tokio::sync::Mutex<()>,
+    /// A resend's recipients by message (Desktop's "Resend" goes to
+    /// those it failed for); taken by the send.
+    resend_only: RefCell<HashMap<i64, Vec<String>>>,
+    /// Delivery receipts waiting for their batch (`receipts.rs`), whether
+    /// the server's queue has drained this connection, and whether a send
+    /// is scheduled.
+    delivery_receipts: RefCell<Vec<receipts::PendingReceipt>>,
+    receipts_ready: std::cell::Cell<bool>,
+    receipts_scheduled: std::cell::Cell<bool>,
 }
 
 pub(crate) async fn run(
@@ -539,6 +577,10 @@ pub(crate) async fn run(
         badge_downloads: std::cell::Cell::new(false),
         username_reservation: RefCell::new(None),
         profile_edit: tokio::sync::Mutex::new(()),
+        resend_only: RefCell::new(HashMap::new()),
+        delivery_receipts: RefCell::new(Vec::new()),
+        receipts_ready: std::cell::Cell::new(false),
+        receipts_scheduled: std::cell::Cell::new(false),
         kt_task: RefCell::new(None),
     });
 
@@ -846,6 +888,7 @@ impl Actor {
                 Command::VotePoll { message_id, options } => self.vote_in_poll(message_id, options).await,
                 Command::EndPoll { message_id } => self.end_poll(message_id).await,
                 Command::MarkRead { conversation } => self.mark_read(conversation).await,
+                Command::MarkViewed { message_id } => self.mark_viewed(message_id).await,
                 Command::Typing { conversation, started } => self.typing(conversation, started).await,
                 Command::DeleteForMe { message_ids } => self.delete_for_me(message_ids).await,
                 Command::RetrySend { message_id } => self.retry_send(message_id).await,
@@ -1108,6 +1151,8 @@ impl Actor {
             let started = Instant::now();
             match manager.receive_messages().await {
                 Ok(stream) => {
+                    // Delivery receipts wait for the queue to drain again.
+                    self.receipts_ready.set(false);
                     self.emit(Event::Connection(ConnectionState::Syncing));
                     pin_mut!(stream);
                     while let Some(received) = stream.next().await {
@@ -1152,6 +1197,9 @@ impl Actor {
         match received {
             Received::QueueEmpty => {
                 self.emit(Event::Connection(ConnectionState::Online));
+                // Desktop's `deliveryReceiptQueue.start()` once caught up.
+                self.receipts_ready.set(true);
+                self.schedule_receipts();
                 self.refresh_titles().await;
                 // As Desktop reads its caches again at startup, once
                 // what was waiting on the server is in.
@@ -1280,7 +1328,24 @@ impl Actor {
                         info!("dropping a message for an ended group");
                         continue;
                     }
+                    // Its delivery receipt, once it's stored: only for what
+                    // came by sealed sender (Desktop's
+                    // `unidentifiedDeliveryReceived`), not stories.
+                    let receipt = match &action {
+                        Action::Insert { message, .. }
+                            if message.direction == Direction::Incoming && content.metadata.unidentified_sender =>
+                        {
+                            Some((message.conversation_id.clone(), message.sent_at))
+                        }
+                        Action::Edit { conversation, sent_at, .. } if sender != self_aci && content.metadata.unidentified_sender => {
+                            Some((conversation.clone(), *sent_at))
+                        }
+                        _ => None,
+                    };
                     self.apply(manager, action).await;
+                    if let Some((chat, sent_at)) = receipt {
+                        self.queue_delivery_receipt(chat, sender.clone(), sent_at).await;
+                    }
                 }
             }
         }
@@ -1300,6 +1365,7 @@ impl Actor {
                 view_once,
                 server_guid,
                 sealed_sender,
+                sent_to,
             } => {
                 let mut spans = Vec::new();
                 let mut style_spans = Vec::new();
@@ -1397,6 +1463,14 @@ impl Actor {
                         if !repeat && !sealed_sender.is_empty() {
                             let _ = self.db.set_sealed_sender(id, &sealed_sender).await;
                         }
+                        // Ours from another device reached whoever its
+                        // transcript lists (receipts move them on).
+                        if !repeat && !sent_to.is_empty() {
+                            let states: Vec<_> = sent_to.iter().map(|r| (r.clone(), signal_store::SendStatus::Sent, None)).collect();
+                            if let Err(error) = self.db.record_send_states(id, &states, message.sent_at).await {
+                                warn!(%error, "failed to save who a message reached");
+                            }
+                        }
                         // Only its start came in the body; the rest follows
                         // (a re-delivery is already on its way).
                         if !repeat && let Some(pointer) = &long_text {
@@ -1463,17 +1537,18 @@ impl Actor {
             Action::React { .. } | Action::Delete { .. } | Action::AdminDelete { .. } | Action::Edit { .. } => {
                 self.modify(manager, action).await;
             }
-            Action::Receipt { sent_at, status } => {
+            Action::Receipt { sent_at, status, sender } => {
                 // With read receipts off we don't see others' either:
                 // Desktop drops read and viewed receipts
                 // (`ts/messageModifiers/MessageReceipts.preload.ts`,
                 // `shouldDropReceipt`). Stories' views count apart.
-                if status == DeliveryStatus::Read && !self.setting_on(AccountSetting::ReadReceipts).await {
-                    debug!("read receipts are off; dropping a read receipt");
+                let read = matches!(status, DeliveryStatus::Read | DeliveryStatus::Viewed);
+                if read && !self.setting_on(AccountSetting::ReadReceipts).await {
+                    debug!("read receipts are off; dropping a read or viewed receipt");
                     return;
                 }
                 for ts in sent_at {
-                    self.modify(manager, Action::Receipt { sent_at: vec![ts], status }).await;
+                    self.modify(manager, Action::Receipt { sent_at: vec![ts], status, sender: sender.clone() }).await;
                 }
             }
             Action::Typing { sender, group_id, started } => {
@@ -3497,8 +3572,18 @@ impl Actor {
             }
             return;
         }
+        // Desktop's resend goes to those it failed for (`getMessageRecipients`
+        // skips the ones sent to), back to pending (`ManuallyRetried`).
+        let failed = self.db.failed_recipients(message_id).await.unwrap_or_default();
         if !matches!(self.db.mark_resending(message_id).await, Ok(true)) {
             return;
+        }
+        if !failed.is_empty() {
+            let pending: Vec<_> = failed.iter().map(|r| (r.clone(), signal_store::SendStatus::Pending, None)).collect();
+            if let Err(error) = self.db.record_send_states(message_id, &pending, now_millis()).await {
+                warn!(%error, "failed to mark a resend pending");
+            }
+            self.resend_only.borrow_mut().insert(message_id, failed);
         }
         let conversation = message.conversation_id.clone();
         self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id });
@@ -4394,12 +4479,18 @@ impl Actor {
             }
             match job {
                 Outbound::Send { conversation, body, timestamp, message } => {
-                    let delivery = self.deliver_to(&mut manager, &conversation, body, timestamp, None).await;
-                    let status = self.report(&conversation, &delivery);
-                    if let Some(id) = message {
-                        // Who our poll reached may vote in it.
-                        self.poll_reached(&manager, id, &delivery.reached).await;
-                        self.finish_send(&conversation, id, timestamp, status).await;
+                    let only = message.and_then(|id| self.resend_only.borrow_mut().remove(&id));
+                    let delivery = self.deliver_to(&mut manager, &conversation, body, timestamp, only.as_deref()).await;
+                    match message {
+                        Some(id) => {
+                            // Who our poll reached may vote in it.
+                            self.poll_reached(&manager, id, &delivery.reached).await;
+                            let status = self.record_delivery(&conversation, id, &delivery).await;
+                            self.finish_send(&conversation, id, timestamp, status).await;
+                        }
+                        None => {
+                            self.report(&conversation, &delivery);
+                        }
                     }
                 }
                 Outbound::SendImages { conversation, mut body, timestamp, message, images, preview_image } => {
@@ -4416,7 +4507,7 @@ impl Actor {
                             if let Some(preview) = body.preview.first_mut() {
                                 preview.image = preview_pointer;
                             }
-                            self.deliver(&mut manager, &conversation, body.into(), timestamp).await
+                            self.deliver(&mut manager, &conversation, body.into(), timestamp, message).await
                         }
                         Err(error) => {
                             self.error("failed to send images", format!("{error:#}"));
@@ -4429,7 +4520,7 @@ impl Actor {
                     let status = match self.upload_gif(&manager, &path, size).await {
                         Ok(pointer) => {
                             body.attachments = vec![pointer];
-                            self.deliver(&mut manager, &conversation, body.into(), timestamp).await
+                            self.deliver(&mut manager, &conversation, body.into(), timestamp, message).await
                         }
                         Err(error) => {
                             self.error("failed to send GIF", format!("{error:#}"));
@@ -4444,7 +4535,7 @@ impl Actor {
                             if let Some(sticker) = &mut body.sticker {
                                 sticker.data = Some(pointer);
                             }
-                            self.deliver(&mut manager, &conversation, body.into(), timestamp).await
+                            self.deliver(&mut manager, &conversation, body.into(), timestamp, message).await
                         }
                         Err(error) => {
                             self.error("failed to send sticker", format!("{error:#}"));
@@ -4491,9 +4582,34 @@ impl Actor {
         conversation: &ConversationId,
         body: ContentBody,
         timestamp: u64,
+        message: i64,
     ) -> DeliveryStatus {
-        let delivery = self.deliver_to(manager, conversation, body, timestamp, None).await;
-        self.report(conversation, &delivery)
+        let only = self.resend_only.borrow_mut().remove(&message);
+        let delivery = self.deliver_to(manager, conversation, body, timestamp, only.as_deref()).await;
+        self.record_delivery(conversation, message, &delivery).await
+    }
+
+    /// Keeps how a send of our message `id` went for each recipient
+    /// (Desktop's `sendStateByConversationId`) and returns the bubble's
+    /// status from them all; with nobody to record (Note to Self, or it
+    /// couldn't go at all), the send's own status.
+    async fn record_delivery(&self, conversation: &ConversationId, id: i64, delivery: &Delivery) -> DeliveryStatus {
+        let status = self.report(conversation, delivery);
+        if self.is_note_to_self(conversation) {
+            return status;
+        }
+        let states = delivery.send_states(conversation.as_group().is_some());
+        if states.is_empty() {
+            return status;
+        }
+        match self.db.record_send_states(id, &states, now_millis()).await {
+            Ok(Some(summary)) => summary,
+            Ok(None) => status,
+            Err(error) => {
+                self.error("failed to save who a message reached", error);
+                status
+            }
+        }
     }
 
     /// A send's status, showing why it failed: a group send fails when

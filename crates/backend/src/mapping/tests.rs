@@ -344,13 +344,18 @@ fn receipts_and_typing() {
     };
     assert_eq!(
         map_content(&content(ALICE, receipt), &ctx()),
-        vec![Action::Receipt { sent_at: vec![1, 2], status: DeliveryStatus::Read }]
+        vec![Action::Receipt { sent_at: vec![1, 2], status: DeliveryStatus::Read, sender: Some(ALICE.into()) }]
     );
     let receipt = ReceiptMessage { r#type: None, timestamp: vec![3] };
     assert_eq!(
         map_content(&content(ALICE, receipt), &ctx()),
-        vec![Action::Receipt { sent_at: vec![3], status: DeliveryStatus::Delivered }]
+        vec![Action::Receipt { sent_at: vec![3], status: DeliveryStatus::Delivered, sender: Some(ALICE.into()) }]
     );
+    // A viewed receipt is the message's (and, for a story, its view).
+    let viewed = ReceiptMessage { r#type: Some(receipt_message::Type::Viewed.into()), timestamp: vec![4] };
+    let actions = map_content(&content(ALICE, viewed), &ctx());
+    assert_eq!(actions[0], Action::Receipt { sent_at: vec![4], status: DeliveryStatus::Viewed, sender: Some(ALICE.into()) });
+    assert!(matches!(actions[1], Action::StoryViewed { .. }));
     let empty = ReceiptMessage { r#type: None, timestamp: vec![] };
     assert!(map_content(&content(ALICE, empty), &ctx()).is_empty());
 

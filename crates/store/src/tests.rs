@@ -939,6 +939,8 @@ async fn drop_later_migrations(db: &AppDb) {
     sqlx::query("DROP TABLE badges").execute(&db.writer).await.unwrap();
     sqlx::query("DROP TABLE badge_image_files").execute(&db.writer).await.unwrap();
     sqlx::query("ALTER TABLE messages DROP COLUMN sealed_sender").execute(&db.writer).await.unwrap();
+    sqlx::query("DROP TABLE message_send_states").execute(&db.writer).await.unwrap();
+    sqlx::query("ALTER TABLE messages DROP COLUMN viewed").execute(&db.writer).await.unwrap();
 }
 
 /// Rewrites the migration history to look like a pre-squash database that
@@ -2203,6 +2205,59 @@ async fn whether_a_chat_is_accepted_is_found_by_index() {
     assert!(!plan.contains("SCAN m"), "{plan}");
     assert!(!plan.contains("SCAN s"), "{plan}");
     assert!(!plan.contains("SCAN p"), "{plan}");
+}
+
+#[tokio::test]
+async fn send_states_move_forward_and_set_the_bubble() {
+    let db = test_db().await;
+    let id = db.insert_message(&outgoing("g:aa", 100, "hi")).await.unwrap();
+    let failed = |e: &str| Some(e.to_owned());
+    let status = db
+        .record_send_states(id, &[("a".into(), SendStatus::Sent, None), ("b".into(), SendStatus::Failed, failed(SEND_ERROR_IDENTITY))], 110)
+        .await
+        .unwrap();
+    // Some failed: partly sent.
+    assert_eq!(status, Some(DeliveryStatus::PartialSent));
+    assert_eq!(db.message(id).await.unwrap().unwrap().status, DeliveryStatus::PartialSent);
+    assert_eq!(db.failed_recipients(id).await.unwrap(), ["b"]);
+    // A receipt from someone it went to moves them on; from anyone else, nothing.
+    assert_eq!(db.apply_receipt_from("a", 100, SendStatus::Read, 120).await.unwrap(), [(conv("g:aa"), id)]);
+    assert_eq!(db.apply_receipt_from("c", 100, SendStatus::Read, 120).await.unwrap(), []);
+    // Never back.
+    assert_eq!(db.apply_receipt_from("a", 100, SendStatus::Delivered, 130).await.unwrap(), []);
+    // The resend: pending, then sent.
+    db.record_send_states(id, &[("b".into(), SendStatus::Pending, None)], 140).await.unwrap();
+    let status = db.record_send_states(id, &[("b".into(), SendStatus::Sent, None)], 150).await.unwrap();
+    assert_eq!(status, Some(DeliveryStatus::Read), "the furthest any got");
+    let states = db.send_states(id).await.unwrap();
+    assert_eq!(states.iter().map(|s| (s.recipient.as_str(), s.status, s.updated_at, s.error.is_some())).collect::<Vec<_>>(), [
+        ("a", SendStatus::Read, Some(120), false),
+        ("b", SendStatus::Sent, Some(150), false)
+    ]);
+    // A message without states takes a receipt as before.
+    let old = db.insert_message(&outgoing("d:x", 200, "old")).await.unwrap();
+    db.update_status(&conv("d:x"), 200, DeliveryStatus::Sent).await.unwrap();
+    assert_eq!(db.apply_receipt_from("x", 200, SendStatus::Viewed, 210).await.unwrap(), [(conv("d:x"), old)]);
+    assert_eq!(db.message(old).await.unwrap().unwrap().status, DeliveryStatus::Read);
+    // Deleting the message drops its states.
+    db.remove_message(id).await.unwrap();
+    assert!(db.send_states(id).await.unwrap().is_empty());
+}
+
+#[test]
+fn the_bubble_reads_its_recipients_as_desktop() {
+    let s = |status| SendState { recipient: String::new(), status, updated_at: None, error: None };
+    assert_eq!(summarize(&[]), None);
+    assert_eq!(summarize(&[s(SendStatus::Failed)]), Some(DeliveryStatus::Failed));
+    assert_eq!(summarize(&[s(SendStatus::Pending), s(SendStatus::Failed)]), Some(DeliveryStatus::Failed));
+    assert_eq!(summarize(&[s(SendStatus::Delivered), s(SendStatus::Sent)]), Some(DeliveryStatus::Delivered));
+    assert_eq!(summarize(&[s(SendStatus::Viewed), s(SendStatus::Pending)]), Some(DeliveryStatus::Viewed));
+    assert_eq!(summarize(&[s(SendStatus::Pending)]), Some(DeliveryStatus::Sending));
+    // Desktop's order puts skipped past read.
+    assert_eq!(summarize(&[s(SendStatus::Skipped), s(SendStatus::Sent)]), Some(DeliveryStatus::Read));
+    assert_eq!(SendStatus::Pending.advance(SendStatus::Failed), SendStatus::Failed);
+    assert_eq!(SendStatus::Sent.advance(SendStatus::Failed), SendStatus::Sent);
+    assert_eq!(SendStatus::Failed.advance(SendStatus::Pending), SendStatus::Pending);
 }
 
 #[tokio::test]

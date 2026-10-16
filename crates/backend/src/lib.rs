@@ -350,6 +350,10 @@ pub enum Command {
     EndPoll { message_id: i64 },
     /// Marks a conversation read locally and sends read receipts / sync.
     MarkRead { conversation: ConversationId },
+    /// A message was played (a voice message): viewed here, on our other
+    /// devices, and (with read receipts on) to its author, once (Desktop's
+    /// `markViewed`). Anything but a voice message is ignored.
+    MarkViewed { message_id: i64 },
     /// Sends a typing indicator.
     Typing { conversation: ConversationId, started: bool },
     /// Deletes messages on this device and your other devices.

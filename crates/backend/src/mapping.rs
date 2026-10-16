@@ -51,6 +51,10 @@ pub enum Action {
         /// Who it came from, or went to, by sealed sender (Desktop's
         /// `unidentifiedDeliveryReceived`, `unidentifiedDeliveries`).
         sealed_sender: Vec<String>,
+        /// Ours from another device: who its transcript says it went to,
+        /// sent to each (Desktop's `createSentMessage` keeps them as
+        /// `sendStateByConversationId`).
+        sent_to: Vec<String>,
     },
     React {
         conversation: ConversationId,
@@ -94,9 +98,14 @@ pub enum Action {
         #[serde(with = "pointer_bytes")]
         long_text: Option<AttachmentPointer>,
     },
+    /// `sender` got (delivered), read or viewed our messages sent at these
+    /// times. `status` is `Delivered`, `Read` or `Viewed`. Receipts kept
+    /// before senders were (early events) have none.
     Receipt {
         sent_at: Vec<i64>,
         status: DeliveryStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sender: Option<String>,
     },
     #[serde(skip)]
     Typing {
@@ -794,7 +803,7 @@ pub fn map_content(content: &Content, ctx: &MapContext) -> Vec<Action> {
         }
         ContentBody::SynchronizeMessage(sync) => map_sync(sync, envelope_ts, ctx),
         ContentBody::ReceiptMessage(receipt) => {
-            let mut out: Vec<Action> = map_receipt(receipt).into_iter().collect();
+            let mut out: Vec<Action> = map_receipt(receipt, &sender).into_iter().collect();
             // A VIEWED receipt is also how a story's views are counted.
             if receipt.r#type() == receipt_message::Type::Viewed && !receipt.timestamp.is_empty() {
                 out.push(Action::StoryViewed {
@@ -1272,6 +1281,7 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
         view_once,
         server_guid: None,
         sealed_sender: Vec::new(),
+        sent_to: Vec::new(),
     }]
 }
 
@@ -1490,6 +1500,7 @@ fn map_story_reply(
         view_once: None,
         server_guid: None,
         sealed_sender: Vec::new(),
+        sent_to: Vec::new(),
     });
     out
 }
@@ -1582,8 +1593,9 @@ fn map_sync(sync: &SyncMessage, envelope_ts: i64, ctx: &MapContext) -> Vec<Actio
                     if let Action::Insert { poll: Some(poll), .. } = &mut action {
                         poll.record_reached(reached.iter().cloned());
                     }
-                    if let Action::Insert { sealed_sender, .. } = &mut action {
+                    if let Action::Insert { sealed_sender, sent_to, .. } = &mut action {
                         sealed_sender.clone_from(&sealed);
+                        sent_to.clone_from(&reached);
                     }
                     action
                 },
@@ -1747,13 +1759,14 @@ pub(crate) fn account_settings(configuration: &sync_message::Configuration) -> c
     settings
 }
 
-fn map_receipt(receipt: &ReceiptMessage) -> Option<Action> {
+fn map_receipt(receipt: &ReceiptMessage, sender: &str) -> Option<Action> {
     let status = match receipt_message::Type::try_from(receipt.r#type.unwrap_or_default()).ok()? {
         receipt_message::Type::Delivery => DeliveryStatus::Delivered,
-        receipt_message::Type::Read | receipt_message::Type::Viewed => DeliveryStatus::Read,
+        receipt_message::Type::Read => DeliveryStatus::Read,
+        receipt_message::Type::Viewed => DeliveryStatus::Viewed,
     };
     let sent_at: Vec<i64> = receipt.timestamp.iter().map(|t| *t as i64).collect();
-    (!sent_at.is_empty()).then_some(Action::Receipt { sent_at, status })
+    (!sent_at.is_empty()).then(|| Action::Receipt { sent_at, status, sender: Some(sender.to_owned()) })
 }
 
 fn map_typing(typing: &TypingMessage, sender: String) -> Action {

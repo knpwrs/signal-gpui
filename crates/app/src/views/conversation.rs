@@ -2769,8 +2769,20 @@ impl ConversationView {
     }
 }
 
-fn render_meta(message: &Message, color: Hsla, palette: Palette) -> impl IntoElement {
+/// Desktop's `icu:partiallySent`, in place of the time and status icon
+/// (`MessageMetadata`); the message's menu has its details.
+const PARTIALLY_SENT: &str = "Partially sent, click for details";
+
+fn render_meta(message: &Message, color: Hsla, palette: Palette) -> AnyElement {
     let outgoing = message.direction == Direction::Outgoing;
+    if outgoing && message.status == DeliveryStatus::PartialSent {
+        return div()
+            .debug_selector(|| "partially-sent".into())
+            .text_size(px(META_SIZE))
+            .text_color(palette.danger)
+            .child(PARTIALLY_SENT)
+            .into_any_element();
+    }
     let status = outgoing
         .then(|| status_icon(message.status, color, palette, StatusPlace::Bubble, message.id.to_string()))
         .flatten();
@@ -2789,6 +2801,7 @@ fn render_meta(message: &Message, color: Hsla, palette: Palette) -> impl IntoEle
         .child(message_time(message.sent_at))
         // Desktop leaves 6pt before the status icon.
         .when_some(status, |d, s| d.child(div().ml(px(STATUS_GAP)).child(s)))
+        .into_any_element()
 }
 
 const BUBBLE_RADIUS: f32 = 18.;
@@ -3122,6 +3135,9 @@ fn text_width(cx: &App, text: &str, size: f32) -> f32 {
 /// Width of what [`render_meta`] draws.
 fn meta_width(message: &Message, cx: &App) -> f32 {
     let outgoing = message.direction == Direction::Outgoing;
+    if outgoing && message.status == DeliveryStatus::PartialSent {
+        return text_width(cx, PARTIALLY_SENT, META_SIZE);
+    }
     let mut parts = vec![text_width(cx, &message_time(message.sent_at), META_SIZE)];
     if message.edited {
         parts.push(text_width(cx, "Edited ·", META_SIZE));
@@ -3134,7 +3150,7 @@ fn meta_width(message: &Message, cx: &App) -> f32 {
     }
     let mut width = parts.iter().sum::<f32>() + META_GAP * (parts.len() - 1) as f32;
     if outgoing && message.status != DeliveryStatus::Failed {
-        let icon = if matches!(message.status, DeliveryStatus::Delivered | DeliveryStatus::Read) { 18. } else { 12. };
+        let icon = if matches!(message.status, DeliveryStatus::Delivered | DeliveryStatus::Read | DeliveryStatus::Viewed) { 18. } else { 12. };
         width += META_GAP + STATUS_GAP + icon;
     }
     width
@@ -4159,7 +4175,8 @@ fn message_menu(
     let (state, note_to_self, chat, ended) =
         this.read_with(cx, |this, cx| (this.state.clone(), this.note_to_self(cx), this.delete_chat(cx), this.ended(cx)));
     let everyone = everyone_delete(std::slice::from_ref(message), chat, now_millis());
-    let failed = message.direction == Direction::Outgoing && message.status == DeliveryStatus::Failed;
+    let failed = message.direction == Direction::Outgoing
+        && matches!(message.status, DeliveryStatus::Failed | DeliveryStatus::PartialSent);
     let with_view = |f: fn(&mut ConversationView, i64, &mut Window, &mut Context<ConversationView>)| {
         let view = view.clone();
         move |_: &gpui_kit::ClickEvent, window: &mut Window, cx: &mut App| {
@@ -5788,6 +5805,22 @@ mod tests {
         cx.simulate_input("all of it");
         cx.simulate_keystrokes("cmd-a enter");
         wait_for_messages(&backend, MAYA, 1, |m| m.body == "all of it" && m.direction == Direction::Outgoing);
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn message_details_list_recipients_by_how_far_it_got(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        let plan = wait_for_messages(&backend, GROUP, 1, |m| m.body.starts_with("Ridge loop it is")).remove(0);
+        let (mut cx, view) = open_view(cx, &backend, GROUP);
+        // Two read it, one has it, one it went to.
+        let plan = wait_for_messages(&backend, GROUP, 1, |m| m.id == plan.id && m.status == DeliveryStatus::Read).remove(0);
+        let state = view.read_with(&cx, |v, _| v.state.clone());
+        cx.update(|window, cx| crate::views::message_info::open(state.clone(), plan.clone(), window, cx));
+        for header in ["Read by", "Delivered to", "Sent to"] {
+            bounds(&mut cx, format!("details-{header}"));
+        }
+        assert!(cx.debug_bounds("details-Not sent").is_none());
         backend.shutdown();
     }
 

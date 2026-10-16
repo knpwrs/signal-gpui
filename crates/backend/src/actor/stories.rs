@@ -226,6 +226,11 @@ impl Actor {
         let mut changed = false;
         for (author, sent_at) in viewed {
             changed |= self.db.mark_story_read(author.as_deref(), sent_at).await.unwrap_or(false);
+            // A voice message played on another device (Desktop's
+            // `ViewSyncs`): no receipt from here.
+            if let Ok(Some((conversation, message_id))) = self.db.mark_viewed_by(author.as_deref(), sent_at).await {
+                self.emit(Event::MessageChanged { conversation, message_id });
+            }
         }
         if changed {
             self.emit(Event::StoriesChanged);

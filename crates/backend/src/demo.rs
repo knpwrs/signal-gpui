@@ -270,6 +270,23 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
     let plan = db
         .insert_message(&outgoing(GROUP, now - 25 * MINUTE, "Ridge loop it is. Meet at the trailhead lot at 8:30 Saturday?", DeliveryStatus::Read))
         .await?;
+    // How far it got with each, for its details.
+    let reached = |who: &str, status| signal_store::SendState {
+        recipient: aci(who).into(),
+        status,
+        updated_at: Some(now - 20 * MINUTE),
+        error: None,
+    };
+    db.import_send_states(
+        plan,
+        &[
+            reached(MAYA, signal_store::SendStatus::Read),
+            reached(JORDAN, signal_store::SendStatus::Read),
+            reached(PRIYA, signal_store::SendStatus::Delivered),
+            reached(SAM, signal_store::SendStatus::Sent),
+        ],
+    )
+    .await?;
     // Four kinds of reaction, so the pills collapse into "+2".
     for (emoji, from) in [("👍", Some(MAYA)), ("👍", Some(JORDAN)), ("❤️", Some(PRIYA)), ("🎉", Some(SAM)), ("🙌", None)] {
         db.set_reaction(plan, react(emoji, from)).await?;
@@ -1164,6 +1181,9 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 {
                     emit(Event::MessageChanged { conversation: m.conversation_id, message_id });
                 }
+            }
+            Command::MarkViewed { message_id } => {
+                let _ = db.mark_viewed(message_id).await;
             }
             Command::MarkRead { conversation } => {
                 let _ = db.mark_read(&conversation).await;

@@ -20,6 +20,7 @@ mod nickname;
 mod poll;
 mod profile;
 mod reminders;
+mod send_states;
 mod stories;
 mod view_once;
 pub use call_history::*;
@@ -30,6 +31,7 @@ pub use nickname::*;
 pub use poll::*;
 pub use profile::*;
 pub use reminders::*;
+pub use send_states::*;
 pub use stories::*;
 pub use view_once::*;
 
@@ -148,6 +150,11 @@ pub enum DeliveryStatus {
     Delivered,
     Read,
     Failed,
+    /// A recipient viewed it (a voice message played, a view-once opened).
+    Viewed,
+    /// It reached some recipients and failed for others (Desktop's
+    /// `partial-sent`).
+    PartialSent,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1008,6 +1015,8 @@ fn kind_from_str(s: &str) -> ConversationKind {
     }
 }
 
+// Viewed and partly sent come after failed (4): the forward-only updates
+// for messages without send states (`status < ?`) never reach them.
 fn status_to_i64(status: DeliveryStatus) -> i64 {
     match status {
         DeliveryStatus::Sending => 0,
@@ -1015,6 +1024,8 @@ fn status_to_i64(status: DeliveryStatus) -> i64 {
         DeliveryStatus::Delivered => 2,
         DeliveryStatus::Read => 3,
         DeliveryStatus::Failed => 4,
+        DeliveryStatus::Viewed => 5,
+        DeliveryStatus::PartialSent => 6,
     }
 }
 
@@ -1024,6 +1035,8 @@ fn status_from_i64(v: i64) -> DeliveryStatus {
         1 => DeliveryStatus::Sent,
         2 => DeliveryStatus::Delivered,
         3 => DeliveryStatus::Read,
+        5 => DeliveryStatus::Viewed,
+        6 => DeliveryStatus::PartialSent,
         _ => DeliveryStatus::Failed,
     }
 }
@@ -2169,10 +2182,12 @@ impl AppDb {
     /// except Failed which can be set from Sending.
     /// A failed message is being sent again.
     pub async fn mark_resending(&self, message_id: i64) -> Result<bool> {
-        let done = sqlx::query("UPDATE messages SET status = ? WHERE id = ? AND status = ?")
+        // Failed, or partly sent (a resend to those it missed).
+        let done = sqlx::query("UPDATE messages SET status = ? WHERE id = ? AND status IN (?, ?)")
             .bind(status_to_i64(DeliveryStatus::Sending))
             .bind(message_id)
             .bind(status_to_i64(DeliveryStatus::Failed))
+            .bind(status_to_i64(DeliveryStatus::PartialSent))
             .execute(&self.writer)
             .await?;
         Ok(done.rows_affected() > 0)

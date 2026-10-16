@@ -950,6 +950,13 @@ async fn import_item(
         message.sent_at = edits.remove(0);
     }
     let id = db.insert_message(&message).await?;
+    // Who ours went to and how far it got with each (Note to Self has none).
+    if let Some(DirectionalDetails::Outgoing(details)) = &item.directionalDetails {
+        let states = send_states(&details.sendStatus, people);
+        if !states.is_empty() {
+            db.import_send_states(id, &states).await?;
+        }
+    }
     for (index, attachment) in message.attachments.iter().enumerate() {
         let Some(remote) = &attachment.remote else { continue };
         let thumbnail = remote.plaintext_hash.is_some() && crate::backup_media::can_have_thumbnail(&attachment.content_type);
@@ -1029,6 +1036,37 @@ fn theme(account: &proto::AccountData) -> &'static str {
         Some(AppTheme::DARK) => "dark",
         _ => "system",
     }
+}
+
+/// Each recipient's send state from an outgoing message's statuses, as
+/// Desktop's import reads them (`fromSendStatus`): pending when unset, a
+/// key mismatch kept as one (message details offer the safety number).
+/// Desktop keeps a pending one pending; see below.
+fn send_states(statuses: &[proto::SendStatus], people: &HashMap<u64, Who>) -> Vec<signal_store::SendState> {
+    use proto::send_status::DeliveryStatus as S;
+    use signal_store::SendStatus;
+    statuses
+        .iter()
+        .filter_map(|s| {
+            let Some(Who::Contact { sid, .. }) = people.get(&s.recipientId) else { return None };
+            let (status, error) = match &s.deliveryStatus {
+                Some(S::Sent(_)) => (SendStatus::Sent, None),
+                Some(S::Delivered(_)) => (SendStatus::Delivered, None),
+                Some(S::Read(_)) => (SendStatus::Read, None),
+                Some(S::Viewed(_)) => (SendStatus::Viewed, None),
+                Some(S::Skipped(_)) => (SendStatus::Skipped, None),
+                Some(S::Failed(failed)) => {
+                    let identity = failed.reason.enum_value_or_default() == proto::send_status::failed::FailureReason::IDENTITY_KEY_MISMATCH;
+                    let error = if identity { signal_store::SEND_ERROR_IDENTITY } else { "failed on your phone" };
+                    (SendStatus::Failed, Some(error.to_owned()))
+                }
+                // Still pending on the phone: it wasn't sent, and as before
+                // these were kept it's failed here, so Resend can send it.
+                _ => (SendStatus::Failed, Some("not sent from your phone".to_owned())),
+            };
+            Some(signal_store::SendState { recipient: sid.clone(), status, updated_at: Some(s.timestamp as i64).filter(|t| *t > 0), error })
+        })
+        .collect()
 }
 
 /// Who an outgoing message reached: the recipients whose status is sent or

@@ -92,7 +92,9 @@ impl Actor {
             Action::Edit { .. } => self.apply_edit(manager, action).await,
             Action::PollVote { .. } => self.apply_poll_vote(action).await,
             Action::PollEnd { .. } => self.apply_poll_end(manager, action).await,
-            Action::Receipt { sent_at, status } if sent_at.len() == 1 => self.apply_receipt(sent_at[0], *status).await,
+            Action::Receipt { sent_at, status, sender } if sent_at.len() == 1 => {
+                self.apply_receipt(sent_at[0], *status, sender.as_deref()).await
+            }
             Action::ReadSync(entries) if entries.len() == 1 => self.apply_read_sync(&entries[0].0, entries[0].1).await,
             Action::ViewOnceOpen { author, sent_at } => self.apply_view_once_open(author, *sent_at).await,
             Action::DeleteForMe { messages, conversations } if messages.len() == 1 && conversations.is_empty() => {
@@ -347,9 +349,23 @@ impl Actor {
         }
     }
 
-    /// A receipt for one of ours (Desktop's `MessageReceipts`).
-    async fn apply_receipt(&self, sent_at: i64, status: signal_store::DeliveryStatus) -> Outcome {
-        match self.db.update_status_by_sent_at(sent_at, status).await {
+    /// A receipt for one of ours (Desktop's `MessageReceipts`): `sender`'s
+    /// send state moves on (one kept from before senders were has none, and
+    /// moves the message's one status).
+    async fn apply_receipt(&self, sent_at: i64, status: signal_store::DeliveryStatus, sender: Option<&str>) -> Outcome {
+        use signal_store::{DeliveryStatus, SendStatus};
+        let applied = match sender {
+            Some(sender) => {
+                let status = match status {
+                    DeliveryStatus::Read => SendStatus::Read,
+                    DeliveryStatus::Viewed => SendStatus::Viewed,
+                    _ => SendStatus::Delivered,
+                };
+                self.db.apply_receipt_from(sender, sent_at, status, now_millis()).await
+            }
+            None => self.db.update_status_by_sent_at(sent_at, status).await,
+        };
+        match applied {
             Ok(changed) if !changed.is_empty() => {
                 for (conversation, message_id) in changed {
                     self.emit(Event::MessageChanged { conversation, message_id });
@@ -462,7 +478,7 @@ mod tests {
                 sent_at: 14,
             },
             Action::PollEnd { conversation: chat, by: Some("bob".into()), target_sent_at: 10, sent_at: 15 },
-            Action::Receipt { sent_at: vec![10], status: signal_store::DeliveryStatus::Read },
+            Action::Receipt { sent_at: vec![10], status: signal_store::DeliveryStatus::Read, sender: Some("bob".into()) },
             Action::ReadSync(vec![("bob".into(), 10)]),
             Action::ViewOnceOpen { author: "bob".into(), sent_at: 10 },
             Action::DeleteForMe {
@@ -505,7 +521,10 @@ mod tests {
         );
         // Several messages at once are kept one by one, and nothing else is.
         assert_eq!(target(&Action::ReadSync(vec![("a".into(), 1), ("b".into(), 2)])), None);
-        assert_eq!(target(&Action::Receipt { sent_at: vec![1, 2], status: signal_store::DeliveryStatus::Read }), None);
+        assert_eq!(target(&Action::Receipt { sent_at: vec![1, 2], status: signal_store::DeliveryStatus::Read, sender: None }), None);
+        // One kept before receipts named their sender still reads.
+        let old: Action = serde_json::from_str(r#"{"Receipt":{"sent_at":[10],"status":"Read"}}"#).unwrap();
+        assert_eq!(old, Action::Receipt { sent_at: vec![10], status: signal_store::DeliveryStatus::Read, sender: None });
         assert_eq!(target(&Action::StorageChanged), None);
         assert!(serde_json::to_string(&Action::StorageChanged).is_err(), "never stored");
     }

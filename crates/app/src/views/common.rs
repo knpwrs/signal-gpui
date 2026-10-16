@@ -218,8 +218,9 @@ pub fn status_icon(
             .into_any_element(),
         DeliveryStatus::Sent => icon("messagestatus-sent", 12.).text_color(color).into_any_element(),
         DeliveryStatus::Delivered => icon("messagestatus-delivered", 18.).text_color(color).into_any_element(),
-        DeliveryStatus::Read => icon("messagestatus-read", 18.).text_color(color).into_any_element(),
-        DeliveryStatus::Failed => match place {
+        // Desktop draws viewed as read (`status-icon--viewed`).
+        DeliveryStatus::Read | DeliveryStatus::Viewed => icon("messagestatus-read", 18.).text_color(color).into_any_element(),
+        DeliveryStatus::Failed | DeliveryStatus::PartialSent => match place {
             StatusPlace::Bubble => return None,
             StatusPlace::List => icon("error-circle", 12.).text_color(palette.danger).into_any_element(),
         },

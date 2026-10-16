@@ -2137,6 +2137,9 @@ impl AppState {
             player.seek(fraction * player.duration());
         }
         player.play();
+        // A voice message played is viewed (Desktop's `markViewed` from
+        // its voice notes player); the backend sends the receipt once.
+        self.send(Command::MarkViewed { message_id });
         let poll = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(AUDIO_POLL).await;
