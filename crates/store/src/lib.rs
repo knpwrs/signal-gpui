@@ -2686,6 +2686,25 @@ impl AppDb {
         Ok(())
     }
 
+    /// Deletes a setting.
+    pub async fn remove_setting(&self, key: &str) -> Result<()> {
+        sqlx::query("DELETE FROM settings WHERE key = ?").bind(key).execute(&self.writer).await?;
+        Ok(())
+    }
+
+    /// Deletes every setting whose key starts with `prefix` (which must end
+    /// in an ASCII character other than DEL), by a range over the primary key.
+    pub async fn remove_settings_with_prefix(&self, prefix: &'static str) -> Result<u64> {
+        let last = prefix.bytes().last().filter(|b| *b < 0x7f).expect("a prefix ending in ASCII");
+        let upper = format!("{}{}", &prefix[..prefix.len() - 1], char::from(last + 1));
+        let done = sqlx::query("DELETE FROM settings WHERE key >= ? AND key < ?")
+            .bind(prefix)
+            .bind(upper)
+            .execute(&self.writer)
+            .await?;
+        Ok(done.rows_affected())
+    }
+
     /// Deletes everything about the account (used when unlinking).
     pub async fn clear(&self) -> Result<()> {
         let mut tx = self.write().await?;

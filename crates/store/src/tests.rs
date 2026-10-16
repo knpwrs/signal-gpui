@@ -13,6 +13,21 @@ async fn test_db() -> AppDb {
     db
 }
 
+#[tokio::test]
+async fn settings_are_removed_by_key_and_by_prefix() {
+    let db = test_db().await;
+    for key in ["kt.account.a", "kt.account.b", "kt.accounts", "kt.account", "kt.distinguished"] {
+        db.set_setting(key, "1").await.unwrap();
+    }
+    // Only keys under the prefix go, not their neighbours in key order.
+    assert_eq!(db.remove_settings_with_prefix("kt.account.").await.unwrap(), 2);
+    assert_eq!(db.setting("kt.account.a").await.unwrap(), None);
+    assert_eq!(db.setting("kt.accounts").await.unwrap().as_deref(), Some("1"));
+    assert_eq!(db.setting("kt.account").await.unwrap().as_deref(), Some("1"));
+    db.remove_setting("kt.distinguished").await.unwrap();
+    assert_eq!(db.setting("kt.distinguished").await.unwrap(), None);
+}
+
 fn conv(s: &str) -> ConversationId {
     ConversationId(s.to_owned())
 }
