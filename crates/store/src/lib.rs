@@ -17,11 +17,13 @@ mod early;
 mod nickname;
 mod poll;
 mod stories;
+mod view_once;
 pub use call_history::*;
 pub use early::*;
 pub use nickname::*;
 pub use poll::*;
 pub use stories::*;
+pub use view_once::*;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -154,6 +156,10 @@ pub struct QuotedAttachment {
     pub voice: bool,
     #[serde(default)]
     pub gif: bool,
+    /// It quotes a view-once message (Desktop's `isViewOnce` quote): no
+    /// text, no thumbnail.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub view_once: bool,
 }
 
 impl QuotedAttachment {
@@ -163,13 +169,30 @@ impl QuotedAttachment {
             file_name: attachment.file_name.clone(),
             voice: attachment.voice,
             gif: attachment.gif,
+            view_once: false,
         }
+    }
+
+    /// What a quote of a view-once message knows, as Desktop's
+    /// `copyQuoteContentFromOriginal` and `makeQuote` put it: a JPEG.
+    pub fn view_once() -> Self {
+        Self { content_type: "image/jpeg".into(), view_once: true, ..Default::default() }
     }
 
     /// What a quote of it says when there's no text, in Desktop's words
     /// (`Quote`'s `getTypeLabel`; any other file shows its name).
     pub fn label(&self) -> String {
         let kind = self.content_type.as_str();
+        if self.view_once {
+            return if kind.starts_with("video/") {
+                "View-once Video"
+            } else if kind.starts_with("image/") {
+                "View-once Photo"
+            } else {
+                "View-once Media"
+            }
+            .into();
+        }
         if self.gif || kind == "image/gif" {
             "GIF".into()
         } else if kind.starts_with("video/") {
@@ -309,6 +332,8 @@ pub struct Message {
     /// A poll, with its votes; `body` holds its question (so search finds
     /// it, as Desktop's does).
     pub poll: Option<Poll>,
+    /// A view-once message, and where it is in its one viewing.
+    pub view_once: Option<ViewOnce>,
 }
 
 /// The group admin who deleted a message for everyone (Desktop's
@@ -556,6 +581,10 @@ impl Message {
     /// What a quote of this message shows beside it: its first downloaded
     /// image, else its link preview's image.
     pub fn thumbnail(&self) -> Option<String> {
+        // Never a view-once message's media.
+        if self.view_once.is_some() {
+            return None;
+        }
         self.attachments
             .iter()
             .filter(|a| a.content_type.starts_with("image/"))
@@ -799,7 +828,7 @@ const CONVERSATION_COLUMNS: &str = "id, kind, title, phone, color, members, last
       AS last_outgoing_status";
 
 const MESSAGE_COLUMNS: &str = "id, conversation_id, sent_at, received_at, direction, author, \
-     author_name, body, status, reactions, quote, attachments, link_preview, deleted, edited, expires_in, expire_start, edit_count, notice, mentions, styles, cta, deleted_by_admin, long_text, poll";
+     author_name, body, status, reactions, quote, attachments, link_preview, deleted, edited, expires_in, expire_start, edit_count, notice, mentions, styles, cta, deleted_by_admin, long_text, poll, view_once";
 
 /// SQL matching a message whose own timestamp, or one of its edits', is
 /// the bound parameter `{param}`.
@@ -1009,6 +1038,7 @@ fn message_from_row(row: &SqliteRow) -> Result<Message> {
             .transpose()?,
         long_text: row.try_get::<Option<String>, _>("long_text")?.map(|l| serde_json::from_str(&l)).transpose()?,
         poll: row.try_get::<Option<String>, _>("poll")?.map(|p| serde_json::from_str(&p)).transpose()?,
+        view_once: row.try_get::<Option<i64>, _>("view_once")?.map(ViewOnce::from_i64),
     })
 }
 
@@ -1584,14 +1614,20 @@ impl AppDb {
     /// Updates the conversation's preview/last_message_at and, for incoming
     /// messages, its unread count. Returns the row id (existing row on dedupe).
     pub async fn insert_message(&self, msg: &NewMessage) -> Result<i64> {
+        self.insert_message_view_once(msg, None).await
+    }
+
+    /// [`insert_message`](Self::insert_message), a view-once message when
+    /// `view_once` says (a message delivered again keeps its state).
+    pub async fn insert_message_view_once(&self, msg: &NewMessage, view_once: Option<ViewOnce>) -> Result<i64> {
         let mut tx = self.write().await?;
         ensure_conversation(&mut tx, &msg.conversation_id).await?;
         let incoming = msg.direction == Direction::Incoming;
         let author_key = msg.author.as_deref().unwrap_or("");
         let inserted: Option<i64> = sqlx::query_scalar(
             "INSERT INTO messages (conversation_id, sent_at, received_at, direction, author, \
-                author_key, author_name, body, status, quote, attachments, link_preview, expires_in, is_read, expire_start) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                author_key, author_name, body, status, quote, attachments, link_preview, expires_in, is_read, expire_start, view_once) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT (conversation_id, author_key, sent_at) DO NOTHING \
              RETURNING id",
         )
@@ -1611,6 +1647,7 @@ impl AppDb {
         .bind(!incoming)
         // Ours count down from when they're sent; others' from when read.
         .bind((!incoming && msg.expires_in > 0).then_some(msg.received_at))
+        .bind(view_once.map(ViewOnce::to_i64))
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -1756,7 +1793,7 @@ impl AppDb {
     pub async fn media_messages(&self, conversation: &ConversationId, limit: u32) -> Result<Vec<Message>> {
         let rows = sqlx::query(AssertSqlSafe(format!(
             "SELECT {MESSAGE_COLUMNS} FROM messages \
-             WHERE conversation_id = ? AND deleted = 0 AND notice IS NULL \
+             WHERE conversation_id = ? AND deleted = 0 AND notice IS NULL AND view_once IS NULL \
                AND (attachments != '[]' OR link_preview IS NOT NULL) \
              ORDER BY sent_at DESC, id DESC LIMIT ?"
         )))
@@ -2310,7 +2347,12 @@ impl AppDb {
         Ok(())
     }
 
-    pub async fn set_attachment_path(&self, message_id: i64, index: usize, path: &str) -> Result<()> {
+    /// Records where attachment `index` was saved. `Ok(false)` when the
+    /// message has no such attachment (any more: deleted, or a view-once
+    /// message erased meanwhile), so the caller can remove the file. An
+    /// attachment that already has a path is overwritten with `Ok(true)`,
+    /// never `Ok(false)`, so a second download of it keeps its file.
+    pub async fn set_attachment_path(&self, message_id: i64, index: usize, path: &str) -> Result<bool> {
         let mut tx = self.write().await?;
         let Some(json) =
             sqlx::query_scalar::<_, String>("SELECT attachments FROM messages WHERE id = ?")
@@ -2318,19 +2360,18 @@ impl AppDb {
                 .fetch_optional(&mut *tx)
                 .await?
         else {
-            return Ok(());
+            return Ok(false);
         };
         let mut list: Vec<AttachmentMeta> = serde_json::from_str(&json)?;
-        if let Some(att) = list.get_mut(index) {
-            att.local_path = Some(path.to_owned());
-            sqlx::query("UPDATE messages SET attachments = ? WHERE id = ?")
-                .bind(serde_json::to_string(&list)?)
-                .bind(message_id)
-                .execute(&mut *tx)
-                .await?;
-        }
+        let Some(att) = list.get_mut(index) else { return Ok(false) };
+        att.local_path = Some(path.to_owned());
+        sqlx::query("UPDATE messages SET attachments = ? WHERE id = ?")
+            .bind(serde_json::to_string(&list)?)
+            .bind(message_id)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(true)
     }
 
     /// Replaces the directory with `entries`.
@@ -2608,7 +2649,7 @@ async fn current_long_text(conn: &mut sqlx::SqliteConnection, message_id: i64) -
 
 async fn refresh_preview(conn: &mut sqlx::SqliteConnection, id: &ConversationId) -> Result<()> {
     let row = sqlx::query(
-        "SELECT m.sent_at, m.body, m.styles, m.deleted, m.attachments, m.direction, m.author_name, m.poll, c.kind \
+        "SELECT m.sent_at, m.body, m.styles, m.deleted, m.attachments, m.direction, m.author_name, m.poll, m.view_once, c.kind \
          FROM messages m JOIN conversations c ON c.id = m.conversation_id \
          WHERE m.conversation_id = ? AND m.notice IS NULL ORDER BY m.sent_at DESC, m.id DESC LIMIT 1",
     )
@@ -2622,8 +2663,12 @@ async fn refresh_preview(conn: &mut sqlx::SqliteConnection, id: &ConversationId)
                 row.try_get::<Option<String>, _>("styles")?.map(|s| serde_json::from_str(&s)).transpose()?.unwrap_or_default();
             let body = hide_spoilers(&row.try_get::<String, _>("body")?, &styles);
             let poll: Option<Poll> = row.try_get::<Option<String>, _>("poll")?.map(|p| serde_json::from_str(&p)).transpose()?;
+            let view_once = row.try_get::<Option<i64>, _>("view_once")?.map(ViewOnce::from_i64);
             let text = if row.try_get::<bool, _>("deleted")? {
                 "This message was deleted".to_owned()
+            } else if let Some(view_once) = view_once {
+                let atts: Vec<AttachmentMeta> = serde_json::from_str(row.try_get("attachments")?)?;
+                view_once_preview(view_once, atts.first()).to_owned()
             } else if let Some(poll) = poll {
                 poll_preview(&poll.question)
             } else if !body.is_empty() {

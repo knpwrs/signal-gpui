@@ -4272,7 +4272,12 @@ impl Actor {
         }
         let path = path.to_string_lossy().into_owned();
         match self.db.set_attachment_path(message_id, index, &path).await {
-            Ok(()) => self.emit(Event::MessageChanged { conversation, message_id }),
+            Ok(true) => self.emit(Event::MessageChanged { conversation, message_id }),
+            // Erased (a view-once message viewed elsewhere) or deleted
+            // while it downloaded: the file isn't kept.
+            Ok(false) => {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
             Err(error) => self.error("failed to record attachment", error),
         }
     }
@@ -4304,7 +4309,11 @@ impl Actor {
             .join("attachments")
             .join(format!("{message_id}-{index}.{}", extension_for(&pointer)));
         tokio::fs::write(&path, &bytes).await?;
-        self.db.set_attachment_path(message_id, index, &path.to_string_lossy()).await?;
+        if !self.db.set_attachment_path(message_id, index, &path.to_string_lossy()).await? {
+            // Erased or deleted while it downloaded.
+            let _ = tokio::fs::remove_file(&path).await;
+            return Ok(());
+        }
         self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id });
         Ok(())
     }

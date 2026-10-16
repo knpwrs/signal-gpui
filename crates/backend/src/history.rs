@@ -482,16 +482,23 @@ async fn import_item(
                     sent_at: q.targetSentTimestamp? as i64,
                     text: q.text.as_ref().map(|t| t.body.clone()).unwrap_or_default(),
                     thumbnail: None,
-                    attachment: q.attachments.first().map(|a| {
-                        use proto::message_attachment::Flag;
-                        let flag = a.thumbnail.as_ref().map(|t| t.flag.enum_value_or_default());
-                        signal_store::QuotedAttachment {
-                            content_type: a.contentType.clone().unwrap_or_default(),
-                            file_name: a.fileName.clone(),
-                            voice: flag == Some(Flag::VOICE_MESSAGE),
-                            gif: flag == Some(Flag::GIF),
-                        }
-                    }),
+                    // A quote of a view-once message says only that
+                    // (Desktop's import: `isViewOnce` from its type).
+                    attachment: if q.type_.enum_value_or_default() == proto::quote::Type::VIEW_ONCE {
+                        Some(signal_store::QuotedAttachment::view_once())
+                    } else {
+                        q.attachments.first().map(|a| {
+                            use proto::message_attachment::Flag;
+                            let flag = a.thumbnail.as_ref().map(|t| t.flag.enum_value_or_default());
+                            signal_store::QuotedAttachment {
+                                content_type: a.contentType.clone().unwrap_or_default(),
+                                file_name: a.fileName.clone(),
+                                voice: flag == Some(Flag::VOICE_MESSAGE),
+                                gif: flag == Some(Flag::GIF),
+                                view_once: false,
+                            }
+                        })
+                    },
                     story: false,
                 })
             });

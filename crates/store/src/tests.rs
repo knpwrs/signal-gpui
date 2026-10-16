@@ -234,8 +234,8 @@ async fn delete_edit_attachments_and_search() {
 
     let got = db.message(id).await.unwrap().unwrap();
     assert_eq!(got.quote.unwrap().text, "q");
-    db.set_attachment_path(id, 0, "/tmp/a.png").await.unwrap();
-    db.set_attachment_path(id, 5, "/tmp/nope").await.unwrap();
+    assert!(db.set_attachment_path(id, 0, "/tmp/a.png").await.unwrap());
+    assert!(!db.set_attachment_path(id, 5, "/tmp/nope").await.unwrap(), "no such attachment");
     assert_eq!(
         db.message(id).await.unwrap().unwrap().attachments[0].local_path.as_deref(),
         Some("/tmp/a.png")
@@ -859,6 +859,8 @@ async fn drop_later_migrations(db: &AppDb) {
     sqlx::query("DROP TABLE early_events").execute(&db.writer).await.unwrap();
     sqlx::query("ALTER TABLE conversations DROP COLUMN can_add_members").execute(&db.writer).await.unwrap();
     sqlx::query("ALTER TABLE conversations DROP COLUMN group_ended").execute(&db.writer).await.unwrap();
+    sqlx::query("DROP INDEX messages_view_once").execute(&db.writer).await.unwrap();
+    sqlx::query("ALTER TABLE messages DROP COLUMN view_once").execute(&db.writer).await.unwrap();
 }
 
 /// Rewrites the migration history to look like a pre-squash database that
@@ -1316,8 +1318,9 @@ fn spoilers_hide_whole_and_overlapping() {
 #[test]
 fn quoted_attachments_say_what_they_are_as_desktop_does() {
     let quoted = |content_type: &str, voice: bool, gif: bool, file_name: Option<&str>| {
-        QuotedAttachment { content_type: content_type.into(), file_name: file_name.map(Into::into), voice, gif }.label()
+        QuotedAttachment { content_type: content_type.into(), file_name: file_name.map(Into::into), voice, gif, view_once: false }.label()
     };
+    assert_eq!(QuotedAttachment::view_once().label(), "View-once Photo", "as Desktop quotes one: a JPEG");
     assert_eq!(quoted("audio/aac", true, false, None), "Voice Message");
     assert_eq!(quoted("audio/mpeg", false, false, Some("song.mp3")), "Audio");
     assert_eq!(quoted("image/jpeg", false, false, None), "Photo");
@@ -1697,4 +1700,84 @@ async fn early_events_wait_for_their_message_and_expire_as_desktops_do() {
     db.keep_early_event(Some("carol"), 5, EarlyKeep::Envelope, "edit", now).await.unwrap();
     assert_eq!(db.load_early_events(now + 45 * DAY).await.unwrap().len(), 1);
     assert!(db.load_early_events(now + 45 * DAY + 1).await.unwrap().is_empty(), "45 days at most");
+}
+
+fn photo(path: Option<&str>) -> AttachmentMeta {
+    AttachmentMeta {
+        content_type: "image/jpeg".into(),
+        file_name: None,
+        size: 10,
+        width: None,
+        height: None,
+        local_path: path.map(Into::into),
+        sticker: false,
+        gif: false,
+        voice: false,
+        remote: None,
+    }
+}
+
+#[tokio::test]
+async fn view_once_messages_are_viewed_once_then_erased() {
+    let db = test_db().await;
+    let mut m = incoming("d:alice", "alice", 100, "");
+    m.attachments = vec![photo(Some("/tmp/vo.jpg"))];
+    let id = db.insert_message_view_once(&m, Some(ViewOnce::Ready)).await.unwrap();
+    let got = db.message(id).await.unwrap().unwrap();
+    assert_eq!(got.view_once, Some(ViewOnce::Ready));
+    assert_eq!(got.thumbnail(), None, "never quoted with its photo");
+    let chat = db.conversation(&conv("d:alice")).await.unwrap().unwrap();
+    assert_eq!((chat.last_message_preview.as_deref(), chat.unread_count), (Some("📷 View-once Photo"), 1));
+    assert!(db.media_messages(&conv("d:alice"), 10).await.unwrap().is_empty(), "not in All Media");
+    // Delivered again: still the one, still ready.
+    assert_eq!(db.insert_message_view_once(&m, Some(ViewOnce::Ready)).await.unwrap(), id);
+
+    // Viewing erases it, reads it, and hands back its files.
+    let erased = db.erase_view_once(id, ViewOnce::Viewed).await.unwrap().unwrap();
+    assert_eq!(erased, ErasedViewOnce { conversation: conv("d:alice"), files: vec!["/tmp/vo.jpg".into()] });
+    let got = db.message(id).await.unwrap().unwrap();
+    assert_eq!((got.view_once, got.attachments.len()), (Some(ViewOnce::Viewed), 0));
+    let chat = db.conversation(&conv("d:alice")).await.unwrap().unwrap();
+    assert_eq!((chat.last_message_preview.as_deref(), chat.unread_count), (Some("View-once Media"), 0));
+    // Only once; a download finishing late isn't kept.
+    assert_eq!(db.erase_view_once(id, ViewOnce::Viewed).await.unwrap(), None);
+    assert_eq!(db.erase_view_once(id, ViewOnce::Gone).await.unwrap(), None);
+    assert!(!db.set_attachment_path(id, 0, "/tmp/late.jpg").await.unwrap());
+    // Nor does a re-delivery bring it back.
+    db.insert_message_view_once(&m, Some(ViewOnce::Ready)).await.unwrap();
+    assert_eq!(db.message(id).await.unwrap().unwrap().view_once, Some(ViewOnce::Viewed));
+
+    // Ours can't be "viewed", only erased.
+    let mut ours = outgoing("d:alice", 200, "");
+    ours.attachments = vec![photo(None)];
+    let ours = db.insert_message_view_once(&ours, Some(ViewOnce::Ready)).await.unwrap();
+    assert_eq!(db.erase_view_once(ours, ViewOnce::Viewed).await.unwrap(), None);
+    assert!(db.erase_view_once(ours, ViewOnce::Gone).await.unwrap().is_some());
+    // Ordinary messages aren't touched.
+    let plain = db.insert_message(&incoming("d:alice", "alice", 300, "hi")).await.unwrap();
+    assert_eq!(db.erase_view_once(plain, ViewOnce::Viewed).await.unwrap(), None);
+    assert_eq!(db.message(plain).await.unwrap().unwrap().view_once, None);
+}
+
+#[tokio::test]
+async fn unviewed_view_once_messages_go_after_thirty_days() {
+    let db = test_db().await;
+    let at = |sent_at: i64| {
+        let mut m = incoming("d:alice", "alice", sent_at, "");
+        m.attachments = vec![photo(None)];
+        m
+    };
+    let old = db.insert_message_view_once(&at(1_000), Some(ViewOnce::Ready)).await.unwrap();
+    let new = db.insert_message_view_once(&at(5_000), Some(ViewOnce::Ready)).await.unwrap();
+    let viewed = db.insert_message_view_once(&at(500), Some(ViewOnce::Ready)).await.unwrap();
+    db.erase_view_once(viewed, ViewOnce::Viewed).await.unwrap();
+    // (received_at is sent_at + 5.)
+    assert_eq!(db.oldest_view_once().await.unwrap(), Some(1_005));
+    assert_eq!(db.view_once_to_erase(1_005).await.unwrap(), vec![old]);
+    db.erase_view_once(old, ViewOnce::Gone).await.unwrap();
+    assert_eq!(db.message(old).await.unwrap().unwrap().view_once, Some(ViewOnce::Gone));
+    assert_eq!(db.oldest_view_once().await.unwrap(), Some(5_005));
+    assert_eq!(db.view_once_to_erase(i64::MAX).await.unwrap(), vec![new]);
+    // An unviewed one that went stays unread, as Desktop leaves it.
+    assert_eq!(db.conversation(&conv("d:alice")).await.unwrap().unwrap().unread_count, 2);
 }

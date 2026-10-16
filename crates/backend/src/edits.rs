@@ -14,6 +14,8 @@ pub fn can_edit(message: &Message, note_to_self: bool, now: i64) -> bool {
         && !message.body.is_empty()
         // A poll's body is its question; polls can't be edited.
         && message.poll.is_none()
+        // Nor view-once messages (Desktop's `handleEditMessage`).
+        && message.view_once.is_none()
         && (note_to_self || (now - message.sent_at).abs() <= DAY_MS)
         && (note_to_self || message.edit_count < MAX_EDITS)
 }
@@ -50,6 +52,7 @@ mod tests {
             deleted_by_admin: None,
             long_text: None,
             poll: None,
+            view_once: None,
         }
     }
 
