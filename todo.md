@@ -77,22 +77,24 @@ done:
 ## Polls
 
 Receiving, voting, making (in groups) and ending polls work, following
-Desktop's `messageModifiers/Polls.preload.ts` and `PollCreateModal`.
-Tested with store, mapping and history import unit tests and demo-mode
-UI tests; not yet tried with a real account or against phones. Not done:
+Desktop's `messageModifiers/Polls.preload.ts`, `sendPollVote` and
+`PollCreateModal`, with who may vote, unread votes and ends, vote retries,
+the pending spinner and the options' emoji picker. Tested with store,
+mapping and history import unit tests and demo-mode UI tests; not yet
+tried with a real account, against phones, or against the server's rate
+limits and refusals. Left:
 
-- **Who may vote:** Desktop counts a vote on our poll only from someone
-  it was sent to (per-recipient send states). We don't keep those, so
-  any member of the chat counts.
-- **Unread:** Desktop counts votes on our polls (`hasUnreadPollVotes`)
-  and someone else's "ended the poll" as unread, and the end notice
-  becomes the chat's preview. Here both notify but don't count as
-  unread, so their notifications stay until dismissed.
-- **Sending votes:** a vote that fails is taken back rather than retried
-  (Desktop's job queue retries), and a group send that reaches only some
-  members counts as failed. There's no pending spinner, only a fainter
-  checkbox.
-- **New poll dialog:** Desktop's emoji picker beside each option.
+- **Send states for other messages:** who a message reached is kept only
+  for polls (all Desktop needs it for here), and only whether it reached
+  them, not per-person delivered or read.
+- **Retrying a poll:** "Retry send" on a poll that reached only some
+  members sends it to everyone again (they drop the repeat by its
+  timestamp); Desktop sends only to the ones it missed.
+- **Ending a poll:** a failed `PollTerminate` isn't retried (Desktop keeps
+  `terminateSendStatus` and retries it).
+- **Spinner timing:** a vote shows its new choice at once and the spinner
+  after 500 ms; Desktop keeps showing the sent choice until the spinner
+  appears.
 
 ## Nicknames and notes
 

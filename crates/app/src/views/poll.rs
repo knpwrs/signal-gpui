@@ -12,7 +12,10 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _};
 use gpui_kit::prelude::*;
-use gpui_kit::{AnyElement, App, Context, Entity, FontWeight, Hsla, SharedString, Subscription, WeakEntity, Window, div, px};
+use gpui_kit::{
+    Anchor, AnyElement, App, Context, Entity, FontWeight, Hsla, SharedString, Subscription, WeakEntity, Window, anchored, deferred, div,
+    px,
+};
 use signal_backend::Command;
 use signal_store::{
     ConversationId, Message, POLL_OPTION_MAX, POLL_OPTIONS_MAX, POLL_OPTIONS_MIN, POLL_QUESTION_MAX_SEND, Poll, PollTally,
@@ -21,8 +24,9 @@ use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::state::AppState;
 use crate::theme::{Palette, color_for};
-use crate::views::common::person_avatar;
+use crate::views::common::{ClosedByClick, person_avatar};
 use crate::views::conversation::ConversationView;
+use crate::views::emoji_picker::{EmojiPicker, PickerEvent};
 
 /// Desktop's poll is 275px wide.
 pub const POLL_WIDTH: f32 = 275.;
@@ -382,27 +386,55 @@ fn truncated(text: &str, max: usize) -> Option<String> {
 }
 
 /// Desktop's "New poll" form: the question, options that grow and shrink
-/// as you type, and "Allow multiple votes".
+/// as you type, each with an emoji picker, and "Allow multiple votes".
 pub struct PollForm {
     pub question: Entity<InputState>,
     pub options: Vec<Entity<InputState>>,
     pub allow_multiple: bool,
     /// The first reason it can't be sent, after Send was pressed.
     pub error: Option<&'static str>,
+    /// The emoji picker beside each option (Desktop's `FunEmojiPicker`);
+    /// `None` without the app's state (some tests).
+    picker: Option<Entity<EmojiPicker>>,
+    /// The option whose emoji picker is open.
+    pub picking_for: Option<Entity<InputState>>,
+    picker_closed_by: ClosedByClick,
     _subscriptions: Vec<Subscription>,
 }
 
 impl PollForm {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(state: Option<Entity<AppState>>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let question = cx.new(|cx| InputState::new(window, cx).placeholder("Ask a question"));
-        let subscription = cx.subscribe_in(&question, window, |this, input, event: &InputEvent, window, cx| {
+        let mut subscriptions = vec![cx.subscribe_in(&question, window, |this, input, event: &InputEvent, window, cx| {
             if let InputEvent::Change = event {
                 Self::limit(input, POLL_QUESTION_MAX_SEND, window, cx);
                 this.error = None;
                 cx.notify();
             }
+        })];
+        let picker = state.map(|state| {
+            let picker = cx.new(|cx| EmojiPicker::new(state, window, cx));
+            picker.update(cx, |picker, cx| picker.set_media(false, window, cx));
+            subscriptions.push(cx.subscribe_in(&picker, window, |this, _, event: &PickerEvent, window, cx| {
+                if let (PickerEvent::Picked(glyph), Some(input)) = (event, this.picking_for.clone()) {
+                    this.insert_emoji(&input, glyph, window, cx);
+                }
+                // Desktop's picker here closes on a pick (`closeOnSelect`).
+                this.picking_for = None;
+                cx.notify();
+            }));
+            picker
         });
-        let mut form = Self { question, options: Vec::new(), allow_multiple: true, error: None, _subscriptions: vec![subscription] };
+        let mut form = Self {
+            question,
+            options: Vec::new(),
+            allow_multiple: true,
+            error: None,
+            picker,
+            picking_for: None,
+            picker_closed_by: ClosedByClick::default(),
+            _subscriptions: subscriptions,
+        };
         // Desktop starts with two empty options, and multiple votes allowed.
         for _ in 0..POLL_OPTIONS_MIN {
             form.add_option(window, cx);
@@ -472,6 +504,33 @@ impl PollForm {
         cx.notify();
     }
 
+    /// Desktop's `handleSelectEmoji`: the emoji replaces what's selected in
+    /// the option (or goes at the cursor), unless that would pass the
+    /// option's limit. The options then grow or shrink as for typing.
+    fn insert_emoji(&mut self, input: &Entity<InputState>, glyph: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.options.contains(input) {
+            return;
+        }
+        let (value, selected) = {
+            let input = input.read(cx);
+            (input.value().to_string(), input.selected_range())
+        };
+        let start = selected.start.min(value.len());
+        let end = selected.end.clamp(start, value.len());
+        // Byte offsets (`InputState::selected_range`); `get` keeps a bad one
+        // from panicking.
+        let (Some(head), Some(tail)) = (value.get(..start), value.get(end..)) else { return };
+        let after = format!("{head}{glyph}{tail}");
+        if graphemes(&after) > POLL_OPTION_MAX {
+            return;
+        }
+        input.update(cx, |input, cx| {
+            input.replace(glyph.to_owned(), window, cx);
+            input.focus(window, cx);
+        });
+        self.on_option_changed(input, window, cx);
+    }
+
     /// Placeholders follow the options' places ("Option 1", "Option 2"…).
     fn renumber(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for (ix, input) in self.options.iter().enumerate() {
@@ -499,6 +558,65 @@ fn remaining(input: &Entity<InputState>, max: usize, cx: &App) -> Option<String>
     (left <= 30).then(|| left.to_string())
 }
 
+impl PollForm {
+    /// An option's field: the characters left near the limit, and Desktop's
+    /// emoji button (`FunEmojiPickerButton`) opening the picker beside it.
+    fn option_field(&self, ix: usize, input: &Entity<InputState>, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let left = remaining(input, POLL_OPTION_MAX, cx);
+        let open = self.picking_for.as_ref() == Some(input);
+        let for_click = input.clone();
+        let button = self.picker.clone().map(|picker| {
+            div()
+                .flex_none()
+                .child(
+                    div()
+                        .id(("poll-option-emoji", ix))
+                        .debug_selector(move || format!("poll-new-option-emoji-{ix}"))
+                        .size(px(24.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .cursor_pointer()
+                        .hover(|d| d.bg(palette.row_hover))
+                        .on_click(cx.listener(move |this, click, window, cx| {
+                            if this.picker_closed_by.take(click) {
+                                return;
+                            }
+                            this.picking_for =
+                                if this.picking_for.as_ref() == Some(&for_click) { None } else { Some(for_click.clone()) };
+                            if let Some(picker) = &this.picker {
+                                picker.update(cx, |picker, cx| picker.reset(window, cx));
+                            }
+                            cx.notify();
+                        }))
+                        .child(Icon::new(IconName::FaceSlightlySmiling).size_4().text_color(palette.text_secondary)),
+                )
+                .when(open, |d| {
+                    d.child(deferred(
+                        anchored().anchor(Anchor::TopRight).snap_to_window_with_margin(px(8.)).child(
+                            div()
+                                .pt_1()
+                                .on_mouse_down_out(cx.listener(|this, event, _, cx| {
+                                    this.picker_closed_by.record(event);
+                                    this.picking_for = None;
+                                    cx.notify();
+                                }))
+                                .child(picker),
+                        ),
+                    ))
+                })
+        });
+        let suffix = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .when_some(left, |d, left| d.child(div().text_xs().text_color(palette.text_secondary).child(left)))
+            .children(button);
+        Input::new(input).suffix(suffix)
+    }
+}
+
 impl Render for PollForm {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::get(cx);
@@ -506,6 +624,14 @@ impl Render for PollForm {
             let left = remaining(input, max, cx);
             Input::new(input).when_some(left, |i, left| i.suffix(div().text_xs().text_color(palette.text_secondary).child(left)))
         };
+        let options: Vec<_> = self
+            .options
+            .iter()
+            .enumerate()
+            .map(|(ix, input)| {
+                div().debug_selector(move || format!("poll-new-option-{ix}")).child(self.option_field(ix, input, palette, cx))
+            })
+            .collect();
         let allow = self.allow_multiple;
         div()
             .flex()
@@ -514,9 +640,7 @@ impl Render for PollForm {
             .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Question"))
             .child(div().debug_selector(|| "poll-question".into()).child(field(&self.question, POLL_QUESTION_MAX_SEND, cx)))
             .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Options"))
-            .child(div().flex().flex_col().gap_3().children(self.options.iter().enumerate().map(|(ix, input)| {
-                div().debug_selector(move || format!("poll-new-option-{ix}")).child(field(input, POLL_OPTION_MAX, cx))
-            })))
+            .child(div().flex().flex_col().gap_3().children(options))
             .child(div().border_t_1().border_color(palette.panel_border))
             .child(
                 div().flex().items_center().gap_3().child(div().flex_1().child("Allow multiple votes")).child(
@@ -534,7 +658,7 @@ impl Render for PollForm {
 
 /// Desktop's "New poll" dialog.
 pub fn open_create(state: Entity<AppState>, conversation: ConversationId, window: &mut Window, cx: &mut App) {
-    let form = cx.new(|cx| PollForm::new(window, cx));
+    let form = cx.new(|cx| PollForm::new(Some(state.clone()), window, cx));
     form.read(cx).question.clone().update(cx, |input, cx| input.focus(window, cx));
     window.open_dialog(cx, move |dialog, _, cx| {
         let ready = form.read(cx).can_send(cx);
@@ -595,7 +719,7 @@ mod tests {
     #[gpui_kit::test]
     fn the_new_poll_form_grows_and_checks_like_desktops(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
-        let window = cx.add_window(PollForm::new);
+        let window = cx.add_window(|window, cx| PollForm::new(None, window, cx));
         let form = window.root(cx).unwrap();
         let mut cx = VisualTestContext::from_window(*window, cx);
         // Typed, so the inputs report their changes as they do in use.
@@ -635,5 +759,55 @@ mod tests {
         };
         assert_eq!(q.len(), 100);
         assert_eq!((options, allow_multiple), (vec!["Tacos".to_owned(), "Pho".to_owned(), String::new()], true));
+    }
+
+    #[gpui_kit::test]
+    fn an_options_emoji_picker_adds_at_the_cursor(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.executor().allow_parking();
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, _events) = signal_backend::Backend::start(signal_backend::Config {
+            data_dir: dir.path().to_owned(),
+            db_key: [7; 32],
+            device_name: "test".into(),
+            demo: true,
+        })
+        .unwrap();
+        let state = cx.update(|cx| crate::state::new_state(backend.clone(), cx));
+        let window = cx.add_window(move |window, cx| PollForm::new(Some(state), window, cx));
+        let form = window.root(cx).unwrap();
+        let mut cx = VisualTestContext::from_window(*window, cx);
+        let first = form.read_with(&cx, |f, _| f.options[0].clone());
+        cx.update(|window, cx| first.update(cx, |input, cx| input.set_value("Tacos ", window, cx)));
+        // The button beside the option opens the picker for it.
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let button = cx.debug_bounds("poll-new-option-emoji-0").expect("emoji button");
+        cx.simulate_click(button.center(), gpui_kit::Modifiers::none());
+        assert!(form.read_with(&cx, |f, _| f.picking_for.as_ref() == Some(&first)));
+        // A pick goes in and closes the picker.
+        let pick = |cx: &mut VisualTestContext, emoji: &str| {
+            let picker = form.read_with(cx, |f, _| f.picker.clone().unwrap());
+            let emoji = emoji.to_owned();
+            cx.update(|_, cx| picker.update(cx, |_, cx| cx.emit(PickerEvent::Picked(emoji))));
+            cx.run_until_parked();
+        };
+        pick(&mut cx, "🌮");
+        assert_eq!(first.read_with(&cx, |i, _| i.value().to_string()), "Tacos 🌮");
+        assert!(form.read_with(&cx, |f, _| f.picking_for.is_none()));
+        assert_eq!(form.read_with(&cx, |f, _| f.options.len()), 2);
+        // In the last option, it grows the options as typing would.
+        let last = form.read_with(&cx, |f, _| f.options[1].clone());
+        form.update(&mut cx, |f, _| f.picking_for = Some(last.clone()));
+        pick(&mut cx, "🍕");
+        assert_eq!(last.read_with(&cx, |i, _| i.value().to_string()), "🍕");
+        assert_eq!(form.read_with(&cx, |f, _| f.options.len()), 3);
+        // Not past the limit.
+        let full = "a".repeat(POLL_OPTION_MAX);
+        cx.update(|window, cx| first.update(cx, |input, cx| input.set_value(full.clone(), window, cx)));
+        form.update(&mut cx, |f, _| f.picking_for = Some(first.clone()));
+        pick(&mut cx, "🌮");
+        assert_eq!(first.read_with(&cx, |i, _| i.value().to_string()), full);
+        backend.shutdown();
     }
 }
