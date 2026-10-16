@@ -560,6 +560,20 @@ fn group_changes_become_notices() {
     );
     assert_eq!(summary.timer, Some(3600));
     assert!(summary.left, "we were removed");
+    assert!(!summary.ended);
+}
+
+#[test]
+fn ending_a_group_is_noticed() {
+    use presage::libsignal_service::groups_v2::{GroupChange, GroupChanges};
+    use signal_store::{GroupNotice, Notice};
+    let editor = presage::libsignal_service::protocol::Aci::parse_from_service_id_string(ALICE).unwrap();
+    let changes =
+        GroupChanges { group_id: [0; 32], editor, version: 3, changes: vec![GroupChange::TerminateGroup], change_epoch: 7 };
+    let summary = summarize_group_change(&changes, ME);
+    assert!(summary.ended);
+    assert!(!summary.left, "ending it doesn't take us out");
+    assert_eq!(summary.notices, vec![Notice::Group { by: Some(ALICE.into()), change: GroupNotice::Ended }]);
 }
 
 #[test]

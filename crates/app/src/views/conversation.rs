@@ -154,6 +154,9 @@ impl ConversationView {
                     cx.notify();
                 }
                 ComposerEvent::EditLast => {
+                    if this.ended(cx) {
+                        return;
+                    }
                     let note_to_self = this.note_to_self(cx);
                     let now = now_millis();
                     let last = this
@@ -873,7 +876,7 @@ impl ConversationView {
                     .child(call("voice-call", IconName::Phone, "Start a call", false))
             })
             // A group's: one button, as Desktop's.
-            .when(conversation.is_some_and(|c| c.kind == ConversationKind::Group && !c.left && !c.blocked), |d| {
+            .when(conversation.is_some_and(|c| c.kind == ConversationKind::Group && !c.left && !c.blocked && !c.ended), |d| {
                 use gpui_kit::component::button::ButtonVariants as _;
                 d.child(
                     gpui_kit::component::button::Button::new("group-call")
@@ -1411,7 +1414,7 @@ impl ConversationView {
         // A poll shows in place of its text (its body is the question).
         let poll = message.poll.as_ref().filter(|_| !message.deleted).map(|poll| {
             let can_vote = !self.id.is_signal()
-                && self.state.read(cx).conversation(&self.id).is_none_or(|c| !c.left && !c.blocked);
+                && self.state.read(cx).conversation(&self.id).is_none_or(|c| !c.left && !c.blocked && !c.ended);
             let secondary = if outgoing { meta_color } else { palette.text_secondary };
             crate::views::poll::render_poll(message, poll, outgoing, fg, secondary, can_vote, palette, cx.entity().downgrade(), self.state.clone())
         });
@@ -1487,6 +1490,8 @@ impl ConversationView {
 
     fn render_hover_actions(&self, message: &Message, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let id = message.id;
+        // Desktop's `canReply` and `canReact`: not in an ended group.
+        let ended = self.ended(cx);
         let for_reply = message.clone();
         let downloadable: Vec<AttachmentMeta> =
             message.attachments.iter().filter(|a| a.local_path.is_some() && !a.sticker).cloned().collect();
@@ -1506,7 +1511,7 @@ impl ConversationView {
             .flex()
             .flex_none()
             .items_center()
-            .child(
+            .when(!ended, |d| d.child(
                 div()
                     .relative()
                     .debug_selector(move || format!("react-{id}"))
@@ -1533,16 +1538,18 @@ impl ConversationView {
                             .with_priority(1),
                         ))
                     }),
-            )
+            ))
             .when(!downloadable.is_empty(), |d| {
                 d.child(button("download", IconName::Download).on_click(move |_, _, cx: &mut App| {
                     download_attachments(downloadable.clone(), cx);
                 }))
             })
-            .child(button("reply", IconName::Reply).on_click(cx.listener(move |this, _, window, cx| {
-                let message = for_reply.clone();
-                this.composer.update(cx, |composer, cx| composer.reply_to(message, window, cx));
-            })))
+            .when(!ended, |d| {
+                d.child(button("reply", IconName::Reply).on_click(cx.listener(move |this, _, window, cx| {
+                    let message = for_reply.clone();
+                    this.composer.update(cx, |composer, cx| composer.reply_to(message, window, cx));
+                })))
+            })
             .child(self.render_message_menu_button(message, cx))
     }
 
@@ -1655,7 +1662,13 @@ impl ConversationView {
         let we_are_admin = state
             .conversation(&self.id)
             .is_some_and(|c| !c.left && me.is_some_and(|me| c.admins.iter().any(|a| a == me)));
-        signal_backend::deletes::Chat::new(self.note_to_self(cx), self.id.as_group().is_some(), we_are_admin)
+        signal_backend::deletes::Chat::new(self.note_to_self(cx), self.id.as_group().is_some(), we_are_admin, self.ended(cx))
+    }
+
+    /// An admin ended this group (Desktop's `terminated`): no sends,
+    /// replies, reactions, edits, pins, votes or calls.
+    fn ended(&self, cx: &App) -> bool {
+        self.state.read(cx).conversation(&self.id).is_some_and(|c| c.ended)
     }
 
     /// What a deleted message says, in Desktop's words (`Message.dom.tsx`):
@@ -3202,8 +3215,23 @@ impl Render for ConversationView {
                 if self.id.is_signal() {
                     return d;
                 }
-                match self.state.read(cx).conversation(&self.id).filter(|c| c.blocked || c.left) {
+                match self.state.read(cx).conversation(&self.id).filter(|c| c.blocked || c.left || c.ended) {
                     Some(conversation) if conversation.blocked => d.child(self.render_blocked(conversation, palette)),
+                    // Desktop's `CompositionArea--group-terminated`.
+                    Some(conversation) if conversation.ended => d.child(
+                        div()
+                            .id("group-ended")
+                            .debug_selector(|| "group-ended".into())
+                            .flex_none()
+                            .px_6()
+                            .py_4()
+                            .border_t_1()
+                            .border_color(palette.panel_border)
+                            .text_sm()
+                            .text_center()
+                            .text_color(palette.text_secondary)
+                            .child("You can't send messages because the group has ended."),
+                    ),
                     // Desktop: "You are no longer a member of the group."
                     Some(_) => d.child(
                         div()
@@ -3313,8 +3341,8 @@ fn message_menu(
     use gpui_kit::component::menu::PopupMenuItem;
     let Some(this) = view.upgrade() else { return menu };
     let id = message.id;
-    let (state, note_to_self, chat) =
-        this.read_with(cx, |this, cx| (this.state.clone(), this.note_to_self(cx), this.delete_chat(cx)));
+    let (state, note_to_self, chat, ended) =
+        this.read_with(cx, |this, cx| (this.state.clone(), this.note_to_self(cx), this.delete_chat(cx), this.ended(cx)));
     let everyone = everyone_delete(std::slice::from_ref(message), chat, now_millis());
     let failed = message.direction == Direction::Outgoing && message.status == DeliveryStatus::Failed;
     let with_view = |f: fn(&mut ConversationView, i64, &mut Window, &mut Context<ConversationView>)| {
@@ -3333,7 +3361,7 @@ fn message_menu(
                 .on_click(move |_, window, cx| crate::views::forward::open(state.clone(), vec![id], window, cx)),
         );
     }
-    if signal_backend::edits::can_edit(message, note_to_self, now_millis()) {
+    if !ended && signal_backend::edits::can_edit(message, note_to_self, now_millis()) {
         let editing = message.clone();
         let view = view.clone();
         menu = menu.item(PopupMenuItem::new("Edit").icon(IconName::Pencil).on_click(move |_, window, cx| {
@@ -3342,7 +3370,8 @@ fn message_menu(
         }));
     }
     let (pinned, can_pin, pin_count) = this.read_with(cx, |this, cx| {
-        let can = !this.id.is_signal() && this.state.read(cx).conversation(&this.id).is_some_and(|c| c.can_edit_info);
+        // Desktop's `canPinMessages`: not in an ended group.
+        let can = !this.id.is_signal() && this.state.read(cx).conversation(&this.id).is_some_and(|c| c.can_edit_info && !c.ended);
         (this.pins.iter().any(|p| p.id == id), can, this.pins.len())
     });
     if can_pin && !message.deleted {
@@ -3366,7 +3395,7 @@ fn message_menu(
             .on_click(with_view(|this, id, _, cx| this.start_selecting(Some(id), cx))),
     );
     // Desktop's "End poll", on our own poll until it's ended.
-    if message.direction == Direction::Outgoing && message.poll.as_ref().is_some_and(|p| !p.ended) && !message.deleted {
+    if !ended && message.direction == Direction::Outgoing && message.poll.as_ref().is_some_and(|p| !p.ended) && !message.deleted {
         let state = state.clone();
         menu = menu.item(
             PopupMenuItem::new("End poll")
@@ -3726,7 +3755,7 @@ mod tests {
     fn admin_deletes_confirm_unless_all_are_ours() {
         use signal_backend::deletes::Chat;
         let now = 10_000;
-        let admin = Chat { note_to_self: false, group: true, we_are_admin: true, admin_deletes: true };
+        let admin = Chat { note_to_self: false, group: true, we_are_admin: true, admin_deletes: true, ended: false };
         let theirs = message(3, now - 100);
         let ours = Message { direction: Direction::Outgoing, author: None, ..message(4, now - 100) };
         let everyone = |m: &[Message], chat| super::everyone_delete(m, chat, now);

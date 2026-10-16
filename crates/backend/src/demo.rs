@@ -633,6 +633,7 @@ const DEMO_REMOTE_CONFIG: &[(&str, &str)] = &[
     ("desktop.adminDelete.send.prod", "8.30.0"),
     ("desktop.stickerReply.send.prod", "8.30.0"),
     ("desktop.groupMemberLabels.edit.prod", "8.30.0"),
+    ("desktop.groupTerminate.send.prod", "8.30.0"),
 ];
 
 pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::UnboundedSender<Event>) {
@@ -1126,6 +1127,21 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     }
                     let update = ConversationUpdate { members: Some(all), ..Default::default() };
                     let _ = db.upsert_conversation(&conversation, update).await;
+                }
+                let _ = events.unbounded_send(Event::ConversationsChanged);
+            }
+            Command::EndGroup { conversation } => {
+                let update = ConversationUpdate {
+                    ended: Some(true),
+                    can_edit_info: Some(false),
+                    can_add_members: Some(false),
+                    can_label: Some(false),
+                    ..Default::default()
+                };
+                let _ = db.upsert_conversation(&conversation, update).await;
+                let notice = signal_store::Notice::Group { by: None, change: signal_store::GroupNotice::Ended };
+                if let Ok(Some(id)) = db.insert_notice(&conversation, now(), &notice).await {
+                    emit(Event::MessageChanged { conversation: conversation.clone(), message_id: id });
                 }
                 let _ = events.unbounded_send(Event::ConversationsChanged);
             }

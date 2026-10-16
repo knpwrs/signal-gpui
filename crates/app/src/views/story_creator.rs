@@ -359,7 +359,7 @@ impl StoryCreator {
                 .conversations
                 .iter()
                 .chain(state.archived.iter())
-                .filter(|c| c.kind == ConversationKind::Group && !c.left && !c.blocked)
+                .filter(|c| c.kind == ConversationKind::Group && !c.left && !c.blocked && !c.ended)
                 .map(|c| (c.id.0.clone(), c.title.clone()))
                 .collect();
             (groups, state.custom_story_lists(), state.my_story(), state.my_story_privacy_set)

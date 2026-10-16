@@ -34,8 +34,9 @@ pub fn open(state: Entity<AppState>, message_ids: Vec<i64>, window: &mut Window,
             .read(cx)
             .conversations
             .iter()
-            // Nothing can be sent to the Signal chat.
-            .filter(|c| !c.blocked && !c.id.is_signal())
+            // Nothing can be sent to the Signal chat, or to an ended group
+            // (Desktop's `maybeForwardMessages`).
+            .filter(|c| !c.blocked && !c.id.is_signal() && !c.ended)
             .filter(|c| query.is_empty() || c.title.to_lowercase().contains(&query))
             .cloned()
             .collect();

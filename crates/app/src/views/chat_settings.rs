@@ -156,8 +156,29 @@ pub fn open(state: Entity<AppState>, conversation: Conversation, window: &mut Wi
             (state.clone(), conversation.id.clone(), title.clone(), description.clone());
         let (original_title, original_description) = (conversation.title.clone(), conversation.description.clone().unwrap_or_default());
         let (leave_state, leave_id) = (state.clone(), conversation.id.clone());
+        // Desktop's `canTerminateGroup`: admins, with `groupTerminate.send`.
+        let can_end = !conversation.left
+            && !conversation.ended
+            && conversation.admins.contains(&me)
+            && signal_backend::remote_config().group_terminate_send();
+        let (end_state, end_chat) = (state.clone(), conversation.clone());
         dialog.title("Group settings").w(px(460.)).child(
-            body.when(editable, |d| {
+            // Desktop's `ConversationDetails__GroupTerminatedBanner`.
+            body.when(conversation.ended, |d| {
+                d.child(
+                    div()
+                        .id("group-ended-banner")
+                        .debug_selector(|| "group-ended-banner".into())
+                        .px_3()
+                        .py_2()
+                        .rounded_lg()
+                        .bg(palette.row_hover)
+                        .text_sm()
+                        .text_center()
+                        .child("This group has ended"),
+                )
+            })
+            .when(editable, |d| {
                 d.child(div().flex().flex_col().gap_1().child(field("Group name")).child(Input::new(&title)))
                     .child(div().flex().flex_col().gap_1().child(field("Description")).child(Input::new(&description)))
                     .child(div().flex().justify_end().child(Button::new("group-save").label("Save").primary().on_click(
@@ -213,11 +234,20 @@ pub fn open(state: Entity<AppState>, conversation: Conversation, window: &mut Wi
                 })))
             })
             .child(div().id("group-members").max_h(px(260.)).overflow_y_scroll().children(member_rows))
-            .when(!conversation.left, |d| {
+            // Desktop doesn't offer leaving an ended group.
+            .when(!conversation.left && !conversation.ended, |d| {
                 d.child(Button::new("group-leave").label("Leave group").danger().on_click(move |_, window, cx| {
                     window.close_all_dialogs(cx);
                     confirm_leave(leave_state.clone(), leave_id.clone(), window, cx);
                 }))
+            })
+            .when(can_end, |d| {
+                d.child(div().debug_selector(|| "group-end".into()).child(Button::new("group-end").label("End group").danger().on_click(
+                    move |_, window, cx| {
+                        window.close_all_dialogs(cx);
+                        confirm_end(end_state.clone(), end_chat.clone(), window, cx);
+                    },
+                )))
             }),
         )
     });
@@ -267,6 +297,41 @@ fn nickname_rows(state: Entity<AppState>, conversation: Conversation, nickname: 
                     }),
             )
         })
+}
+
+/// Desktop's two confirmations before ending a group
+/// (`ConversationDetailsActions`): what it means, then whether you're sure.
+pub fn confirm_end(state: Entity<AppState>, conversation: Conversation, window: &mut Window, cx: &mut App) {
+    let title = format!("End \"{}\"?", conversation.title);
+    window.open_alert_dialog(cx, move |alert, _, _| {
+        let (state, id) = (state.clone(), conversation.id.clone());
+        alert
+            .title(SharedString::from(title.clone()))
+            .description(
+                "Members will no longer be able to send messages or start calls in the group. They will be notified that you ended the group, and will still have access to message history.",
+            )
+            .confirm()
+            .ok_text("End group")
+            .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
+            .on_ok(move |_, window, cx| {
+                window.close_all_dialogs(cx);
+                let (state, id) = (state.clone(), id.clone());
+                window.open_alert_dialog(cx, move |alert, _, _| {
+                    let (state, id) = (state.clone(), id.clone());
+                    alert
+                        .description("This will end the group permanently. Are you sure you want to proceed?")
+                        .confirm()
+                        .ok_text("End group")
+                        .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
+                        .on_ok(move |_, window, cx| {
+                            state.read(cx).send(Command::EndGroup { conversation: id.clone() });
+                            window.close_all_dialogs(cx);
+                            true
+                        })
+                });
+                false
+            })
+    });
 }
 
 /// Desktop's "Do you really want to leave?".

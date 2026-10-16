@@ -47,12 +47,15 @@ pub struct Chat {
     /// The remote config lets us send admin deletes
     /// ([`crate::RemoteConfig::admin_delete_send`]).
     pub admin_deletes: bool,
+    /// An admin ended the group: no deletes for everyone in it (Desktop's
+    /// `canDeleteForEveryone`, "terminated conversation").
+    pub ended: bool,
 }
 
 impl Chat {
     /// A chat's rules, with admin deletes as the remote config has them.
-    pub fn new(note_to_self: bool, group: bool, we_are_admin: bool) -> Self {
-        Self { note_to_self, group, we_are_admin, admin_deletes: crate::remote_config().admin_delete_send() }
+    pub fn new(note_to_self: bool, group: bool, we_are_admin: bool, ended: bool) -> Self {
+        Self { note_to_self, group, we_are_admin, admin_deletes: crate::remote_config().admin_delete_send(), ended }
     }
 }
 
@@ -61,6 +64,9 @@ impl Chat {
 /// delete (Desktop's `canSendDeleteForEveryone`) when the remote config
 /// allows those (`isAdminDeleteSendEnabled`).
 pub fn send_kind(message: &Message, chat: Chat, now: i64) -> Option<Kind> {
+    if chat.ended {
+        return None;
+    }
     if can_send(message, chat.note_to_self, now) {
         return Some(Kind::Normal);
     }
@@ -192,7 +198,7 @@ mod tests {
         assert!(!can_receive(&target, true, 1));
     }
 
-    const GROUP: Chat = Chat { note_to_self: false, group: true, we_are_admin: true, admin_deletes: true };
+    const GROUP: Chat = Chat { note_to_self: false, group: true, we_are_admin: true, admin_deletes: true, ended: false };
 
     #[test]
     fn admins_delete_anyones_message_in_a_group() {
@@ -204,6 +210,8 @@ mod tests {
         assert_eq!(send_kind(&theirs, Chat { note_to_self: true, ..GROUP }, now), None);
         // Not without the remote config's `adminDelete.send`.
         assert_eq!(send_kind(&theirs, Chat { admin_deletes: false, ..GROUP }, now), None);
+        // Nothing in an ended group, even our own.
+        assert_eq!(send_kind(&theirs, Chat { ended: true, ..GROUP }, now), None);
         let old = message(Direction::Incoming, DeliveryStatus::Read, now - DAY_MS - 1);
         assert_eq!(can_send_as_admin(&old, GROUP, now), Err("too old"));
         let deleted = Message { deleted: true, ..theirs.clone() };

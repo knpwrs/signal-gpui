@@ -660,6 +660,7 @@ impl Actor {
                 Command::Unlink => self.unlink().await,
                 Command::SkipHistory => self.skip_history().await,
                 Command::AddGroupMembers { conversation, members } => self.add_group_members(conversation, members).await,
+                Command::EndGroup { conversation } => self.end_group(conversation).await,
                 Command::RefreshRemoteConfig => self.maybe_refresh_remote_config().await,
             }
         });
@@ -892,6 +893,16 @@ impl Actor {
                     {
                         continue;
                     }
+                    // Nor any message in an ended group (Desktop's
+                    // `handleDataMessage`; the change that ended it was
+                    // applied above).
+                    if let Action::Insert { message, .. } = &action
+                        && message.conversation_id.as_group().is_some()
+                        && self.is_ended(&message.conversation_id).await
+                    {
+                        info!("dropping a message for an ended group");
+                        continue;
+                    }
                     self.apply(manager, action).await;
                 }
             }
@@ -1051,6 +1062,10 @@ impl Actor {
                         None => return,
                     },
                 };
+                // Desktop's `notifyTyping` drops them in ended groups.
+                if self.is_ended(&conversation).await {
+                    return;
+                }
                 self.emit(Event::Typing { conversation, author: sender, started });
             }
             Action::CallEvent(event) => self.on_call_event(event).await,
@@ -1373,6 +1388,33 @@ impl Actor {
         }
     }
 
+    /// Desktop's "End group" (`terminateGroup`, `buildTerminateChange`): an
+    /// admin ends the group for everyone, for good. Behind the remote
+    /// config's `groupTerminate.send`.
+    async fn end_group(self: Rc<Self>, conversation: ConversationId) {
+        if !crate::remote_config().group_terminate_send() {
+            return self.error("couldn't end the group", "not enabled for this account");
+        }
+        let stored = self.db.conversation(&conversation).await.ok().flatten();
+        if stored.as_ref().is_some_and(|c| c.ended || c.left) {
+            return;
+        }
+        if !self.is_group_admin(&conversation, &self.self_aci()).await {
+            return self.error("couldn't end the group", "only admins can end a group");
+        }
+        let result = self
+            .change_group(&conversation, |_, actions| {
+                actions.terminate_group = Some(presage::proto::group_change::actions::TerminateGroupAction {});
+                Ok(())
+            })
+            .await;
+        if let Err(error) = result {
+            warn!(error = %format!("{error:#}"), "couldn't end the group");
+            // Desktop's `TerminateGroupFailedModal`.
+            self.emit(Event::Error("Couldn't end the group. Check your connection and try again.".into()));
+        }
+    }
+
     /// Our label in a group (Signal's member labels), encrypted like other
     /// group strings. Desktop allows 24 characters (96 bytes) and one emoji.
     async fn set_member_label(self: Rc<Self>, conversation: ConversationId, emoji: Option<String>, text: String) {
@@ -1514,6 +1556,19 @@ impl Actor {
         if let Some(seconds) = summary.timer {
             let version = self.db.conversation(&conversation).await.ok().flatten().map_or(1, |c| c.expire_timer_version);
             let _ = self.db.set_expire_timer(&conversation, seconds, version).await;
+        }
+        if summary.ended {
+            // Desktop's `terminated`: for good, so nothing is editable.
+            let update = ConversationUpdate {
+                ended: Some(true),
+                can_edit_info: Some(false),
+                can_add_members: Some(false),
+                can_label: Some(false),
+                ..Default::default()
+            };
+            if let Err(error) = self.db.upsert_conversation(&conversation, update).await {
+                warn!(%error, "failed to record that a group ended");
+            }
         }
         if summary.left {
             let _ = self.db.set_left(&conversation, true).await;
@@ -2421,7 +2476,8 @@ impl Actor {
             let stored = self.db.conversation(conversation).await.ok().flatten();
             let left = stored.as_ref().is_some_and(|c| c.left);
             let ended = stored.as_ref().is_some_and(|c| c.ended);
-            let can_edit_info = !left && mapping::can_edit_group_info(&group, &me);
+            // Desktop's `canEditGroupInfo`: never in an ended group.
+            let can_edit_info = !left && !ended && mapping::can_edit_group_info(&group, &me);
             let admins: Vec<String> = group
                 .members
                 .iter()
@@ -2436,7 +2492,7 @@ impl Actor {
                     Some((m.aci.service_id_string(), signal_store::MemberLabel { emoji: m.label_emoji.clone(), text }))
                 })
                 .collect();
-            let can_label = !left && mapping::can_set_member_label(&group, &me);
+            let can_label = !left && !ended && mapping::can_set_member_label(&group, &me);
             let can_add_members = !left && !ended && mapping::can_add_group_members(&group, &me);
             return Some(ConversationUpdate {
                 can_add_members: Some(can_add_members),
@@ -2825,6 +2881,12 @@ impl Actor {
     /// Desktop's "Forward": a new message per chat with the same text and
     /// media. Attachments we haven't downloaded can't go along.
     async fn forward(self: Rc<Self>, message_ids: Vec<i64>, conversations: Vec<ConversationId>) {
+        // Desktop's `maybeForwardMessages` refuses ended groups.
+        for conversation in &conversations {
+            if self.is_ended(conversation).await {
+                return self.error("can't forward", "the group has ended");
+            }
+        }
         let mut skipped = 0;
         for conversation in &conversations {
             for message_id in &message_ids {
@@ -3289,11 +3351,13 @@ impl Actor {
             return;
         };
         let conversation = &target.conversation_id;
-        let left = self.db.conversation(conversation).await.ok().flatten().is_some_and(|c| c.left);
+        let stored = self.db.conversation(conversation).await.ok().flatten();
+        let left = stored.as_ref().is_some_and(|c| c.left);
         let chat = crate::deletes::Chat::new(
             self.is_note_to_self(conversation),
             conversation.as_group().is_some(),
             !left && self.is_group_admin(conversation, &self.self_aci()).await,
+            stored.as_ref().is_some_and(|c| c.ended),
         );
         let Some(kind) = crate::deletes::send_kind(&target, chat, now_millis()) else {
             return self.error(
@@ -3341,6 +3405,11 @@ impl Actor {
             timestamp,
             message: None,
         });
+    }
+
+    /// An admin ended this group (Desktop's `terminated`).
+    async fn is_ended(&self, conversation: &ConversationId) -> bool {
+        conversation.as_group().is_some() && self.db.conversation(conversation).await.ok().flatten().is_some_and(|c| c.ended)
     }
 
     async fn is_blocked(&self, conversation: &ConversationId) -> bool {

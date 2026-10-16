@@ -540,6 +540,10 @@ impl Actor {
                     Some(list) => lists.push(list.clone()),
                     None => self.error("couldn't post to a story", "that story list is gone"),
                 },
+                // Desktop's `sendStoryMessage`: "cannot send to a terminated group".
+                crate::StoryTarget::Group(group) if self.is_ended(&group).await => {
+                    self.error("couldn't post to a story", "the group has ended")
+                }
                 crate::StoryTarget::Group(group) => groups.push(group),
             }
         }

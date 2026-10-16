@@ -98,7 +98,8 @@ fn group_text(by: Option<&str>, change: &GroupNotice, name: impl Fn(&str) -> Str
         GroupNotice::AnnouncementsOnly { on: false } => {
             format!("{} changed the group settings to allow all members to send messages.", actor())
         }
-        GroupNotice::Ended => format!("{} ended the group.", actor()),
+        // Desktop's `GroupV2--terminated--you` and `--other`, without a period.
+        GroupNotice::Ended => format!("{} ended the group", actor()),
     }
 }
 
@@ -145,6 +146,8 @@ mod tests {
             "Alice changed the group name to \"Hikers\"."
         );
         assert_eq!(text(group(by("b"), GroupNotice::Removed { member: by("b") })), "Bob left the group.");
+        assert_eq!(text(group(None, GroupNotice::Ended)), "You ended the group");
+        assert_eq!(text(group(by("a"), GroupNotice::Ended)), "Alice ended the group");
         assert_eq!(text(group(None, GroupNotice::Removed { member: None })), "You left the group.");
         assert_eq!(text(group(by("a"), GroupNotice::Removed { member: None })), "Alice removed you.");
         assert_eq!(text(group(None, GroupNotice::Added { member: by("b") })), "You added Bob.");

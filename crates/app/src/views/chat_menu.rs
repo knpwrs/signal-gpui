@@ -160,7 +160,8 @@ pub fn build(
     // The Signal chat (release notes) has no timer or settings, as Desktop's.
     let signal = conversation.id.is_signal();
     // Groups: only people allowed to edit the group's details.
-    let timer_locked = signal || conversation.blocked || conversation.left || (group && !conversation.can_edit_info);
+    // Desktop's `canChangeTimer`: not in an ended group either.
+    let timer_locked = signal || conversation.blocked || conversation.left || conversation.ended || (group && !conversation.can_edit_info);
     let menu = if timer_locked {
         menu
     } else {
@@ -265,7 +266,8 @@ pub fn build(
             .icon(IconName::Trash)
             .on_click(move |_, window, cx| confirm_delete_chat(delete_state.clone(), delete_id.clone(), group, window, cx)),
     );
-    if group && !conversation.left {
+    // Desktop doesn't offer leaving an ended group.
+    if group && !conversation.left && !conversation.ended {
         let (state, id) = (state.clone(), id.clone());
         menu = menu.item(
             PopupMenuItem::new("Leave group")

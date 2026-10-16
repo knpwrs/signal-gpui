@@ -209,6 +209,9 @@ pub enum Command {
     /// Adds people (ACIs) to a group, inviting those whose profile key we
     /// don't have (Desktop's "Add members").
     AddGroupMembers { conversation: ConversationId, members: Vec<String> },
+    /// Ends a group for everyone (an admin's "End group"), behind the remote
+    /// config's `groupTerminate.send`.
+    EndGroup { conversation: ConversationId },
     /// Sets (or with an empty `text`, clears) our label in a group.
     SetMemberLabel { conversation: ConversationId, emoji: Option<String>, text: String },
     /// Computes a 1:1 chat's safety number; answered with `Event::SafetyNumber`.

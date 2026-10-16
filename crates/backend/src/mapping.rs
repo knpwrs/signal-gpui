@@ -215,13 +215,14 @@ mod pointer_bytes {
 }
 
 /// What a group change means here: a notice per change (`by`: who made
-/// it, `None` for us), the new timer if it changed, and whether we're out
-/// of the group now.
+/// it, `None` for us), the new timer if it changed, whether we're out of
+/// the group now, and whether an admin ended it.
 #[derive(Debug, Default, PartialEq)]
 pub struct GroupChangeSummary {
     pub notices: Vec<signal_store::Notice>,
     pub timer: Option<u32>,
     pub left: bool,
+    pub ended: bool,
 }
 
 pub fn summarize_group_change(changes: &presage::libsignal_service::groups_v2::GroupChanges, me: &str) -> GroupChangeSummary {
@@ -249,7 +250,10 @@ pub fn summarize_group_change(changes: &presage::libsignal_service::groups_v2::G
             GroupChange::AttributeAccess(access) => GroupNotice::InfoAccess { admins_only: admins_only(access) },
             GroupChange::MemberAccess(access) => GroupNotice::MemberAccess { admins_only: admins_only(access) },
             GroupChange::AnnouncementOnly(on) => GroupNotice::AnnouncementsOnly { on: *on },
-            GroupChange::TerminateGroup => GroupNotice::Ended,
+            GroupChange::TerminateGroup => {
+                summary.ended = true;
+                GroupNotice::Ended
+            }
             GroupChange::Timer(timer) => {
                 let seconds = timer.as_ref().map_or(0, |t| t.duration);
                 summary.timer = Some(seconds);

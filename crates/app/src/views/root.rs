@@ -692,4 +692,21 @@ mod tests {
         assert!(cx.debug_bounds("story-viewer").is_some());
         backend.shutdown();
     }
+
+    #[gpui_kit::test]
+    fn an_ended_group_has_no_composer(cx: &mut TestAppContext) {
+        let (mut cx, state, _root, backend, _dir) = demo_window(cx);
+        let hikers = signal_store::ConversationId("g:0000000000000000000000000000000000000000000000000000000000000001".into());
+        wait(&mut cx, "the demo group", &|cx| state.read_with(cx, |s, _| s.conversation(&hikers).is_some()));
+        state.update(&mut cx, |s, cx| s.select(Some(hikers.clone()), cx));
+        wait(&mut cx, "its composer", &|cx| cx.debug_bounds("emoji-button").is_some());
+        assert!(cx.debug_bounds("group-ended").is_none());
+
+        state.read_with(&cx, |s, _| s.send(signal_backend::Command::EndGroup { conversation: hikers.clone() }));
+        wait(&mut cx, "Desktop's ended notice", &|cx| cx.debug_bounds("group-ended").is_some());
+        assert!(cx.debug_bounds("emoji-button").is_none(), "no composer");
+        let chat = state.read_with(&cx, |s, _| s.conversation(&hikers).cloned()).unwrap();
+        assert!(chat.ended && !chat.can_edit_info && !chat.can_add_members);
+        backend.shutdown();
+    }
 }
