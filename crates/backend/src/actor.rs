@@ -554,7 +554,7 @@ impl Actor {
                     let result = crate::search_gifs(&self.db, &cache, &query, offset).await;
                     self.emit(Event::Gifs { query, offset, result });
                 }
-                Command::SendGif { conversation, gif } => self.send_gif(conversation, gif).await,
+                Command::SendGif { conversation, gif, quote } => self.send_gif(conversation, gif, quote).await,
                 Command::LoadStickers => {
                     let packs = self.load_stickers().await;
                     self.emit(Event::Stickers(packs));
@@ -1884,8 +1884,9 @@ impl Actor {
     }
 
     /// Downloads the GIF (through Signal's content proxy), shows it at once,
-    /// and queues the upload.
-    async fn send_gif(self: Rc<Self>, conversation: ConversationId, gif: crate::giphy::Gif) {
+    /// and queues the upload. It replies to `quote` when given, as Desktop's
+    /// GIF goes with the composer's quote (`sendMultiMediaMessage`).
+    async fn send_gif(self: Rc<Self>, conversation: ConversationId, gif: crate::giphy::Gif, quote: Option<i64>) {
         let bytes = match crate::giphy::download(&gif.original.url).await {
             Ok(bytes) => bytes,
             Err(error) => return self.error("couldn't get the GIF", format!("{error:#}")),
@@ -1906,7 +1907,7 @@ impl Actor {
             voice: false,
             remote: None,
         };
-        let Some((id, data, timestamp)) = self.store_outgoing(&conversation, String::new(), None, vec![meta], None).await
+        let Some((id, data, timestamp)) = self.store_outgoing(&conversation, String::new(), quote, vec![meta], None).await
         else {
             return;
         };

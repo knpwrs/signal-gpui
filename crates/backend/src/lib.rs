@@ -108,8 +108,9 @@ pub enum Command {
     },
     /// GIF search (trending when `query` is empty); answered with `Event::Gifs`.
     SearchGifs { query: String, offset: u32 },
-    /// Sends a GIF from search results.
-    SendGif { conversation: ConversationId, gif: giphy::Gif },
+    /// Sends a GIF from search results, replying to `quote` (our row id)
+    /// when given.
+    SendGif { conversation: ConversationId, gif: giphy::Gif, quote: Option<i64> },
     /// Lists installed sticker packs; answered with `Event::Stickers`.
     LoadStickers,
     /// Uploads a new sticker pack and installs it; answered with

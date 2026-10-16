@@ -22,7 +22,7 @@ flag as on whenever it's set.
 | Flag | What it gates in Desktop | Here |
 |---|---|---|
 | `adminDelete.receive` / `.send` | Group admins deleting anyone's message for everyone. Desktop turns receiving and sending on separately (`isAdminDeleteReceiveEnabled` / `isAdminDeleteSendEnabled`). | Done, both always on. People whose clients don't know `adminDelete` yet still see the message. |
-| `stickerReply.send` | Sending a sticker as a reply (with a quote). | Done, always on. GIFs sent while replying still drop the reply. |
+| `stickerReply.send` | Sending a sticker as a reply (with a quote). | Done, always on. GIFs reply too; Desktop opens a dialog to caption a GIF with the draft first (`DraftGifMessageSendModal`), and here a GIF goes at once, so the draft and the reply stay in the composer, as for a sticker. |
 | `pollSend1to1` | Creating polls in 1:1 chats (groups already have polls). | Off (`signal_backend::POLLS_IN_DIRECT_CHATS`), as Desktop is while the flag isn't set: polls are made in groups only. Received 1:1 polls show and can be voted in. |
 | `groupMemberLabels.edit` | Editing your own member label in a group. | Done (Group settings), always on: whether you may set one follows the group's label access, as Desktop's `getCanAddLabel`. |
 | `groupTerminate.send` | Admins ending a group for everyone. | Not done. We also don't know when a group was ended, so we'd still let you send to it. Desktop blocks sends and delete-for-everyone in ended groups. |

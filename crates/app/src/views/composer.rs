@@ -249,17 +249,20 @@ impl Composer {
                         // The sticker replies; the reply stays for a draft
                         // still to send, as in Desktop's `sendStickerMessage`
                         // (`ts/state/ducks/composer.preload.ts`).
-                        let quote = this.reply_to.as_ref().map(|m| m.id);
-                        if this.input.read(cx).value().is_empty() && this.images.is_empty() && this.files.is_empty() {
-                            this.reply_to = None;
-                        }
+                        let quote = this.take_reply_for_media(cx);
                         this.state.update(cx, |state, cx| state.send_sticker(conversation, pack, sticker, quote, cx));
                         this.close_picker(window, cx);
                         cx.emit(ComposerEvent::Sent);
                     }
                     PickerEvent::Gif(gif) => {
                         let conversation = this.conversation.clone();
-                        this.state.read(cx).send(Command::SendGif { conversation, gif: gif.clone() });
+                        // A GIF replies too, as Desktop's goes with the
+                        // composer's quote (`sendMultiMediaMessage`). Desktop
+                        // also takes the draft as its caption, so its reply
+                        // always goes; here the draft stays in the composer,
+                        // so the reply stays with it, as for a sticker.
+                        let quote = this.take_reply_for_media(cx);
+                        this.state.read(cx).send(Command::SendGif { conversation, gif: gif.clone(), quote });
                         this.close_picker(window, cx);
                         cx.emit(ComposerEvent::Sent);
                     }
@@ -741,6 +744,17 @@ impl Composer {
                 this.state.update(cx, |state, cx| state.reload_conversations(cx));
             });
         }));
+    }
+
+    /// The reply a sticker or GIF sends with: it stays for a draft still to
+    /// send, as in Desktop's `sendStickerMessage`
+    /// (`ts/state/ducks/composer.preload.ts`).
+    fn take_reply_for_media(&mut self, cx: &App) -> Option<i64> {
+        let quote = self.reply_to.as_ref().map(|m| m.id);
+        if self.input.read(cx).value().is_empty() && self.images.is_empty() && self.files.is_empty() {
+            self.reply_to = None;
+        }
+        quote
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2053,6 +2067,48 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(stickers(&f).iter().all(|m| m.quote.as_ref().is_some_and(|q| q.sent_at == original.sent_at)));
+    }
+
+    /// The GIF itself would come from Giphy, which tests don't reach (the
+    /// backend refuses this made-up URL), so this checks the composer's
+    /// side: the reply goes with the GIF as with a sticker.
+    #[gpui_kit::test]
+    fn a_gif_sent_while_replying_takes_the_reply(cx: &mut TestAppContext) {
+        let f = mount(cx);
+        let target = input_id(&f, cx);
+        cx.update_window(f.window, |_, window, cx| {
+            window.click(target, cx);
+            window.input("the original", cx);
+            f.composer.update(cx, |c, cx| c.submit(window, cx));
+        })
+        .unwrap();
+        let original =
+            sent(&f, |m| m.body == "the original").into_iter().find(|m| m.body == "the original").unwrap();
+        let media = signal_backend::giphy::GifMedia { url: "https://example.invalid/gif.mp4".into(), width: 200, height: 150 };
+        let gif = signal_backend::giphy::Gif { id: "g".into(), title: "A GIF".into(), preview: media.clone(), original: media };
+        let send_gif = |cx: &mut TestAppContext| {
+            cx.update_window(f.window, |_, _, cx| {
+                f.composer.update(cx, |c, _| c.picker_open = true);
+                let picker = f.composer.read(cx).picker.clone();
+                picker.update(cx, |_, cx| cx.emit(PickerEvent::Gif(gif.clone())));
+            })
+            .unwrap();
+            cx.run_until_parked();
+        };
+        let replying = |cx: &mut TestAppContext| cx.update(|cx| f.composer.read(cx).reply_to.as_ref().map(|m| m.id));
+        cx.update_window(f.window, |_, window, cx| {
+            f.composer.update(cx, |c, cx| c.reply_to(original.clone(), window, cx));
+            window.input("still typing", cx);
+        })
+        .unwrap();
+        send_gif(cx);
+        assert_eq!(replying(cx), Some(original.id), "kept for the draft");
+        cx.update_window(f.window, |_, window, cx| {
+            f.composer.update(cx, |c, cx| c.input.update(cx, |input, cx| input.set_value("", window, cx)));
+        })
+        .unwrap();
+        send_gif(cx);
+        assert_eq!(replying(cx), None, "went with the GIF");
     }
 
     thread_local! {

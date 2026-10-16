@@ -1145,7 +1145,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     let _ = events.unbounded_send(Event::Gifs { query, offset, result });
                 });
             }
-            Command::SendGif { conversation, gif } => {
+            Command::SendGif { conversation, gif, quote } => {
                 let bytes = match crate::giphy::download(&gif.original.url).await {
                     Ok(bytes) => bytes,
                     Err(error) => {
@@ -1157,6 +1157,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 if std::fs::write(&path, &bytes).is_err() {
                     continue;
                 }
+                let quote = demo_quote(&db, quote).await;
                 let sent_at = next_sent_at();
                 let msg = NewMessage {
                     conversation_id: conversation.clone(),
@@ -1167,7 +1168,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     author_name: None,
                     body: String::new(),
                     status: DeliveryStatus::Sent,
-                    quote: None,
+                    quote,
                     attachments: vec![AttachmentMeta {
                         content_type: "video/mp4".into(),
                         file_name: None,
