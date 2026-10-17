@@ -105,6 +105,20 @@ async fn conversation_upsert_and_ordering() {
     assert_eq!(db.conversation(&conv("d:alice")).await.unwrap().unwrap().draft.as_deref(), Some("draft"));
     db.set_draft(&conv("d:alice"), Some("")).await.unwrap();
     assert_eq!(db.conversation(&conv("d:alice")).await.unwrap().unwrap().draft, None);
+
+    // A formatted draft keeps its spans; a plain one, or none, drops them.
+    let bold = [StyleSpan { start: 0, len: 4, style: TextStyle::Bold }];
+    db.set_draft_with_styles(&conv("d:alice"), Some("bold move"), &bold).await.unwrap();
+    let chat = db.conversation(&conv("d:alice")).await.unwrap().unwrap();
+    assert_eq!((chat.draft.as_deref(), chat.draft_styles.as_slice()), (Some("bold move"), &bold[..]));
+    assert!(db.conversation(&conv("g:00ff")).await.unwrap().unwrap().draft_styles.is_empty());
+    db.set_draft(&conv("d:alice"), Some("plain now")).await.unwrap();
+    assert!(db.conversation(&conv("d:alice")).await.unwrap().unwrap().draft_styles.is_empty());
+    db.set_draft_with_styles(&conv("d:alice"), None, &bold).await.unwrap();
+    assert_eq!(db.setting(&format!("{DRAFT_STYLES}d:alice")).await.unwrap(), None);
+    db.set_draft_with_styles(&conv("d:alice"), Some("bold"), &bold).await.unwrap();
+    db.remove_conversation(&conv("d:alice")).await.unwrap();
+    assert_eq!(db.setting(&format!("{DRAFT_STYLES}d:alice")).await.unwrap(), None, "deleting the chat drops them");
 }
 
 #[tokio::test]

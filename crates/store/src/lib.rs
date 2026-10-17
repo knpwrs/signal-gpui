@@ -95,6 +95,10 @@ pub struct Conversation {
     pub marked_unread: bool,
     pub blocked: bool,
     pub draft: Option<String>,
+    /// The draft's formatting (spans over `draft`), as Desktop keeps a
+    /// draft's `draftBodyRanges`. Kept in a settings row beside the draft
+    /// ([`DRAFT_STYLES`]).
+    pub draft_styles: Vec<StyleSpan>,
     /// Disappearing message timer in seconds; 0 = off.
     pub expire_timer: u32,
     /// Version of a 1:1 chat's timer (Signal's `expireTimerVersion`).
@@ -450,6 +454,11 @@ pub fn attachment_preview(attachment: &AttachmentMeta) -> &'static str {
 /// Settings key: `"true"` to keep muted chats archived when a message
 /// comes (Desktop's `keepMutedChatsArchived`), which a new message reads.
 pub const KEEP_MUTED_CHATS_ARCHIVED: &str = "keep_muted_chats_archived";
+
+/// Settings key prefix (followed by the conversation id): a draft's
+/// formatting, JSON `StyleSpan`s over the conversation's `draft`. A
+/// settings row rather than a column, so no migration was needed.
+pub const DRAFT_STYLES: &str = "draft_styles:";
 
 /// The Signal chat's made-up account (Desktop's `SIGNAL_ACI`,
 /// `ts/types/SignalConversation.std.ts`): release notes appear from it, and
@@ -1084,7 +1093,8 @@ fn fts_query(input: &str) -> Option<String> {
 
 const CONVERSATION_COLUMNS: &str = "id, kind, title, phone, color, members, last_message_preview, \
      last_message_at, unread_count, pinned, (muted_until > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)) AS muted, muted_until, archived, \
-     marked_unread, blocked, draft, expire_timer, expire_timer_version, can_edit_info, left_group, description, admins, member_labels, can_label, can_add_members, group_ended, group_state, avatar_path, \
+     marked_unread, blocked, draft, \
+     (SELECT value FROM settings WHERE key = 'draft_styles:' || conversations.id) AS draft_styles, expire_timer, expire_timer_version, can_edit_info, left_group, description, admins, member_labels, can_label, can_add_members, group_ended, group_state, avatar_path, \
      (SELECT CASE WHEN m.direction = 1 AND m.deleted = 0 THEN m.status END FROM messages m \
       WHERE m.conversation_id = conversations.id AND m.notice IS NULL ORDER BY m.sent_at DESC, m.id DESC LIMIT 1) \
       AS last_outgoing_status, \
@@ -1247,6 +1257,12 @@ fn conversation_from_row(row: &SqliteRow) -> Result<Conversation> {
         marked_unread: row.try_get("marked_unread")?,
         blocked: row.try_get("blocked")?,
         draft: row.try_get("draft")?,
+        // Formatting that doesn't read is dropped, not an error: the draft
+        // still opens, plain.
+        draft_styles: row
+            .try_get::<Option<String>, _>("draft_styles")?
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default(),
         expire_timer: row.try_get::<i64, _>("expire_timer")? as u32,
         expire_timer_version: row.try_get::<i64, _>("expire_timer_version")? as u32,
         can_edit_info: row.try_get("can_edit_info")?,
@@ -1822,12 +1838,27 @@ impl AppDb {
         self.set_flag(id, "blocked", blocked).await
     }
 
+    /// Sets (or with `None` clears) a conversation's draft, unformatted.
     pub async fn set_draft(&self, id: &ConversationId, draft: Option<&str>) -> Result<()> {
-        sqlx::query("UPDATE conversations SET draft = ? WHERE id = ?")
-            .bind(draft.filter(|d| !d.is_empty()))
-            .bind(&id.0)
-            .execute(&self.writer)
-            .await?;
+        self.set_draft_with_styles(id, draft, &[]).await
+    }
+
+    /// Sets a conversation's draft and its formatting together.
+    pub async fn set_draft_with_styles(&self, id: &ConversationId, draft: Option<&str>, styles: &[StyleSpan]) -> Result<()> {
+        let draft = draft.filter(|d| !d.is_empty());
+        let key = format!("{DRAFT_STYLES}{}", id.0);
+        let mut tx = self.write().await?;
+        sqlx::query("UPDATE conversations SET draft = ? WHERE id = ?").bind(draft).bind(&id.0).execute(&mut *tx).await?;
+        if draft.is_some() && !styles.is_empty() {
+            sqlx::query("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
+                .bind(&key)
+                .bind(serde_json::to_string(styles)?)
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            sqlx::query("DELETE FROM settings WHERE key = ?").bind(&key).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2863,6 +2894,10 @@ impl AppDb {
         sqlx::query("DELETE FROM messages WHERE conversation_id = ?").bind(&id.0).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM pinned_messages WHERE conversation_id = ?").bind(&id.0).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM conversations WHERE id = ?").bind(&id.0).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM settings WHERE key = ?")
+            .bind(format!("{DRAFT_STYLES}{}", id.0))
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
     }

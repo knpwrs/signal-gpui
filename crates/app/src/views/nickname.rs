@@ -426,6 +426,7 @@ mod tests {
             marked_unread: false,
             blocked: false,
             draft: None,
+            draft_styles: Vec::new(),
             expire_timer: 0,
             expire_timer_version: 0,
             can_edit_info: true,
