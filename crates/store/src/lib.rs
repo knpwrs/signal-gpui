@@ -2369,7 +2369,7 @@ impl AppDb {
         self.update_and_refresh(
             message_id,
             "UPDATE messages SET deleted = 1, body = '', attachments = '[]', reactions = '[]', \
-             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL, poll = NULL, unread_poll_votes = 0, edit_history = NULL \
+             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL, poll = NULL, unread_poll_votes = 0, edit_history = NULL, content = NULL \
              WHERE id = ? RETURNING conversation_id",
             None,
         )
@@ -2383,7 +2383,7 @@ impl AppDb {
         let mut tx = self.write().await?;
         let conversation: Option<String> = sqlx::query_scalar(
             "UPDATE messages SET deleted = 1, deleted_by_admin = ?2, body = '', attachments = '[]', reactions = '[]', \
-             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL, poll = NULL, edit_history = NULL WHERE id = ?1 AND deleted = 0 \
+             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL, poll = NULL, edit_history = NULL, content = NULL WHERE id = ?1 AND deleted = 0 \
              RETURNING conversation_id",
         )
         .bind(message_id)

@@ -241,7 +241,7 @@ impl AppDb {
     pub async fn set_content(&self, message_id: i64, content: &MessageContent) -> Result<()> {
         let mut tx = self.write().await?;
         let conversation: Option<String> = sqlx::query_scalar(
-            "UPDATE messages SET content = ? WHERE id = ? AND content IS NULL RETURNING conversation_id",
+            "UPDATE messages SET content = ? WHERE id = ? AND content IS NULL AND deleted = 0 RETURNING conversation_id",
         )
         .bind(serde_json::to_string(content)?)
         .bind(message_id)

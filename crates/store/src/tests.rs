@@ -2577,6 +2577,25 @@ async fn message_content_previews_and_gift_badge_states() {
     assert_eq!(preview(db.clone()).await.as_deref(), Some("💳 You activated Payments."));
 }
 
+#[tokio::test]
+async fn deleting_a_message_clears_its_content() {
+    let db = test_db().await;
+    let contact = || MessageContent::Contact(Box::new(SharedContact { given_name: "Rosa".into(), ..Default::default() }));
+
+    let mine = db.insert_message(&incoming("d:a", "a", 1_000, "")).await.unwrap();
+    db.set_content(mine, &contact()).await.unwrap();
+    db.mark_deleted(mine).await.unwrap();
+    assert_eq!(db.message(mine).await.unwrap().unwrap().content, None);
+    // A re-delivery after the delete doesn't bring it back.
+    db.set_content(mine, &contact()).await.unwrap();
+    assert_eq!(db.message(mine).await.unwrap().unwrap().content, None);
+
+    let admin = db.insert_message(&incoming("d:a", "a", 2_000, "")).await.unwrap();
+    db.set_content(admin, &contact()).await.unwrap();
+    assert!(db.mark_deleted_by_admin(admin, &DeletedByAdmin { by: None }).await.unwrap());
+    assert_eq!(db.message(admin).await.unwrap().unwrap().content, None);
+}
+
 #[test]
 fn payment_descriptions_are_desktops() {
     let note = PaymentEvent::Notification { note: None };
