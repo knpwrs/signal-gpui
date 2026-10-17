@@ -6,9 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::{Icon, Sizable as _};
+use gpui_kit::component::Icon;
 use gpui_kit::component::input::{
-    Enter, Escape, IndentInline, InputEvent, MoveDown, MoveUp, Paste, Textarea, TextareaState,
+    Enter, Escape, IndentInline, MoveDown, MoveUp, Paste,
 };
 use gpui_kit::prelude::*;
 use gpui_kit::{
@@ -20,6 +20,7 @@ use signal_emoji::{Emoji, SearchOptions};
 use signal_store::{ConversationId, ConversationKind, Message};
 
 use crate::recorder::Recording;
+use crate::rich_input::{RichInput, RichInputEvent};
 use crate::state::AppState;
 use crate::theme::Palette;
 use crate::views::common::ClosedByClick;
@@ -180,7 +181,9 @@ const MENTION_LIMIT: usize = 8;
 pub struct Composer {
     state: Entity<AppState>,
     conversation: ConversationId,
-    pub(crate) input: Entity<TextareaState>,
+    pub(crate) input: Entity<RichInput>,
+    /// Whether a change may turn `:joy:` into 😂 (not while undoing).
+    substitute: bool,
     picker: Entity<EmojiPicker>,
     picker_open: bool,
     picker_closed_by: ClosedByClick,
@@ -226,19 +229,26 @@ impl Composer {
         state: Entity<AppState>,
         picker: Entity<EmojiPicker>,
         conversation: ConversationId,
-        draft: Option<String>,
+        draft: Option<(String, Vec<signal_store::StyleSpan>)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let input = cx.new(|cx| {
-            let mut input = TextareaState::new(window, cx)
+            let mut input = RichInput::new(window, cx)
                 .auto_grow(1, MAX_ROWS)
-                .submit_on_enter(true)
+                .text_size(px(14.5), px(20.))
                 .placeholder("Message");
-            if let Some(draft) = draft.filter(|d| !d.is_empty()) {
-                input.set_value(draft, window, cx);
+            if let Some((draft, styles)) = draft.filter(|(d, _)| !d.is_empty()) {
+                input.set_content(draft, &styles, window, cx);
             }
             input
+        });
+        let composer = cx.entity().downgrade();
+        input.update(cx, |input, _| {
+            input.set_context_menu(move |menu, _, cx| match composer.upgrade() {
+                Some(composer) => composer.read(cx).spelling_menu(menu, cx),
+                None => menu,
+            })
         });
         let subscriptions = vec![
             // Previews staged in a chat you switch away from.
@@ -269,12 +279,18 @@ impl Composer {
                     this.save_draft_recording(cx);
                 }
             }),
-            cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| match event {
-                InputEvent::Change => this.on_typed(window, cx),
-                // In the large composer Enter adds a line; ⌘Enter sends.
-                InputEvent::PressEnter { shift: false, secondary } if !this.large || *secondary => this.submit(window, cx),
-                InputEvent::Blur => this.stop_typing(cx),
-                _ => {}
+            // Enter that sends is taken before the input sees it (the
+            // `Enter` capture in `render`).
+            cx.subscribe_in(&input, window, |this, _, event: &RichInputEvent, window, cx| match event {
+                RichInputEvent::Change { restored: false } => this.on_typed(window, cx),
+                // Undo or redo: no emoji substitution, or undoing one would
+                // redo it at once.
+                RichInputEvent::Change { restored: true } => {
+                    this.substitute = false;
+                    this.on_change(window, cx);
+                    this.substitute = true;
+                }
+                RichInputEvent::Blur => this.stop_typing(cx),
             }),
             cx.subscribe_in(&picker, window, |this, _, event: &PickerEvent, window, cx| {
                 if !this.picker_open {
@@ -319,6 +335,7 @@ impl Composer {
             state,
             conversation,
             input,
+            substitute: true,
             picker,
             picker_open: false,
             picker_closed_by: ClosedByClick::default(),
@@ -360,7 +377,7 @@ impl Composer {
             let checked = text.clone();
             let found = cx.background_executor().spawn(async move { crate::spelling::check(&checked) }).await;
             let _ = this.update(cx, |this, cx| {
-                if this.input.read(cx).value().as_ref() == text.as_str() {
+                if this.input.read(cx).value() == text.as_str() {
                     this.spelling.checked = text;
                     this.spelling.found = found;
                     cx.notify();
@@ -442,9 +459,9 @@ impl Composer {
             return;
         }
         self.large = large;
+        // Enter adds a line in the large composer (the `Enter` capture in
+        // `render` lets it through).
         self.input.update(cx, |input, cx| {
-            // Enter adds a line in the large composer.
-            input.set_submit_on_enter(!large, cx);
             if large {
                 input.set_auto_grow(LARGE_ROWS, LARGE_ROWS, cx)
             } else {
@@ -488,29 +505,21 @@ impl Composer {
             .iter()
             .filter_map(|m| Some((message.body.get(m.start..m.start + m.len)?.to_owned(), m.aci.clone())))
             .collect();
-        // Its formatting, as markers to edit.
-        let body = crate::formatting::to_markers(&message.body, &message.styles);
+        // With its formatting, shown as it is in the message.
+        let (body, styles) = (message.body.clone(), message.styles.clone());
         self.reply_to = None;
         self.editing = Some(message);
-        self.input.update(cx, |input, cx| input.set_value(body, window, cx));
+        self.input.update(cx, |input, cx| input.set_content(body, &styles, window, cx));
         self.focus(window, cx);
         cx.notify();
     }
 
-    /// Wraps (or unwraps) the selection in `style`'s marker.
-    fn format(&mut self, style: signal_store::TextStyle, window: &mut Window, cx: &mut Context<Self>) {
-        let (text, selection) = {
-            let input = self.input.read(cx);
-            (input.value().to_string(), input.selected_range())
-        };
-        let (text, selection) = crate::formatting::toggle(&text, selection, style);
-        self.input.update(cx, |input, cx| {
-            input.set_value(text, window, cx);
-            input.set_selected_range(selection, cx);
-        });
-        // `set_value` reports no change: the draft, typing and send button
-        // follow by hand.
-        self.on_change(window, cx);
+    /// Desktop's formatting shortcuts and menu: `style` on or off the
+    /// selection (or for what's typed next at the caret).
+    fn format(&mut self, style: signal_store::TextStyle, _: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, cx| input.toggle_style(style, cx));
+        // The draft keeps its formatting.
+        self.save_draft_later(cx);
         cx.notify();
     }
 
@@ -569,7 +578,7 @@ impl Composer {
         };
 
         // `:joy:` → 😂 as soon as the closing colon is typed.
-        if let Some((range, emoji)) = signal_emoji::shortcode_replacement_at(&text, cursor) {
+        if let Some((range, emoji)) = signal_emoji::shortcode_replacement_at(&text, cursor).filter(|_| self.substitute) {
             let glyph = emoji.glyph_with(self.skin_tone(cx)).to_owned();
             self.insert_emoji(glyph, Some(range), window, cx);
             return;
@@ -583,7 +592,7 @@ impl Composer {
         self.update_typeahead(&text, cursor, cx);
         self.update_link_preview(&text, cx);
         self.update_typing(!text.trim().is_empty(), cx);
-        self.save_draft_later(text, cx);
+        self.save_draft_later(cx);
         cx.notify();
     }
 
@@ -684,7 +693,7 @@ impl Composer {
         self.state.update(cx, |state, _| state.record_emoji(&glyph));
         let text = self.input.read(cx).value().to_string();
         self.update_typing(!text.trim().is_empty(), cx);
-        self.save_draft_later(text, cx);
+        self.save_draft_later(cx);
         cx.notify();
     }
 
@@ -920,15 +929,21 @@ impl Composer {
         cx.emit(ComposerEvent::Sent);
     }
 
-    fn save_draft_later(&mut self, text: String, cx: &mut Context<Self>) {
+    /// Saves the input's text and formatting as the chat's draft once
+    /// typing pauses.
+    fn save_draft_later(&mut self, cx: &mut Context<Self>) {
         let backend = self.state.read(cx).backend.clone();
         let conversation = self.conversation.clone();
+        let (text, styles) = {
+            let input = self.input.read(cx);
+            (input.value().to_owned(), input.spans())
+        };
         self.draft_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(DRAFT_DEBOUNCE).await;
             let db = backend.db().clone();
             let draft = (!text.trim().is_empty()).then_some(text);
             let _ = backend
-                .spawn(async move { db.set_draft(&conversation, draft.as_deref()).await })
+                .spawn(async move { db.set_draft_with_styles(&conversation, draft.as_deref(), &styles).await })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.state.update(cx, |state, cx| state.reload_conversations(cx));
@@ -955,7 +970,8 @@ impl Composer {
             self.accept_typeahead(None, window, cx);
             return;
         }
-        let text = self.input.read(cx).value().trim().to_string();
+        // The text as sent (trimmed) and its formatting over it.
+        let (text, text_styles) = self.input.read(cx).trimmed();
         // Desktop's composer stops at 64 KiB with this toast
         // (`ts/components/CompositionInput.dom.tsx`); here the text stays to
         // be shortened.
@@ -987,20 +1003,22 @@ impl Composer {
                 return;
             }
         }
-        let (plain, styles) = crate::formatting::parse(&text);
-        let (body, mentions, styles) = encode_mentions(&plain, &std::mem::take(&mut self.mentions), &styles);
+        let (body, mentions, styles) = encode_mentions(&text, &std::mem::take(&mut self.mentions), &text_styles);
         if let Some(original) = self.editing.take() {
             // Who's mentioned can change without the text changing (two people
             // with one name), so compare both.
             let mut before: Vec<&signal_store::MentionSpan> = original.mentions.iter().collect();
             before.sort_by_key(|m| m.start);
             let same_people = before.iter().map(|m| m.aci.as_str()).eq(mentions.iter().map(String::as_str));
-            let original_text = crate::formatting::to_markers(&original.body, &original.styles);
-            if !text.is_empty() && (text != original_text || !same_people) {
+            // Formatting changed alone is an edit too; the original's spans
+            // are compared as the input would write them.
+            let original_styles = crate::rich_input::styles::Styles::from_spans(&original.body, &original.styles)
+                .to_spans(&original.body);
+            if !text.is_empty() && (text != original.body || text_styles != original_styles || !same_people) {
                 self.state.read(cx).send(Command::EditMessage { message_id: original.id, body, mentions, styles });
             }
             self.input.update(cx, |input, cx| input.set_value("", window, cx));
-            self.save_draft_later(String::new(), cx);
+            self.save_draft_later(cx);
             self.set_large(false, cx);
             cx.notify();
             return;
@@ -1064,7 +1082,7 @@ impl Composer {
         }
         self.input.update(cx, |input, cx| input.set_value("", window, cx));
         self.typing_sent_at = None; // sending a message implicitly stops typing
-        self.save_draft_later(String::new(), cx);
+        self.save_draft_later(cx);
         // Desktop collapses the large composer once sent.
         self.set_large(false, cx);
         cx.emit(ComposerEvent::Sent);
@@ -1948,8 +1966,7 @@ impl Render for Composer {
                     }))
                     .child(Icon::new(IconName::FaceSlightlySmiling).size_5().text_color(palette.text_secondary));
                 // One line tall when empty, like Signal Desktop: the pill
-                // supplies the padding, the textarea none.
-                let composer = cx.entity().downgrade();
+                // supplies the padding, the input none.
                 let input = div()
                     .debug_selector(|| "composer-input".into())
                     .relative()
@@ -1959,17 +1976,8 @@ impl Render for Composer {
                     .py(px(6.))
                     .rounded(px(16.))
                     .bg(palette.input_bg)
-                    .child(
-                        Textarea::new(&self.input)
-                            .appearance(false)
-                            .xsmall()
-                            .text_size(px(14.5))
-                            .line_height(px(20.))
-                            .context_menu(move |menu, _, cx| match composer.upgrade() {
-                                Some(composer) => composer.read(cx).spelling_menu(menu, cx),
-                                None => menu,
-                            }),
-                    )
+                    .text_color(palette.text)
+                    .child(self.input.clone())
                     .child(self.render_misspellings(palette));
                 let send = div()
                     .id("send-button")
@@ -2050,7 +2058,6 @@ impl Composer {
             return None;
         }
         let bounds = input.range_to_bounds(&selection)?;
-        let text = input.value().to_string();
         const STYLES: [(TextStyle, IconName, &str); 5] = [
             (TextStyle::Bold, IconName::Bold, "Mark selected text as bold"),
             (TextStyle::Italic, IconName::Italic, "Mark selected text as italic"),
@@ -2059,7 +2066,7 @@ impl Composer {
             (TextStyle::Spoiler, IconName::EyeOff, "Mark selected text as a spoiler"),
         ];
         let buttons = STYLES.map(|(style, icon, label)| {
-            let on = crate::formatting::is_wrapped(&text, selection.clone(), style);
+            let on = input.style_active(style);
             div()
                 .id(SharedString::from(format!("format-{style:?}")))
                 .debug_selector(move || format!("format-{style:?}"))
@@ -2330,7 +2337,7 @@ mod tests {
     use gpui_kit::test::TestWindowExt as _;
     use gpui_kit::{ElementId, Entity, TestAppContext, WindowBounds, WindowOptions, size, px};
     use signal_backend::{Backend, Config};
-    use signal_store::ConversationId;
+    use signal_store::{ConversationId, StyleSpan, TextStyle};
 
     use super::*;
 
@@ -2400,11 +2407,200 @@ mod tests {
 
     fn input_id(fixture: &Fixture, cx: &mut TestAppContext) -> ElementId {
         let input = cx.update(|cx| fixture.composer.read(cx).input.clone());
-        ("input", input.entity_id()).into()
+        ("rich-input", input.entity_id()).into()
     }
 
     fn text(fixture: &Fixture, cx: &mut TestAppContext) -> String {
         cx.update(|cx| fixture.composer.read(cx).input.read(cx).value().to_string())
+    }
+
+    /// The input's text and `(styled text, style)` for each span.
+    fn styled(fixture: &Fixture, cx: &mut TestAppContext) -> (String, Vec<(String, TextStyle)>) {
+        cx.update(|cx| {
+            let input = fixture.composer.read(cx).input.read(cx);
+            let text = input.value().to_owned();
+            let spans = input.spans().iter().map(|s| (text[s.start..s.start + s.len].to_owned(), s.style)).collect();
+            (text, spans)
+        })
+    }
+
+    /// Mounts the composer with the app's key bindings (the formatting
+    /// shortcuts among them), focused.
+    fn mount_with_keys(cx: &mut TestAppContext) -> Fixture {
+        let f = mount(cx);
+        cx.update(crate::bind_keys);
+        let target = input_id(&f, cx);
+        cx.update_window(f.window, |_, window, cx| window.click(target, cx)).unwrap();
+        f
+    }
+
+    fn type_in(f: &Fixture, cx: &mut TestAppContext, text: &str) {
+        cx.update_window(f.window, |_, window, cx| window.input(text, cx)).unwrap();
+        cx.run_until_parked();
+    }
+
+    fn press(f: &Fixture, cx: &mut TestAppContext, key: &str) {
+        cx.update_window(f.window, |_, window, cx| window.press(key, cx)).unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    fn a_shortcut_then_typing_continues_the_style_and_sends_it(cx: &mut TestAppContext) {
+        let f = mount_with_keys(cx);
+        type_in(&f, cx, "plain ");
+        press(&f, cx, "cmd-b");
+        type_in(&f, cx, "bold");
+        // Typed at its end, text stays bold until it's toggled off.
+        press(&f, cx, "cmd-b");
+        type_in(&f, cx, " end");
+        assert_eq!(styled(&f, cx), ("plain bold end".into(), vec![("bold".into(), TextStyle::Bold)]));
+        press(&f, cx, "enter");
+        assert_eq!(text(&f, cx), "");
+        // (The demo saves its formatting just after the message.)
+        let messages = sent(&f, |m| m.body == "plain bold end" && !m.styles.is_empty());
+        let message = messages.iter().find(|m| m.body == "plain bold end").unwrap();
+        assert_eq!(message.styles, [StyleSpan { start: 6, len: 4, style: TextStyle::Bold }]);
+    }
+
+    #[gpui_kit::test]
+    fn every_shortcut_toggles_its_style_over_the_selection(cx: &mut TestAppContext) {
+        let f = mount_with_keys(cx);
+        type_in(&f, cx, "one two");
+        press(&f, cx, "alt-shift-left");
+        for key in ["cmd-i", "cmd-shift-x", "cmd-e", "cmd-shift-b"] {
+            press(&f, cx, key);
+        }
+        assert_eq!(styled(&f, cx).1, [
+            ("two".into(), TextStyle::Italic),
+            ("two".into(), TextStyle::Strikethrough),
+            ("two".into(), TextStyle::Monospace),
+            ("two".into(), TextStyle::Spoiler),
+        ]);
+        press(&f, cx, "cmd-e");
+        assert_eq!(styled(&f, cx).1.len(), 3, "monospace toggled off");
+        // Markers typed by hand stay text, as in Desktop's composer.
+        press(&f, cx, "cmd-right");
+        type_in(&f, cx, " *three*");
+        assert_eq!(styled(&f, cx).0, "one two *three*");
+    }
+
+    #[gpui_kit::test]
+    fn an_edited_formatted_message_round_trips(cx: &mut TestAppContext) {
+        let f = mount_with_keys(cx);
+        type_in(&f, cx, "hide this");
+        press(&f, cx, "alt-shift-left");
+        press(&f, cx, "cmd-shift-b");
+        press(&f, cx, "enter");
+        let original = sent(&f, |m| m.body == "hide this" && !m.styles.is_empty()).into_iter().find(|m| m.body == "hide this").unwrap();
+        assert_eq!(original.styles, [StyleSpan { start: 5, len: 4, style: TextStyle::Spoiler }]);
+
+        cx.update_window(f.window, |_, window, cx| f.composer.update(cx, |c, cx| c.start_edit(original.clone(), window, cx)))
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(styled(&f, cx), ("hide this".into(), vec![("this".into(), TextStyle::Spoiler)]), "loaded as it was");
+        // Formatting alone changed is an edit.
+        press(&f, cx, "cmd-a");
+        press(&f, cx, "cmd-b");
+        press(&f, cx, "enter");
+        let edited = sent(&f, |m| m.id == original.id && m.styles.len() == 2).into_iter().find(|m| m.id == original.id).unwrap();
+        assert!(edited.edited);
+        assert_eq!(edited.body, "hide this");
+        assert_eq!(edited.styles, [
+            StyleSpan { start: 0, len: 9, style: TextStyle::Bold },
+            StyleSpan { start: 5, len: 4, style: TextStyle::Spoiler },
+        ]);
+    }
+
+    #[gpui_kit::test]
+    fn mentions_and_emoji_typed_inside_styled_text_take_its_style(cx: &mut TestAppContext) {
+        let f = mount_with_keys(cx);
+        f.composer.update(cx, |c, _| c.members = vec![("aci-1".into(), "Avery Quill".into())]);
+        press(&f, cx, "cmd-i");
+        type_in(&f, cx, "hi @Av");
+        assert!(cx.update(|cx| matches!(f.composer.read(cx).typeahead.as_ref().map(|t| &t.results), Some(Suggestions::People(_)))));
+        press(&f, cx, "enter");
+        type_in(&f, cx, ":pizz");
+        press(&f, cx, "enter");
+        let (text, spans) = styled(&f, cx);
+        assert_eq!(text, "hi @Avery Quill 🍕");
+        assert_eq!(spans, [(text.clone(), TextStyle::Italic)]);
+        // A `:joy:` completed by typing becomes its emoji, still italic.
+        type_in(&f, cx, " :joy:");
+        assert_eq!(styled(&f, cx).1, [("hi @Avery Quill 🍕 😂".into(), TextStyle::Italic)]);
+    }
+
+    /// With macOS's text system (fonts measure differently): monospace text
+    /// is shaped in Menlo, and a misspelling's underline after it starts
+    /// where the word is drawn, not where it would be in one font.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn spell_check_underlines_line_up_after_monospace_text() {
+        let mut cx = TestAppContext::build_with_text_system(
+            gpui_kit::TestDispatcher::new(0),
+            None,
+            std::sync::Arc::new(gpui_apple::AppleTextSystem::new()),
+        );
+        let cx = &mut cx;
+        let f = mount_with_keys(cx);
+        type_in(&f, cx, "mmmm iiii then Thiss ");
+        f.composer.update(cx, |c, cx| c.input.update(cx, |i, cx| i.set_selected_range(0..9, cx)));
+        press(&f, cx, "cmd-e");
+        press(&f, cx, "cmd-right");
+        assert_eq!(styled(&f, cx).1, [("mmmm iiii".into(), TextStyle::Monospace)]);
+
+        let mut vcx = gpui_kit::VisualTestContext::from_window(f.window, cx);
+        vcx.executor().advance_clock(SPELL_CHECK_PAUSE + Duration::from_millis(50));
+        let mut marked = Vec::new();
+        for _ in 0..200 {
+            vcx.update(|window, _| window.refresh());
+            vcx.run_until_parked();
+            marked = vcx.update(|_, cx| f.composer.read(cx).spelling.marked.clone());
+            if !marked.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(marked.contains(&(15..20)), "{marked:?}");
+
+        let (underline, origin, font_ids) = vcx.update(|_, cx| {
+            let input = f.composer.read(cx).input.read(cx);
+            (input.range_to_bounds(&(15..20)).unwrap(), input.input_bounds().origin, input.drawn_fonts())
+        });
+        // What the prefix measures in its own fonts, shaped apart.
+        let (expected, menlo, system) = vcx.update(|window, _| {
+            let run = |len: usize, family: &str| gpui_kit::TextRun {
+                len,
+                font: gpui_kit::font(family),
+                color: gpui_kit::black(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let runs = [run(9, crate::rich_input::MONOSPACE_FAMILY), run(6, ".SystemUIFont")];
+            let width = window.text_system().shape_line("mmmm iiii then ".into(), px(14.5), &runs, None).width;
+            let menlo = window.text_system().resolve_font(&gpui_kit::font(crate::rich_input::MONOSPACE_FAMILY));
+            let system = window.text_system().resolve_font(&gpui_kit::font(".SystemUIFont"));
+            (width, menlo, system)
+        });
+        assert_eq!(font_ids.first(), Some(&menlo), "monospace drawn in Menlo");
+        assert!(font_ids.contains(&system));
+        assert!((underline.left() - (origin.x + expected)).abs() < px(0.01), "{underline:?} vs {expected:?}");
+    }
+
+    #[gpui_kit::test]
+    fn a_formatted_draft_opens_formatted(cx: &mut TestAppContext) {
+        let f = mount(cx);
+        let state = cx.update(|cx| f.composer.read(cx).state.clone());
+        let window = f.window;
+        let composer = cx
+            .update_window(window, |_, window, cx| {
+                let picker = cx.new(|cx| EmojiPicker::new(state.clone(), window, cx));
+                let draft = ("saved draft".to_owned(), vec![StyleSpan { start: 6, len: 5, style: TextStyle::Strikethrough }]);
+                cx.new(|cx| Composer::new(state, picker, ConversationId("d:test".into()), Some(draft), window, cx))
+            })
+            .unwrap();
+        let spans = cx.update(|cx| composer.read(cx).input.read(cx).spans());
+        assert_eq!(spans, [StyleSpan { start: 6, len: 5, style: TextStyle::Strikethrough }]);
     }
 
     #[gpui_kit::test]
@@ -2913,6 +3109,27 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn undo_takes_back_a_shortcode_replacement(cx: &mut TestAppContext) {
+        let f = mount(cx);
+        let target = input_id(&f, cx);
+        cx.update_window(f.window, |_, window, cx| {
+            window.click(target, cx);
+            window.input("lol :joy:", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(text(&f, cx), "lol 😂");
+        // Undo brings the shortcode back without turning it into 😂 again,
+        // and redo turns it back.
+        cx.update_window(f.window, |_, window, cx| window.dispatch_action(Box::new(gpui_kit::component::input::Undo), cx)).unwrap();
+        cx.run_until_parked();
+        assert_eq!(text(&f, cx), "lol :joy:");
+        cx.update_window(f.window, |_, window, cx| window.dispatch_action(Box::new(gpui_kit::component::input::Redo), cx)).unwrap();
+        cx.run_until_parked();
+        assert_eq!(text(&f, cx), "lol 😂");
+    }
+
+    #[gpui_kit::test]
     fn enter_sends_and_clears(cx: &mut TestAppContext) {
         let f = mount(cx);
         let target = input_id(&f, cx);
@@ -2999,7 +3216,18 @@ mod tests {
         let bold = vcx.debug_bounds("format-Bold").expect("the popover over the selection");
         vcx.simulate_click(bold.center(), gpui_kit::Modifiers::none());
         vcx.run_until_parked();
-        assert_eq!(text(&f, cx), "*make it bold*");
+        // Styled in place: no markers, the selection kept and the button lit.
+        assert_eq!(styled(&f, cx), ("make it bold".into(), vec![("make it bold".into(), TextStyle::Bold)]));
+        assert_eq!(cx.update(|cx| f.composer.read(cx).input.read(cx).selected_range()), 0..12);
+        assert!(cx.update(|cx| f.composer.read(cx).input.read(cx).style_active(TextStyle::Bold)));
+        // Clicked again: off.
+        let mut vcx = gpui_kit::VisualTestContext::from_window(f.window, cx);
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+        let bold = vcx.debug_bounds("format-Bold").expect("still over the selection");
+        vcx.simulate_click(bold.center(), gpui_kit::Modifiers::none());
+        vcx.run_until_parked();
+        assert_eq!(styled(&f, cx).1, []);
 
         // Off in Settings: no popover.
         let state = cx.update(|cx| f.composer.read(cx).state.clone());

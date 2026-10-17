@@ -18,6 +18,7 @@ mod platform;
 mod prefs;
 mod recorder;
 mod reminders;
+mod rich_input;
 mod shortcuts;
 mod sidebar_width;
 mod sounds;

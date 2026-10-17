@@ -9662,6 +9662,7 @@ dependencies = [
  "directories",
  "futures",
  "gpui-kit",
+ "gpui-pre-apple",
  "hex",
  "image",
  "linkify",

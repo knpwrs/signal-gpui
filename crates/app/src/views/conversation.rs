@@ -191,7 +191,7 @@ impl ConversationView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let draft = state.read(cx).conversation(&id).and_then(|c| c.draft.clone());
+        let draft = state.read(cx).conversation(&id).and_then(|c| Some((c.draft.clone()?, c.draft_styles.clone())));
         let composer = cx.new(|cx| Composer::new(state.clone(), picker.clone(), id.clone(), draft, window, cx));
 
         let list = ListState::new(0, ListAlignment::Top, px(800.));
@@ -6440,7 +6440,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn formatting_markers_are_sent_as_styles_beside_a_mention(cx: &mut TestAppContext) {
+    fn formatting_is_sent_as_styles_beside_a_mention(cx: &mut TestAppContext) {
         let (backend, _dir) = demo_backend(cx);
         wait_for_messages(&backend, GROUP, 1, |_| true);
         let state = cx.update(|cx| crate::state::new_state(backend.clone(), cx));
@@ -6468,10 +6468,22 @@ mod tests {
             cx.run_until_parked();
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        cx.update(|_, cx| {
+            cx.bind_keys([
+                gpui_kit::KeyBinding::new("cmd-b", crate::views::composer::FormatBold, Some("Composer")),
+                gpui_kit::KeyBinding::new("cmd-shift-b", crate::views::composer::FormatSpoiler, Some("Composer")),
+            ]);
+        });
         cx.simulate_input("hi @May");
         cx.run_until_parked();
         cx.simulate_keystrokes("enter");
-        cx.simulate_input("*bring* ||snacks||");
+        // Bold for one word, toggled off, then a spoiler for the next.
+        cx.simulate_keystrokes("cmd-b");
+        cx.simulate_input("bring");
+        cx.simulate_keystrokes("cmd-b");
+        cx.simulate_input(" ");
+        cx.simulate_keystrokes("cmd-shift-b");
+        cx.simulate_input("snacks");
         cx.simulate_keystrokes("enter");
         let sent = wait_for_messages(&backend, GROUP, 1, |m| m.body.ends_with("snacks") && !m.styles.is_empty()).remove(0);
         assert_eq!(sent.body, "hi @Maya Chen bring snacks");

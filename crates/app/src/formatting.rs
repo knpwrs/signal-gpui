@@ -1,16 +1,15 @@
-//! Formatting in the composer, written as markers around the text:
-//! `*bold*`, `_italic_`, `~strikethrough~`, `` `monospace` `` and
-//! `||spoiler||` (`**bold**` and `~~strikethrough~~` too). The input can't
-//! show styled text, so markers stand in for Desktop's formatting menu and
-//! its shortcuts wrap the selection in them. On sending they become Signal's
-//! styles, which every client shows.
+//! Formatting written as markers around the text: `*bold*`, `_italic_`,
+//! `~strikethrough~`, `` `monospace` `` and `||spoiler||` (`**bold**` and
+//! `~~strikethrough~~` too), for the plain text fields that can't show
+//! styled text: a story's caption and a notification's inline reply. On
+//! sending they become Signal's styles, which every client shows. (The
+//! composer shows formatting as styled text instead, as Desktop's does;
+//! see `crate::rich_input`.)
 //!
 //! As in WhatsApp, a marker only counts at a word's edge: an opening one
 //! after a space, punctuation or the start, before a non-space; a closing
 //! one after a non-space, before a space, punctuation or the end, on the
 //! same line. So `snake_case_name` and `2*3*4` stay as typed.
-
-use std::ops::Range;
 
 use signal_store::{StyleSpan, TextStyle};
 
@@ -24,17 +23,6 @@ const MARKERS: [(&str, TextStyle); 7] = [
     ("~", TextStyle::Strikethrough),
     ("`", TextStyle::Monospace),
 ];
-
-/// The marker each style is written with.
-pub fn marker(style: TextStyle) -> &'static str {
-    match style {
-        TextStyle::Bold => "*",
-        TextStyle::Italic => "_",
-        TextStyle::Strikethrough => "~",
-        TextStyle::Monospace => "`",
-        TextStyle::Spoiler => "||",
-    }
-}
 
 /// The text without its markers, and the styles they marked (spans over
 /// that text).
@@ -113,91 +101,9 @@ fn closing(text: &str, from: usize, marker: &str) -> Option<usize> {
     None
 }
 
-/// `body` with its styles written back as markers (the reverse of
-/// [`parse`]), for editing a sent message. Styles that cross each other are
-/// written as nested as they can be.
-pub fn to_markers(body: &str, styles: &[StyleSpan]) -> String {
-    let mut styles: Vec<&StyleSpan> = styles
-        .iter()
-        .filter(|s| s.len > 0 && s.start + s.len <= body.len() && body.is_char_boundary(s.start) && body.is_char_boundary(s.start + s.len))
-        .collect();
-    // Outer before inner where they start together.
-    styles.sort_by_key(|s| (s.start, std::cmp::Reverse(s.len)));
-    let mut out = String::with_capacity(body.len() + styles.len() * 4);
-    let mut open: Vec<&StyleSpan> = Vec::new();
-    let mut next = styles.into_iter().peekable();
-    for (at, c) in body.char_indices().chain(std::iter::once((body.len(), '\0'))) {
-        // Close what ends here, innermost first.
-        while let Some(last) = open.last()
-            && last.start + last.len <= at
-        {
-            out.push_str(marker(last.style));
-            open.pop();
-        }
-        while let Some(span) = next.next_if(|s| s.start == at) {
-            out.push_str(marker(span.style));
-            open.push(span);
-        }
-        if at < body.len() {
-            out.push(c);
-        }
-    }
-    // Anything left open (crossing styles) closes at the end.
-    while let Some(span) = open.pop() {
-        out.push_str(marker(span.style));
-    }
-    out
-}
-
-/// Desktop's formatting shortcuts, with markers: wraps the selection in
-/// `style`'s marker, or unwraps it if it's already wrapped. An empty
-/// selection gets a pair to type between. Returns the new text and what to
-/// select (the same words, inside the markers).
-pub fn toggle(text: &str, selection: Range<usize>, style: TextStyle) -> (String, Range<usize>) {
-    let m = marker(style);
-    let (a, b) = (selection.start.min(text.len()), selection.end.min(text.len()));
-    let (start, end) = (a.min(b), a.max(b));
-    if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
-        return (text.to_owned(), start..end);
-    }
-    if is_wrapped(text, start..end, style) {
-        let text = format!("{}{}{}", &text[..start - m.len()], &text[start..end], &text[end + m.len()..]);
-        return (text, start - m.len()..end - m.len());
-    }
-    // The selected words, without the spaces around them (a marker before a
-    // space wouldn't open).
-    let selected = &text[start..end];
-    let trimmed_start = start + (selected.len() - selected.trim_start().len());
-    let trimmed_end = (end - (selected.len() - selected.trim_end().len())).max(trimmed_start);
-    let text = format!(
-        "{}{m}{}{m}{}",
-        &text[..trimmed_start],
-        &text[trimmed_start..trimmed_end],
-        &text[trimmed_end..]
-    );
-    (text, trimmed_start + m.len()..trimmed_end + m.len())
-}
-
-/// Whether the selection sits just inside `style`'s markers, so that
-/// toggling it unwraps it (the formatting popover shows it as on).
-pub fn is_wrapped(text: &str, selection: Range<usize>, style: TextStyle) -> bool {
-    let m = marker(style);
-    let (start, end) = (selection.start.min(selection.end), selection.start.max(selection.end));
-    start >= m.len() && text.get(start - m.len()..start) == Some(m) && text.get(end..end + m.len()) == Some(m)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn wrapped_selections_show_their_style() {
-        let text = "a *bold* word";
-        assert!(is_wrapped(text, 3..7, TextStyle::Bold));
-        assert!(!is_wrapped(text, 3..7, TextStyle::Italic));
-        assert!(!is_wrapped(text, 0..1, TextStyle::Bold));
-        assert!(!is_wrapped(text, 9..13, TextStyle::Bold), "at the end");
-    }
 
     fn styled(text: &str) -> (String, Vec<(String, TextStyle)>) {
         let (plain, spans) = parse(text);
@@ -233,31 +139,5 @@ mod tests {
         }
         // Punctuation is a word's edge.
         assert_eq!(styled("(*yes*)").1, vec![("yes".into(), TextStyle::Bold)]);
-    }
-
-    #[test]
-    fn styles_round_trip_through_markers() {
-        for text in ["a *bold* _and_ ||hidden|| `code` ~gone~", "*_both_* end", "plain"] {
-            let (plain, spans) = parse(text);
-            assert_eq!(parse(&to_markers(&plain, &spans)), (plain.clone(), spans), "{text:?}");
-        }
-        // Received formatting written out for editing.
-        let spans = [StyleSpan { start: 0, len: 5, style: TextStyle::Bold }, StyleSpan { start: 6, len: 5, style: TextStyle::Spoiler }];
-        assert_eq!(to_markers("hello world", &spans), "*hello* ||world||");
-    }
-
-    #[test]
-    fn shortcuts_wrap_and_unwrap_the_selection() {
-        let (text, selection) = toggle("say hello there", 4..9, TextStyle::Bold);
-        assert_eq!((text.as_str(), selection.clone()), ("say *hello* there", 5..10));
-        let (text, selection) = toggle(&text, selection, TextStyle::Bold);
-        assert_eq!((text.as_str(), selection), ("say hello there", 4..9));
-        // Spaces at the selection's edges stay outside.
-        assert_eq!(toggle("say hello there", 3..10, TextStyle::Spoiler).0, "say ||hello|| there");
-        // Nothing selected: a pair to type between.
-        assert_eq!(toggle("hi ", 3..3, TextStyle::Italic), ("hi __".into(), 4..4));
-        // Reversed, or inside a character: no panic.
-        assert_eq!(toggle("say hello", Range { start: 9, end: 4 }, TextStyle::Bold).0, "say *hello*");
-        assert_eq!(toggle("é", 1..2, TextStyle::Bold).0, "é");
     }
 }

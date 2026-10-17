@@ -526,6 +526,39 @@ it was tried with a real account. Left:
   Desktop also shows whether each voice message was played (its dot in
   All media), which isn't tracked here.
 
+## Formatting in the composer
+
+The composer shows formatting as styled text, as Desktop's Quill
+composer does (`crate::rich_input`, our own input on GPUI's
+`EntityInputHandler`, since gpui-kit's `Textarea` draws one style):
+bold, italic, strikethrough, monospace (Menlo) and spoilers (a shaded
+box) in place, toggled over the selection by the shortcuts and the
+popover, or at the caret for what's typed next (Quill's cursor format).
+Typing continues the style of the character before the caret. Drafts keep
+their formatting (a `draft_styles:<chat>` settings row, no migration), and
+editing a message loads its formatting. Tested with unit tests of the
+styles through every kind of edit, layout tests against macOS's text
+system (caret, hit testing, the IME's bounds and spell check underlines
+after monospace text) and demo-mode UI tests. How it looks wasn't
+checked by eye (no screenshots). Left:
+
+- **Typed markers stay text.** The old composer turned `*bold*` into
+  bold when sent; Desktop's composer has no markdown shortcuts, so now
+  `*bold*` is sent as typed.
+- **Formatted text pasted from other apps** arrives plain: GPUI's
+  clipboard gives text, not HTML, where Desktop's paste matchers
+  (`ts/quill/formatting/matchers.dom.ts`) keep bold, italic,
+  strikethrough and monospace. Text copied in the composer pastes back
+  formatted (the spans ride along as clipboard metadata).
+- **The input:** no accessibility role or value for VoiceOver yet
+  (gpui-kit's `Textarea` had one); dragging a selection past the input's
+  edge doesn't scroll it; a caret where a line wraps is drawn at the next
+  row's start, and a click past a wrapped row's end puts it before that
+  row's last character. Mentions aren't drawn as pills in the composer.
+- **Chat list:** a draft shows as plain text, spoilers included; Desktop
+  draws a draft with its formatting there (`ConversationListItem.dom.tsx`
+  passes `draftPreview.bodyRanges`).
+
 ## Voice messages
 
 Recording, the draft kept when you leave the app, and sending work. Not
@@ -568,9 +601,10 @@ formatting, and Desktop's tabs work. Not done yet:
   cropping) for photo stories. Not started: what's drawn has to be
   painted into the photo's pixels before it's uploaded, and nothing here
   does that yet.
-- **Caption formatting** is written with the composer's markers
-  (`*bold*` and so on), not Desktop's formatting menu, and captions can't
-  mention anyone.
+- **Caption formatting** is written with markers (`*bold*` and so on,
+  `crate::formatting`), not Desktop's formatting menu, and captions can't
+  mention anyone. The caption field could become a `RichInput` as the
+  composer did. A notification's inline reply reads markers the same way.
 - **Fonts for other scripts:** Desktop picks other fonts for Arabic,
   Japanese and other scripts (`getFontNameByTextScript`); those fall back
   to the system's fonts here.
