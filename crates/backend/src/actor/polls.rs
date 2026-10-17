@@ -343,6 +343,10 @@ impl Actor {
             }
             None => Delivery { error: Some("not connected".into()), ..Default::default() },
         };
+        // A 428: the captcha dialog asks; the vote goes again on its schedule.
+        if let Some(token) = &delivery.challenge {
+            self.note_challenge(token).await;
+        }
         let recorded = self
             .db
             .update_poll(message_id, |poll| poll.record_vote_sends(vote_count, &delivery.reached, &delivery.unregistered))

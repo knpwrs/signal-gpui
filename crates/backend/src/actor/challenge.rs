@@ -56,6 +56,19 @@ impl Actor {
         DeliveryStatus::Paused
     }
 
+    /// A send that holds no message of ours (a reaction, an edit, a group
+    /// change, a delete) got a 428: the challenge is kept with nothing
+    /// held so the dialog asks, as Desktop's `ChallengeHandler` registers a
+    /// challenge for any conversation job. Nothing goes again by itself.
+    pub(super) async fn note_challenge(&self, token: &str) {
+        let _lock = self.challenge_lock.lock().await;
+        let mut challenge =
+            self.saved_challenge().await.unwrap_or(Challenge { token: token.to_owned(), held: Vec::new(), created_at: now_millis() });
+        challenge.token = token.to_owned();
+        self.save_challenge(Some(&challenge)).await;
+        self.emit(Event::CaptchaRequired);
+    }
+
     /// At startup: a challenge still waiting asks again.
     pub(super) async fn resume_challenge(&self) {
         if self.saved_challenge().await.is_some() {
@@ -83,6 +96,9 @@ impl Actor {
                 drop(lock);
                 self.emit(Event::Captcha(Ok(())));
                 for id in challenge.held {
+                    // Failed first, so one that can't go again here (a
+                    // sticker) keeps Retry Send rather than staying paused.
+                    self.unpause(id).await;
                     self.clone().retry_send(id).await;
                 }
             }
@@ -107,14 +123,19 @@ impl Actor {
     async fn release_held(&self, challenge: Challenge) {
         self.save_challenge(None).await;
         for id in challenge.held {
-            let Ok(Some(message)) = self.db.message(id).await else { continue };
-            if message.status != DeliveryStatus::Paused {
-                continue;
-            }
-            if let Err(error) = self.db.set_message_status(id, DeliveryStatus::Failed).await {
-                self.error("failed to update a held message", error);
-            }
-            self.emit(Event::MessageChanged { conversation: message.conversation_id, message_id: id });
+            self.unpause(id).await;
         }
+    }
+
+    /// A held message that's still paused fails.
+    async fn unpause(&self, id: i64) {
+        let Ok(Some(message)) = self.db.message(id).await else { return };
+        if message.status != DeliveryStatus::Paused {
+            return;
+        }
+        if let Err(error) = self.db.set_message_status(id, DeliveryStatus::Failed).await {
+            self.error("failed to update a held message", error);
+        }
+        self.emit(Event::MessageChanged { conversation: message.conversation_id, message_id: id });
     }
 }

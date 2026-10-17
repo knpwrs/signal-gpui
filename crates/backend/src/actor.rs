@@ -4651,12 +4651,14 @@ impl Actor {
                         }
                         None => {
                             self.report(&conversation, &delivery);
+                            self.untracked_challenge(&delivery).await;
                         }
                     }
                 }
                 Outbound::Delete { conversation, body, timestamp, target, only } => {
                     let delivery = self.deliver_to(&mut manager, &conversation, body, timestamp, only.as_deref()).await;
                     let status = self.report(&conversation, &delivery);
+                    self.untracked_challenge(&delivery).await;
                     self.finish_delete(&conversation, target, Some(&delivery), status).await;
                 }
                 Outbound::SendImages { conversation, mut body, timestamp, message, images, preview_image } => {
@@ -4783,6 +4785,16 @@ impl Actor {
                 self.error("failed to save who a message reached", error);
                 None
             }
+        }
+    }
+
+    /// A 428 on a send that holds no message of ours: it's lost, so say so,
+    /// and the captcha dialog asks before the next one.
+    async fn untracked_challenge(&self, delivery: &Delivery) {
+        if let Some(token) = &delivery.challenge {
+            warn!("a send that isn't a message needs a captcha");
+            self.error("failed to send", "Signal needs a verification first");
+            self.note_challenge(token).await;
         }
     }
 
