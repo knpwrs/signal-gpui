@@ -47,9 +47,10 @@ objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-user-notifications = "0.3"
 block2 = "0.6"
-# The ringtone (NSSound), hiding the main window on close (NSWindow), and
-# spell checking the composer (NSSpellChecker).
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSSound", "NSResponder", "NSView", "NSWindow", "NSSpellChecker"] }
+# The ringtone (NSSound), hiding the main window on close (NSWindow), spell
+# checking the composer (NSSpellChecker), and knowing when the Mac wakes
+# (NSWorkspace).
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSSound", "NSResponder", "NSView", "NSWindow", "NSSpellChecker", "NSWorkspace"] }
 # The main window's NSView, to hide its NSWindow.
 raw-window-handle = "0.6"
 # Playing audio attachments and voice messages, and their waveforms.

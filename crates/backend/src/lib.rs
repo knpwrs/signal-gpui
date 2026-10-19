@@ -622,6 +622,10 @@ pub enum Command {
     /// The window became active: fetches the remote config again if it's
     /// been two hours (Desktop's `maybeRefreshRemoteConfig`).
     RefreshRemoteConfig,
+    /// The machine woke from sleep: checks the server connections are still
+    /// alive and reconnects if not (Desktop's `checkSockets` on
+    /// `powerMonitorResume`, `ts/background.preload.ts`).
+    Resumed,
     /// Someone's profile is being shown (their chat, About or contact
     /// details): fetched again unless it was in the last five minutes
     /// (Desktop's `throttledGetProfiles`). Answered with

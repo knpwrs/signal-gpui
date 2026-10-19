@@ -15,6 +15,7 @@ mod menus;
 mod loop_cache;
 mod notifications;
 mod platform;
+mod power;
 mod prefs;
 mod recorder;
 mod reminders;
@@ -174,6 +175,8 @@ fn main() -> Result<()> {
         bind_keys(cx);
         menus::install(cx);
 
+        let wake_backend = backend.clone();
+        power::on_wake(move || wake_backend.send(signal_backend::Command::Resumed));
         let state = state::new_state(backend, cx);
         cx.on_action(|_: &Quit, cx| main_window::quit(cx));
         // However the app quits (the menu, the Dock, logging out), the

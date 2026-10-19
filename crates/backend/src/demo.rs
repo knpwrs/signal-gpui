@@ -2285,7 +2285,8 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
             | Command::FetchLongText { .. }
             | Command::Unlink
             | Command::SkipHistory
-            | Command::RefreshRemoteConfig => {}
+            | Command::RefreshRemoteConfig
+            | Command::Resumed => {}
         }
     }
 }

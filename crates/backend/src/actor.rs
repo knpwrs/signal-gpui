@@ -1076,6 +1076,11 @@ impl Actor {
                 Command::AddGroupMembers { conversation, members } => self.add_group_members(conversation, members).await,
                 Command::EndGroup { conversation } => self.end_group(conversation).await,
                 Command::RefreshRemoteConfig => self.maybe_refresh_remote_config().await,
+                Command::Resumed => {
+                    if let Some(manager) = self.manager() {
+                        manager.check_websockets().await;
+                    }
+                }
                 Command::LoadProfile { service_id } => self.load_profile(service_id).await,
                 Command::SetProfile(edit) => self.set_profile(edit).await,
                 Command::ReserveUsername { nickname, discriminator } => self.reserve_username(nickname, discriminator),
