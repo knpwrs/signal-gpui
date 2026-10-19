@@ -481,17 +481,21 @@ pub fn same_name_contact<'a>(chat: &Conversation, all: impl IntoIterator<Item = 
     if chat.kind != ConversationKind::Direct || chat.accepted || chat.blocked {
         return None;
     }
+    // Desktop's `isConversationNameKnown`: no name, nothing to imitate.
+    if chat.title == signal_store::UNKNOWN_NAME {
+        return None;
+    }
     all.into_iter().find(|other| {
         other.id != chat.id && other.kind == ConversationKind::Direct && other.accepted && other.title == chat.title
     })
 }
 
 /// Desktop's `getCollisionsFromMemberships`: a group's members (not us,
-/// name known) sharing a title, by title, unless all of them are in our
-/// address book.
+/// name known, as `isConversationNameKnown` checks) sharing a title, by
+/// title, unless all of them are in our address book.
 pub fn name_collisions(members: &[(String, String)], me: &str, system: &HashSet<String>) -> BTreeMap<String, Vec<String>> {
     let mut by_title: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (aci, name) in members.iter().filter(|(aci, name)| aci != me && !name.trim().is_empty()) {
+    for (aci, name) in members.iter().filter(|(aci, name)| aci != me && !name.trim().is_empty() && name != signal_store::UNKNOWN_NAME) {
         by_title.entry(name.clone()).or_default().push(aci.clone());
     }
     by_title.retain(|_, acis| acis.len() >= 2 && !acis.iter().all(|a| system.contains(a)));
@@ -880,19 +884,24 @@ mod tests {
         let mut blocked = stranger.clone();
         blocked.blocked = true;
         assert!(same_name_contact(&blocked, &all).is_none());
+        // Nor between two people whose names we don't know.
+        let unknown = chat("d", "Unknown", true);
+        let unknown_stranger = chat("e", "Unknown", false);
+        assert!(same_name_contact(&unknown_stranger, &[unknown, unknown_stranger.clone()]).is_none());
     }
 
     #[test]
     fn group_collisions_follow_desktop() {
         let members: Vec<(String, String)> =
-            [("me", "Me"), ("a", "Sam"), ("b", "Sam"), ("c", "Ana"), ("d", "Ana"), ("e", "Leo"), ("f", "")]
+            [("me", "Me"), ("a", "Sam"), ("b", "Sam"), ("c", "Ana"), ("d", "Ana"), ("e", "Leo"), ("f", ""), ("g", "Unknown"), ("h", "Unknown")]
                 .map(|(a, n)| (a.to_owned(), n.to_owned()))
                 .to_vec();
         let mut system = HashSet::new();
         system.insert("c".to_owned());
         system.insert("d".to_owned());
         let found = name_collisions(&members, "me", &system);
-        // Both Anas are in our address book: no collision.
+        // Both Anas are in our address book: no collision. Nor are two
+        // people whose names we don't know.
         assert_eq!(found.keys().collect::<Vec<_>>(), ["Sam"]);
         assert_eq!(group_warning_text(&found), "2 group members have the same name.");
         system.remove("d");

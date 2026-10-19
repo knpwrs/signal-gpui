@@ -465,6 +465,11 @@ pub const DRAFT_STYLES: &str = "draft_styles:";
 /// nothing is ever sent to it.
 pub const SIGNAL_ACI: &str = "11111111-1111-4111-8111-111111111111";
 
+/// The title of someone a history transfer knew no name, number or
+/// username for (Desktop shows "Unknown" too). It isn't their name: two of
+/// them aren't a name collision.
+pub const UNKNOWN_NAME: &str = "Unknown";
+
 /// A group member's label: a short text with an optional emoji.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MemberLabel {

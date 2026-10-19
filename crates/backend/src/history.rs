@@ -267,7 +267,7 @@ fn contact_name(contact: &proto::Contact) -> String {
         .or(profile)
         .or_else(|| contact.e164.map(|e| format!("+{e}")))
         .or_else(|| contact.username.clone())
-        .unwrap_or_else(|| "Unknown".into())
+        .unwrap_or_else(|| signal_store::UNKNOWN_NAME.into())
 }
 
 fn who(recipient: &proto::Recipient) -> Who {
