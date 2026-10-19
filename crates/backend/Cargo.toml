@@ -84,6 +84,10 @@ image = { version = "0.25", default-features = false, features = ["png", "tiff",
 rand_chacha = "0.9"
 # Paused time, for retries and back-off in tests.
 tokio = { workspace = true, features = ["test-util"] }
+# A local websocket server, for the connection check after a sleep, and
+# libsignal-service's client socket to it.
+tokio-tungstenite = "0.29"
+reqwest-websocket = "0.6"
 jpeg-encoder = "0.6"
 jpeg-decoder = "0.3"
 tempfile = "3"

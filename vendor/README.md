@@ -69,6 +69,10 @@ upstream workspace). Modified by Ken Powers for signal-gpui since
   pack's manifest or one sticker without saving (for previews). Upstream
   only installs, always telling our other devices.
 
+- `src/manager/registered.rs`: `Manager::check_websockets` checks the
+  websockets already open (`SignalWebSocket::check`), for when the machine
+  wakes, as Desktop's `checkSockets`. Upstream has no way to.
+
 ## libsignal-service
 
 whisperfish/libsignal-service-rs at `fb92b13c82fde40ba4d10696cf79aa4f36ce25f1`
@@ -140,3 +144,11 @@ Powers for signal-gpui since 2026-10-15. Changes:
 - `protobuf/StorageService.proto`: `InstalledStickerPackRecord` and its
   identifier and record type (6), from Signal Desktop's
   `protos/SignalStorage.proto`, for installed sticker packs.
+- `src/websocket/mod.rs`: a socket whose last answered keepalive is more
+  than five minutes old by the wall clock is closed at the next keepalive
+  (Desktop's `STALE_THRESHOLD_MS`), and `SignalWebSocket::check` sends a
+  keepalive now and closes the socket if it isn't answered in 30 seconds
+  (Desktop's `forceKeepAlive`, `ts/textsecure/WebsocketResources.preload.ts`).
+  Upstream times keepalives with tokio's clock, which stops while the
+  machine sleeps, so a socket that died meanwhile went unnoticed for
+  minutes after waking.

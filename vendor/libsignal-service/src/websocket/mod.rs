@@ -3,6 +3,8 @@ use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use std::future::Future;
+use std::pin::Pin;
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use futures::channel::oneshot::Canceled;
@@ -12,7 +14,7 @@ use futures::prelude::*;
 use futures::stream::FuturesUnordered;
 use reqwest::Method;
 use reqwest_websocket::WebSocket;
-use tokio::time::Instant;
+use tokio::time::{Instant, Sleep};
 use tracing::debug;
 
 use crate::configuration::SignalServers;
@@ -87,7 +89,20 @@ pub struct SignalWebSocket<C: WebSocketType> {
         WebSocketRequestMessage,
         oneshot::Sender<Result<WebSocketResponseMessage, ServiceError>>,
     )>,
+    /// signal-gpui: asks the socket's task to check it's still alive
+    /// ([`SignalWebSocket::check`]).
+    check_sink: mpsc::UnboundedSender<()>,
 }
+
+/// signal-gpui: a socket whose last answered keepalive is older than this
+/// by the wall clock, which goes on while the machine sleeps, is closed at
+/// the next keepalive or check (Desktop's `STALE_THRESHOLD_MS`,
+/// `ts/textsecure/WebsocketResources.preload.ts`).
+const STALE_AFTER: Duration = Duration::from_secs(5 * 60);
+
+/// signal-gpui: how long a check's keepalive may go unanswered before the
+/// socket is closed (Desktop's `KEEPALIVE_TIMEOUT_MS`).
+const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct SignalWebSocketInner {
     stream: Option<SignalRequestStream>,
@@ -111,6 +126,13 @@ struct SignalWebSocketProcess {
     >,
 
     outgoing_keep_alive_set: HashSet<u64>,
+
+    /// signal-gpui: checks asked for, and the one under way: its
+    /// keepalive's id and when it's overdue.
+    checks: mpsc::UnboundedReceiver<()>,
+    check: Option<(u64, Pin<Box<Sleep>>)>,
+    /// signal-gpui: when a keepalive was last answered, by the wall clock.
+    last_alive_at: SystemTime,
 
     outgoing_responses: FuturesUnordered<
         BoxFuture<'static, Result<WebSocketResponseMessage, Canceled>>,
@@ -184,6 +206,9 @@ impl SignalWebSocketProcess {
                     } else if let Some(_x) =
                         self.outgoing_keep_alive_set.take(&id)
                     {
+                        if self.check.as_ref().is_some_and(|(check, _)| *check == id) {
+                            self.check = None;
+                        }
                         let status = reqwest::StatusCode::from_u16(
                             response.status() as _,
                         )
@@ -204,6 +229,7 @@ impl SignalWebSocketProcess {
                                     .into_owned(),
                             });
                         }
+                        self.last_alive_at = SystemTime::now();
                     } else {
                         tracing::warn!(
                             ?response,
@@ -218,6 +244,42 @@ impl SignalWebSocketProcess {
                 reason: "type was response, but does not contain response",
             }),
         }
+    }
+
+    /// signal-gpui: no keepalive answered for [`STALE_AFTER`] by the wall
+    /// clock. tokio's clock stops while the machine sleeps, so the
+    /// keepalive interval alone takes a while to notice a socket that died
+    /// meanwhile.
+    fn is_stale(&self) -> bool {
+        SystemTime::now()
+            .duration_since(self.last_alive_at)
+            .is_ok_and(|since| since > STALE_AFTER)
+    }
+
+    /// Closes the socket; the caller then leaves `run`.
+    async fn close(self) {
+        if let Err(e) = self.ws.close(reqwest_websocket::CloseCode::Away, None).await {
+            tracing::debug!("Could not close WebSocket: {:?}", e);
+        }
+    }
+
+    /// Sends a keepalive request; returns its id.
+    async fn send_keep_alive(&mut self) -> Result<u64, reqwest_websocket::Error> {
+        use prost::Message;
+        let request = WebSocketRequestMessage::new(Method::GET)
+            .id(self.next_request_id())
+            .path(&self.keep_alive_path)
+            .build();
+        let id = request.id.unwrap();
+        self.outgoing_keep_alive_set.insert(id);
+        let msg = WebSocketMessage {
+            r#type: Some(web_socket_message::Type::Request.into()),
+            request: Some(request),
+            ..Default::default()
+        };
+        let buffer = msg.encode_to_vec();
+        self.ws.send(reqwest_websocket::Message::Binary(buffer.into())).await?;
+        Ok(id)
     }
 
     fn next_request_id(&self) -> u64 {
@@ -240,31 +302,54 @@ impl SignalWebSocketProcess {
         loop {
             futures::select! {
                 _ = ka_interval.tick().fuse() => {
-                    use prost::Message;
-                    if !self.outgoing_keep_alive_set.is_empty() {
+                    if self.is_stale() {
+                        tracing::warn!("Websocket will be closed: no keepalive answered since before a sleep.");
+                        self.close().await;
+                        break;
+                    }
+                    // signal-gpui: not counting a check's, which has its
+                    // own deadline.
+                    let checking = self.check.as_ref().map(|(id, _)| *id);
+                    if self.outgoing_keep_alive_set.iter().any(|id| Some(*id) != checking) {
                         tracing::warn!("Websocket will be closed due to failed keepalives.");
-                        if let Err(e) = self.ws.close(reqwest_websocket::CloseCode::Away, None).await {
-                            tracing::debug!("Could not close WebSocket: {:?}", e);
-                        }
-                        self.outgoing_keep_alive_set.clear();
+                        self.close().await;
                         break;
                     }
                     tracing::debug!("sending keep-alive");
-                    let request = WebSocketRequestMessage::new(Method::GET)
-                        .id(self.next_request_id())
-                        .path(&self.keep_alive_path)
-                        .build();
-                    self.outgoing_keep_alive_set.insert(request.id.unwrap());
-                    let msg = WebSocketMessage {
-                        r#type: Some(web_socket_message::Type::Request.into()),
-                        request: Some(request),
-                        ..Default::default()
-                    };
-                    let buffer = msg.encode_to_vec();
-                    if let Err(e) = self.ws.send(reqwest_websocket::Message::Binary(buffer.into())).await {
+                    if let Err(e) = self.send_keep_alive().await {
                         tracing::info!("Websocket sink has closed: {:?}.", e);
                         break;
                     };
+                },
+                // signal-gpui: a check (after the machine wakes): closed
+                // at once if stale, else when its keepalive goes unanswered.
+                check = self.checks.next() => {
+                    if check.is_none() {
+                        debug!("end of application check stream; websocket closing");
+                        return Ok(());
+                    }
+                    if self.is_stale() {
+                        tracing::warn!("Websocket will be closed: no keepalive answered since before a sleep.");
+                        self.close().await;
+                        break;
+                    }
+                    if self.check.is_none() {
+                        tracing::debug!("checking the websocket");
+                        match self.send_keep_alive().await {
+                            Ok(id) => self.check = Some((id, Box::pin(tokio::time::sleep(CHECK_TIMEOUT)))),
+                            Err(e) => {
+                                tracing::info!("Websocket sink has closed: {:?}.", e);
+                                break;
+                            }
+                        }
+                    }
+                },
+                _ = check_overdue(&mut self.check).fuse() => {
+                    if self.check.take().is_some_and(|(id, _)| self.outgoing_keep_alive_set.contains(&id)) {
+                        tracing::warn!("Websocket will be closed: no answer to a keepalive check.");
+                        self.close().await;
+                        break;
+                    }
                 },
                 // Process requests from the application, forward them to Signal
                 x = self.requests.next() => {
@@ -359,6 +444,15 @@ impl SignalWebSocketProcess {
     }
 }
 
+/// signal-gpui: resolves when the check under way is overdue; never
+/// without one.
+async fn check_overdue(check: &mut Option<(u64, Pin<Box<Sleep>>)>) {
+    match check {
+        Some((_, overdue)) => overdue.as_mut().await,
+        None => future::pending().await,
+    }
+}
+
 impl<C: WebSocketType> SignalWebSocket<C> {
     fn inner_locked(&self) -> MutexGuard<'_, SignalWebSocketInner> {
         self.inner.lock().unwrap()
@@ -373,6 +467,7 @@ impl<C: WebSocketType> SignalWebSocket<C> {
         let (incoming_request_sink, incoming_request_stream) =
             mpsc::unbounded();
         let (outgoing_request_sink, outgoing_requests) = mpsc::channel(1);
+        let (check_sink, checks) = mpsc::unbounded();
 
         let process = SignalWebSocketProcess {
             keep_alive_path,
@@ -380,6 +475,9 @@ impl<C: WebSocketType> SignalWebSocket<C> {
             request_sink: incoming_request_sink,
             outgoing_requests: HashMap::default(),
             outgoing_keep_alive_set: HashSet::new(),
+            checks,
+            check: None,
+            last_alive_at: SystemTime::now(),
             // Initializing the FuturesUnordered with a `pending` future means it will never fuse
             // itself, so an "empty" FuturesUnordered will still allow new futures to be added.
             outgoing_responses: vec![
@@ -400,6 +498,7 @@ impl<C: WebSocketType> SignalWebSocket<C> {
             Self {
                 _type: PhantomData,
                 request_sink: outgoing_request_sink,
+                check_sink,
                 unidentified_push_service,
                 inner: Arc::new(Mutex::new(SignalWebSocketInner {
                     stream: Some(SignalRequestStream {
@@ -413,6 +512,15 @@ impl<C: WebSocketType> SignalWebSocket<C> {
 
     pub fn servers(&self) -> SignalServers {
         self.unidentified_push_service.servers
+    }
+
+    /// signal-gpui: checks the socket is still alive, as Desktop's
+    /// `SocketManager.check` does when the machine wakes: closed at once if
+    /// no keepalive was answered in five minutes, else if this one isn't
+    /// answered in 30 seconds. A closed socket ends the request stream, as
+    /// any closed socket does.
+    pub fn check(&self) {
+        let _ = self.check_sink.unbounded_send(());
     }
 
     pub fn is_closed(&self) -> bool {

@@ -310,6 +310,19 @@ impl<S: Store> Manager<S, Registered> {
         }
     }
 
+    /// signal-gpui: checks the websockets already open are still alive, as
+    /// Desktop's `checkSockets` does when the machine wakes (see
+    /// `SignalWebSocket::check`). A dead one is closed, which ends the
+    /// message stream if it was the receiving one. Opens none.
+    pub async fn check_websockets(&self) {
+        if let Some(ws) = self.state.identified_websocket.lock().await.as_ref().filter(|ws| !ws.is_closed()) {
+            ws.check();
+        }
+        if let Some(ws) = self.state.unidentified_websocket.lock().await.as_ref().filter(|ws| !ws.is_closed()) {
+            ws.check();
+        }
+    }
+
     /// signal-gpui: the unauthenticated chat websocket, for requests
     /// libsignal-service has no call for (key transparency's
     /// `/v1/key-transparency/*`, which libsignal-net sends on its own
