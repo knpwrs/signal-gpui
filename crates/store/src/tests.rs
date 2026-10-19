@@ -1495,6 +1495,24 @@ async fn renaming_an_author_looks_up_their_messages_by_index() {
 }
 
 #[tokio::test]
+async fn a_message_named_by_author_and_time_is_one_seek() {
+    // Receipts, reactions and read syncs name a message this way. Reading
+    // every message by the author instead took 2 to 5 seconds a receipt on
+    // a real account, with the write lock held.
+    let db = test_db().await;
+    for sql in [
+        format!("SELECT id FROM messages WHERE {}", sent_at_matches("?1", "?2")),
+        format!("UPDATE messages SET status = 2 WHERE direction = 1 AND {}", sent_at_matches("''", "?1")),
+    ] {
+        let rows: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}"))).fetch_all(&db.pool).await.unwrap();
+        let plan = rows.into_iter().map(|r| r.3).collect::<Vec<_>>().join("; ");
+        assert!(plan.contains("(author_key=? AND sent_at=?)"), "{plan}");
+        assert!(plan.contains("rowid=?"), "{plan}");
+    }
+}
+
+#[tokio::test]
 async fn styles_are_kept_and_spoilers_stay_out_of_previews() {
     let db = test_db().await;
     let id = db.insert_message(&incoming("d:a", "a", 1, "the ending: he was a ghost")).await.unwrap();
@@ -2165,7 +2183,7 @@ async fn pending_votes_and_unread_votes_are_found_by_index() {
     assert!(list.contains("messages_unread_poll_votes"), "{list}");
     let sync =
         plan("UPDATE messages SET unread_poll_votes = 0 WHERE author_key = '' AND sent_at = 1 AND unread_poll_votes = 1".into()).await;
-    assert!(sync.contains("messages_outgoing_sent_at"), "{sync}");
+    assert!(sync.contains("sent_at=?"), "{sync}");
 }
 
 #[test]

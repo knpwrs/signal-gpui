@@ -1116,10 +1116,18 @@ const CONVERSATION_COLUMNS: &str = "id, kind, title, phone, color, members, last
 const MESSAGE_COLUMNS: &str = "id, conversation_id, sent_at, received_at, direction, author, \
      author_name, body, status, reactions, quote, attachments, link_preview, deleted, edited, expires_in, expire_start, edit_count, notice, mentions, styles, cta, deleted_by_admin, long_text, poll, view_once, sealed_sender, is_read, content";
 
-/// SQL matching a message whose own timestamp, or one of its edits', is
-/// the bound parameter `{param}`.
-fn sent_at_matches(param: &str) -> String {
-    format!("(sent_at = {param} OR id IN (SELECT message_id FROM message_edits WHERE sent_at = {param}))")
+/// SQL matching a message by `{author}` whose own timestamp, or one of its
+/// edits', is the bound parameter `{param}`. Not `author_key = … AND
+/// (sent_at = … OR id IN (…))`: SQLite can't use an index for that `OR`, and
+/// read every message by the author (every one we sent, for a receipt).
+/// Nothing outside should test `author_key` either, or the planner may walk
+/// the author's messages and filter them against this list.
+fn sent_at_matches(author: &str, param: &str) -> String {
+    format!(
+        "id IN (SELECT id FROM messages WHERE author_key = {author} AND sent_at = {param} \
+         UNION SELECT e.message_id FROM message_edits e JOIN messages m ON m.id = e.message_id \
+         WHERE e.sent_at = {param} AND m.author_key = {author})"
+    )
 }
 
 /// How every transaction here starts (they all write); see `AppDb::write`.
@@ -1928,8 +1936,8 @@ impl AppDb {
         let conversation: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
             "UPDATE messages SET is_read = 1, \
                 expire_start = CASE WHEN expires_in > 0 THEN CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) END \
-             WHERE author_key = ?1 AND {} AND is_read = 0 RETURNING conversation_id",
-            sent_at_matches("?2")
+             WHERE {} AND is_read = 0 RETURNING conversation_id",
+            sent_at_matches("?1", "?2")
         )))
         .bind(author)
         .bind(sent_at)
@@ -1956,8 +1964,8 @@ impl AppDb {
         let mut tx = self.write().await?;
         let mut target: Option<(String, i64, i64)> = sqlx::query_as(AssertSqlSafe(format!(
             "SELECT conversation_id, sent_at, id FROM messages \
-             WHERE author_key = ?1 AND direction = 0 AND {} ORDER BY sent_at = ?2 DESC LIMIT 1",
-            sent_at_matches("?2")
+             WHERE direction = 0 AND {} ORDER BY sent_at = ?2 DESC LIMIT 1",
+            sent_at_matches("?1", "?2")
         )))
         .bind(author)
         .bind(sent_at)
@@ -2139,9 +2147,9 @@ impl AppDb {
         // Its own timestamp wins over another message's edit.
         let row = sqlx::query(AssertSqlSafe(format!(
             "SELECT {MESSAGE_COLUMNS} FROM messages \
-             WHERE conversation_id = ?1 AND author_key = ?2 AND {} \
+             WHERE conversation_id = ?1 AND {} \
              ORDER BY sent_at = ?3 DESC LIMIT 1",
-            sent_at_matches("?3")
+            sent_at_matches("?2", "?3")
         )))
         .bind(&conversation.0)
         .bind(author.unwrap_or(""))
@@ -2155,8 +2163,8 @@ impl AppDb {
     /// content that doesn't name its conversation (e.g. receipts, sync reads).
     pub async fn find_message_any(&self, author: Option<&str>, sent_at: i64) -> Result<Option<Message>> {
         let row = sqlx::query(AssertSqlSafe(format!(
-            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE author_key = ?1 AND {} ORDER BY sent_at = ?2 DESC LIMIT 1",
-            sent_at_matches("?2")
+            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE {} ORDER BY sent_at = ?2 DESC LIMIT 1",
+            sent_at_matches("?1", "?2")
         )))
         .bind(author.unwrap_or(""))
         .bind(sent_at)
@@ -2320,9 +2328,9 @@ impl AppDb {
     ) -> Result<()> {
         sqlx::query(AssertSqlSafe(format!(
             "UPDATE messages SET status = ?1 \
-             WHERE conversation_id = ?2 AND author_key = '' AND {} \
+             WHERE conversation_id = ?2 AND {} \
                AND ((?1 != 4 AND status != 4 AND status < ?1) OR (?1 = 4 AND status = 0))",
-            sent_at_matches("?3")
+            sent_at_matches("''", "?3")
         )))
         .bind(status_to_i64(status))
         .bind(&conversation.0)
@@ -2342,10 +2350,10 @@ impl AppDb {
     ) -> Result<Vec<(ConversationId, i64)>> {
         let rows = sqlx::query(AssertSqlSafe(format!(
             "UPDATE messages SET status = ?1 \
-             WHERE author_key = '' AND {} AND direction = 1 \
+             WHERE {} AND direction = 1 \
                AND ((?1 != 4 AND status != 4 AND status < ?1) OR (?1 = 4 AND status = 0)) \
              RETURNING conversation_id, id",
-            sent_at_matches("?2")
+            sent_at_matches("''", "?2")
         )))
         .bind(status_to_i64(status))
         .bind(sent_at)

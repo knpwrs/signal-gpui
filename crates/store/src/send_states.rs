@@ -188,8 +188,8 @@ impl AppDb {
             // A deleted message's states are its delete's, which receipts
             // for the message don't move (Desktop keeps
             // `deletedForEveryoneSendStatus` apart).
-            "SELECT id, conversation_id, status FROM messages WHERE author_key = '' AND direction = 1 AND deleted = 0 AND {}",
-            sent_at_matches("?1")
+            "SELECT id, conversation_id, status FROM messages WHERE direction = 1 AND deleted = 0 AND {}",
+            sent_at_matches("''", "?1")
         )))
         .bind(sent_at)
         .fetch_all(&mut *tx)
@@ -289,8 +289,8 @@ impl AppDb {
     /// viewed here. Returns it when it changed.
     pub async fn mark_viewed_by(&self, author: Option<&str>, sent_at: i64) -> Result<Option<(ConversationId, i64)>> {
         let row = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "UPDATE messages SET viewed = 1 WHERE author_key = ?1 AND viewed = 0 AND {} RETURNING id, conversation_id",
-            sent_at_matches("?2")
+            "UPDATE messages SET viewed = 1 WHERE viewed = 0 AND {} RETURNING id, conversation_id",
+            sent_at_matches("?1", "?2")
         )))
         .bind(author.unwrap_or(""))
         .bind(sent_at)
