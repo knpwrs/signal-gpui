@@ -248,7 +248,7 @@ impl ConversationView {
                         this.load_around(id, cx);
                     }
                 }
-                AppEvent::TypingChanged { conversation } if *conversation == this.id => cx.notify(),
+                AppEvent::TypingChanged { conversation } if *conversation == this.id => this.remeasure_typing(cx),
                 AppEvent::ConversationsChanged => {
                     this.read_open_poll_votes(cx);
                     cx.notify()
@@ -1069,7 +1069,7 @@ impl ConversationView {
                         this.has_newer = false;
                         this.messages = messages;
                         this.start_seen();
-                        this.list.reset(this.messages.len());
+                        this.list.reset(this.messages.len() + 1);
                         this.relayout(cx);
                         this.list.set_follow_mode(FollowMode::Tail);
                         this.list.scroll_to_end();
@@ -1175,7 +1175,7 @@ impl ConversationView {
                 this.messages = messages;
                 this.start_seen();
                 // The message jumped to is never folded away.
-                this.list.reset(this.messages.len());
+                this.list.reset(this.messages.len() + 1);
                 this.relayout(cx);
                 if let Slot::Head { set, .. } | Slot::Folded { set } = this.slot(message_id) {
                     this.expanded.insert(set);
@@ -1232,6 +1232,10 @@ impl ConversationView {
                 }
                 let Ok(newer) = result else { return };
                 this.has_newer = newer.len() as u32 == PAGE;
+                if !this.has_newer {
+                    // The newest message is loaded: the typing bubble may show.
+                    this.remeasure_typing(cx);
+                }
                 if newer.is_empty() {
                     return;
                 }
@@ -1622,7 +1626,9 @@ impl ConversationView {
     /// Desktop's `ConversationHero` for a message request (and Safety tips).
     fn render_item(&mut self, ix: usize, palette: Palette, cx: &mut Context<Self>) -> AnyElement {
         let Some(message) = self.messages.get(ix).cloned() else {
-            return div().into_any_element();
+            // The list's last item, after the messages: the typing bubble,
+            // which scrolls with them as Desktop's does.
+            return div().children(self.render_typing(palette, cx)).into_any_element();
         };
         let prev = ix.checked_sub(1).and_then(|i| self.messages.get(i));
         let next = self.messages.get(ix + 1);
@@ -3087,14 +3093,23 @@ impl ConversationView {
             .unwrap_or_else(|| author.get(..8).unwrap_or(author).to_owned())
     }
 
+    /// The typing bubble (the list's last item) came, went or changed.
+    fn remeasure_typing(&mut self, cx: &mut Context<Self>) {
+        let ix = self.messages.len();
+        self.list.remeasure_items(ix..ix + 1);
+        cx.notify();
+    }
+
     /// Signal Desktop's typing bubble: three pulsing dots in an incoming
-    /// bubble; in groups, the typists' avatars beside it (up to three,
+    /// bubble, after the newest message, inside the scrolling timeline
+    /// (none while newer messages aren't loaded: `haveNewest` in
+    /// `ts/components/conversation/Timeline.dom.tsx`); in groups, the typists' avatars beside it (up to three,
     /// overlapping, then "+N").
     fn render_typing(&self, palette: Palette, cx: &App) -> Option<impl IntoElement + use<>> {
         use gpui_kit::{Animation, AnimationExt as _};
         let state = self.state.read(cx);
         let typists = state.typing_in(&self.id);
-        if typists.is_empty() {
+        if typists.is_empty() || self.has_newer {
             return None;
         }
         let is_group = state.conversation(&self.id).is_some_and(|c| c.kind == ConversationKind::Group);
@@ -4404,7 +4419,6 @@ impl Render for ConversationView {
         self.timeline_focused = self.timeline_focus.is_focused(window);
         let palette = Palette::get(cx);
         let entity = cx.entity();
-        let typing = self.render_typing(palette, cx);
         // Messages that arrived while scrolled up wait below, even when the
         // list hasn't measured them yet (it can't tell where its end is then).
         let scrolled_up = self.has_newer
@@ -4467,7 +4481,6 @@ impl Render for ConversationView {
                         ))
                     }),
             )
-            .when_some(typing, |d, t| d.child(t))
             .map(|d| {
                 if let Some(selected) = &self.selecting {
                     return d.child(self.render_select_bar(selected, palette, cx));
@@ -5967,6 +5980,39 @@ mod tests {
         let bubble = bounds(&mut cx, "typing-bubble".into());
         // Avatars, then a 36pt bubble.
         assert!(bubble.size.height >= px(36.), "{bubble:?}");
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn the_typing_bubble_scrolls_with_the_messages(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        // The group's last seeded message, so it's all there.
+        wait_for_messages(&backend, GROUP, 1, |m| m.body == "Perfect. I'll bring the first aid kit");
+        // Short enough that the chat scrolls.
+        let (mut cx, view) = open_view_sized(cx, &backend, GROUP, 500.);
+        let state = view.read_with(&cx, |v, _| v.state.clone());
+        state.update(&mut cx, |state, cx| {
+            state.handle(
+                signal_backend::Event::Typing {
+                    conversation: ConversationId(GROUP.into()),
+                    author: "00000000-0000-4000-8000-000000000001".into(),
+                    started: true,
+                },
+                cx,
+            )
+        });
+        // At the bottom, it shows below the newest message.
+        let bubble = bounds(&mut cx, "typing-bubble".into());
+        let newest = view.read_with(&cx, |v, _| v.messages.last().map(|m| (m.id, m.notice.is_none())));
+        let (newest, has_bubble) = newest.expect("messages loaded");
+        assert!(has_bubble, "the demo group ends with a message");
+        let last = bounds(&mut cx, format!("bubble-{newest}"));
+        assert!(bubble.top() >= last.bottom(), "typing {bubble:?} vs newest {last:?}");
+        // Scrolled to the oldest, it's gone off screen with the newest.
+        view.update(&mut cx, |v, _| v.list.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(0.) }));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("typing-bubble").is_none(), "typing bubble still drawn");
         backend.shutdown();
     }
 
