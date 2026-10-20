@@ -563,11 +563,12 @@ pub fn hero(state: &Entity<AppState>, conversation: &Conversation, details: Opti
                     div()
                         .debug_selector(|| "hero-groups".into())
                         .flex()
+                        .max_w_full()
                         .items_center()
                         .gap_1()
                         .text_sm()
                         .child(Icon::new(IconName::Users).size_4().flex_none())
-                        .child(div().text_center().child(groups)),
+                        .child(div().min_w_0().text_center().child(groups)),
                 )
             })
         }
@@ -587,11 +588,12 @@ pub fn hero(state: &Entity<AppState>, conversation: &Conversation, details: Opti
                     div()
                         .debug_selector(|| "hero-members".into())
                         .flex()
+                        .max_w_full()
                         .items_center()
                         .gap_1()
                         .text_sm()
                         .child(Icon::new(IconName::Users).size_4().flex_none())
-                        .child(div().text_center().child(members_text(&others, has_me))),
+                        .child(div().min_w_0().text_center().child(members_text(&others, has_me))),
                 )
         }
     };
@@ -768,6 +770,10 @@ mod ui_tests {
         // A group's names its members.
         let mut group = open_chat(cx, ConversationId(GROUP.into()));
         wait(&mut group, "the group's hero", &mut |cx| shows(cx, "hero-members"));
+        // Long names wrap inside the card rather than running past it.
+        let card = group.debug_bounds("conversation-hero").unwrap();
+        let members = group.debug_bounds("hero-members").unwrap();
+        assert!(members.left() >= card.left() && members.right() <= card.right(), "{members:?} outside {card:?}");
         backend.shutdown();
     }
 }
