@@ -45,3 +45,4 @@ pub mod syncing;
 #[cfg(test)]
 pub mod test_support;
 pub mod video_viewer;
+pub mod wrapped_text;

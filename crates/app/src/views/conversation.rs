@@ -3896,14 +3896,14 @@ fn message_text(
     if let Some((spacer, bg)) = spacer {
         push_run(&mut content, &mut runs, spacer, bg, FontWeight::NORMAL, false);
     }
-    let styled = gpui_kit::StyledText::new(content).with_runs(runs);
+    let message_id = message.id;
+    let wrapped = super::wrapped_text::WrappedText::new(("message-text", message_id as u64), content, runs);
     if clicks.is_empty() {
-        return text.child(styled).into_any_element();
+        return text.child(wrapped).into_any_element();
     }
     let (ranges, actions): (Vec<_>, Vec<_>) = clicks.into_iter().unzip();
-    let message_id = message.id;
     let view = cx.entity().downgrade();
-    text.child(gpui_kit::InteractiveText::new(("message-text", message_id as u64), styled).on_click(
+    text.child(wrapped.on_click(
         ranges,
         move |ix, _, cx| match &actions[ix] {
             TextClick::Open(url) => {
