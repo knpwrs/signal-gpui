@@ -1063,8 +1063,13 @@ impl<S: Store> Manager<S, Registered> {
                                 }
                                 Err(error) => {
                                     error!(%error, "error opening envelope, message will be skipped!");
-                                    if let libsignal_service::prelude::ServiceError::SealedSenderDecryptionError(libsignal_service::cipher::SealedSenderDecryptionError { sender: Some(sender), .. }) = &error {
-                                        if let Some(service_id) = ServiceId::parse_from_service_id_string(sender.name()) {
+                                    // A message we already decrypted, sent
+                                    // again (its ack was lost), isn't a
+                                    // decryption error: Desktop drops it
+                                    // (`DuplicatedMessage` in MessageReceiver).
+                                    if let libsignal_service::prelude::ServiceError::SealedSenderDecryptionError(libsignal_service::cipher::SealedSenderDecryptionError { sender: Some(sender), inner }) = &error {
+                                        let duplicate = matches!(inner, libsignal_service::protocol::SignalProtocolError::DuplicatedMessage(..));
+                                        if let Some(service_id) = ServiceId::parse_from_service_id_string(sender.name()).filter(|_| !duplicate) {
                                             let device = u32::from(sender.device_id());
                                             return Some((Received::DecryptionError(service_id, device), state));
                                         }

@@ -60,7 +60,9 @@ upstream workspace). Modified by Ken Powers for signal-gpui since
   `Received::DecryptionError` carries the sender's device and is only for
   messages we couldn't decrypt; a `DecryptionErrorMessage` someone sent us
   (they couldn't decrypt ours) is the new `Received::RetryRequest`.
-  Upstream reports both as `DecryptionError`.
+  Upstream reports both as `DecryptionError`. A message that fails only
+  because we decrypted it before (`DuplicatedMessage`, sent again after a
+  lost ack) isn't reported, as Desktop drops it.
 
 - `src/manager/registered.rs`: `Manager::download_sticker_pack` downloads
   and saves a pack without the sync message `install_sticker_pack` sends
