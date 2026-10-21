@@ -151,6 +151,16 @@ fn image_format(bytes: &[u8]) -> Option<ImageFormat> {
     })
 }
 
+/// What "Photos & videos" takes, by extension: Desktop's supported image
+/// and video types (`ts/util/GoogleChrome.std.ts`).
+fn is_photo_or_video(path: &std::path::Path) -> bool {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    matches!(
+        ext.as_str(),
+        "avif" | "bmp" | "gif" | "jpg" | "jpeg" | "webp" | "xbm" | "ico" | "apng" | "png" | "mp4" | "m4v" | "ogv" | "webm"
+    )
+}
+
 struct Typeahead {
     range: Range<usize>,
     query: String,
@@ -1297,7 +1307,10 @@ impl Composer {
         .detach();
     }
 
-    fn pick_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// `media`: Desktop's "Photos & videos", whose picker takes only images
+    /// and videos (`CompositionUpload`'s `acceptMediaOnly`). Ours can't
+    /// filter, so anything else picked is skipped and said so.
+    fn pick_files(&mut self, media: bool, window: &mut Window, cx: &mut Context<Self>) {
         let picked = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -1305,8 +1318,20 @@ impl Composer {
             prompt: Some("Attach".into()),
         });
         cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = picked.await {
-                let _ = this.update_in(cx, |this, window, cx| this.add_paths(paths, window, cx));
+            if let Ok(Ok(Some(mut paths))) = picked.await {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    if media {
+                        let picked = paths.len();
+                        paths.retain(|path| is_photo_or_video(path));
+                        let skipped = picked - paths.len();
+                        if skipped > 0 {
+                            this.state.update(cx, |state, cx| {
+                                state.report_error(format!("Skipped {skipped} file(s): not a photo or video"), cx);
+                            });
+                        }
+                    }
+                    this.add_paths(paths, window, cx)
+                });
             }
         })
         .detach();
@@ -1447,7 +1472,7 @@ impl Composer {
     /// Desktop's ⌘U (`onAttachFileShortcut`).
     pub fn attach_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.recording.is_none() {
-            self.pick_files(window, cx);
+            self.pick_files(false, window, cx);
         }
     }
 
@@ -1478,43 +1503,36 @@ impl Composer {
         cx.notify();
     }
 
-    /// The paperclip picks files. Where polls can be made it opens Desktop's
-    /// attach menu instead (`CompositionArea`): File, and Poll.
-    fn render_attach_button(&self, palette: Palette, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+    /// Desktop's add button (`composerAddMenuButton` in `CompositionArea`):
+    /// a plus opening Photos & videos, File, and Poll where polls can be
+    /// made.
+    fn render_add_button(&self, palette: Palette, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         use gpui_kit::component::button::{Button, ButtonVariants as _};
         use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
         let polls = !self.conversation.is_signal()
             && self.state.read(cx).conversation(&self.conversation).is_some_and(|c| signal_backend::can_create_poll(c.kind));
-        if !polls {
-            return div()
-                .id("attach-button")
-                .flex_none()
-                .size(px(32.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded_full()
-                .cursor_pointer()
-                .hover(|d| d.bg(palette.row_hover))
-                .on_click(cx.listener(|this, _, window, cx| this.pick_files(window, cx)))
-                .child(Icon::new(IconName::Paperclip).size_5().text_color(palette.text_secondary))
-                .into_any_element();
-        }
         let this = cx.entity().downgrade();
         let (state, conversation) = (self.state.clone(), self.conversation.clone());
-        Button::new("attach-button")
+        Button::new("add-button")
+            .debug_selector(|| "add-button".into())
             .ghost()
             .rounded_full()
-            .icon(Icon::new(IconName::Paperclip).size_5().text_color(palette.text_secondary))
+            .icon(Icon::new(IconName::Plus).size_5().text_color(palette.text))
             .tooltip("Add attachment or poll")
             .dropdown_menu(move |menu, _, _| {
-                let (this, state, conversation) = (this.clone(), state.clone(), conversation.clone());
-                menu.item(PopupMenuItem::new("File").icon(IconName::File).on_click(move |_, window, cx| {
-                    let _ = this.update(cx, |this, cx| this.pick_files(window, cx));
+                let (media, file) = (this.clone(), this.clone());
+                let (state, conversation) = (state.clone(), conversation.clone());
+                menu.item(PopupMenuItem::new("Photos & videos").icon(IconName::Image).on_click(move |_, window, cx| {
+                    let _ = media.update(cx, |this, cx| this.pick_files(true, window, cx));
                 }))
-                .item(PopupMenuItem::new("Poll").icon(IconName::ChartBar).on_click(move |_, window, cx| {
-                    crate::views::poll::open_create(state.clone(), conversation.clone(), window, cx)
+                .item(PopupMenuItem::new("File").icon(IconName::File).on_click(move |_, window, cx| {
+                    let _ = file.update(cx, |this, cx| this.pick_files(false, window, cx));
                 }))
+                .when(polls, |menu| {
+                    menu.item(PopupMenuItem::new("Poll").icon(IconName::ChartBar).on_click(move |_, window, cx| {
+                        crate::views::poll::open_create(state.clone(), conversation.clone(), window, cx)
+                    }))
+                })
             })
             .into_any_element()
     }
@@ -1839,8 +1857,8 @@ impl Render for Composer {
             .relative()
             .flex()
             .flex_col()
-            .border_t_1()
-            .border_color(palette.panel_border)
+            // No rule above, as in Desktop's (`CompositionArea.scss` draws
+            // one only for SMS-only chats).
             .bg(palette.background)
             .capture_action(cx.listener(|this, _: &Paste, window, cx| {
                 if this.paste_image(window, cx) {
@@ -1964,7 +1982,7 @@ impl Render for Composer {
                             this.toggle_picker(window, cx);
                         }
                     }))
-                    .child(Icon::new(IconName::FaceSlightlySmiling).size_5().text_color(palette.text_secondary));
+                    .child(Icon::new(IconName::FaceSlightlySmiling).size_5().text_color(palette.text));
                 // One line tall when empty, like Signal Desktop: the pill
                 // supplies the padding, the input none.
                 let input = div()
@@ -1979,8 +1997,12 @@ impl Render for Composer {
                     .text_color(palette.text)
                     .child(self.input.clone())
                     .child(self.render_misspellings(palette));
+                // Send, or while editing the check that saves the edit
+                // (Desktop's `sendButtonFragment`, `editMessageFragment`).
+                let editing = self.editing.is_some();
                 let send = div()
                     .id("send-button")
+                    .debug_selector(|| "send-button".into())
                     .flex_none()
                     .size(px(32.))
                     .flex()
@@ -1990,9 +2012,14 @@ impl Render for Composer {
                     .bg(palette.accent)
                     .cursor_pointer()
                     .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
-                    .child(Icon::new(IconName::Send).size_4().text_color(palette.on_accent));
-                // Desktop's microphone, where Send goes once there's
-                // something to send (never in the large composer).
+                    .child(Icon::new(if editing { IconName::Check } else { IconName::Send }).size_4().text_color(palette.on_accent));
+                // The plus goes while editing or showing a loaded link
+                // preview (Desktop's `composerAddMenuButton` checks
+                // `linkPreviewResult`, not one loading or missing).
+                let previewing = self.link_preview.as_ref().is_some_and(|p| matches!(p.state, PreviewState::Ready { .. }));
+                let add = (!editing && !previewing).then(|| self.render_add_button(palette, cx));
+                // Desktop's microphone, while there's nothing to send
+                // (never in the large composer).
                 let mic = (!can_send && self.editing.is_none() && !large).then(|| {
                     div()
                         .id("mic-button")
@@ -2006,7 +2033,7 @@ impl Render for Composer {
                         .cursor_pointer()
                         .hover(|d| d.bg(palette.row_hover))
                         .on_click(cx.listener(|this, _, window, cx| this.start_recording(window, cx)))
-                        .child(Icon::new(IconName::Mic).size_5().text_color(palette.text_secondary))
+                        .child(Icon::new(IconName::Mic).size_5().text_color(palette.text))
                 });
                 if large {
                     // Desktop's large composer: the input across, then its
@@ -2019,7 +2046,7 @@ impl Render for Composer {
                             .px_3()
                             .py_2()
                             .child(emoji)
-                            .child(self.render_attach_button(palette, cx))
+                            .children(add)
                             .child(div().flex_1())
                             .child(send),
                     )
@@ -2031,11 +2058,18 @@ impl Render for Composer {
                             .gap_2()
                             .px_3()
                             .py_2()
+                            // Desktop's row: Enter sends, with no Send button
+                            // but for a view-once photo, which shows Send
+                            // alone (`isViewOnceActive`).
                             .child(emoji)
-                            .child(self.render_attach_button(palette, cx))
                             .child(input)
-                            .when(can_send, |d| d.child(send))
-                            .children(mic),
+                            .map(|d| {
+                                if self.view_once_active() {
+                                    d.child(send)
+                                } else {
+                                    d.children(mic).when(editing, |d| d.child(send)).children(add)
+                                }
+                            }),
                     )
                 }
             })
@@ -2482,6 +2516,22 @@ mod tests {
         press(&f, cx, "cmd-right");
         type_in(&f, cx, " *three*");
         assert_eq!(styled(&f, cx).0, "one two *three*");
+    }
+
+    #[gpui_kit::test]
+    fn an_edit_trades_the_plus_for_a_check(cx: &mut TestAppContext) {
+        let f = mount_with_keys(cx);
+        type_in(&f, cx, "first");
+        press(&f, cx, "enter");
+        let original = sent(&f, |m| m.body == "first").into_iter().find(|m| m.body == "first").unwrap();
+        let mut vcx = gpui_kit::VisualTestContext::from_window(f.window, cx);
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("add-button").is_some());
+        assert!(vcx.debug_bounds("send-button").is_none());
+        vcx.update(|window, cx| f.composer.update(cx, |c, cx| c.start_edit(original.clone(), window, cx)));
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("add-button").is_none());
+        assert!(vcx.debug_bounds("send-button").is_some());
     }
 
     #[gpui_kit::test]
@@ -3036,7 +3086,10 @@ mod tests {
             window.input("hello", cx);
         });
         cx.run_until_parked();
-        assert!(cx.debug_bounds("mic-button").is_none(), "Send takes its place");
+        // Desktop's row: Enter sends, so nothing takes its place.
+        assert!(cx.debug_bounds("mic-button").is_none());
+        assert!(cx.debug_bounds("send-button").is_none());
+        assert!(cx.debug_bounds("add-button").is_some());
         // A voice message goes alone: not with a file staged.
         f.composer.update(&mut cx, |c, cx| assert!(c.add_file(b"x".to_vec(), Some("a.txt".into()), cx)));
         cx.update(|window, cx| f.composer.update(cx, |c, cx| c.start_recording(window, cx)));
@@ -3310,9 +3363,14 @@ mod tests {
         f.composer.update(&mut cx, |c, cx| assert!(c.add_image(png(), Some("dot.png".into()), cx)));
         cx.run_until_parked();
         let toggle = cx.debug_bounds("view-once-toggle").expect("offered for one photo");
+        assert!(cx.debug_bounds("send-button").is_none(), "Enter sends a photo");
         cx.simulate_click(toggle.center(), gpui_kit::Modifiers::none());
         assert!(cx.update(|_, cx| f.composer.read(cx).view_once));
-        cx.update(|window, cx| f.composer.update(cx, |c, cx| c.submit(window, cx)));
+        // A view-once photo has Send alone, as in Desktop.
+        cx.run_until_parked();
+        let send = cx.debug_bounds("send-button").expect("Send shows for a view-once photo");
+        assert!(cx.debug_bounds("add-button").is_none());
+        cx.simulate_click(send.center(), gpui_kit::Modifiers::none());
 
         let messages = sent(&f, |m| m.view_once.is_some());
         let once = messages.iter().find(|m| m.view_once.is_some()).unwrap();
