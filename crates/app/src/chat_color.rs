@@ -238,6 +238,22 @@ pub fn custom(color: &CustomColor) -> BubbleFill {
     }
 }
 
+/// A quote's fill and border in a chat of color `fill`, as Desktop's
+/// `Quote` draws one in either direction (`.module-quote--color-solid` and
+/// `--color-gradient` in `stylesheets/components/Quote.scss`): each color
+/// 60% of the way to white in a light theme, 40% of the way to black in a
+/// dark one. A gradient is fixed to the window, as bubbles are. The border
+/// is the color (a gradient's start) beside incoming text, white beside
+/// outgoing.
+pub fn quote(fill: BubbleFill, outgoing: bool, dark: bool) -> (BubbleFill, Hsla) {
+    let tone = |color: Hsla| Hsla { l: if dark { color.l * 0.6 } else { color.l + (1. - color.l) * 0.6 }, ..color };
+    let (quote, border) = match fill {
+        BubbleFill::Solid(color) => (BubbleFill::Solid(tone(color)), color),
+        BubbleFill::Gradient(deg, start, end) => (BubbleFill::Gradient(deg, tone(start), tone(end)), start),
+    };
+    (quote, if outgoing { Hsla { h: 0., s: 0., l: 1., a: 1. } } else { border })
+}
+
 /// What a chat color fills our bubbles with; a preset Desktop doesn't
 /// have falls back to ultramarine, its default.
 pub fn fill(color: &ChatColor) -> BubbleFill {
@@ -275,6 +291,22 @@ mod tests {
         assert!((hsl(kept).l - 0.2).abs() < 1e-6);
         let gradient = CustomColor { end: Some(kept), deg: Some(90.), ..solid };
         assert!(matches!(custom(&gradient), BubbleFill::Gradient(deg, _, _) if deg == 180.));
+    }
+
+    #[test]
+    fn quotes_take_a_tone_of_the_chat_color() {
+        let color = Hsla { h: 0.1, s: 0.8, l: 0.5, a: 1. };
+        let white = Hsla { h: 0., s: 0., l: 1., a: 1. };
+        // Quote.scss: css-darken($solid, 0.4) and css-lighten($solid, 0.6).
+        assert_eq!(quote(BubbleFill::Solid(color), false, true), (BubbleFill::Solid(Hsla { l: 0.3, ..color }), color));
+        assert_eq!(quote(BubbleFill::Solid(color), false, false), (BubbleFill::Solid(Hsla { l: 0.8, ..color }), color));
+        assert_eq!(quote(BubbleFill::Solid(color), true, true).1, white);
+        let end = Hsla { l: 0.2, ..color };
+        let (fill, border) = quote(BubbleFill::Gradient(168., color, end), false, true);
+        assert_eq!(border, color);
+        let BubbleFill::Gradient(deg, start, stop) = fill else { panic!("a gradient stays one") };
+        assert_eq!(deg, 168.);
+        assert!((start.l - 0.3).abs() < 1e-6 && (stop.l - 0.12).abs() < 1e-6);
     }
 
     /// gpui's `fill_color` for a two-stop linear gradient at a point, as

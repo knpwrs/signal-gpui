@@ -2175,7 +2175,7 @@ impl ConversationView {
                             .py_1p5()
                             .rounded_lg()
                             .text_color(fg)
-                            .child(self.render_quote(message.id, quote, fg, palette, cx))
+                            .child(self.render_quote(message.id, quote, outgoing, palette, cx))
                             .window_fill(fill),
                     )
                 })
@@ -2297,7 +2297,7 @@ impl ConversationView {
                             .when(show_author && !outgoing, |d| {
                                 d.child(author_line(author_name, author_color, author_label, author_open))
                             })
-                            .when_some(message.quote.clone(), |d, quote| d.child(self.render_quote(message.id, quote, fg, palette, cx))),
+                            .when_some(message.quote.clone(), |d, quote| d.child(self.render_quote(message.id, quote, outgoing, palette, cx))),
                     )
                 })
                 .child(
@@ -2379,7 +2379,7 @@ impl ConversationView {
                             .when(show_author && !outgoing, |d| {
                                 d.child(author_line(author_name, author_color, author_label, author_open))
                             })
-                            .when_some(message.quote.clone(), |d, quote| d.child(self.render_quote(message.id, quote, fg, palette, cx))),
+                            .when_some(message.quote.clone(), |d, quote| d.child(self.render_quote(message.id, quote, outgoing, palette, cx))),
                     )
                 })
                 .child(render_preview_card(self.state.clone(), message.id, preview, full, (!header).then_some(corners), meta_color))
@@ -2421,7 +2421,7 @@ impl ConversationView {
             .when(show_author && !outgoing, |d| {
                 d.child(author_line(author_name, author_color, author_label, author_open))
             })
-            .when_some(message.quote.clone(), |d, quote| d.child(self.render_quote(message.id, quote, fg, palette, cx)))
+            .when_some(message.quote.clone(), |d, quote| d.child(self.render_quote(message.id, quote, outgoing, palette, cx)))
             .children(
                 message
                     .attachments
@@ -2500,7 +2500,7 @@ impl ConversationView {
             .py_2()
             .text_color(fg)
             .when(show_author && !outgoing, |d| d.child(author_line(author_name, author_color, author_label, author_open)))
-            .when_some(message.quote.clone(), |d, quote| d.child(self.render_quote(message.id, quote, fg, palette, cx)))
+            .when_some(message.quote.clone(), |d, quote| d.child(self.render_quote(message.id, quote, outgoing, palette, cx)))
             .child(body)
             .when_some(meta, |d, m| d.child(place_meta(m, false)))
             .window_fill(fill)
@@ -4220,8 +4220,10 @@ const QUOTE_THUMBNAIL: f32 = 54.;
 
 impl ConversationView {
     /// A reply's quote; clicking it shows the quoted message, as in Desktop.
-    fn render_quote(&self, message_id: i64, quote: signal_store::Quote, fg: Hsla, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_quote(&self, message_id: i64, quote: signal_store::Quote, outgoing: bool, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let (author, sent_at) = (quote.author.clone(), quote.sent_at);
+        let dark = gpui_kit::component::ActiveTheme::theme(&**cx).is_dark();
+        let colors = crate::chat_color::quote(self.state.read(cx).bubble_fill(&self.id), outgoing, dark);
         div()
             .id(("quote", message_id as u64))
             .debug_selector(move || format!("quote-{message_id}"))
@@ -4231,11 +4233,15 @@ impl ConversationView {
                 // Desktop's toast when it's gone (`icu:originalMessageNotFound`).
                 this.go_to(author.clone(), sent_at, "Original message not found", cx);
             }))
-            .child(render_quote(quote, fg, palette))
+            .child(render_quote(quote, colors, palette))
     }
 }
 
-fn render_quote(quote: signal_store::Quote, fg: Hsla, palette: Palette) -> impl IntoElement {
+/// `(fill, border)`: the quote's colors from `chat_color::quote`. Its text
+/// is Desktop's gray-90 or gray-05 whichever way it faces, which
+/// `palette.text` is.
+fn render_quote(quote: signal_store::Quote, (fill, border): (crate::chat_color::BubbleFill, Hsla), palette: Palette) -> impl IntoElement {
+    let fg = palette.text;
     // A column with a left border, not a row with a bar beside the text: in a
     // flex row the text is measured unwrapped and would widen the bubble past
     // its maximum. A thumbnail is placed over reserved padding for the same
@@ -4280,8 +4286,8 @@ fn render_quote(quote: signal_store::Quote, fg: Hsla, palette: Palette) -> impl 
         .rounded_md()
         .overflow_hidden()
         .border_l_4()
-        .border_color(fg)
-        .bg(Hsla { a: 0.15, ..palette.text })
+        .border_color(border)
+        .text_color(fg)
         .child(
             div()
                 .text_sm()
@@ -4292,6 +4298,7 @@ fn render_quote(quote: signal_store::Quote, fg: Hsla, palette: Palette) -> impl 
             Some(label) => d.child(div().text_sm().italic().truncate().child(label)),
             None => d.child(div().text_sm().line_clamp(3).text_ellipsis().child(collapse_whitespace(&quote.text))),
         })
+        .window_fill(fill)
 }
 
 /// A view-once bubble's icon, title and detail, in Desktop's words
