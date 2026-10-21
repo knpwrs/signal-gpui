@@ -15,6 +15,7 @@ use signal_store::{
     AttachmentMeta, ConversationId, ConversationKind, DeliveryStatus, Direction, Message, Reaction, ViewOnce,
 };
 
+use crate::chat_color::WindowFillExt as _;
 use crate::state::{AppEvent, AppState};
 use crate::image_cache::LruImageCache;
 use crate::views::image_viewer::ViewedImage;
@@ -2116,7 +2117,7 @@ impl ConversationView {
             (palette.bubble_in, palette.bubble_in_text, palette.text_secondary)
         };
 
-        let fill: gpui_kit::Background = ours.map_or_else(|| bg.into(), crate::chat_color::BubbleFill::background);
+        let fill = ours.unwrap_or(crate::chat_color::BubbleFill::Solid(bg));
         let jumbo = jumbo_count(message);
 
         let meta = show_meta.then(|| {
@@ -2173,9 +2174,9 @@ impl ConversationView {
                             .px_2()
                             .py_1p5()
                             .rounded_lg()
-                            .bg(fill)
                             .text_color(fg)
-                            .child(self.render_quote(message.id, quote, fg, palette, cx)),
+                            .child(self.render_quote(message.id, quote, fg, palette, cx))
+                            .window_fill(fill),
                     )
                 })
                 .child(match &sticker.local_path {
@@ -2283,7 +2284,6 @@ impl ConversationView {
                 .flex()
                 .flex_col()
                 .w(px(width))
-                .bg(fill)
                 .text_color(fg)
                 .when(header, |d| {
                     d.child(
@@ -2348,6 +2348,7 @@ impl ConversationView {
                             .when_some(meta, |d, m| d.child(place_meta(m, inline_meta))),
                     )
                 })
+                .window_fill(fill)
                 .into_any_element();
         }
 
@@ -2365,7 +2366,6 @@ impl ConversationView {
                 .flex()
                 .flex_col()
                 .when_some(full.as_ref().map(|(_, (width, _))| *width), |d, width| d.w(px(width)))
-                .bg(fill)
                 .text_color(fg)
                 .when(header, |d| {
                     d.child(
@@ -2394,6 +2394,7 @@ impl ConversationView {
                         })
                         .when_some(meta, |d, m| d.child(place_meta(m, inline_meta))),
                 )
+                .window_fill(fill)
                 .into_any_element();
         }
 
@@ -2416,7 +2417,6 @@ impl ConversationView {
             .gap_1()
             .px_3()
             .py_2()
-            .bg(fill)
             .text_color(fg)
             .when(show_author && !outgoing, |d| {
                 d.child(author_line(author_name, author_color, author_label, author_open))
@@ -2443,6 +2443,7 @@ impl ConversationView {
                 }
             })
             .when_some(meta, |d, m| d.child(place_meta(m, inline_meta)))
+            .window_fill(fill)
             .into_any_element()
     }
 
@@ -2455,7 +2456,7 @@ impl ConversationView {
         content: &signal_store::MessageContent,
         show_author: bool,
         corners: Corners,
-        (bg, fg, meta_color): (gpui_kit::Background, Hsla, Hsla),
+        (fill, fg, meta_color): (crate::chat_color::BubbleFill, Hsla, Hsla),
         meta: Option<impl IntoElement>,
         palette: Palette,
         cx: &mut Context<Self>,
@@ -2497,12 +2498,12 @@ impl ConversationView {
             .gap_1()
             .px_3()
             .py_2()
-            .bg(bg)
             .text_color(fg)
             .when(show_author && !outgoing, |d| d.child(author_line(author_name, author_color, author_label, author_open)))
             .when_some(message.quote.clone(), |d, quote| d.child(self.render_quote(message.id, quote, fg, palette, cx)))
             .child(body)
             .when_some(meta, |d, m| d.child(place_meta(m, false)))
+            .window_fill(fill)
             .into_any_element()
     }
 
@@ -2517,7 +2518,7 @@ impl ConversationView {
         view_once: ViewOnce,
         show_author: bool,
         corners: Corners,
-        (bg, fg, meta_color): (gpui_kit::Background, Hsla, Hsla),
+        (fill, fg, meta_color): (crate::chat_color::BubbleFill, Hsla, Hsla),
         meta: Option<AnyElement>,
         palette: Palette,
         cx: &mut Context<Self>,
@@ -2551,7 +2552,6 @@ impl ConversationView {
             .gap_1()
             .px_3()
             .py_2()
-            .bg(bg)
             .text_color(fg)
             .when(show_author && !outgoing, |d| d.child(author_line(author_name, author_color, author_label, author_open)))
             .child(
@@ -2580,6 +2580,7 @@ impl ConversationView {
                     window.push_notification(gpui_kit::component::notification::Notification::new().message(toast), cx);
                 })
             })
+            .window_fill(fill)
             .into_any_element()
     }
 
