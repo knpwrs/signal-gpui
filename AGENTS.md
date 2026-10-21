@@ -25,13 +25,14 @@ presage stores the first profile, profile photo and group photo it downloads and
 ## Privacy and the user's account
 
 - Never use the user's messages, contacts, screenshots or photos as test data or demo content. The demo's people are made up and its images are drawn in code.
-- The user's real account runs from `target/release/signal-gpui`. Don't kill it, don't build release over it, and don't touch its data directory except to read logs or databases when asked. Opening a database needs the Keychain key, which prompts the user.
+- The user's real account runs from `target/release/signal-gpui`. Don't kill it, don't build release over it, and don't touch its data directory except to read logs or databases when asked. Opening a database needs the Keychain key, which prompts the user. Any `target/debug/signal-gpui` run without `SIGNAL_GPUI_DATA_DIR` is also the real account.
 - Screenshot only windows of a process you started (match by PID). Never send synthetic input. A window on another Space doesn't draw; wait for it rather than activating it.
 - Don't ship Signal's Giphy key.
 
 ## Testing and screenshots
 
 - `SIGNAL_GPUI_DEMO=1` runs with seeded demo data and no network. Several UI tests read demo names and messages, so change `demo.rs` and those tests together.
+- **Always pair `SIGNAL_GPUI_DEMO=1` with `SIGNAL_GPUI_DATA_DIR=<a scratch directory>`.** The demo flag changes only the backend, not where data lives. Without a data dir, any build (debug included) opens the real profile with the Keychain key and seeds demo data into it. A 20-second run did that: `seed_profiles` cleared every username in `profiles`, overwrote `account.username` and `account.username_link`, and added demo profiles, a badge and files; the window also showed real chats and photos. Before capturing anything, check the log's `data directory:` line names the scratch directory. If it doesn't, kill the process.
 - Headless GPUI tests (`#[gpui_kit::test]` with the demo backend) only see backend events if the test pumps them into `AppState` as `main.rs` does.
 - To preview a state you can't click to (a dialog, a loading screen), patch the demo to emit it, capture, and restore the file. Keep a backup and confirm the patch is gone afterwards.
 - Optimize README images with `oxipng -o max --strip safe`.
