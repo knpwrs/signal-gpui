@@ -2229,22 +2229,42 @@ impl ConversationView {
                 Some(std::path::PathBuf::from(path).into())
             };
             // Corners the photo shares with the bubble get the bubble's radius.
+            // gpui clips to a plain rectangle, so the image, its placeholder
+            // and its border each round their own corners.
+            let radii = [
+                if header { 0. } else { corners.top_left },
+                if header { 0. } else { corners.top_right },
+                if footer { 0. } else { corners.bottom_left },
+                if footer { 0. } else { corners.bottom_right },
+            ];
+            fn round<E: Styled>(e: E, [tl, tr, bl, br]: [f32; 4]) -> E {
+                e.rounded_tl(px(tl)).rounded_tr(px(tr)).rounded_bl(px(bl)).rounded_br(px(br))
+            }
             let image = match source {
-                Some(source) => img(source)
-                    .id(SharedString::from(format!("photo-image-{}", message.id)))
-                    .w_full()
-                    .h(px(height))
-                    .object_fit(gpui_kit::ObjectFit::Cover)
-                    .into_any_element(),
-                None => div().w_full().h(px(height)).bg(palette.row_hover).into_any_element(),
+                Some(source) => round(
+                    img(source)
+                        .id(SharedString::from(format!("photo-image-{}", message.id)))
+                        .w_full()
+                        .h(px(height))
+                        .object_fit(gpui_kit::ObjectFit::Cover),
+                    radii,
+                )
+                .into_any_element(),
+                None => round(div().w_full().h(px(height)).bg(palette.row_hover), radii).into_any_element(),
+            };
+            // Desktop's hairline over the image (`module-image__border-overlay--with-border`,
+            // stylesheets/_modules.scss): black at 8.5% in light, white at 20% in dark.
+            let hairline = if gpui_kit::component::ActiveTheme::theme(&**cx).is_dark() {
+                Hsla { h: 0., s: 0., l: 1., a: 0.2 }
+            } else {
+                Hsla { h: 0., s: 0., l: 0., a: 0.085 }
             };
             let image = div()
+                .relative()
                 .w_full()
                 .h(px(height))
-                .overflow_hidden()
-                .when(!header, |d| d.rounded_tl(px(corners.top_left)).rounded_tr(px(corners.top_right)))
-                .when(!footer, |d| d.rounded_bl(px(corners.bottom_left)).rounded_br(px(corners.bottom_right)))
-                .child(image);
+                .child(image)
+                .child(round(div().absolute().inset_0().border_1().border_color(hairline), radii));
             return corners
                 .apply(div())
                 .debug_selector(|| format!("bubble-{}", message.id))
@@ -4260,7 +4280,10 @@ fn render_video(
         .overflow_hidden()
         .cursor_pointer()
         .bg(gpui_kit::hsla(0., 0., 0.1, 1.))
-        .when_some(poster, |d, poster| d.child(img(poster).absolute().inset_0().size_full().object_fit(gpui_kit::ObjectFit::Cover)))
+        // Rounded itself: gpui's clip to the box above is a plain rectangle.
+        .when_some(poster, |d, poster| {
+            d.child(img(poster).absolute().inset_0().size_full().rounded_lg().object_fit(gpui_kit::ObjectFit::Cover))
+        })
         .child(
             div()
                 .absolute()
