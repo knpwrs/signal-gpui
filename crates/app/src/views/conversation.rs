@@ -2244,8 +2244,12 @@ impl ConversationView {
                 Some(source) => round(
                     img(source)
                         .id(SharedString::from(format!("photo-image-{}", message.id)))
+                        .debug_selector(|| format!("photo-image-{}", message.id))
                         .w_full()
                         .h(px(height))
+                        // gpui otherwise takes the picture's ratio, and a
+                        // photo taller than the 450pt cap grows past its box.
+                        .aspect_ratio(width / height)
                         .object_fit(gpui_kit::ObjectFit::Cover),
                     radii,
                 )
@@ -3407,11 +3411,13 @@ fn render_preview_card(
         .bg(Hsla { h: 0., s: 0., l: 0., a: 0.14 })
         .cursor_pointer()
         .on_click(move |_, _, cx| open_link(&state, &url, cx))
-        .when_some(full, |d, (path, (_, height))| {
+        .when_some(full, |d, (path, (width, height))| {
             d.child(
                 img(std::path::PathBuf::from(path))
                     .w_full()
                     .h(px(height))
+                    // The box's ratio, not the picture's (see the photo's).
+                    .aspect_ratio(width / height)
                     .object_fit(gpui_kit::ObjectFit::Cover)
                     .when_some(top_corners, |d, c| d.rounded_tl(px(c.top_left)).rounded_tr(px(c.top_right))),
             )
@@ -4282,7 +4288,15 @@ fn render_video(
         .bg(gpui_kit::hsla(0., 0., 0.1, 1.))
         // Rounded itself: gpui's clip to the box above is a plain rectangle.
         .when_some(poster, |d, poster| {
-            d.child(img(poster).absolute().inset_0().size_full().rounded_lg().object_fit(gpui_kit::ObjectFit::Cover))
+            d.child(
+                img(poster)
+                    .absolute()
+                    .inset_0()
+                    .size_full()
+                    .aspect_ratio(w / h)
+                    .rounded_lg()
+                    .object_fit(gpui_kit::ObjectFit::Cover),
+            )
         })
         .child(
             div()
@@ -4363,7 +4377,14 @@ fn render_attachment(
             .rounded_lg()
             .overflow_hidden()
             .cursor_pointer()
-            .child(img(std::path::PathBuf::from(thumbnail)).absolute().inset_0().size_full().object_fit(gpui_kit::ObjectFit::Cover))
+            .child(
+                img(std::path::PathBuf::from(thumbnail))
+                    .absolute()
+                    .inset_0()
+                    .size_full()
+                    .aspect_ratio(w / h)
+                    .object_fit(gpui_kit::ObjectFit::Cover),
+            )
             .child(
                 div()
                     .absolute()
@@ -5814,6 +5835,65 @@ mod tests {
         // Padding (8 + 8) plus one 20pt line: the time didn't add a line.
         let bubble = bounds(&mut cx, format!("bubble-{}", messages[0].id));
         assert_eq!(bubble.size.height, px(36.), "{bubble:?}");
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn a_tall_photo_is_cropped_to_its_box(cx: &mut TestAppContext) {
+        let (backend, dir) = demo_backend(cx);
+        wait_for_messages(&backend, NOTE_TO_SELF, 1, |_| true);
+        // A 9:16 photo: 300 wide, its height capped at 450.
+        let path = dir.path().join("tall.png");
+        image::RgbaImage::new(90, 160).save(&path).unwrap();
+        let db = backend.db().clone();
+        let sent_at = chrono::Utc::now().timestamp_millis();
+        let attachment = AttachmentMeta {
+            content_type: "image/png".into(),
+            file_name: None,
+            size: 1,
+            width: Some(900),
+            height: Some(1600),
+            local_path: Some(path.to_string_lossy().into_owned()),
+            sticker: false,
+            gif: false,
+            voice: false,
+            remote: None,
+            thumbnail_path: None,
+        };
+        let id = futures::executor::block_on(backend.spawn(async move {
+            db.insert_message(&signal_store::NewMessage {
+                conversation_id: ConversationId(NOTE_TO_SELF.into()),
+                sent_at,
+                received_at: sent_at,
+                direction: Direction::Outgoing,
+                author: None,
+                author_name: None,
+                body: String::new(),
+                status: DeliveryStatus::Sent,
+                quote: None,
+                attachments: vec![attachment],
+                link_preview: None,
+                expires_in: 0,
+            })
+            .await
+        }))
+        .unwrap();
+        let (mut cx, view) = open_view(cx, &backend, NOTE_TO_SELF);
+        bounds(&mut cx, format!("photo-image-{id}"));
+        // Wait for the picture to decode: only then does gpui size the image
+        // by it.
+        let cache = cx.update(|_, cx| view.read(cx).image_cache.clone());
+        for _ in 0..300 {
+            if cx.update(|_, cx| cache.read(cx).has_loaded(&path)) {
+                break;
+            }
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(cx.update(|_, cx| cache.read(cx).has_loaded(&path)), "the photo never loaded");
+        let image = bounds(&mut cx, format!("photo-image-{id}"));
+        assert_eq!(image.size, size(px(300.), px(450.)), "{image:?}");
         backend.shutdown();
     }
 

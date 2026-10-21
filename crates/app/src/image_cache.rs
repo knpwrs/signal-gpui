@@ -70,6 +70,19 @@ impl LruImageCache {
     pub fn loaded(&self) -> usize {
         self.items.values().filter(|item| matches!(item.get(), Some(Ok(_)))).count()
     }
+
+    /// Whether the image at `path` has decoded.
+    #[cfg(test)]
+    pub fn has_loaded(&self, path: &std::path::Path) -> bool {
+        let key = Self::key(&Resource::Path(path.into()));
+        self.items.get(&key).is_some_and(|item| matches!(item.get(), Some(Ok(_))))
+    }
+
+    fn key(resource: &Resource) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        resource.hash(&mut hasher);
+        hasher.finish()
+    }
 }
 
 fn image_bytes(image: &RenderImage) -> usize {
@@ -88,9 +101,7 @@ impl ImageCache for LruImageCache {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        resource.hash(&mut hasher);
-        let key = hasher.finish();
+        let key = Self::key(resource);
         if let Some(position) = self.order.iter().position(|k| *k == key) {
             self.order.remove(position);
         }
