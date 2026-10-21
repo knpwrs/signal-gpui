@@ -252,7 +252,10 @@ impl EmojiPicker {
                     .bg(palette.row_hover)
                     .cursor_pointer()
                     .on_click(cx.listener(move |_, _, _, cx| cx.emit(PickerEvent::Gif(pick.clone()))))
-                    .when_some(frames, |d, frames| d.child(img(frames).size_full().object_fit(ObjectFit::Cover)))
+                    // With an id, so gpui steps its frames.
+                    .when_some(frames, |d, frames| {
+                        d.child(img(frames).id(SharedString::from(format!("gif-frames-{ix}"))).size_full().object_fit(ObjectFit::Cover))
+                    })
                     .into_any_element(),
             );
         }

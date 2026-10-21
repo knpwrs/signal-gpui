@@ -2218,7 +2218,8 @@ impl ConversationView {
             let rest = &message.attachments[1..];
             let footer = caption || !rest.is_empty();
             // A GIF is a looping video, decoded to frames (at 2× for Retina);
-            // a plain box shows until they're ready.
+            // a plain box shows until they're ready. gpui only steps the
+            // frames of an `img` with an id, where it keeps the frame index.
             let source: Option<gpui_kit::ImageSource> = if gif {
                 let path = std::path::PathBuf::from(&path);
                 self.state
@@ -2229,7 +2230,12 @@ impl ConversationView {
             };
             // Corners the photo shares with the bubble get the bubble's radius.
             let image = match source {
-                Some(source) => img(source).w_full().h(px(height)).object_fit(gpui_kit::ObjectFit::Cover).into_any_element(),
+                Some(source) => img(source)
+                    .id(SharedString::from(format!("photo-image-{}", message.id)))
+                    .w_full()
+                    .h(px(height))
+                    .object_fit(gpui_kit::ObjectFit::Cover)
+                    .into_any_element(),
                 None => div().w_full().h(px(height)).bg(palette.row_hover).into_any_element(),
             };
             let image = div()
