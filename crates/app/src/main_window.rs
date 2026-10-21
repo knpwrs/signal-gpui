@@ -41,6 +41,9 @@ struct MainWindow {
     quitting: bool,
     /// The window, once open.
     window: Option<AnyWindowHandle>,
+    /// It was in full screen when saved and goes back once it's first
+    /// active; until then saves keep saying so.
+    pending_fullscreen: bool,
 }
 
 impl Global for MainWindow {}
@@ -48,7 +51,7 @@ impl Global for MainWindow {}
 /// Opens the main window at its saved size and place (or the default).
 pub fn open(state: Entity<AppState>, data_dir: PathBuf, background: bool, cx: &mut App) -> anyhow::Result<()> {
     let saved = window_state::load(&data_dir);
-    cx.set_global(MainWindow { state, data_dir, background, save: None, quitting: false, window: None });
+    cx.set_global(MainWindow { state, data_dir, background, save: None, quitting: false, window: None, pending_fullscreen: false });
     let bounds = initial_bounds(saved, cx);
     open_window(bounds, cx)
 }
@@ -70,6 +73,19 @@ fn open_window(bounds: WindowBounds, cx: &mut App) -> anyhow::Result<()> {
         let main = cx.global::<MainWindow>();
         (main.state.clone(), main.background)
     };
+    // Full screen comes once the window is up and active, as Desktop's
+    // `setFullScreen` after `new BrowserWindow` (app/main.main.ts); opened in
+    // the background, that's when it's first shown. Asked for while gpui
+    // creates the window, entering can fail, which leaves the titlebar
+    // opaque over the top of the window: gpui turns transparency off as it
+    // starts to enter and back on only as it leaves.
+    let bounds = match bounds {
+        WindowBounds::Fullscreen(frame) => {
+            cx.global_mut::<MainWindow>().pending_fullscreen = true;
+            WindowBounds::Windowed(frame)
+        }
+        other => other,
+    };
     let options = WindowOptions {
         window_bounds: Some(bounds),
         window_min_size: Some(gpui_kit::size(px(MIN_SIZE.0), px(MIN_SIZE.1))),
@@ -89,11 +105,28 @@ fn open_window(bounds: WindowBounds, cx: &mut App) -> anyhow::Result<()> {
         window.on_window_should_close(cx, should_close);
         cx.new(|cx| {
             cx.observe_window_bounds(window, |_, window, cx| schedule_save(window, cx)).detach();
+            cx.observe_window_activation(window, |_, window, cx| enter_pending_fullscreen(window, cx)).detach();
             RootView::new(state.clone(), window, cx)
         })
     })?;
     cx.global_mut::<MainWindow>().window = Some(window);
+    // In case it was already active before anything was watching: not now,
+    // which is as early as gpui's own try and fails the same way, but once
+    // it has drawn.
+    let _ = window.update(cx, |_, window, _| window.on_next_frame(enter_pending_fullscreen));
     Ok(())
+}
+
+fn enter_pending_fullscreen(window: &mut Window, cx: &mut App) {
+    if !window.is_window_active() {
+        return;
+    }
+    if !cx.has_global::<MainWindow>() {
+        return;
+    }
+    if std::mem::take(&mut cx.global_mut::<MainWindow>().pending_fullscreen) && !window.is_fullscreen() {
+        window.toggle_fullscreen();
+    }
 }
 
 /// The app's state, once the window has been opened.
@@ -313,7 +346,8 @@ fn flush_save(window: &mut Window, cx: &mut App) {
     }
     let main = cx.global_mut::<MainWindow>();
     main.save = None;
-    let state = WindowState::capture(window.window_bounds(), window.is_maximized());
+    let mut state = WindowState::capture(window.window_bounds(), window.is_maximized());
+    state.fullscreen |= main.pending_fullscreen;
     window_state::save(&main.data_dir, &state);
 }
 
@@ -328,6 +362,14 @@ pub(crate) mod tests {
     /// from it, saving to `<dir>/window`.
     pub(crate) fn open_demo(
         cx: &mut TestAppContext,
+    ) -> (signal_backend::Backend, Entity<AppState>, AnyWindowHandle, tempfile::TempDir) {
+        open_demo_saved(cx, None)
+    }
+
+    /// `open_demo`, with the window saved as `saved` before it opens.
+    fn open_demo_saved(
+        cx: &mut TestAppContext,
+        saved: Option<WindowState>,
     ) -> (signal_backend::Backend, Entity<AppState>, AnyWindowHandle, tempfile::TempDir) {
         cx.update(gpui_kit::init);
         cx.executor().allow_parking();
@@ -347,9 +389,27 @@ pub(crate) mod tests {
         });
         let data_dir = dir.path().join("window");
         std::fs::create_dir_all(&data_dir).unwrap();
+        if let Some(saved) = saved {
+            window_state::save(&data_dir, &saved);
+        }
         cx.update(|cx| open(state.clone(), data_dir, true, cx)).unwrap();
         let window = cx.update(|cx| handle(cx)).expect("the main window");
         (backend, state, window, dir)
+    }
+
+    #[gpui_kit::test]
+    fn full_screen_waits_for_the_window_and_stays_saved_until_then(cx: &mut TestAppContext) {
+        let saved = WindowState { x: 100., y: 100., width: 1000., height: 700., maximized: false, fullscreen: true };
+        // Opened in the background: windowed, not yet active.
+        let (backend, _state, window, dir) = open_demo_saved(cx, Some(saved));
+        let mut vcx = gpui_kit::VisualTestContext::from_window(window, cx);
+        assert!(!vcx.update(|window, _| window.is_fullscreen()));
+        assert!(vcx.update(|_, cx| cx.global::<MainWindow>().pending_fullscreen));
+        // Hiding saves it as it'll be: in full screen.
+        vcx.update(should_close);
+        let data_dir = dir.path().join("window");
+        assert!(window_state::load(&data_dir).is_some_and(|w| w.fullscreen));
+        backend.shutdown();
     }
 
     #[gpui_kit::test]
