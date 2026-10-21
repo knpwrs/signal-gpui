@@ -8,7 +8,7 @@
 //! behind `desktop.senderKey.retry`); that isn't done here, so this is
 //! Desktop's fallback for when asking fails.
 
-use presage::libsignal_service::session_store::SessionStoreExt as _;
+use presage::libsignal_service::protocol::SessionStore as _;
 
 use super::*;
 
@@ -44,8 +44,11 @@ impl Actor {
     }
 
     /// Desktop's `lightSessionReset`: at most hourly per device, the
-    /// session is dropped and a null message starts a new one. A reset
+    /// session is archived and a null message starts a new one. A reset
     /// that couldn't be started may be tried again before the hour is up.
+    /// Archiving rather than deleting keeps the old state, so messages the
+    /// sender had already sent on it still decrypt; deleting it made each
+    /// of those fail as well, every one adding a notice.
     async fn light_session_reset(&self, sender: &ServiceId, device: u32) {
         let key = format!("{SETTING_SESSION_RESET}{}.{device}", sender.service_id_string());
         let now = now_millis();
@@ -56,8 +59,17 @@ impl Actor {
         }
         let Ok(device_id) = DeviceId::new(device as u8) else { return };
         let address = ProtocolAddress::new(sender.service_id_string(), device_id);
-        let store = presage::store::Store::aci_protocol_store(&self.store);
-        if let Err(error) = store.delete_service_addr_device_session(&address).await {
+        let mut store = presage::store::Store::aci_protocol_store(&self.store);
+        // Desktop's `archiveSession`.
+        let archived = match store.load_session(&address).await {
+            Ok(Some(mut record)) => match record.archive_current_state() {
+                Ok(()) => store.store_session(&address, &record).await,
+                Err(error) => Err(error),
+            },
+            Ok(None) => Ok(()),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = archived {
             return warn!(%error, "couldn't reset a session");
         }
         if let Err(error) = self.db.set_setting(&key, &now.to_string()).await {
