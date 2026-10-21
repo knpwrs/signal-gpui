@@ -2205,29 +2205,22 @@ impl ConversationView {
             .and_then(|author| self.state.read(cx).conversation(&self.id)?.member_labels.get(author).cloned());
 
         // Like Signal Desktop, a downloaded photo fills the bubble edge to edge
-        // and sets its width; a caption wraps below it.
-        let photo = (!message.deleted)
+        // and sets its width, and two or more photos and videos make its grid;
+        // a caption wraps below either.
+        let grid = !message.deleted
+            && message.attachments.len() > 1
+            && message.attachments.iter().all(|a| is_visual(a) && !too_big(a));
+        let photo = (!message.deleted && !grid)
             .then(|| message.attachments.first())
             .flatten()
             .filter(|a| a.content_type.starts_with("image/") || a.gif)
             .and_then(|a| Some((a.local_path.clone()?, media_size(a.width, a.height), viewed_image(a), a.gif)));
-        if let Some((path, (width, height), viewed, gif)) = photo {
+        if grid || photo.is_some() {
             let photo_message = message.id;
             let header = (show_author && !outgoing) || message.quote.is_some();
             let caption = !message.body.is_empty();
-            let rest = &message.attachments[1..];
+            let rest = if grid { &[][..] } else { &message.attachments[1..] };
             let footer = caption || !rest.is_empty();
-            // A GIF is a looping video, decoded to frames (at 2× for Retina);
-            // a plain box shows until they're ready. gpui only steps the
-            // frames of an `img` with an id, where it keeps the frame index.
-            let source: Option<gpui_kit::ImageSource> = if gif {
-                let path = std::path::PathBuf::from(&path);
-                self.state
-                    .update(cx, |state, cx| state.video_loop(&path, (width * 2.) as u32, cx))
-                    .map(Into::into)
-            } else {
-                Some(std::path::PathBuf::from(path).into())
-            };
             // Corners the photo shares with the bubble get the bubble's radius.
             // gpui clips to a plain rectangle, so the image, its placeholder
             // and its border each round their own corners.
@@ -2237,25 +2230,6 @@ impl ConversationView {
                 if footer { 0. } else { corners.bottom_left },
                 if footer { 0. } else { corners.bottom_right },
             ];
-            fn round<E: Styled>(e: E, [tl, tr, bl, br]: [f32; 4]) -> E {
-                e.rounded_tl(px(tl)).rounded_tr(px(tr)).rounded_bl(px(bl)).rounded_br(px(br))
-            }
-            let image = match source {
-                Some(source) => round(
-                    img(source)
-                        .id(SharedString::from(format!("photo-image-{}", message.id)))
-                        .debug_selector(|| format!("photo-image-{}", message.id))
-                        .w_full()
-                        .h(px(height))
-                        // gpui otherwise takes the picture's ratio, and a
-                        // photo taller than the 450pt cap grows past its box.
-                        .aspect_ratio(width / height)
-                        .object_fit(gpui_kit::ObjectFit::Cover),
-                    radii,
-                )
-                .into_any_element(),
-                None => round(div().w_full().h(px(height)).bg(palette.row_hover), radii).into_any_element(),
-            };
             // Desktop's hairline over the image (`module-image__border-overlay--with-border`,
             // stylesheets/_modules.scss): black at 8.5% in light, white at 20% in dark.
             let hairline = if gpui_kit::component::ActiveTheme::theme(&**cx).is_dark() {
@@ -2263,12 +2237,46 @@ impl ConversationView {
             } else {
                 Hsla { h: 0., s: 0., l: 0., a: 0.085 }
             };
-            let image = div()
-                .relative()
-                .w_full()
-                .h(px(height))
-                .child(image)
-                .child(round(div().absolute().inset_0().border_1().border_color(hairline), radii));
+            let (width, image, viewed, gif) = match photo {
+                Some((path, (width, height), viewed, gif)) => {
+                    // A GIF is a looping video, decoded to frames (at 2× for Retina);
+                    // a plain box shows until they're ready. gpui only steps the
+                    // frames of an `img` with an id, where it keeps the frame index.
+                    let source: Option<gpui_kit::ImageSource> = if gif {
+                        let path = std::path::PathBuf::from(&path);
+                        self.state
+                            .update(cx, |state, cx| state.video_loop(&path, (width * 2.) as u32, cx))
+                            .map(Into::into)
+                    } else {
+                        Some(std::path::PathBuf::from(path).into())
+                    };
+                    let image = match source {
+                        Some(source) => round(
+                            img(source)
+                                .id(SharedString::from(format!("photo-image-{}", message.id)))
+                                .debug_selector(|| format!("photo-image-{}", message.id))
+                                .w_full()
+                                .h(px(height))
+                                // gpui otherwise takes the picture's ratio, and a
+                                // photo taller than the 450pt cap grows past its box.
+                                .aspect_ratio(width / height)
+                                .object_fit(gpui_kit::ObjectFit::Cover),
+                            radii,
+                        )
+                        .into_any_element(),
+                        None => round(div().w_full().h(px(height)).bg(palette.row_hover), radii).into_any_element(),
+                    };
+                    let image = div()
+                        .relative()
+                        .w_full()
+                        .h(px(height))
+                        .child(image)
+                        .child(round(div().absolute().inset_0().border_1().border_color(hairline), radii))
+                        .into_any_element();
+                    (width, image, viewed, gif)
+                }
+                None => (GRID_WIDTH, render_grid(message, radii, hairline, palette, &self.state, cx), None, false),
+            };
             return corners
                 .apply(div())
                 .debug_selector(|| format!("bubble-{}", message.id))
@@ -3999,6 +4007,211 @@ fn media_size(width: Option<u32>, height: Option<u32>) -> (f32, f32) {
         }
         _ => (MAX_WIDTH, 225.),
     }
+}
+
+/// Rounds each corner by its own radius: top left, top right, bottom left,
+/// bottom right.
+fn round<E: Styled>(e: E, [tl, tr, bl, br]: [f32; 4]) -> E {
+    e.rounded_tl(px(tl)).rounded_tr(px(tr)).rounded_bl(px(bl)).rounded_br(px(br))
+}
+
+/// A photo or video, which Desktop puts in its grid (`areAllAttachmentsVisual`
+/// in ts/util/Attachment.std.ts).
+fn is_visual(attachment: &AttachmentMeta) -> bool {
+    (attachment.content_type.starts_with("image/") || attachment.content_type.starts_with("video/"))
+        && !attachment.sticker
+        && !attachment.voice
+}
+
+/// Desktop's grid is 300pt wide (`getGridDimensions`, ts/util/Attachment.std.ts).
+const GRID_WIDTH: f32 = 300.;
+
+/// One cell of the grid: where it sits, and which of the grid's corners
+/// (top left, top right, bottom left, bottom right) it takes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GridCell {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    corners: [bool; 4],
+}
+
+/// Desktop's layouts for `count` attachments (ts/components/conversation/ImageGrid.dom.tsx),
+/// with its 1px gaps (`cropWidth`/`cropHeight` of `GAP`), and the grid's height.
+/// Past five, the fifth cell stands for the rest.
+fn grid_layout(count: usize) -> (f32, Vec<GridCell>) {
+    let cell = |x, y, width, height, corners| GridCell { x, y, width, height, corners };
+    const TL: [bool; 4] = [true, false, false, false];
+    const TR: [bool; 4] = [false, true, false, false];
+    const BL: [bool; 4] = [false, false, true, false];
+    const BR: [bool; 4] = [false, false, false, true];
+    const NONE: [bool; 4] = [false; 4];
+    match count {
+        // A B
+        2 => (150., vec![cell(0., 0., 149., 150., [true, false, true, false]), cell(150., 0., 150., 150., [false, true, false, true])]),
+        // A A B
+        // A A C
+        3 => (
+            200.,
+            vec![cell(0., 0., 199., 200., [true, false, true, false]), cell(200., 0., 100., 99., TR), cell(200., 100., 100., 100., BR)],
+        ),
+        // A B
+        // C D
+        4 => (
+            300.,
+            vec![
+                cell(0., 0., 149., 149., TL),
+                cell(150., 0., 150., 149., TR),
+                cell(0., 150., 149., 150., BL),
+                cell(150., 150., 150., 150., BR),
+            ],
+        ),
+        //  A  B
+        // C D E
+        _ => (
+            251.,
+            vec![
+                cell(0., 0., 149., 150., TL),
+                cell(150., 0., 150., 150., TR),
+                cell(0., 151., 99., 100., BL),
+                cell(100., 151., 99., 100., NONE),
+                cell(200., 151., 100., 100., BR),
+            ],
+        ),
+    }
+}
+
+/// Two or more photos and videos in Desktop's grid. Each opens in the viewer
+/// once downloaded; before that, its backup thumbnail (or a plain box) shows,
+/// and a click downloads it. When none is downloaded, Desktop's pill offers
+/// them all (`renderDownloadPill`).
+fn render_grid(
+    message: &Message,
+    radii: [f32; 4],
+    hairline: Hsla,
+    palette: Palette,
+    state: &Entity<AppState>,
+    cx: &mut Context<ConversationView>,
+) -> AnyElement {
+    let message_id = message.id;
+    let attachments = &message.attachments;
+    let (height, cells) = grid_layout(attachments.len());
+    let white = gpui_kit::hsla(0., 0., 1., 1.);
+    let more = attachments.len().saturating_sub(cells.len());
+    let none_downloaded = attachments.iter().all(|a| a.local_path.is_none());
+    let count = attachments.len();
+    div()
+        .relative()
+        .w(px(GRID_WIDTH))
+        .h(px(height))
+        .children(cells.iter().zip(attachments).enumerate().map(|(index, (cell, attachment))| {
+            let corners = [0, 1, 2, 3].map(|i| if cell.corners[i] { radii[i] } else { 0. });
+            let video = attachment.content_type.starts_with("video/");
+            let local = attachment.local_path.as_ref().map(std::path::PathBuf::from);
+            let source: Option<std::path::PathBuf> = match &local {
+                Some(path) if video => state.update(cx, |state, cx| state.poster(path, cx)),
+                Some(path) => Some(path.clone()),
+                None => attachment.thumbnail_path.as_ref().map(std::path::PathBuf::from),
+            };
+            let picture = match source {
+                Some(source) => round(
+                    img(source)
+                        .absolute()
+                        .inset_0()
+                        .size_full()
+                        // The cell's ratio, not the picture's (see the photo's).
+                        .aspect_ratio(cell.width / cell.height)
+                        .object_fit(gpui_kit::ObjectFit::Cover),
+                    corners,
+                )
+                .into_any_element(),
+                None => round(div().absolute().inset_0().bg(palette.row_hover), corners).into_any_element(),
+            };
+            let last = index + 1 == cells.len() && more > 0;
+            let viewed = viewed_image(attachment);
+            let file_name = attachment.file_name.clone();
+            div()
+                .id(SharedString::from(format!("grid-{message_id}-{index}")))
+                .debug_selector(move || format!("grid-{message_id}-{index}"))
+                .absolute()
+                .left(px(cell.x))
+                .top(px(cell.y))
+                .w(px(cell.width))
+                .h(px(cell.height))
+                .cursor_pointer()
+                .child(picture)
+                // Desktop's play button on a downloaded video (`module-image__overlay-circle`).
+                .when(video && local.is_some() && !last, |d| {
+                    d.child(
+                        div().absolute().inset_0().flex().items_center().justify_center().child(
+                            div()
+                                .size(px(48.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_full()
+                                .bg(gpui_kit::hsla(0., 0., 0., 0.55))
+                                .child(Icon::new(IconName::Play).size_6().text_color(white)),
+                        ),
+                    )
+                })
+                // The rest, counted over the last cell, which darkens
+                // (`module-image__border-overlay--dark`, black at 20%).
+                .when(last, |d| {
+                    d.child(
+                        round(div().absolute().inset_0().bg(gpui_kit::hsla(0., 0., 0., 0.2)), corners)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_color(white)
+                            .child(format!("+{more}")),
+                    )
+                })
+                .child(round(div().absolute().inset_0().border_1().border_color(hairline), corners))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let in_chat = Some(crate::views::lightbox::InChat::new(this.id.clone(), message_id, index));
+                    match (&local, &viewed) {
+                        (Some(path), _) if video => {
+                            let video = crate::views::video_viewer::ViewedVideo { path: path.clone(), file_name: file_name.clone(), view_once: false, in_chat };
+                            this.state.update(cx, |state, cx| state.view_video(video, cx));
+                        }
+                        (Some(_), Some(viewed)) => {
+                            let mut image = viewed.clone();
+                            image.in_chat = in_chat;
+                            this.state.update(cx, |state, cx| state.view_image(image, cx));
+                        }
+                        _ => this.state.read(cx).send(Command::FetchAttachment { message_id, index }),
+                    }
+                }))
+        }))
+        .when(none_downloaded, |d| {
+            d.child(
+                div().absolute().inset_0().flex().items_center().justify_center().child(
+                    div()
+                        .id(SharedString::from(format!("grid-download-{message_id}")))
+                        .debug_selector(move || format!("grid-download-{message_id}"))
+                        .h(px(44.))
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .pl_2p5()
+                        .pr_3p5()
+                        .rounded_full()
+                        .cursor_pointer()
+                        .bg(gpui_kit::hsla(0., 0., 0., 0.8))
+                        .text_color(white)
+                        .child(Icon::new(IconName::Download).size_6())
+                        // Desktop's `icu:downloadNItems`.
+                        .child(format!("Download {count} items"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.state.read(cx).send(Command::FetchAttachments { message_id });
+                        })),
+                ),
+            )
+        })
+        .into_any_element()
 }
 
 /// Side of the image beside a quote (the quoted photo or preview image).
@@ -5784,29 +5997,47 @@ mod tests {
             remote: None,
             thumbnail_path: thumbnail.clone(),
         };
-        let db = backend.db().clone();
         let sent_at = chrono::Utc::now().timestamp_millis();
-        let message = signal_store::NewMessage {
-            conversation_id: ConversationId(NOTE_TO_SELF.into()),
-            sent_at,
-            received_at: sent_at,
-            direction: Direction::Outgoing,
-            author: None,
-            author_name: None,
-            body: "From the backup".into(),
-            status: DeliveryStatus::Sent,
-            quote: None,
-            attachments: vec![not_downloaded("image/jpeg", 800, 600), not_downloaded("video/mp4", 600, 800)],
-            link_preview: None,
-            expires_in: 0,
-        };
-        let id = futures::executor::block_on(backend.spawn(async move { db.insert_message(&message).await })).unwrap();
+        let [image, video, both]: [i64; 3] = [
+            vec![not_downloaded("image/jpeg", 800, 600)],
+            vec![not_downloaded("video/mp4", 600, 800)],
+            vec![not_downloaded("image/jpeg", 800, 600), not_downloaded("video/mp4", 600, 800)],
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, attachments)| {
+            let db = backend.db().clone();
+            let sent_at = sent_at + i as i64;
+            let message = signal_store::NewMessage {
+                conversation_id: ConversationId(NOTE_TO_SELF.into()),
+                sent_at,
+                received_at: sent_at,
+                direction: Direction::Outgoing,
+                author: None,
+                author_name: None,
+                body: "From the backup".into(),
+                status: DeliveryStatus::Sent,
+                quote: None,
+                attachments,
+                link_preview: None,
+                expires_in: 0,
+            };
+            futures::executor::block_on(backend.spawn(async move { db.insert_message(&message).await })).unwrap()
+        })
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
         let mut cx = open(cx, &backend, NOTE_TO_SELF);
-        // The image's box at its own proportions, not the file row.
-        let image = bounds(&mut cx, format!("thumbnail-{id}-0"));
-        assert_eq!((image.size.width, image.size.height), (px(300.), px(225.)));
-        let video = bounds(&mut cx, format!("video-{id}-1"));
-        assert_eq!((video.size.width, video.size.height), (px(300.), px(400.)));
+        // Alone, each box at its own proportions, not the file row.
+        let alone = bounds(&mut cx, format!("thumbnail-{image}-0"));
+        assert_eq!((alone.size.width, alone.size.height), (px(300.), px(225.)));
+        let alone = bounds(&mut cx, format!("video-{video}-0"));
+        assert_eq!((alone.size.width, alone.size.height), (px(300.), px(400.)));
+        // Together, Desktop's grid of two, with its pill to download both.
+        let first = bounds(&mut cx, format!("grid-{both}-0"));
+        let second = bounds(&mut cx, format!("grid-{both}-1"));
+        assert_eq!((first.size, second.size), (size(px(149.), px(150.)), size(px(150.), px(150.))));
+        bounds(&mut cx, format!("grid-download-{both}"));
         backend.shutdown();
     }
 
@@ -5835,6 +6066,87 @@ mod tests {
         // Padding (8 + 8) plus one 20pt line: the time didn't add a line.
         let bubble = bounds(&mut cx, format!("bubble-{}", messages[0].id));
         assert_eq!(bubble.size.height, px(36.), "{bubble:?}");
+        backend.shutdown();
+    }
+
+    #[test]
+    fn grids_follow_desktops_layouts() {
+        for count in 2..=7 {
+            let (height, cells) = grid_layout(count);
+            assert_eq!(cells.len(), count.min(5));
+            // Every cell inside the 300pt grid, none overlapping, 1px apart.
+            for (i, a) in cells.iter().enumerate() {
+                assert!(a.x + a.width <= GRID_WIDTH && a.y + a.height <= height, "{count}: {a:?}");
+                for b in &cells[i + 1..] {
+                    let apart = a.x + a.width < b.x || b.x + b.width < a.x || a.y + a.height < b.y || b.y + b.height < a.y;
+                    assert!(apart, "{count}: {a:?} touches {b:?}");
+                }
+            }
+            // Each of the grid's corners is rounded by exactly one cell.
+            for corner in 0..4 {
+                assert_eq!(cells.iter().filter(|c| c.corners[corner]).count(), 1, "{count}: corner {corner}");
+            }
+        }
+        // getGridDimensions: 300×150, 300×200, 300×300; five is 150 + 1 + 100.
+        assert_eq!([2, 3, 4, 5].map(|n| grid_layout(n).0), [150., 200., 300., 251.]);
+        assert_eq!(grid_layout(3).1[0], GridCell { x: 0., y: 0., width: 199., height: 200., corners: [true, false, true, false] });
+    }
+
+    #[gpui_kit::test]
+    fn three_photos_make_desktops_grid(cx: &mut TestAppContext) {
+        let (backend, dir) = demo_backend(cx);
+        wait_for_messages(&backend, NOTE_TO_SELF, 1, |_| true);
+        let attachments: Vec<AttachmentMeta> = (0..3)
+            .map(|i| {
+                let path = dir.path().join(format!("grid-{i}.png"));
+                image::RgbaImage::new(40, 30).save(&path).unwrap();
+                AttachmentMeta {
+                    content_type: "image/png".into(),
+                    file_name: None,
+                    size: 1,
+                    width: Some(400),
+                    height: Some(300),
+                    local_path: Some(path.to_string_lossy().into_owned()),
+                    sticker: false,
+                    gif: false,
+                    voice: false,
+                    remote: None,
+                    thumbnail_path: None,
+                }
+            })
+            .collect();
+        let db = backend.db().clone();
+        let sent_at = chrono::Utc::now().timestamp_millis();
+        let id = futures::executor::block_on(backend.spawn(async move {
+            db.insert_message(&signal_store::NewMessage {
+                conversation_id: ConversationId(NOTE_TO_SELF.into()),
+                sent_at,
+                received_at: sent_at,
+                direction: Direction::Outgoing,
+                author: None,
+                author_name: None,
+                body: String::new(),
+                status: DeliveryStatus::Sent,
+                quote: None,
+                attachments,
+                link_preview: None,
+                expires_in: 0,
+            })
+            .await
+        }))
+        .unwrap();
+        let mut cx = open(cx, &backend, NOTE_TO_SELF);
+        let bubble = bounds(&mut cx, format!("bubble-{id}"));
+        assert_eq!(bubble.size, size(px(300.), px(200.)), "{bubble:?}");
+        let cell = |cx: &mut VisualTestContext, i| {
+            let b = bounds(cx, format!("grid-{id}-{i}"));
+            (b.origin.x - bubble.origin.x, b.origin.y - bubble.origin.y, b.size.width, b.size.height)
+        };
+        assert_eq!(cell(&mut cx, 0), (px(0.), px(0.), px(199.), px(200.)));
+        assert_eq!(cell(&mut cx, 1), (px(200.), px(0.), px(100.), px(99.)));
+        assert_eq!(cell(&mut cx, 2), (px(200.), px(100.), px(100.), px(100.)));
+        // All downloaded: no download pill.
+        assert!(cx.debug_bounds(Box::leak(format!("grid-download-{id}").into_boxed_str())).is_none());
         backend.shutdown();
     }
 

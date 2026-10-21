@@ -958,6 +958,14 @@ impl Actor {
                 Command::FetchAttachment { message_id, index } => {
                     self.fetch_attachment(message_id, index).await
                 }
+                Command::FetchAttachments { message_id } => {
+                    let Some(message) = self.db.message(message_id).await.ok().flatten() else { return };
+                    let missing: Vec<usize> =
+                        message.attachments.iter().enumerate().filter(|(_, a)| a.local_path.is_none()).map(|(i, _)| i).collect();
+                    for index in missing {
+                        self.clone().fetch_attachment(message_id, index).await;
+                    }
+                }
                 Command::OpenViewOnce { message_id } => self.open_view_once(message_id).await,
                 Command::SendViewOnce { conversation, media } => self.send_view_once(conversation, media).await,
                 Command::FetchLongText { message_id } => {

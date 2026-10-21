@@ -2282,6 +2282,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
             | Command::Link
             | Command::Typing { .. }
             | Command::FetchAttachment { .. }
+            | Command::FetchAttachments { .. }
             | Command::FetchLongText { .. }
             | Command::Unlink
             | Command::SkipHistory

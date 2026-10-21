@@ -413,6 +413,9 @@ pub enum Command {
     RetryDeleteForEveryone { message_id: i64 },
     /// Downloads attachment `index` of `message_id`.
     FetchAttachment { message_id: i64, index: usize },
+    /// Downloads every attachment of `message_id` not yet downloaded, one at
+    /// a time (Desktop's "Download N items" on a grid).
+    FetchAttachments { message_id: i64 },
     /// Opens their view-once message, its one time: answered with
     /// `Event::ViewOnceOpened`, after which it's erased.
     OpenViewOnce { message_id: i64 },
