@@ -5,10 +5,12 @@ use std::path::{Path, PathBuf};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::{Disableable as _, Sizable as _};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla, KeyDownEvent, ObjectFit, SharedString, Window, div, img, px,
+    App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla, Image, ImageFormat, KeyDownEvent, ObjectFit,
+    SharedString, Window, div, img, px,
 };
 
 use crate::state::AppState;
@@ -26,6 +28,8 @@ pub struct ViewedImage {
     /// Pixel size, when known; without it the image can only be fitted.
     pub size: Option<(u32, u32)>,
     pub file_name: Option<String>,
+    /// Its stored MIME type, which "Copy Image" puts on the clipboard.
+    pub content_type: String,
     /// A view-once message's copy (`Event::ViewOnceOpened`): it can't be
     /// saved, and the file is deleted when the viewer closes.
     pub view_once: bool,
@@ -139,6 +143,12 @@ impl ImageViewer {
         lightbox::save_as(self.image.path.clone(), download_name(&self.image), cx);
     }
 
+    /// Desktop's "Copy Image" (`app/spell_check.main.ts`): the file's bytes,
+    /// typed by its stored content type.
+    fn copy(&self, cx: &mut Context<Self>) {
+        copy_image(self.image.path.clone(), &self.image.content_type, cx);
+    }
+
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let area = available_area(window);
         // Desktop's lightbox: ⌘S saves the one shown (not a view-once copy).
@@ -168,6 +178,21 @@ pub fn delete_on_release<V: 'static>(path: PathBuf, cx: &mut Context<V>) {
         if let Err(error) = std::fs::remove_file(&path) {
             tracing::warn!(%error, "couldn't delete a view-once copy");
         }
+    })
+    .detach();
+}
+
+/// Puts the image at `path` on the clipboard as `content_type`. A type the
+/// clipboard can't carry is logged and skipped.
+pub fn copy_image(path: PathBuf, content_type: &str, cx: &mut App) {
+    let Some(format) = ImageFormat::from_mime_type(content_type) else {
+        tracing::warn!(content_type, "can't copy an image of this type");
+        return;
+    };
+    let read = cx.background_spawn(async move { std::fs::read(&path) });
+    cx.spawn(async move |cx| match read.await {
+        Ok(bytes) => cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_image(&Image::from_bytes(format, bytes)))),
+        Err(error) => tracing::warn!(%error, "failed to read an image to copy"),
     })
     .detach();
 }
@@ -372,7 +397,23 @@ impl gpui_kit::Render for ImageViewer {
                                         cx.stop_propagation();
                                         this.toggle_zoom(cx);
                                     }))
-                                    .child(img(self.image.path.clone()).size_full().object_fit(ObjectFit::Contain)),
+                                    .child(img(self.image.path.clone()).size_full().object_fit(ObjectFit::Contain))
+                                    .map(|d| {
+                                        // Desktop offers no copy of a view-once photo.
+                                        if self.image.view_once {
+                                            return d.into_any_element();
+                                        }
+                                        let viewer = cx.weak_entity();
+                                        d.context_menu(move |menu, _, _| {
+                                            let viewer = viewer.clone();
+                                            menu.item(PopupMenuItem::new("Copy Image").icon(IconName::Copy).on_click(
+                                                move |_, _, cx| {
+                                                    let _ = viewer.update(cx, |this, cx| this.copy(cx));
+                                                },
+                                            ))
+                                        })
+                                        .into_any_element()
+                                    }),
                             ),
                     ),
             )
@@ -408,6 +449,7 @@ mod tests {
             path: PathBuf::from("/x/123-0.png"),
             size: None,
             file_name: name.map(Into::into),
+            content_type: "image/png".into(),
             view_once: false,
             in_chat: None,
         };
@@ -424,7 +466,7 @@ mod tests {
     fn opens_fitted_and_zooms_to_actual_size(cx: &mut gpui_kit::TestAppContext) {
         use gpui_kit::{AppContext as _, VisualTestContext, WindowBounds, WindowOptions, size};
         cx.update(gpui_kit::init);
-        let image = ViewedImage { path: PathBuf::from("/nonexistent.png"), size: Some((4000, 3000)), file_name: None, view_once: false, in_chat: None };
+        let image = ViewedImage { path: PathBuf::from("/nonexistent.png"), size: Some((4000, 3000)), file_name: None, content_type: "image/png".into(), view_once: false, in_chat: None };
         let (window, viewer) = cx.update(|cx| {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(gpui_kit::Bounds {
@@ -455,6 +497,27 @@ mod tests {
         assert_eq!(shown(&mut cx), fitted);
     }
 
+    #[gpui_kit::test]
+    fn copies_the_file_as_its_stored_type(cx: &mut gpui_kit::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo");
+        // Not a real JPEG: the stored type decides, not the bytes.
+        std::fs::write(&path, b"bytes").unwrap();
+        cx.update(|cx| copy_image(path.clone(), "image/jpeg", cx));
+        cx.run_until_parked();
+        let copied = cx.update(|cx| cx.read_from_clipboard()).and_then(|item| match item.entries().first()? {
+            gpui_kit::ClipboardEntry::Image(image) => Some(image.clone()),
+            _ => None,
+        });
+        assert_eq!(copied, Some(Image::from_bytes(ImageFormat::Jpeg, b"bytes".to_vec())));
+
+        // A type the clipboard can't carry leaves it as it was.
+        cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("before".into())));
+        cx.update(|cx| copy_image(path.clone(), "image/x-unknown", cx));
+        cx.run_until_parked();
+        assert_eq!(cx.update(|cx| cx.read_from_clipboard()).and_then(|item| item.text()), Some("before".into()));
+    }
+
     #[test]
     fn fit_never_enlarges() {
         // Limited by height.
@@ -471,7 +534,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("copy.png");
         std::fs::write(&path, b"").unwrap();
-        let image = ViewedImage { path: path.clone(), size: Some((10, 10)), file_name: None, view_once: true, in_chat: None };
+        let image = ViewedImage { path: path.clone(), size: Some((10, 10)), file_name: None, content_type: "image/png".into(), view_once: true, in_chat: None };
         let (window, viewer) = cx.update(|cx| {
             gpui_kit::open_window(Default::default(), cx, |_, cx| cx.new(|cx| ImageViewer::new(image, None, cx))).unwrap()
         });

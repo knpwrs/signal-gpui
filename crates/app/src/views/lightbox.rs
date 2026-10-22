@@ -28,6 +28,7 @@ pub struct MediaItem {
     /// A photo's pixel size, when known.
     pub size: Option<(u32, u32)>,
     pub file_name: Option<String>,
+    pub content_type: String,
     pub sent_at: i64,
     /// Who sent it ("You" for ours).
     pub sender: String,
@@ -96,6 +97,7 @@ pub fn gallery(newest_first: &[Message]) -> Vec<MediaItem> {
                 video,
                 size: attachment.width.zip(attachment.height).filter(|(w, h)| *w > 0 && *h > 0),
                 file_name: attachment.file_name.clone(),
+                content_type: attachment.content_type.clone(),
                 sent_at: message.sent_at,
                 sender: sender.clone(),
             });
@@ -153,6 +155,7 @@ pub fn show(state: &Entity<AppState>, in_chat: &InChat, item: &MediaItem, cx: &m
                 path: item.path.clone(),
                 size: item.size,
                 file_name: item.file_name.clone(),
+                content_type: item.content_type.clone(),
                 view_once: false,
                 in_chat: Some(next),
             };
@@ -307,6 +310,7 @@ mod tests {
             path: first.path.clone(),
             size: first.size,
             file_name: None,
+            content_type: first.content_type.clone(),
             view_once: false,
             in_chat: Some(InChat::new(me.clone(), first.message_id, first.index)),
         };

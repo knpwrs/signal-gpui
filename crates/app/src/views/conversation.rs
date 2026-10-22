@@ -4339,6 +4339,7 @@ fn viewed_image(attachment: &AttachmentMeta) -> Option<ViewedImage> {
         path: std::path::PathBuf::from(attachment.local_path.as_ref()?),
         size: attachment.width.zip(attachment.height).filter(|(w, h)| *w > 0 && *h > 0),
         file_name: attachment.file_name.clone(),
+        content_type: attachment.content_type.clone(),
         view_once: false,
         in_chat: None,
     })

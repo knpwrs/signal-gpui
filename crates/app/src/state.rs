@@ -2537,7 +2537,14 @@ impl AppState {
             self.view_video(video, cx);
         } else {
             let size = opened.size.filter(|(w, h)| *w > 0 && *h > 0);
-            let image = crate::views::image_viewer::ViewedImage { path: opened.path, size, file_name: None, view_once: true, in_chat: None };
+            let image = crate::views::image_viewer::ViewedImage {
+                path: opened.path,
+                size,
+                file_name: None,
+                content_type: opened.content_type,
+                view_once: true,
+                in_chat: None,
+            };
             self.view_image(image, cx);
         }
     }

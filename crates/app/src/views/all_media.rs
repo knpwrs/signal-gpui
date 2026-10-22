@@ -199,6 +199,7 @@ fn media_grid(items: &[Item], state: &Entity<AppState>, palette: Palette) -> gpu
                 path: path.clone().into(),
                 size: item.attachment.width.zip(item.attachment.height),
                 file_name: item.attachment.file_name.clone(),
+                content_type: item.attachment.content_type.clone(),
                 view_once: false,
                 in_chat: Some(InChat::new(item.conversation.clone(), item.message_id, item.index)),
             };
