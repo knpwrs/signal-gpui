@@ -119,7 +119,7 @@ mod macos {
 
     define_class!(
         #[unsafe(super(NSObject))]
-        #[name = "SignalGpuiNotificationDelegate"]
+        #[name = "ZiggyNotificationDelegate"]
         struct Delegate;
 
         unsafe impl NSObjectProtocol for Delegate {}

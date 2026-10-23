@@ -49,7 +49,7 @@ pub fn show(window: &mut Window, cx: &mut App) {
     window.open_dialog(cx, |dialog, _, cx| {
         let palette = Palette::get(cx);
         let source = format!("Source code: {REPOSITORY}");
-        dialog.title("About Signal GPUI").w(px(440.)).child(
+        dialog.title("About Ziggy").w(px(440.)).child(
             div()
                 .flex()
                 .flex_col()
@@ -59,7 +59,7 @@ pub fn show(window: &mut Window, cx: &mut App) {
                     div()
                         .flex()
                         .flex_col()
-                        .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("Signal GPUI"))
+                        .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("Ziggy"))
                         .child(
                             div()
                                 .text_color(palette.text_secondary)

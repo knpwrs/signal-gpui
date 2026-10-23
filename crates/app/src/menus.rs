@@ -60,18 +60,18 @@ pub fn bind_keys(cx: &mut App) {
 /// and the like by the main window).
 pub fn install(cx: &mut App) {
     cx.set_menus(vec![
-        Menu::new("Signal GPUI").items([
-            MenuItem::action("About Signal GPUI", About),
+        Menu::new("Ziggy").items([
+            MenuItem::action("About Ziggy", About),
             MenuItem::separator(),
             MenuItem::action("Settings…", OpenSettings),
             MenuItem::separator(),
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),
-            MenuItem::action("Hide Signal GPUI", Hide),
+            MenuItem::action("Hide Ziggy", Hide),
             MenuItem::action("Hide Others", HideOthers),
             MenuItem::action("Show All", ShowAll),
             MenuItem::separator(),
-            MenuItem::action("Quit Signal GPUI", Quit),
+            MenuItem::action("Quit Ziggy", Quit),
         ]),
         Menu::new("File").items([
             MenuItem::action("Create/upload sticker pack", CreateStickerPack),

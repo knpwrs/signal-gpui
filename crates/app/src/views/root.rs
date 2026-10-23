@@ -551,7 +551,7 @@ impl Render for RootView {
                         .gap_2()
                         .bg(palette.background)
                         .text_color(palette.text_secondary)
-                        .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).text_color(palette.text).child("Welcome to Signal GPUI"))
+                        .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).text_color(palette.text).child("Welcome to Ziggy"))
                         .child("Select a chat to start messaging")
                         .child(
                             div()

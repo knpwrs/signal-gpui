@@ -1470,7 +1470,7 @@ pub(crate) fn push_service(manager: &SignalManager) -> anyhow::Result<PushServic
         password: Some(password),
         device_id: data.device_id.and_then(|d| d.try_into().ok()),
     };
-    Ok(PushService::new(data.signal_servers, Some(credentials), "signal-gpui"))
+    Ok(PushService::new(data.signal_servers, Some(credentials), "ziggy"))
 }
 
 /// A story list (Desktop's `StoryDistributionListRecord`): its members as

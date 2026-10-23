@@ -8,7 +8,7 @@
 BIN="$1"
 case "$BIN" in
     */deps/*) ;;
-    */signal-gpui)
+    */ziggy)
         if [ -z "${SIGNAL_GPUI_SIGN_IDENTITY:-}" ] \
             && ! security find-identity -v -p codesigning 2>/dev/null | grep -q '"Apple Development: '; then
             echo "note: no Apple Development certificate, so macOS asks for Keychain access after each rebuild." >&2

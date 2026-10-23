@@ -84,7 +84,7 @@ pub fn new_path() -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or_default();
-    std::env::temp_dir().join(format!("signal-gpui-voice-{}-{millis}-{n}.m4a", std::process::id()))
+    std::env::temp_dir().join(format!("ziggy-voice-{}-{millis}-{n}.m4a", std::process::id()))
 }
 
 /// Records from the default microphone. macOS asks for permission the first

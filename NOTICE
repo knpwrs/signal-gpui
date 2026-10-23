@@ -1,4 +1,4 @@
-signal-gpui
+Ziggy (formerly Signal GPUI)
 Copyright (C) 2026 Ken Powers
 
 This program is free software: you can redistribute it and/or modify it under
@@ -27,7 +27,7 @@ Modified libraries, vendored in vendor/ (AGPL-3.0-only):
   - libsignal-service-rs   https://github.com/whisperfish/libsignal-service-rs
   Both are Copyright their upstream authors (the whisperfish contributors)
   and keep their licenses in vendor/*/LICENSE.md. They are modified
-  versions, changed by Ken Powers for signal-gpui since 2026-10-15:
+  versions, changed by Ken Powers for Ziggy (then Signal GPUI) since 2026-10-15:
   vendor/README.md lists each change, and the git history of vendor/ dates
   it.
 

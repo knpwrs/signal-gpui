@@ -1,8 +1,10 @@
 # Code signing and the Keychain prompt
 
-On macOS the database key (one random 256-bit key that encrypts both `app.db` and presage's protocol store) lives in the login keychain as the item `signal-gpui`. When a build reads it, macOS may show:
+On macOS the database key (one random 256-bit key that encrypts both `app.db` and presage's protocol store) lives in the login keychain as the item `ziggy`. When a build reads it, macOS may show:
 
-> Signal GPUI wants to access key "signal-gpui" in your keychain.
+> Ziggy wants to access key "ziggy" in your keychain.
+
+Before the app was Ziggy it was Signal GPUI, and the key was the item `signal-gpui`. When Ziggy finds no `ziggy` item, it reads `signal-gpui` (macOS asks once: "Ziggy wants to access key "signal-gpui"") and copies the key to `ziggy`. The old item stays.
 
 This page explains when that prompt appears and how to make it appear once instead of after every rebuild.
 
@@ -12,7 +14,7 @@ This page explains when that prompt appears and how to make it appear once inste
 
 A keychain item carries two lists, and an app reads the item without a prompt only when it is on both.
 
-**The access list** names trusted apps by their *designated requirement*, a rule derived from the code signature. For an app signed with a certificate, the rule is roughly "identifier `org.signal-gpui`, signed by this certificate", so it stays the same across rebuilds as long as the certificate does. For an ad hoc or linker-signed binary, the rule is the build's hash, so every build is a new app.
+**The access list** names trusted apps by their *designated requirement*, a rule derived from the code signature. For an app signed with a certificate, the rule is roughly "identifier `io.github.knpwrs.ziggy`, signed by this certificate", so it stays the same across rebuilds as long as the certificate does. For an ad hoc or linker-signed binary, the rule is the build's hash, so every build is a new app.
 
 **The partition list** names apps by partition ID:
 
@@ -41,7 +43,7 @@ That second case is why the self-signed certificate from `scripts/setup-dev-sign
 To confirm a build carries a team ID:
 
 ```sh
-codesign -dv "target/release/Signal GPUI.app" 2>&1 | grep TeamIdentifier
+codesign -dv "target/release/Ziggy.app" 2>&1 | grep TeamIdentifier
 ```
 
 `TeamIdentifier=not set` means the build will keep prompting.
@@ -55,18 +57,18 @@ codesign -dv "target/release/Signal GPUI.app" 2>&1 | grep TeamIdentifier
 
 ## Running the signed build
 
-The signature that matters is on `Signal GPUI.app`, not on the binary cargo writes. The bare `target/<profile>/signal-gpui` carries only the linker's ad hoc signature, so the Keychain treats every build of it as a new app.
+The signature that matters is on `Ziggy.app`, not on the binary cargo writes. The bare `target/<profile>/ziggy` carries only the linker's ad hoc signature, so the Keychain treats every build of it as a new app.
 
-- `cargo run` and `cargo run --release` go through `scripts/cargo-runner.sh`, which bundles, signs and starts `target/<profile>/Signal GPUI.app`.
+- `cargo run` and `cargo run --release` go through `scripts/cargo-runner.sh`, which bundles, signs and starts `target/<profile>/Ziggy.app`.
 - For a build you start yourself, bundle it and run the path the script prints:
 
   ```sh
   cargo build --release
-  "$(scripts/bundle.sh)"                          # target/release/signal-gpui
-  "$(scripts/bundle.sh target/debug/signal-gpui)" # any other build
+  "$(scripts/bundle.sh)"                    # target/release/ziggy
+  "$(scripts/bundle.sh target/debug/ziggy)" # any other build
   ```
 
-  `mise run bundle` runs the first two steps: it builds release and bundles `target/release/signal-gpui`.
+  `mise run bundle` runs the first two steps: it builds release and bundles `target/release/ziggy`.
 
 The bundle is also what lets macOS show notifications.
 
@@ -76,4 +78,4 @@ Switching identities (ad hoc to self-signed, or self-signed to Apple Development
 
 To remove the self-signed certificate, delete `signal-gpui dev` from My Certificates in Keychain Access.
 
-Don't delete the `signal-gpui` key item. Without it neither database can be decrypted, and you would have to unlink and link again.
+Don't delete the `ziggy` key item. Without it neither database can be decrypted, and you would have to unlink and link again. The exception is data moved over from Signal GPUI while its `signal-gpui` item still exists: that item holds the same key, and Ziggy copies it back. A profile Ziggy started itself has no such copy.

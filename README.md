@@ -1,12 +1,12 @@
-# Signal GPUI
+# Ziggy
 
-An unofficial native Signal client for macOS, built with Rust and [GPUI](https://gpui-kit.com). It links to your phone as a secondary device, the way Signal Desktop does.
+An unofficial native Signal client for macOS, built with Rust and [GPUI](https://gpui-kit.com). It links to your phone as a secondary device, the way Signal Desktop does. It was called Signal GPUI until October 2026; the first launch under the new name moves that app's data over.
 
-![Signal GPUI in demo mode: the chat list and a group chat](docs/screenshot.png)
+![Ziggy in demo mode: the chat list and a group chat](docs/screenshot.png)
 
 ## A fraction of the memory
 
-Signal Desktop is an Electron app: a main process, a renderer and four helpers. Signal GPUI is one native process. In an Activity Monitor spot check (Memory column, same account, both apps open), Signal GPUI used 121 MB, about 12% of the 1,038 MB that Signal Desktop's six processes used.
+Signal Desktop is an Electron app: a main process, a renderer and four helpers. Ziggy is one native process. In an Activity Monitor spot check (Memory column, same account, both apps open), Ziggy used 121 MB, about 12% of the 1,038 MB that Signal Desktop's six processes used.
 
 It stays small as you use it:
 
@@ -57,7 +57,7 @@ SIGNAL_GPUI_BACKGROUND=1 …                                       # open withou
 
 The database key lives in the login keychain, and Keychain access depends on the app's code signature: unsigned builds ask for your password after every rebuild. A free "Apple Development" certificate from Xcode stops that, and `scripts/bundle.sh` signs with it. [docs/signing.md](docs/signing.md) has the steps.
 
-macOS only shows notifications, and only grants camera and microphone access, to an app bundle. `cargo run` runs the app from `target/<profile>/Signal GPUI.app`; for a build you start yourself, `scripts/bundle.sh` makes the bundle. `mise run bundle` does both: it builds release and makes `target/release/Signal GPUI.app`.
+macOS only shows notifications, and only grants camera and microphone access, to an app bundle. `cargo run` runs the app from `target/<profile>/Ziggy.app`; for a build you start yourself, `scripts/bundle.sh` makes the bundle. `mise run bundle` does both: it builds release and makes `target/release/Ziggy.app`.
 
 GIF search needs your own Giphy API key (free at developers.giphy.com), pasted in the GIFs tab or set as `GIPHY_API_KEY`. Signal Desktop's key belongs to Signal, so it isn't used here.
 

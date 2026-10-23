@@ -5,10 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "A native Signal Desktop client built on GPUI"
+description = "Ziggy, an unofficial native Signal client built on GPUI"
 
 [[bin]]
-name = "signal-gpui"
+name = "ziggy"
 path = "src/main.rs"
 
 [dependencies]
@@ -50,9 +50,10 @@ objc2-foundation = "0.3"
 objc2-user-notifications = "0.3"
 block2 = "0.6"
 # The ringtone (NSSound), hiding the main window on close (NSWindow), spell
-# checking the composer (NSSpellChecker), and knowing when the Mac wakes
-# (NSWorkspace).
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSSound", "NSResponder", "NSView", "NSWindow", "NSSpellChecker", "NSWorkspace"] }
+# checking the composer (NSSpellChecker), knowing when the Mac wakes
+# (NSWorkspace), and asking to quit Signal GPUI before moving its data
+# (NSAlert, NSApplication).
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSSound", "NSResponder", "NSView", "NSWindow", "NSSpellChecker", "NSWorkspace", "NSAlert", "NSApplication"] }
 # The main window's NSView, to hide its NSWindow.
 raw-window-handle = "0.6"
 # Playing audio attachments and voice messages, and their waveforms.

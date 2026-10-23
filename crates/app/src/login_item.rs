@@ -48,7 +48,7 @@ mod system {
 
     pub fn set(on: bool) -> Result<(), String> {
         if NSBundle::mainBundle().bundleIdentifier().is_none() {
-            return Err("Signal GPUI can only open at login when run as an app.".into());
+            return Err("Ziggy can only open at login when run as an app.".into());
         }
         let service = service().ok_or("Opening at login needs macOS 13 or later.")?;
         let result: Result<(), Retained<NSError>> = unsafe {

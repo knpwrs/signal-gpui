@@ -1,4 +1,6 @@
-# Working on signal-gpui
+# Working on Ziggy
+
+Ziggy was called Signal GPUI; the repository, the cargo package and the `SIGNAL_GPUI_*` environment variables keep the old name.
 
 Lessons from building this client and from its code reviews. README.md covers what the app does; this covers how to change it without repeating old mistakes.
 
@@ -25,7 +27,7 @@ presage stores the first profile, profile photo and group photo it downloads and
 ## Privacy and the user's account
 
 - Never use the user's messages, contacts, screenshots or photos as test data or demo content. The demo's people are made up and its images are drawn in code.
-- The user's real account runs from `target/release/signal-gpui`. Don't kill it, don't build release over it, and don't touch its data directory except to read logs or databases when asked. Opening a database needs the Keychain key, which prompts the user. Any `target/debug/signal-gpui` run without `SIGNAL_GPUI_DATA_DIR` is also the real account.
+- The user's real account runs from `target/release/Ziggy.app` (`target/release/Signal GPUI.app` until the user rebuilds after the rename). Don't kill it, don't build release over it, and don't touch its data directory (`~/Library/Application Support/io.github.knpwrs.Ziggy`, before that `org.signal-gpui.Signal-GPUI`) except to read logs or databases when asked. Opening a database needs the Keychain key, which prompts the user. Any `ziggy` run without `SIGNAL_GPUI_DATA_DIR`, debug included, is also the real account, and the first one moves Signal GPUI's data directory to Ziggy's (`former_name.rs`).
 - Screenshot only windows of a process you started (match by PID). Never send synthetic input. A window on another Space doesn't draw; wait for it rather than activating it.
 - Don't ship Signal's Giphy key.
 

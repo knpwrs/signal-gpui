@@ -1,4 +1,4 @@
-//! Signal GPUI: a native Signal Desktop client.
+//! Ziggy: a native client for Signal, unofficial, after Signal Desktop.
 
 mod assets;
 mod avatar_presets;
@@ -6,6 +6,7 @@ mod chat_color;
 mod audio;
 mod emoji_usage;
 mod fonts;
+mod former_name;
 mod formatting;
 mod image_cache;
 mod keys;
@@ -45,14 +46,17 @@ use signal_backend::{Backend, Config};
 gpui_kit::actions!(signal, [Quit, About, OpenSettings, ShowDebugLog, FocusSearch, SearchInChat, NextConversation, PreviousConversation, CreateStickerPack]);
 
 /// `$SIGNAL_GPUI_DATA_DIR` (a development profile, keyed by a file), or the
-/// platform's application data directory (keyed by the Keychain).
-fn data_dir() -> Result<(PathBuf, keys::KeyStore)> {
+/// platform's application data directory (keyed by the Keychain), where
+/// Signal GPUI's data moves on first launch.
+fn data_dir() -> Result<(PathBuf, keys::KeyStore, former_name::Moved)> {
     if let Some(dir) = std::env::var_os("SIGNAL_GPUI_DATA_DIR") {
-        return Ok((PathBuf::from(dir), keys::KeyStore::File));
+        return Ok((PathBuf::from(dir), keys::KeyStore::File, former_name::Moved::Nothing));
     }
-    directories::ProjectDirs::from("org", "signal-gpui", "Signal GPUI")
-        .map(|dirs| (dirs.data_dir().to_path_buf(), keys::KeyStore::System))
-        .context("no home directory")
+    let dir = directories::ProjectDirs::from("io.github", "knpwrs", "Ziggy")
+        .map(|dirs| dirs.data_dir().to_path_buf())
+        .context("no home directory")?;
+    let moved = former_name::move_data(&dir)?;
+    Ok((dir, keys::KeyStore::System, moved))
 }
 
 fn device_name() -> String {
@@ -63,7 +67,7 @@ fn device_name() -> String {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty());
-    host.unwrap_or_else(|| "Signal GPUI".into())
+    host.unwrap_or_else(|| "Ziggy".into())
 }
 
 /// Logs to stderr and to daily files in `logs/` (three days kept), which
@@ -79,7 +83,7 @@ fn init_logging(data_dir: &std::path::Path) -> Option<tracing_appender::non_bloc
     };
     let files = tracing_appender::rolling::Builder::new()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
-        .filename_prefix("signal-gpui")
+        .filename_prefix("ziggy")
         .filename_suffix("log")
         .max_log_files(3)
         .build(signal_backend::debug_log::log_dir(data_dir));
@@ -111,8 +115,9 @@ fn init_logging(data_dir: &std::path::Path) -> Option<tracing_appender::non_bloc
 fn start_backend(
     data_dir: PathBuf,
     key_store: keys::KeyStore,
+    moved_in: bool,
 ) -> Result<(Backend, futures::channel::mpsc::UnboundedReceiver<signal_backend::Event>)> {
-    let db_key = keys::load_or_create(&data_dir, key_store)?;
+    let db_key = keys::load_or_create(&data_dir, key_store, moved_in)?;
     tracing::info!("data directory: {}", data_dir.display());
     Backend::start(Config {
         data_dir,
@@ -146,16 +151,25 @@ fn bind_keys(cx: &mut App) {
 }
 
 fn main() -> Result<()> {
-    let (data_dir, key_store) = data_dir()?;
+    let (data_dir, key_store, moved) = data_dir()?;
     std::fs::create_dir_all(&data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
     let _log_guard = init_logging(&data_dir);
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting");
+    let moved_in = matches!(moved, former_name::Moved::From(_));
+    match moved {
+        former_name::Moved::From(former) => tracing::info!("moved Signal GPUI's data here from {}", former.display()),
+        former_name::Moved::LeftIn(former) => {
+            tracing::warn!("Signal GPUI's data is still in {}: this directory existed already", former.display())
+        }
+        // (`StillRunning` doesn't get here: `move_data` stops the launch.)
+        former_name::Moved::Nothing | former_name::Moved::StillRunning => {}
+    }
 
     // Parse the emoji index off the main thread while the window opens.
     std::thread::spawn(signal_emoji::warm_up);
 
     let window_dir = data_dir.clone();
-    let (backend, mut events) = start_backend(data_dir, key_store)?;
+    let (backend, mut events) = start_backend(data_dir, key_store, moved_in)?;
 
     // Links macOS opens us with (`sgnl://`, registered in the bundle's
     // Info.plist by scripts/bundle.sh), handed to the app once it runs.

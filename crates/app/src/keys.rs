@@ -11,7 +11,12 @@ use anyhow::{Context as _, Result};
 use rand::RngCore as _;
 
 #[cfg(target_os = "macos")]
-const SERVICE: &str = "signal-gpui";
+const SERVICE: &str = "ziggy";
+/// Where the key was kept while the app was called Signal GPUI. Read when
+/// [`SERVICE`] has none, and copied there; left in place, so the old app
+/// can still read it.
+#[cfg(target_os = "macos")]
+const FORMER_SERVICE: &str = "signal-gpui";
 #[cfg(target_os = "macos")]
 const ACCOUNT: &str = "database-key";
 
@@ -26,9 +31,11 @@ pub enum KeyStore {
 }
 
 /// Loads the database key, creating and storing a new one on first run.
-pub fn load_or_create(data_dir: &Path, store_kind: KeyStore) -> Result<[u8; 32]> {
+/// `moved_in`: Signal GPUI's data just moved to `data_dir`, so its key is
+/// the one that opens it.
+pub fn load_or_create(data_dir: &Path, store_kind: KeyStore, moved_in: bool) -> Result<[u8; 32]> {
     let existing = match store_kind {
-        KeyStore::System => load(data_dir)?,
+        KeyStore::System => load(data_dir, moved_in)?,
         KeyStore::File => load_file(data_dir)?,
     };
     if let Some(key) = existing {
@@ -51,13 +58,30 @@ fn decode(hex_key: &[u8]) -> Result<[u8; 32]> {
 }
 
 #[cfg(target_os = "macos")]
-fn load(_data_dir: &Path) -> Result<Option<[u8; 32]>> {
+fn load(data_dir: &Path, moved_in: bool) -> Result<Option<[u8; 32]>> {
+    // A `ziggy` key from before is for a profile of Ziggy's own that's gone
+    // (the data moved in only because Ziggy's directory didn't exist), and
+    // can't open Signal GPUI's databases.
+    if !moved_in && let Some(key) = load_service(SERVICE)? {
+        return Ok(Some(key));
+    }
+    // Never a new key for databases the old name's key encrypts.
+    let Some(key) = load_service(FORMER_SERVICE)? else {
+        return if moved_in { load_service(SERVICE) } else { Ok(None) };
+    };
+    store(data_dir, &key)?;
+    tracing::info!("copied the database key from the Keychain item {FORMER_SERVICE:?} to {SERVICE:?}");
+    Ok(Some(key))
+}
+
+#[cfg(target_os = "macos")]
+fn load_service(service: &str) -> Result<Option<[u8; 32]>> {
     use security_framework::passwords::get_generic_password;
-    match get_generic_password(SERVICE, ACCOUNT) {
+    match get_generic_password(service, ACCOUNT) {
         Ok(bytes) => decode(&bytes).map(Some),
         // errSecItemNotFound
         Err(e) if e.code() == -25300 => Ok(None),
-        Err(e) => Err(e).context("reading database key from the Keychain"),
+        Err(e) => Err(e).with_context(|| format!("reading database key {service:?} from the Keychain")),
     }
 }
 
@@ -68,7 +92,7 @@ fn store(_data_dir: &Path, key: &[u8; 32]) -> Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn load(data_dir: &Path) -> Result<Option<[u8; 32]>> {
+fn load(data_dir: &Path, _moved_in: bool) -> Result<Option<[u8; 32]>> {
     load_file(data_dir)
 }
 

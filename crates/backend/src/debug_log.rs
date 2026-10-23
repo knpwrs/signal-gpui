@@ -123,7 +123,7 @@ pub fn assemble(log_dir: &Path, header: &Header, sensitive_paths: &[PathBuf]) ->
 pub async fn upload(log: &str, app_version: &str) -> anyhow::Result<String> {
     let client = reqwest::Client::builder()
         .use_preconfigured_tls(crate::link_preview::tls_config()?)
-        .user_agent(format!("signal-gpui/{app_version}"))
+        .user_agent(format!("ziggy/{app_version}"))
         .timeout(UPLOAD_TIMEOUT)
         .build()?;
 
@@ -157,7 +157,7 @@ pub async fn upload(log: &str, app_version: &str) -> anyhow::Result<String> {
     multipart = multipart.text("Content-Type", "application/gzip").part(
         "file",
         reqwest::multipart::Part::bytes(body)
-            .file_name(format!("signal-gpui-debug-log-{app_version}.txt.gz"))
+            .file_name(format!("ziggy-debug-log-{app_version}.txt.gz"))
             .mime_str("application/gzip")?,
     );
     let response = client.post(target).multipart(multipart).send().await?;
@@ -173,9 +173,9 @@ mod tests {
 
     #[test]
     fn redacts_like_desktop() {
-        let paths = [PathBuf::from("/Users/me/Library/Application Support/signal-gpui")];
+        let paths = [PathBuf::from("/Users/me/Library/Application Support/io.github.knpwrs.Ziggy")];
         let line = "send to +15551234567 aci 6b1a2b3c-0000-4000-8000-000000000abc in groupv2(abcdefXYZ==) \
-                    file /Users/me/Library/Application Support/signal-gpui/attachments/1.png \
+                    file /Users/me/Library/Application Support/io.github.knpwrs.Ziggy/attachments/1.png \
                     card 4111-1111-1111-1111 at 0x00007ff8a1b2c3d4 \
                     conversation g:0000000000000000000000000000000000000000000000000000000000000123";
         let redacted = redact(line, &paths);
@@ -191,8 +191,8 @@ mod tests {
     #[test]
     fn assembles_header_then_logs_in_order() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("signal-gpui.2026-10-13.log"), "older +15551234567\n").unwrap();
-        std::fs::write(dir.path().join("signal-gpui.2026-10-14.log"), "newer\n").unwrap();
+        std::fs::write(dir.path().join("ziggy.2026-10-13.log"), "older +15551234567\n").unwrap();
+        std::fs::write(dir.path().join("ziggy.2026-10-14.log"), "newer\n").unwrap();
         let header = Header {
             app_version: "0.1.0".into(),
             os_version: "macOS 26".into(),

@@ -200,7 +200,7 @@ fn submitted(link: SharedString, palette: Palette) -> gpui_kit::AnyElement {
 fn save_log(model: &Entity<DebugLog>, cx: &mut App) {
     let Some(log) = model.read(cx).log.clone() else { return };
     let directory = std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Downloads")).unwrap_or_default();
-    let name = format!("signal-gpui-debug-log-{}.txt", chrono::Local::now().format("%Y-%m-%d-%H%M%S"));
+    let name = format!("ziggy-debug-log-{}.txt", chrono::Local::now().format("%Y-%m-%d-%H%M%S"));
     let chosen = cx.prompt_for_new_path(&directory, Some(&name));
     cx.spawn(async move |_| {
         if let Ok(Ok(Some(path))) = chosen.await
@@ -265,7 +265,7 @@ mod tests {
         cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("logs")).unwrap();
-        std::fs::write(dir.path().join("logs/signal-gpui.2026-10-14.log"), "INFO hello\n").unwrap();
+        std::fs::write(dir.path().join("logs/ziggy.2026-10-14.log"), "INFO hello\n").unwrap();
         let (backend, _events) = Backend::start(Config {
             data_dir: dir.path().to_owned(),
             db_key: [7; 32],

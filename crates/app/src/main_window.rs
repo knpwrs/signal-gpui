@@ -96,7 +96,7 @@ fn open_window(bounds: WindowBounds, cx: &mut App) -> anyhow::Result<()> {
             // span about 59), like Desktop's.
             traffic_light_position: Some(point(px(10.5), px(18.))),
         }),
-        app_id: Some("org.signal-gpui".into()),
+        app_id: Some("io.github.knpwrs.ziggy".into()),
         focus: !background,
         ..Default::default()
     };
