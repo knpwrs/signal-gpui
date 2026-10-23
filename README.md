@@ -1,6 +1,6 @@
 # Ziggy
 
-An unofficial native Signal client for macOS, built with Rust and [GPUI](https://gpui-kit.com). It links to your phone as a secondary device, the way Signal Desktop does. It was called Signal GPUI until October 2026; the first launch under the new name moves that app's data over.
+An unofficial native Signal client, built with Rust and [GPUI](https://gpui-kit.com). It links to your phone as a secondary device, the way Signal Desktop does. It was called Signal GPUI until October 2026; the first launch under the new name moves that app's data over.
 
 ![Ziggy in demo mode: the chat list and a group chat](docs/screenshot.png)
 
