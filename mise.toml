@@ -1,0 +1,8 @@
+[tools]
+# spqr's build script runs protoc. mise's release binary is self-contained,
+# so a Homebrew abseil upgrade can't break it.
+protoc = "36.2"
+
+[tasks.bundle]
+description = "Build release and wrap it in target/release/Signal GPUI.app"
+run = ["cargo build --release", "scripts/bundle.sh"]

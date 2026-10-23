@@ -46,7 +46,7 @@ Where Signal's server turns features on or sets limits through remote config, th
 
 ## Running
 
-Building needs `cmake` (BoringSSL, for contact discovery) and `protoc` (RingRTC), and GIFs and video posters need `ffmpeg`: `brew install cmake protobuf ffmpeg`. The first build downloads Signal's prebuilt WebRTC (about 28 MB) into `target/webrtc`.
+Building needs `cmake` (BoringSSL, for contact discovery) and `protoc` (RingRTC and libsignal's `spqr`), and GIFs and video posters need `ffmpeg`: `brew install cmake ffmpeg`, then `mise install` for the `protoc` pinned in `mise.toml`. mise's `protoc` is the upstream release binary; Homebrew's links Homebrew's abseil and stops starting when abseil upgrades ahead of it. The first build downloads Signal's prebuilt WebRTC (about 28 MB) into `target/webrtc`.
 
 ```sh
 cargo run --release                                              # your account: scan the QR code with Signal on your phone
@@ -57,7 +57,7 @@ SIGNAL_GPUI_BACKGROUND=1 …                                       # open withou
 
 The database key lives in the login keychain, and Keychain access depends on the app's code signature: unsigned builds ask for your password after every rebuild. A free "Apple Development" certificate from Xcode stops that, and `scripts/bundle.sh` signs with it. [docs/signing.md](docs/signing.md) has the steps.
 
-macOS only shows notifications, and only grants camera and microphone access, to an app bundle. `cargo run` runs the app from `target/<profile>/Signal GPUI.app`; for a build you start yourself, `scripts/bundle.sh` makes the bundle.
+macOS only shows notifications, and only grants camera and microphone access, to an app bundle. `cargo run` runs the app from `target/<profile>/Signal GPUI.app`; for a build you start yourself, `scripts/bundle.sh` makes the bundle. `mise run bundle` does both: it builds release and makes `target/release/Signal GPUI.app`.
 
 GIF search needs your own Giphy API key (free at developers.giphy.com), pasted in the GIFs tab or set as `GIPHY_API_KEY`. Signal Desktop's key belongs to Signal, so it isn't used here.
 

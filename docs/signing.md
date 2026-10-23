@@ -66,6 +66,8 @@ The signature that matters is on `Signal GPUI.app`, not on the binary cargo writ
   "$(scripts/bundle.sh target/debug/signal-gpui)" # any other build
   ```
 
+  `mise run bundle` runs the first two steps: it builds release and bundles `target/release/signal-gpui`.
+
 The bundle is also what lets macOS show notifications.
 
 ## Changing or removing certificates
