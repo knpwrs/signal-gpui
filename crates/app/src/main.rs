@@ -124,6 +124,12 @@ fn start_backend(
         db_key,
         device_name: device_name(),
         demo: std::env::var_os("SIGNAL_GPUI_DEMO").is_some(),
+        // The paths Signal GPUI stored name its directory, even once the
+        // data has moved.
+        former_data_dir: match key_store {
+            keys::KeyStore::System => former_name::former_data_dir(),
+            keys::KeyStore::File => None,
+        },
     })
 }
 

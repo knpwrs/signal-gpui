@@ -1495,6 +1495,60 @@ async fn renaming_an_author_looks_up_their_messages_by_index() {
 }
 
 #[tokio::test]
+async fn stored_paths_follow_a_moved_data_directory() {
+    let db = test_db().await;
+    let (old, new) = ("/Users/me/Library/Application Support/old", "/Users/me/Library/Application Support/io.github.knpwrs.Ziggy");
+    let id = db.insert_message(&incoming("d:a", "a", 1, "see the photo")).await.unwrap();
+    let other = db.insert_message(&incoming("d:a", "a", 2, "not a path: /Users/me/Library/Application Support/older/x")).await.unwrap();
+    let written = format!("my avatar was {old}/avatars/me.jpg");
+    let quoted = db.insert_message(&incoming("d:a", "a", 3, &written)).await.unwrap();
+    sqlx::query("UPDATE messages SET attachments = ?1 WHERE id = ?2")
+        .bind(format!(r#"[{{"content_type":"image/png","local_path":"{old}/attachments/1.png","thumbnail":"{old}/attachments/1-thumb.png"}}]"#))
+        .bind(id)
+        .execute(&db.writer)
+        .await
+        .unwrap();
+    db.set_person_avatar("b", &format!("{old}/avatars/b.jpg")).await.unwrap();
+    // Someone's text beside a path, in one JSON value: only the path moves.
+    sqlx::query("UPDATE messages SET link_preview = ?1 WHERE id = ?2")
+        .bind(format!(r#"{{"description":"files live in {old}/attachments/","image":"{old}/attachments/p.jpg"}}"#))
+        .bind(other)
+        .execute(&db.writer)
+        .await
+        .unwrap();
+    db.set_setting("some.paths", &format!(r#"{{"c":"{old}/contact-avatars/c.jpg"}}"#)).await.unwrap();
+
+    let changed = db.rebase_paths(old, new).await.unwrap();
+    assert_eq!(changed, 4, "the two messages, the avatar and the setting");
+    let attachments: String =
+        sqlx::query_scalar("SELECT attachments FROM messages WHERE id = ?").bind(id).fetch_one(&db.pool).await.unwrap();
+    assert!(!attachments.contains(old) && attachments.matches(&format!("{new}/attachments/")).count() == 2, "{attachments}");
+    assert_eq!(db.person_avatars().await.unwrap(), [("b".to_owned(), format!("{new}/avatars/b.jpg"))]);
+    assert_eq!(db.setting("some.paths").await.unwrap().unwrap(), format!(r#"{{"c":"{new}/contact-avatars/c.jpg"}}"#));
+    // A directory whose name starts the same is another directory.
+    let body: String = sqlx::query_scalar("SELECT body FROM messages WHERE id = ?").bind(other).fetch_one(&db.pool).await.unwrap();
+    assert!(body.contains("/older/x"), "{body}");
+    let preview: String =
+        sqlx::query_scalar("SELECT link_preview FROM messages WHERE id = ?").bind(other).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(preview, format!(r#"{{"description":"files live in {old}/attachments/","image":"{new}/attachments/p.jpg"}}"#));
+    // What someone wrote stays as written, path or not, and so does the
+    // chat list's copy of it.
+    let body: String = sqlx::query_scalar("SELECT body FROM messages WHERE id = ?").bind(quoted).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(body, written);
+    let last: String = sqlx::query_scalar("SELECT last_message_preview FROM conversations WHERE id = 'd:a'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert!(last.contains(old), "{last}");
+    // Numbers stay numbers; search still works; nothing left to do.
+    let sent_at: (String,) = sqlx::query_as("SELECT typeof(sent_at) FROM messages WHERE id = ?").bind(id).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(sent_at.0, "integer");
+    assert_eq!(db.search_messages("photo", 10).await.unwrap().len(), 1);
+    sqlx::query("INSERT INTO messages_fts (messages_fts) VALUES ('integrity-check')").execute(&db.writer).await.unwrap();
+    assert_eq!(db.rebase_paths(old, new).await.unwrap(), 0);
+}
+
+#[tokio::test]
 async fn a_message_named_by_author_and_time_is_one_seek() {
     // Receipts, reactions and read syncs name a message this way. Reading
     // every message by the author instead took 2 to 5 seconds a receipt on

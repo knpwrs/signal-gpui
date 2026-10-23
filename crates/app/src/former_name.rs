@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result, bail};
 
 /// The data directory the app had as Signal GPUI.
-fn former_data_dir() -> Option<PathBuf> {
+pub fn former_data_dir() -> Option<PathBuf> {
     directories::ProjectDirs::from("org", "signal-gpui", "Signal GPUI").map(|dirs| dirs.data_dir().to_path_buf())
 }
 

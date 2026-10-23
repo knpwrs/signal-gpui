@@ -275,6 +275,10 @@ pub struct Config {
     pub device_name: String,
     /// Demo mode: sample data, never connects to Signal (see `demo.rs`).
     pub demo: bool,
+    /// Where this profile's data was before it moved (Signal GPUI's data
+    /// directory, before Ziggy's): the paths stored for its files are
+    /// rewritten once to name `data_dir` instead.
+    pub former_data_dir: Option<PathBuf>,
 }
 
 /// A group a link leads to, as Desktop's `GroupV2JoinDialog` shows it.
@@ -1336,6 +1340,9 @@ impl Backend {
         if let Err(error) = runtime.block_on(db.upgrade_previews()) {
             tracing::warn!(%error, "failed to refresh conversation previews");
         }
+        if let Some(former) = &config.former_data_dir {
+            runtime.block_on(rebase_paths(&db, former, &config.data_dir));
+        }
 
         // Never let the pool drop implicitly: see `actor::run` on SQLCipher's
         // exit-time shutdown. `Backend::shutdown` closes it explicitly.
@@ -1408,5 +1415,25 @@ impl Backend {
     {
         let handle = self.runtime.spawn(fut);
         async move { handle.await.expect("backend task panicked") }
+    }
+}
+
+/// Rewrites the paths stored for files in `former`, the data directory
+/// before it moved to `data_dir`, before anything reads them: once per
+/// former directory. A failure is tried again at the next start.
+async fn rebase_paths(db: &AppDb, former: &std::path::Path, data_dir: &std::path::Path) {
+    let (from, to) = (former.to_string_lossy(), data_dir.to_string_lossy());
+    if from == to || db.setting(signal_store::SETTING_REBASED_FROM).await.ok().flatten().as_deref() == Some(&*from) {
+        return;
+    }
+    let started = std::time::Instant::now();
+    match db.rebase_paths(&from, &to).await {
+        Ok(changed) => {
+            tracing::info!(changed, elapsed = ?started.elapsed(), "rewrote stored file paths from {from}");
+            if let Err(error) = db.set_setting(signal_store::SETTING_REBASED_FROM, &from).await {
+                tracing::warn!(%error, "couldn't record the rewritten file paths");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "couldn't rewrite stored file paths from {from}"),
     }
 }

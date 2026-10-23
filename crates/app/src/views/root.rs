@@ -638,7 +638,7 @@ mod tests {
         cx.update(gpui_kit::init);
         cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
-        let config = Config { data_dir: dir.path().to_owned(), db_key: [7; 32], device_name: "test".into(), demo: true };
+        let config = Config { data_dir: dir.path().to_owned(), db_key: [7; 32], device_name: "test".into(), demo: true, former_data_dir: None };
         let (backend, mut events) = Backend::start(config).unwrap();
         let state = cx.update(|cx| crate::state::new_state(backend.clone(), cx));
         // As the app does: backend events into the model.
@@ -702,7 +702,7 @@ mod tests {
         cx.update(gpui_kit::init);
         cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
-        let config = Config { data_dir: dir.path().to_owned(), db_key: [7; 32], device_name: "test".into(), demo: true };
+        let config = Config { data_dir: dir.path().to_owned(), db_key: [7; 32], device_name: "test".into(), demo: true, former_data_dir: None };
         let (backend, mut events) = Backend::start(config).unwrap();
         let state = cx.update(|cx| crate::state::new_state(backend.clone(), cx));
         cx.update(|cx| {
@@ -766,7 +766,7 @@ mod tests {
         cx.update(gpui_kit::init);
         cx.executor().allow_parking();
         let dir = tempfile::tempdir().unwrap();
-        let config = Config { data_dir: dir.path().to_owned(), db_key: [7; 32], device_name: "test".into(), demo: true };
+        let config = Config { data_dir: dir.path().to_owned(), db_key: [7; 32], device_name: "test".into(), demo: true, former_data_dir: None };
         let (backend, mut events) = Backend::start(config).unwrap();
         let state = cx.update(|cx| crate::state::new_state(backend.clone(), cx));
         cx.update(|cx| {

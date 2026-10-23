@@ -974,6 +974,7 @@ mod tests {
                 db_key: [7; 32],
                 device_name: "test".into(),
                 demo: true,
+                former_data_dir: None,
             })
             .unwrap();
             let (window, view, state) = cx.update(|cx| {

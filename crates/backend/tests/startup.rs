@@ -11,6 +11,7 @@ fn fresh_install_needs_linking() {
         db_key: [3u8; 32],
         device_name: "test".into(),
         demo: false,
+        former_data_dir: None,
     };
     let (backend, mut events) = Backend::start(config).unwrap();
     assert_eq!(block_on(events.next()), Some(Event::NeedsLinking));
