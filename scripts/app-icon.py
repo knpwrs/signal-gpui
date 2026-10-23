@@ -1,24 +1,21 @@
-# Draws the app icon: Signal Desktop's macOS logo (build/icons/mac/
-# AppIcon.icon/Assets/logo.svg, white) on a rust gradient, in the shape and
-# size macOS gives app icons, for crates/app/assets/app-icon:
-#   uv run --with pillow scripts/app-icon.py LOGO.svg OUT_DIR
-# then oxipng -o max --strip safe OUT_DIR/*.png. Needs rsvg-convert
-# (brew install librsvg).
+# Makes the app icon's sizes, for crates/app/assets/app-icon, from artwork
+# drawn as a rounded square (crates/app/assets/app-icon/source.png):
+#   uv run --with pillow --with numpy scripts/app-icon.py SOURCE.png OUT_DIR
+# then oxipng -o max --strip safe OUT_DIR/[0-9]*.png.
 #
-# Desktop's icon is an Icon Composer file, whose shape macOS draws; an .icns
-# draws its own. Apple's grid: on a 1024 canvas, an 824 square at 100 with
-# continuous corners (a superellipse here) and a soft shadow below.
+# An .icns draws its own shape. Apple's grid: on a 1024 canvas, an 824
+# square at 100 with continuous corners (a superellipse here) and a soft
+# shadow below. The artwork's own square is cut out, scaled to 824, and
+# given that shape, so its margins, corners and background don't matter.
 import math
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
-from PIL import Image, ImageChops, ImageDraw, ImageFilter
+import numpy as np
+from PIL import Image, ImageDraw, ImageFilter
 
-logo_svg, out_dir = Path(sys.argv[1]), Path(sys.argv[2])
+source, out_dir = Path(sys.argv[1]), Path(sys.argv[2])
 CANVAS, BODY, INSET = 1024, 824, 100
-TOP, BOTTOM = (0xD9, 0x55, 0x2A), (0xA8, 0x38, 0x0F)
 SIZES = [16, 24, 32, 48, 64, 128, 256, 512, 1024]
 
 
@@ -38,27 +35,34 @@ def squircle(size: int, exponent: float = 5.0, supersample: int = 4) -> Image.Im
     return mask.resize((size, size), Image.LANCZOS)
 
 
-def gradient(size: int) -> Image.Image:
-    image = Image.new("RGBA", (size, size))
-    pixels = image.load()
-    for y in range(size):
-        f = y / (size - 1)
-        color = tuple(round(a + (b - a) * f) for a, b in zip(TOP, BOTTOM)) + (255,)
-        for x in range(size):
-            pixels[x, y] = color
-    return image
+def filled(image: Image.Image) -> Image.Image:
+    """`image` opaque: where it's transparent (outside its own corners), the
+    colors nearest, spread by ever wider blurs of the premultiplied image."""
+    rgba = np.asarray(image, dtype=np.float64) / 255
+    alpha = rgba[..., 3:]
+    color = rgba[..., :3] * alpha
+    out_color, out_alpha = color.copy(), alpha.copy()
+    for radius in (4, 8, 16, 32, 64, 128):
+        blur = lambda channels: np.asarray(
+            Image.fromarray(np.uint8(np.clip(channels, 0, 1) * 255)).filter(ImageFilter.GaussianBlur(radius)),
+            dtype=np.float64,
+        ) / 255
+        spread_color = np.dstack([blur(color[..., i]) for i in range(3)])
+        spread_alpha = blur(alpha[..., 0])[..., None]
+        # Over what's there, under what's drawn.
+        out_color = out_color + spread_color * (1 - out_alpha)
+        out_alpha = out_alpha + spread_alpha * (1 - out_alpha)
+    rgb = out_color / np.maximum(out_alpha, 1e-6)
+    return Image.fromarray(np.uint8(np.clip(rgb, 0, 1) * 255 + 0.5), "RGB").convert("RGBA")
 
 
-with tempfile.TemporaryDirectory() as tmp:
-    logo_png = Path(tmp) / "logo.png"
-    # The logo is drawn on the shape's own 1024 square; scale it with it.
-    subprocess.run(["rsvg-convert", "-w", str(BODY), "-h", str(BODY), "-o", str(logo_png), str(logo_svg)], check=True)
-    logo = Image.open(logo_png).convert("RGBA")
-
+art = Image.open(source).convert("RGBA")
+# The artwork's square: what's nearly opaque. Fainter pixels around it
+# (antialiasing, stray haze) are left out.
+square = art.getchannel("A").point(lambda a: 255 if a > 200 else 0).getbbox()
+body = filled(art.crop(square)).resize((BODY, BODY), Image.LANCZOS)
 shape = squircle(BODY)
-body = gradient(BODY)
-body.alpha_composite(logo)
-body.putalpha(ImageChops.multiply(body.getchannel("A"), shape))
+body.putalpha(shape)
 
 icon = Image.new("RGBA", (CANVAS, CANVAS), (0, 0, 0, 0))
 # A soft shadow, a little below, as macOS icons have.

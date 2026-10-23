@@ -18,8 +18,7 @@ BIN="${1:-target/release/ziggy}"
 [ -x "$BIN" ] || { echo "no binary at $BIN; build it first" >&2; exit 1; }
 APP="$(dirname "$BIN")/Ziggy.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-# The app icon (Signal Desktop's logo on a rust rounded square; see
-# scripts/app-icon.py), from its PNGs.
+# The app icon, from its PNGs (made by scripts/app-icon.py).
 ICONS="$(cd "$(dirname "$0")/.." && pwd)/crates/app/assets/app-icon"
 ICONSET="$(mktemp -d)/AppIcon.iconset"
 mkdir -p "$ICONSET"
