@@ -1,6 +1,6 @@
 # Working on Ziggy
 
-Ziggy was called Signal GPUI; the repository, the cargo package and the `SIGNAL_GPUI_*` environment variables keep the old name.
+Ziggy was called Signal GPUI (the repository was knpwrs/signal-gpui); the cargo package and the `SIGNAL_GPUI_*` environment variables keep the old name.
 
 Lessons from building this client and from its code reviews. README.md covers what the app does; this covers how to change it without repeating old mistakes.
 
